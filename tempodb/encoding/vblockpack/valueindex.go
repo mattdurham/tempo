@@ -14,10 +14,12 @@ package vblockpack
 
 import (
 	"context"
-	"log/slog"
 	"os"
 	"strings"
 	"sync"
+
+	"github.com/go-kit/log/level"
+	util_log "github.com/grafana/tempo/pkg/util/log"
 
 	minio "github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -83,7 +85,7 @@ func ConfigureValueIndex(enabled bool, s3cfg *s3backend.Config, indexPrefix stri
 	valueIndexConfigOnce.Do(func() {
 		client, err := newMinioForValueIndex(s3cfg)
 		if err != nil {
-			slog.Warn("vblockpack: value-index write path disabled", "err", err)
+			level.Warn(util_log.Logger).Log("msg", "vblockpack: value-index write path disabled — S3 client init failed", "err", err)
 			return
 		}
 		if indexPrefix == "" {
@@ -93,6 +95,7 @@ func ConfigureValueIndex(enabled bool, s3cfg *s3backend.Config, indexPrefix stri
 		valueIndexSink = &s3ObjectPutter{client: client, bucket: s3cfg.Bucket}
 		valueIndexPrefix = indexPrefix
 		valueIndexSinkMu.Unlock()
+		level.Info(util_log.Logger).Log("msg", "vblockpack: value-index write path configured", "bucket", s3cfg.Bucket, "prefix", indexPrefix)
 	})
 }
 

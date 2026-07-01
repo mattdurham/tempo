@@ -1,221 +1,265 @@
-# Brainstorm
+# Brainstorm: Three Open Problems
+
+## Problem 1: Value-index L0 write silently stopped
+
+### Root cause analysis
+
+The code in `create.go:173` does:
+
+```go
+if r, rerr := blockpack.NewReaderFromProvider(&fileReaderProvider{f: tmp}); rerr == nil {
+    // ... WriteValueIndexL0 ...
+}
+// rerr != nil → silently dropped
+```
 
-## 2026-03-29 00:00:00 - Task Received
+The writer (`vendor/.../blockio/writer/v8_sections.go`) unconditionally writes
+`FooterV9Version = 9`. The reader (`vendor/.../blockio/reader/parser.go`) in
+`tryReadFooterMagic18()` accepts **only** `FooterV9Version`:
 
-Optimize blockpack intrinsic section and field population path to fix the #1 performance bottleneck for range predicate queries.
+```go
+if ver != shared.FooterV9Version {
+    return false, &UnsupportedFormatVersionError{Version: ver}
+}
+```
 
-The intrinsic section stores sorted-by-value columns for efficient predicate evaluation (binary search to find matching refs). However it is currently also used for field population (getting values for display after matching), which requires O(N) scans over 3.3M entries × 11 columns per file. Three coordinated changes are required:
+Any prior block format (V3–V8, i.e. version byte ≠ 9) causes
+`NewReaderFromProvider` to return a non-nil `rerr` of type
+`*UnsupportedFormatVersionError` — which is silently swallowed by the
+`rerr == nil` guard in `create.go`.
+
+**But the actual freshly-written temp file always carries FooterV9** (the writer
+emits it unconditionally since commit `76b7477b`). The writer and the vendored
+reader are identical format versions, so `NewReaderFromProvider` on a
+freshly-written temp file should succeed.
+
+The more likely explanation for the July 07:15 UTC halt is one of:
+
+1. **`tmp.Seek(0, io.SeekStart)` failure is silently swallowed** — the outer
+   `if _, serr := tmp.Seek(0, io.SeekStart); serr == nil` guard also eats its
+   error without logging. If OS-level `seek` on a temp file fails (e.g. bad fd,
+   OOM, disk full), the value-index write is skipped with no log line.
+
+2. **`getValueIndexSink()` returned `nil`** — if the S3 client initialization
+   in `ConfigureValueIndex` failed silently (its `sync.Once` swallowed the
+   error via `slog.Warn`) and `valueIndexSink` was never set. In that case the
+   outer `if store, prefix := getValueIndexSink(); store != nil` is false and
+   the block proceeds without touching the index path — again no log line.
+
+3. **An `ErrUnsupportedFormatVersion` could appear** only if the vendor
+   (`tempo/vendor/github.com/grafana/blockpack`) and the writer diverged —
+   e.g. if blockpack was updated to emit V10+ but tempo's vendor still carries
+   the V9 reader. Not currently the case (both are V9).
+
+### Fix
+
+Two concrete changes needed:
 
-1. Remove identity columns from the intrinsic accumulator (shrink from 11 to 7 columns)
-2. Switch field population from intrinsic scan to block reads (O(M) not O(N))
-3. Remove RefBloom from page encoding (256 bytes/page, 100% FPR at 10K entries — useless)
+**a) Log the silent `rerr != nil` case** — add a `level.Warn` for
+`NewReaderFromProvider` failures so the skip is visible in logs:
 
-Starting brainstorm process...
+```go
+if r, rerr := blockpack.NewReaderFromProvider(&fileReaderProvider{f: tmp}); rerr == nil {
+    // ...
+} else {
+    level.Warn(util_log.Logger).Log(
+        "msg", "vblockpack: value-index L0 skipped (could not open temp file)",
+        "block", blockObjectKey(meta.TenantID, blockUUID.String()),
+        "err", rerr,
+    )
+}
+```
 
-## 2026-03-29 00:01:00 - Research Findings
+**b) Log the silent `serr != nil` seek-failure case** similarly.
 
-### Existing Patterns Found
+**c) Separately investigate** whether `ConfigureValueIndex`'s `slog.Warn` on
+minio-client construction failure is being hidden. Add a metric or a startup
+error log that is visible in block-builder startup logs.
 
-**Pattern 1: Intrinsic accumulator — feedIntrinsic calls**
-- Location: `vendor/github.com/grafana/blockpack/internal/modules/blockio/writer/writer_block.go`
-- Description: Calls `feedIntrinsicSpanID`, `feedIntrinsicParentID`, `feedIntrinsicStatusMessage`, and `feedIntrinsicTraceID` alongside the predicate-relevant intrinsics (name, duration, status, kind). These identity/display-only columns are accumulated into the sorted intrinsic section, inflating its size without enabling efficient predicate evaluation.
-- Relevance: Removing these four `feedIntrinsic*` calls is the core write-path change.
+---
 
-**Pattern 2: Intrinsic accumulator and page ref range**
-- Location: `vendor/github.com/grafana/blockpack/internal/modules/blockio/writer/intrinsic_accum.go`
-- Description: `computePageRefRange` computes per-page min/max ref bounds used to build the RefBloom filter. The RefBloom itself is 256 bytes per page and is written into the page TOC.
-- Relevance: Remove `computePageRefRange` call and RefBloom generation entirely.
+## Problem 2: VCNT not wired
+
+### What exists in blockpack
+
+The `internal/modules/valuecounts` package provides:
+
+- **`Record`** — one row: `(ColumnName, Value, TimeStart, TimeEnd, Count int64)`.
+- **`EncodeRecords(records []Record, perChunk int) ([]byte, []ChunkDirEntry)`** — encodes
+  a pre-sorted slice into snappy-chunked wire bytes.
+- **`Sort(records []Record)`** — sorts in canonical `(ColumnName, TimeStart, Value,
+  Count)` order required before `EncodeRecords`.
+- **`Compact(records []Record) []Record`** — sums by `(col, timeStart, timeEnd, value)`,
+  drops keys ≤ 0. Used during compaction.
+- **`ValuesInRange`, `TopNInRange`, `CardinalityInRange`** — read-path queries over
+  encoded data.
+- Section is stamped `ToCSubTypeValueCounts = 16` in the ToC.
+
+### What is missing (no public API yet)
+
+There is **no** public `WriteVCNT` or `AccumulateVCNT` function in the blockpack
+root package. The `valuecounts` package lives under `internal/modules/` and is
+not re-exported at the blockpack root (no wiring in `blockpack/api.go` or any
+`blockpack/*.go` file). The blockpack writer (`Writer.Flush()`) does not emit a
+VCNT section.
 
-**Pattern 3: PageMeta and RefBloom in shared types**
-- Location: `vendor/github.com/grafana/blockpack/internal/modules/blockio/shared/types.go`
-- Description: `PageMeta` carries a `RefBloom []byte` field. `IntrinsicColumn` carries `RefIndexEntry`, `refIndex`, and `refIndexOnce` fields used to build a lazy ref-to-page index.
-- Relevance: All four fields/types removed as part of RefBloom removal.
+The only place `ToCSubTypeValueCounts` is referenced is in the reader test and
+the shared constants — confirming the section is defined but not yet emitted by
+any production path.
 
-**Pattern 4: RefBloom constants**
-- Location: `vendor/github.com/grafana/blockpack/internal/modules/blockio/shared/constants.go`
-- Description: `IntrinsicRefBloomBytes` and `IntrinsicRefBloomK` define the bloom filter sizing parameters.
-- Relevance: Both constants removed.
+### What tempo's block-builder needs to do
 
-**Pattern 5: Ref filter helpers**
-- Location: `vendor/github.com/grafana/blockpack/internal/modules/blockio/shared/intrinsic_ref_filter.go`
-- Description: `matchesRefFilter`, `DecodePagedColumnBlobFiltered`, `EnsureRefIndex`, and `LookupRefFast` implement the ref-based page filtering logic tied to RefBloom.
-- Relevance: Entire file removed (or functions removed if file contains other unrelated code).
+To produce VCNT data, the block-builder must:
 
-**Pattern 6: RefBloom in page TOC encode/decode**
-- Location: `vendor/github.com/grafana/blockpack/internal/modules/blockio/shared/intrinsic_codec.go`
-- Description: Page TOC serialization includes RefBloom bytes. Decode reads them back into `PageMeta.RefBloom`.
-- Relevance: RefBloom encode/decode paths removed; backward compat handled by treating absent RefBloom as nil (already skipped).
+1. After writing each span via `writer.AddTempoTrace`, accumulate per-column
+   value counts into an in-memory `map[string]map[string]int64` (column →
+   value → count) with the block's minute-bucket time window.
+2. After `writer.Flush()`, encode the accumulated records:
 
-**Pattern 7: collectIntrinsicPlain — useIntrinsicLookup branch**
-- Location: `vendor/github.com/grafana/blockpack/internal/modules/executor/stream.go`
-- Description: `collectIntrinsicPlain` has a `useIntrinsicLookup` branch that, for range predicates, scans the full intrinsic column to populate field values after matching. This is the O(N) path. The non-intrinsic path calls `forEachBlockInGroups` to read actual block data for field population, which is O(M) where M is the result count.
-- Relevance: Remove the `useIntrinsicLookup` branch entirely. Both equality and range predicate paths use `forEachBlockInGroups` for field population after the predicate evaluation step.
+   ```go
+   recs := // build []valuecounts.Record from accumulator
+   valuecounts.Sort(recs)
+   data, dir := valuecounts.EncodeRecords(recs, 0)
+   ```
 
-**Pattern 8: scanIntrinsicLeafRefs — predicate evaluation**
-- Location: `vendor/github.com/grafana/blockpack/internal/modules/executor/predicates.go`
-- Description: Uses `GetIntrinsicColumn` to retrieve the sorted column, then binary-searches (range) or dict-searches (equality) to find matching refs. This is the fast path that STAYS — intrinsic section is kept for predicate evaluation.
-- Relevance: Clean up any code referencing the removed `useIntrinsicLookup` / ref bloom paths; predicate eval logic itself is preserved.
+3. Write the VCNT file to object storage under the standard key:
+   `<tenant>/indexes/unique_values/<colHash>/L0-<id>.vcnt`
 
-**Pattern 9: lookupIntrinsicFields — retained for TopK**
-- Location: `vendor/github.com/grafana/blockpack/internal/modules/executor/stream.go` (or nearby)
-- Description: `lookupIntrinsicFields` is used by `collectIntrinsicTopK` (Case B timestamp sort path) for field population. This function stays — it serves a different use case where the intrinsic section is used for ordering.
-- Relevance: Only `collectIntrinsicPlain`'s `useIntrinsicLookup` branch is removed; TopK path is untouched.
+**However** — to add the VCNT section to the blockpack file itself (as
+`ToCSubTypeValueCounts`), blockpack's writer would need a new API, e.g.
+`writer.SetVCNTRecords([]valuecounts.Record)` before `Flush()`. That API does
+**not exist yet** — it needs to be added to blockpack first, then vendored into
+tempo.
 
-**Pattern 10: forEachBlockInGroups — block read field population**
-- Location: `vendor/github.com/grafana/blockpack/internal/modules/executor/stream.go`
-- Description: Groups refs by block, reads each block once, then reads field values from block columns (O(1) per field per span). Already used for equality queries and all non-intrinsic paths.
-- Relevance: This becomes the sole field population path after the change.
+Alternatively, the VCNT data can be written as a **separate object** in S3 (a
+`.vcnt` file), bypassing the blockpack file format entirely, similar to how the
+value-index L0 files work today. The query path in `valuecounts.ValuesInRange`
+operates on raw bytes, not on a blockpack ToC — so a standalone `.vcnt` file
+would work with no blockpack changes.
+
+### Recommended path
 
-### Architecture Observations
+Option A (simpler, no blockpack changes): accumulate value counts in tempo
+during span ingest, write a standalone `.vcnt` file to S3 after each block flush
+using `EncodeRecords`. A separate querier-side `.vcnt` reader reads these files
+for tag autocomplete.
 
-The intrinsic section serves two logically distinct purposes today:
-- **Predicate evaluation**: sorted-by-value columns enable binary search to find matching refs. This is fast and correct.
-- **Field population**: after finding refs, scan the same column to read display values. This is O(N) and is the bottleneck.
+Option B (cleaner, requires blockpack change): add a `WriterConfig.VCNTRecords
+[]valuecounts.Record` field (or a `writer.AddVCNTRecord(...)` method) so the
+VCNT section is embedded in the blockpack file's ToC. This requires a blockpack
+change + vendor update.
 
-The block data (non-intrinsic columns) already stores all field values accessible in O(1) per field per span via `forEachBlockInGroups`. The only cost is loading the relevant blocks from storage, which is proportional to M (result count), not N (total spans).
+---
 
-### Dependencies
+## Problem 3: Cubes not wired
 
-- All changes are within `vendor/github.com/grafana/blockpack/` — the blockpack submodule
-- Tempo-side code (`tempodb/encoding/vblockpack/`) calls blockpack's public API and is not directly affected
-- Backward compat: existing files with RefBloom in page TOC or with identity columns in intrinsic section must continue to decode correctly — old readers ignore unknown TOC fields, new readers handle absent RefBloom as nil
+### What exists in blockpack
 
-### Test Patterns
+The `internal/modules/cube` package provides:
 
-- Table-driven tests in `*_test.go` files adjacent to the packages
-- Spec-driven modules require SPECS.md / NOTES.md / TESTS.md updates alongside code changes
-- Correctness validated against 30 real-world queries and 62 expanded queries (see project memory)
+- **`SpanValues` interface** (in `accumulator.go`):
 
-### Spec-Driven Modules in Scope
+  ```go
+  type SpanValues interface {
+      String(column string) (string, bool)
+      Int64(column string) (int64, bool)
+  }
+  ```
 
-**`internal/modules/blockio/shared/`** — spec-driven
-- Has: NOTES.md, TESTS.md (and likely SPECS.md entries)
-- Relevant invariants: intrinsic codec round-trip must remain valid; removing RefBloom must not break decode of old files
-- Impact: constants.go, types.go, intrinsic_codec.go, intrinsic_ref_filter.go all change; NOTES.md requires a dated entry documenting the RefBloom removal decision
+- **`Accumulator`** — per-minute, per-cube in-memory counter:
 
-**`internal/modules/executor/`** — spec-driven
-- Has: SPECS.md, NOTES.md, TESTS.md, BENCHMARKS.md
-- Relevant invariants: field population must return correct values; result count must not exceed requested limit; predicate evaluation correctness unchanged
-- Impact: stream.go changes; SPECS.md must document that field population uses block reads not intrinsic scan; NOTES.md requires dated design decision entry; BENCHMARKS.md Metric Targets table should be updated with new expected I/O figures
+  ```go
+  acc := cube.NewAccumulator(def, minute)
+  counted, err := acc.Add(spanValues)  // call once per span
+  key, err := acc.FlushTo(store, tenant) // write L0 cube file
+  acc.Reset(nextMinute)                // rotate to next minute
+  ```
 
-**`internal/modules/blockio/writer/`** — spec-driven
-- Has: NOTES.md
-- Impact: writer_block.go and intrinsic_accum.go change; NOTES.md requires dated entry documenting the removal of identity columns from the intrinsic accumulator and the RefBloom removal
+- **`Definition`** — what the accumulator needs from the cube config:
+  `{Dim1Column, Dim2Column, Filters, ID [16]byte, Resolution uint32}`.
+- **`RegistryEntry`** — stable JSON-serialized cube description in `index.json`.
+- **`Registry`** — conditional-PUT S3 index at `<tenant>/cubes/index.json`.
+- **`CreationTrigger`** — first-query cube registration after cardinality gate.
+- **`Filename(tenant, cubeID) string`** — returns the L0 object key
+  `<tenant>/cubes/<hex_id>/L0-<xid>.cube`.
+- **`ObjectPutter`** interface (same shape as value-index's `ObjectPutter`):
 
-## 2026-03-29 00:02:00 - Approaches Considered
+  ```go
+  type ObjectPutter interface {
+      Put(path string, data []byte) error
+  }
+  ```
 
-### Approach 1: Validated Design (as specified)
+### What is missing
 
-**Description:**
-Implement exactly the three-change plan described in the task:
-1. Remove `feedIntrinsic*` calls for trace:id, span:id, span:parent_id, span:status_message from `writer_block.go`
-2. Remove `useIntrinsicLookup` branch in `collectIntrinsicPlain`; use `forEachBlockInGroups` for all field population
-3. Remove RefBloom (constants, types, codec, filter helpers, accum generation)
+There is **no public wiring** in blockpack's root package for the cube path.
+The `cube` package exists under `internal/modules/cube/` and is not exported
+in `blockpack/api.go`. The blockpack writer does not call any cube accumulation.
 
-**Pros:**
-- Directly addresses the measured bottleneck (286MB intrinsic scan → 16MB block reads)
-- Storage savings are substantial (~125 MB per large file, ~48% intrinsic section reduction)
-- No regression for equality queries (already use block reads)
-- Scales with M (result count) not N (total spans)
-- Backward compat preserved (old files still decode; new files simply lack those columns in intrinsic TOC)
-- RefBloom removal is pure cleanup — 100% FPR at 10K entries means it was providing zero benefit
+Tempo has no `cube.Accumulator`, no `cube.Registry`, and no `ObjectPutter` for
+cube L0 files.
 
-**Cons:**
-- Requires touching multiple files across three packages simultaneously
-- Doc updates required across three spec-driven modules
-- Must verify that `lookupIntrinsicFields` (TopK path) is not accidentally removed
+### What the block-builder needs
 
-**Fits existing patterns:** Yes — `forEachBlockInGroups` is already the non-intrinsic field population pattern; this change makes it universal for the plain path
+1. **Load cube definitions** at startup from `<tenant>/cubes/index.json` via
+   `cube.Registry.Load()`. Convert each `RegistryEntry` to a `cube.Definition`
+   (mapping `Dimensions[0]` → `Dim1Column`, `Dimensions[1]` → `Dim2Column`).
 
-### Approach 2: Intrinsic Column Removal Only (no RefBloom, no field-pop change)
+2. **Create one `cube.Accumulator` per active cube per minute**:
 
-**Description:**
-Only remove the four identity columns from the intrinsic accumulator. Keep RefBloom and keep the `useIntrinsicLookup` branch in `collectIntrinsicPlain`.
+   ```go
+   acc := cube.NewAccumulator(def, currentMinute)
+   ```
 
-**Pros:**
-- Smaller diff, lower risk
-- Reduces storage ~48%
+3. **For each span ingested**, call `acc.Add(spanValues)` where `spanValues`
+   implements `cube.SpanValues`. Tempo's span representation would need a thin
+   adapter that exposes `String(col)` / `Int64(col)` from the OTLP attributes.
 
-**Cons:**
-- Does NOT fix the performance bottleneck — field population still scans 7 intrinsic columns O(N)
-- RefBloom removal is deferred even though it is pure dead weight
-- Leaves code complexity in place
+4. **On minute rotation (or block flush)**, call `acc.FlushTo(store, tenant)` for
+   each accumulator. This writes the encoded cube file to S3 and resets the
+   accumulator.
 
-**Fits existing patterns:** Yes, but incomplete
+5. **Register new cubes** on first query via `cube.CreationTrigger.TryCreate()`
+   in the query path — this is not a block-builder concern but a querier concern.
 
-### Approach 3: Field Population Change Only (no intrinsic column removal, no RefBloom)
+### Key constraint
 
-**Description:**
-Only change `collectIntrinsicPlain` to use `forEachBlockInGroups` for field population. Leave the four identity columns in the intrinsic accumulator and leave RefBloom in place.
+The `cube.SpanValues` interface is the bridge point. Tempo's current ingest path
+(OTLP protobuf → `writer.AddTempoTrace`) does not surface individual span fields
+for cube accumulation. A new adapter layer is needed:
 
-**Pros:**
-- Fixes the performance bottleneck directly
-- Smallest behavioral change
+```go
+type protoSpanValues struct {
+    span     *v1.Span
+    resource *resource.Resource
+}
+func (s *protoSpanValues) String(col string) (string, bool) { /* lookup attribute */ }
+func (s *protoSpanValues) Int64(col string) (int64, bool)   { /* lookup attribute */ }
+```
 
-**Cons:**
-- Storage not reduced — intrinsic section still written with 11 columns
-- RefBloom still wastes 256 bytes/page for zero benefit
-- Two follow-up PRs still needed to get full benefit
-- Leaves dead code (intrinsic entries for display-only columns are written but never read for predicates)
+The block-builder's ingest loop would need to be modified to call
+`acc.Add(adapter)` per span before handing the span to the blockpack writer.
 
-**Fits existing patterns:** Partially — misses the cleanup that makes the change coherent
+---
 
-## 2026-03-29 00:03:00 - Recommendation
+## Summary Table
 
-### Chosen Approach: Approach 1 — Validated Design (all three changes together)
+| Problem | Root cause | Fix complexity | Blockpack changes needed? |
+|---------|-----------|---------------|--------------------------|
+| 1. L0 write silently stopped | `rerr != nil` swallowed silently; likely `getValueIndexSink()==nil` at startup or seek error | Low — add 2 log lines | No |
+| 2. VCNT not wired | No public API in blockpack root; `valuecounts` is internal | Medium — either standalone .vcnt file write (no blockpack change) or embed in ToC (needs blockpack change) | Yes for Option B, No for Option A |
+| 3. Cubes not wired | No public API in blockpack root; `cube` is internal; no tempo-side adapter | High — requires blockpack API export + SpanValues adapter + per-minute rotate logic in block-builder | Yes (export cube package) |
 
-**Rationale:**
-The three changes are tightly coupled and best landed together:
-- Removing identity columns from the writer makes sense only if field population doesn't rely on reading them back from the intrinsic section — which requires the `collectIntrinsicPlain` change
-- The `collectIntrinsicPlain` change makes the RefBloom ref-index filtering code dead (no callers for field population via intrinsic section), making RefBloom removal a natural cleanup
-- Doing all three together means a single backward-compat story: old files still decode, new files are smaller and faster
-- The performance gain is only realized when all three are applied; partial application leaves the bottleneck in place
+## Immediate next steps
 
-The design is already validated and the file-level mapping is precise. No architectural ambiguity remains.
+1. **Problem 1 (high priority, low effort):** Add `level.Warn` logging for
+   `rerr != nil` and `serr != nil` in `create.go`. Check `ConfigureValueIndex`
+   startup for silent minio failures. Ship this now.
 
-**Implementation Strategy:**
+2. **Problem 2 (medium):** Decide Option A vs B. Option A (standalone `.vcnt`
+   files) can be done entirely in tempo using the already-vendored internal
+   packages. Option B needs a blockpack PR first.
 
-1. **writer/intrinsic_accum.go**: Remove `computePageRefRange` call and RefBloom generation. Remove `RefBloom`-related field assignments.
-
-2. **shared/constants.go**: Remove `IntrinsicRefBloomBytes` and `IntrinsicRefBloomK`.
-
-3. **shared/types.go**: Remove `RefBloom []byte` from `PageMeta`. Remove `RefIndexEntry`, `refIndex`, `refIndexOnce` from `IntrinsicColumn`.
-
-4. **shared/intrinsic_ref_filter.go**: Remove `matchesRefFilter`, `DecodePagedColumnBlobFiltered`, `EnsureRefIndex`, `LookupRefFast` (or delete file if it contains only these functions).
-
-5. **shared/intrinsic_codec.go**: Remove RefBloom from page TOC encode/decode paths. Ensure old files with RefBloom bytes in TOC still decode without error (treat as ignored/nil).
-
-6. **writer/writer_block.go**: Remove `feedIntrinsicTraceID`, `feedIntrinsicSpanID`, `feedIntrinsicParentID`, `feedIntrinsicStatusMessage` calls. Retain `addPresent` calls so block columns still carry those values.
-
-7. **executor/predicates.go**: Clean up `scanIntrinsicLeafRefs` — remove any references to the now-deleted RefBloom / ref-index types. Predicate eval logic (binary search via `GetIntrinsicColumn`) is preserved unchanged.
-
-8. **executor/stream.go**: In `collectIntrinsicPlain`, remove the `useIntrinsicLookup` branch entirely. After `BlockRefsFromIntrinsicTOC` finds matching refs and they are truncated to the limit, call `forEachBlockInGroups` for field population. `lookupIntrinsicFields` is retained — it is still used by `collectIntrinsicTopK`.
-
-9. **Spec docs**: Append dated entries to NOTES.md in `shared/`, `executor/`, `writer/`. Update SPECS.md in `shared/` and `executor/` to reflect new invariants. Update BENCHMARKS.md in `executor/` with revised I/O cost figures.
-
-**Key Decisions:**
-
-- **Backward compat via TOC skipping**: The intrinsic codec already skips unknown TOC entries on read. Old files with RefBloom bytes in the page TOC are safe — the bytes are read and discarded. New files simply don't write them. No version bump required.
-- **lookupIntrinsicFields is retained**: The TopK path (`collectIntrinsicTopK`) uses `lookupIntrinsicFields` for timestamp-ordered field lookup. This is a different use case (ordering by timestamp intrinsic, not field population for plain predicate results) and is not changed.
-- **addPresent calls stay**: The four removed identity columns still have `addPresent` calls so block columns retain their values. Field population via `forEachBlockInGroups` reads them from block columns, not the intrinsic section.
-- **No public API change**: The blockpack public API (`api.go`) is not affected. Tempo's `vblockpack` wrapper is not affected.
-
-**Risks Identified:**
-
-- **TopK path accidentally broken**: The `lookupIntrinsicFields` function must not be removed. Mitigation: explicitly verify it has callers in `collectIntrinsicTopK` before finalizing the diff.
-- **Old file decode regression**: If RefBloom codec removal causes a panic on old files that have RefBloom bytes. Mitigation: ensure the codec reads and discards RefBloom bytes gracefully when the type is removed from `PageMeta`.
-- **Test failures from removed types**: Tests in `shared/` and `executor/` that reference `RefBloom`, `RefIndexEntry`, or `useIntrinsicLookup` will need updating. Mitigation: run `go build ./...` and `go test ./...` across the blockpack module after changes.
-- **Spec doc drift**: Spec-driven modules require NOTES.md / SPECS.md updates or CI may flag them. Mitigation: update all three spec-driven module docs as part of the same changeset.
-
-**Open Questions:**
-
-- Does the intrinsic codec use a length-prefixed or fixed-size encoding for RefBloom? If length-prefixed, old files can be decoded by reading and discarding the bytes. If fixed-size with no length field, a different skip strategy is needed. This must be verified in `intrinsic_codec.go` before implementing.
-- Are there any other callers of `DecodePagedColumnBlobFiltered` or `EnsureRefIndex` outside of `intrinsic_ref_filter.go` and `stream.go`? A grep across the module is needed to confirm the full removal surface.
-
-## 2026-03-29 00:04:00 - BRAINSTORM COMPLETE
-
-**Status:** Complete
-**Recommendation:** Approach 1 — all three changes (intrinsic column removal + field population switch to block reads + RefBloom removal)
-**Next Phase:** PLAN
-
-Ready for workflow-planner agent to create detailed implementation plan.
+3. **Problem 3 (high effort):** Requires a blockpack PR to export the `cube`
+   package surface plus significant tempo-side work. Should be planned as a
+   separate spike.

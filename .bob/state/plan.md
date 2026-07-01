@@ -1,750 +1,681 @@
-# Implementation Plan: Intrinsic Section Optimization
+# Implementation Plan: Value-Index Logging, VCNT, and Cubes
 
-## Overview
-
-Remove identity columns (trace:id, span:id, span:parent_id, span:status_message) from the
-intrinsic accumulator, switch range-predicate field population from O(N) intrinsic scan to
-O(M) block reads, and remove the RefBloom per-page filter (256 bytes/page, 100% FPR at 10K
-entries). All three changes land together because they are tightly coupled and share a single
-backward-compat story.
-
-The vendor copy at `/home/matt/source/tempo-mrd/vendor/github.com/grafana/blockpack/` is the
-source of truth. All changes apply there first, then are mirrored to the upstream source at
-`/home/matt/source/blockpack-tempo/`.
+*Created: 2026-07-01*
+*Based on: brainstorm.md*
+*Priority order: Task 1 → Task 2 → Task 3*
 
 ---
 
-## Spec-Driven Modules in Scope
+## Task 1 (High Priority, Low Effort): Fix Silent Value-Index Write Failures
 
-| Module | Files with spec docs |
-|--------|---------------------|
-| `internal/modules/blockio/shared/` | NOTES.md |
-| `internal/modules/blockio/writer/` | NOTES.md |
-| `internal/modules/executor/` | SPECS.md, NOTES.md, TESTS.md, BENCHMARKS.md |
+### Background
 
-All three modules carry the `// NOTE: Any changes to this file must be reflected in the
-corresponding specs.md or NOTES.md.` invariant. Doc updates are paired with code changes.
+`tempodb/encoding/vblockpack/create.go` lines 171–178 contain two silent-skip
+patterns that make value-index L0 write failures invisible in logs:
 
----
-
-## Files to Modify (vendor copy — apply first)
-
-1. `internal/modules/blockio/shared/constants.go` — remove `IntrinsicRefBloomBytes`, `IntrinsicRefBloomK`
-2. `internal/modules/blockio/shared/types.go` — remove `RefBloom []byte` from `PageMeta`; remove `RefIndexEntry` type and `refIndex`/`refIndexOnce` from `IntrinsicColumn`
-3. `internal/modules/blockio/shared/intrinsic_ref_filter.go` — delete file (all functions become dead)
-4. `internal/modules/blockio/shared/intrinsic_codec.go` — remove RefBloom from `EncodePageTOC`; update `DecodePageTOC` to read-and-discard RefBloom bytes from old v0x02 files without storing them
-5. `internal/modules/blockio/shared/NOTES.md` — add dated entry for RefBloom removal
-6. `internal/modules/blockio/writer/intrinsic_accum.go` — remove `computePageRefRange`, `collectDictPageRefs`; remove `RefBloom`/`MinRef`/`MaxRef` from `PageMeta` literals in `encodePagedFlatColumn` and `encodePagedDictColumn`
-7. `internal/modules/blockio/writer/writer_block.go` — remove `feedIntrinsicBytes` calls for `trace:id`, `span:id`, `span:parent_id` in `addRowFromProto`, `addRowFromTempoProto`, `applyTraceID`, `applySpanID`, `applySpanParentID`; remove `feedIntrinsicString` call for `span:status_message` in same functions; remove `feedIntrinsicBytes("trace:id", ...)` in `applyTraceID`; fix `feedIntrinsicsFromIndex` to skip the four identity columns
-8. `internal/modules/blockio/writer/NOTES.md` — add dated entry documenting removal of identity columns from intrinsic accumulator
-9. `internal/modules/executor/stream.go` — remove `useIntrinsicLookup` branch from `collectIntrinsicPlain`; always use `forEachBlockInGroups`; remove `useIntrinsicLookup bool` parameter from `collectIntrinsicPlain`; update call site at line 648
-10. `internal/modules/executor/SPECS.md` — update field-population invariant: block reads are always used for field population in Case A
-11. `internal/modules/executor/NOTES.md` — add dated entry for the change
-12. `internal/modules/executor/TESTS.md` — update test plan for `execution_path_test.go` changes
-13. `internal/modules/executor/execution_path_test.go` — update EP-01 and EP-03 to assert `Block` populated (not `IntrinsicFields`); update EP-02 description to match unified behavior; remove EP-01/EP-03 `IntrinsicFields != nil` assertions
-
-## Files to Mirror (upstream source — apply after vendor)
-
-Same list but rooted at `/home/matt/source/blockpack-tempo/`. Note that `RefBloom`/`MinRef`/`MaxRef` and `IntrinsicPageTOCVersion2` may not exist yet in the upstream source — adapt as needed (the changes may be no-ops for those symbols if the upstream is at an older version).
-
----
-
-## Implementation Steps
-
-### Phase 1: Update Tests First (TDD)
-
-**Step 1.1: Update `execution_path_test.go` to reflect new behavior**
-
-File: `vendor/github.com/grafana/blockpack/internal/modules/executor/execution_path_test.go`
-
-After the change, `collectIntrinsicPlain` always uses `forEachBlockInGroups`. This means:
-- Range predicates now return `MatchedRow.Block` populated (not `IntrinsicFields`)
-- The comment at the top of the file must be updated to remove the distinction
-
-Actions:
-- [ ] Update the file-header comment: remove "Range/regex predicates → IntrinsicFields"; state "all collectIntrinsicPlain results return Block populated"
-- [ ] Update `TestExecutionPath_RangePredicate_IntrinsicFields` (EP-01):
-  - Rename to `TestExecutionPath_RangePredicate_BlockPopulated`
-  - Change assertions: `row.Block != nil` (not `IntrinsicFields`)
-  - Change assertions: `row.IntrinsicFields == nil` (not Block)
-  - Keep result count assertions unchanged
-- [ ] Update EP-03 `TestExecutionPath_RangeAndEquality_IntrinsicFields`:
-  - Rename to `TestExecutionPath_RangeAndEquality_BlockPopulated`
-  - Same assertion swap: Block not nil, IntrinsicFields nil
-- [ ] Update EP-02 `TestExecutionPath_EqualityPredicate_BlockPopulated`:
-  - Comment update only (the assertions are already correct: Block != nil, IntrinsicFields nil)
-  - Remove note about "different from range predicate path" since they now use the same path
-
-**Step 1.2: Verify tests fail before implementation**
-
-```bash
-cd /home/matt/source/tempo-mrd && go test ./vendor/github.com/grafana/blockpack/internal/modules/executor/ -run TestExecutionPath_RangePredicate_BlockPopulated -v 2>&1 | head -30
-```
-
-Expected: compilation error (function renamed) or test failure (IntrinsicFields still populated by old code).
-
----
-
-### Phase 2: Remove RefBloom from `shared/`
-
-**Step 2.1: Remove RefBloom constants**
-
-File: `vendor/github.com/grafana/blockpack/internal/modules/blockio/shared/constants.go`
-
-Remove these two constants (lines ~83-94):
 ```go
-// IntrinsicRefBloomBytes is the fixed size of the per-page ref bloom filter in bytes.
-IntrinsicRefBloomBytes = 256
-// IntrinsicRefBloomK is the number of hash functions for the ref bloom filter.
-IntrinsicRefBloomK = 3
-```
-
-Keep `IntrinsicPageTOCVersion2` — still needed by the codec to detect old files.
-
-Verify:
-```bash
-cd /home/matt/source/tempo-mrd && go build ./vendor/github.com/grafana/blockpack/internal/modules/blockio/shared/ 2>&1
-```
-Expected: errors for `IntrinsicRefBloomBytes` references (in `intrinsic_accum.go`, `intrinsic_ref_filter.go`). That is correct — those will be fixed in subsequent steps.
-
-**Step 2.2: Remove RefBloom from `PageMeta` and `IntrinsicColumn` types**
-
-File: `vendor/github.com/grafana/blockpack/internal/modules/blockio/shared/types.go`
-
-Changes to `PageMeta`:
-- Remove `RefBloom []byte` field
-- Remove `MinRef uint32` and `MaxRef uint32` fields
-- Remove comments for those fields
-
-Changes to `IntrinsicColumn`:
-- Remove `refIndex []RefIndexEntry` field
-- Remove `refIndexOnce sync.Once` field
-- Remove `sync` import if no longer used
-
-Remove type `RefIndexEntry` entirely (was used only by `refIndex`).
-
-After removal, `PageMeta` becomes:
-```go
-type PageMeta struct {
-    Min      string
-    Max      string
-    Bloom    []byte
-    Offset   uint32
-    Length   uint32
-    RowCount uint32
-}
-```
-
-And `IntrinsicColumn` no longer has `refIndex`/`refIndexOnce`/`RefIndexEntry` fields.
-
-**Step 2.3: Delete `intrinsic_ref_filter.go`**
-
-File to delete: `vendor/github.com/grafana/blockpack/internal/modules/blockio/shared/intrinsic_ref_filter.go`
-
-This file contains: `matchesRefFilter`, `refFilterRange`, `DecodePagedColumnBlobFiltered`, `EnsureRefIndex`, `LookupRefFast`, `LookupRef`, `uint32ToLE`.
-
-Before deleting, grep to confirm no other callers outside this file:
-```bash
-cd /home/matt/source/tempo-mrd && grep -r "DecodePagedColumnBlobFiltered\|EnsureRefIndex\|LookupRefFast\|matchesRefFilter" vendor/github.com/grafana/blockpack/ --include="*.go" | grep -v "_test.go" | grep -v "intrinsic_ref_filter.go"
-```
-Expected: matches in `internal/modules/blockio/reader/intrinsic_reader.go` and possibly `executor/`. Find all callers.
-
-Check if `LookupRef` has callers:
-```bash
-cd /home/matt/source/tempo-mrd && grep -rn "\.LookupRef\b" vendor/github.com/grafana/blockpack/ --include="*.go"
-```
-
-If `LookupRef` (non-Fast) has callers outside this file, move it to `intrinsic_codec.go` before deleting. If it has no callers, delete.
-
-To delete the file: replace its content with an empty package declaration or use `rm`. Since we cannot use Bash rm, overwrite with a redirect comment marking it for deletion. Actually — the Write tool can overwrite; but we cannot delete. Instead, remove all exported functions and make the file compile-clean with just the package declaration. The linter (`deadcode`) will flag unused unexported helpers. Best approach: keep the file but remove all functions except `LookupRef` if it has callers; otherwise overwrite with just `package shared`.
-
-**Step 2.4: Update `intrinsic_codec.go` — EncodePageTOC**
-
-File: `vendor/github.com/grafana/blockpack/internal/modules/blockio/shared/intrinsic_codec.go`
-
-In `EncodePageTOC`, remove the v0x02 block that writes `MinRef`, `MaxRef`, `RefBloom`:
-```go
-// REMOVE these lines:
-binary.LittleEndian.PutUint32(tmp4[:], p.MinRef)
-buf.Write(tmp4[:])
-binary.LittleEndian.PutUint32(tmp4[:], p.MaxRef)
-buf.Write(tmp4[:])
-binary.LittleEndian.PutUint16(tmp2[:], uint16(len(p.RefBloom)))
-buf.Write(tmp2[:])
-buf.Write(p.RefBloom)
-```
-
-Change `EncodePageTOC` to write `IntrinsicPageTOCVersion2` still (to avoid changing the version byte, which keeps the wire format stable for new files). Actually — since we're removing the ref-range fields, we should write `0x01` or a new version. Best decision: write version `0x01` for new files (no ref-range fields). Old v0x02 files can still be read. This avoids creating a third version.
-
-Update `EncodePageTOC`:
-- Change `buf.WriteByte(IntrinsicPageTOCVersion2)` to `buf.WriteByte(0x01)` — new files are v0x01, no ref-range fields.
-
-Update `DecodePageTOC`:
-- Keep v0x01 decode path unchanged (already reads min/max/bloom, sets conservative MinRef/MaxRef defaults)
-- Keep v0x02 decode path: read MinRef/MaxRef/RefBloom bytes but discard them (do not store in `PageMeta` since those fields are removed). This preserves backward compat with existing files.
-
-The v0x02 decode path becomes:
-```go
-if version == IntrinsicPageTOCVersion2 {
-    // Read and discard ref-range index fields from legacy v0x02 files.
-    if pos+10 > len(raw) {
-        return PagedIntrinsicTOC{}, fmt.Errorf("DecodePageTOC: truncated at ref-range fields")
-    }
-    pos += 4 // MinRef — discard
-    pos += 4 // MaxRef — discard
-    refBloomLen := int(binary.LittleEndian.Uint16(raw[pos:]))
-    pos += 2
-    if refBloomLen > 0 {
-        if pos+refBloomLen > len(raw) {
-            return PagedIntrinsicTOC{}, fmt.Errorf("DecodePageTOC: truncated at ref_bloom")
+if store, prefix := getValueIndexSink(); store != nil {
+    if _, serr := tmp.Seek(0, io.SeekStart); serr == nil {   // ← silent skip
+        if r, rerr := blockpack.NewReaderFromProvider(&fileReaderProvider{f: tmp}); rerr == nil {  // ← silent skip
+            sourceRef := blockObjectKey(meta.TenantID, blockUUID.String())
+            if werr := blockpack.WriteValueIndexL0(r, store, sourceRef, meta.TenantID, prefix); werr != nil {
+                level.Warn(util_log.Logger).Log(...)  // ← only this path logs
+            }
         }
-        pos += refBloomLen // RefBloom — discard
     }
 }
 ```
 
-**Step 2.5: Update `shared/NOTES.md`**
+The same `NewReaderFromProvider` silent-skip exists in `compactor.go`'s
+`tempoOutputStorage.Put` (lines ~295–302).
 
-Append a new dated entry documenting the removal. The entry must be assigned the next sequential ID (check existing entries — current last is NOTE-006).
+`ConfigureValueIndex` in `valueindex.go` calls `slog.Warn` when the minio client
+fails — but `slog.Warn` writes to the default Go `slog` handler, **not** to Tempo's
+`go-kit/log` structured logger. On a block-builder startup this produces a log line
+that may not be captured or correlated with the block-builder's own logs.
 
-New entry:
-```markdown
-## NOTE-007: RefBloom Removed from Page TOC (2026-03-29)
-*Added: 2026-03-29*
+### Exact Changes
 
-**Decision:** Removed `RefBloom []byte`, `MinRef uint32`, and `MaxRef uint32` from
-`PageMeta`. Removed `IntrinsicRefBloomBytes` (256) and `IntrinsicRefBloomK` (3) constants.
-Removed `RefIndexEntry` type and `refIndex`/`refIndexOnce` fields from `IntrinsicColumn`.
-Deleted (emptied) `intrinsic_ref_filter.go`. `EncodePageTOC` now writes version 0x01 (no
-ref-range fields). `DecodePageTOC` reads and discards the ref-range bytes in v0x02 files for
-backward compatibility.
+#### 1a. `tempodb/encoding/vblockpack/create.go`
 
-**Rationale:** RefBloom was designed to skip pages during reverse-lookup (lookupIntrinsicFields).
-After the companion change that switches field population entirely to `forEachBlockInGroups`
-(block reads), there are no remaining reverse-lookup callers. The ref-bloom provided zero
-pruning benefit at 10K entries/page with 256 bytes (FPR ≈ 100% when full). Removal saves
-256 bytes/page of storage and eliminates the bloom maintenance cost at write time.
+**Add logging for the two silent-skip guards** (lines 171–178). The seek failure
+and reader-open failure both need `level.Warn` log lines.
 
-**Backward compat:** v0x02 files decode correctly — the ref-range bytes are read and
-discarded. New files write v0x01 (no ref-range fields).
+Current code (lines 171–178):
 
-Back-ref: `shared/constants.go`, `shared/types.go`, `shared/intrinsic_codec.go`,
-`writer/intrinsic_accum.go`
-```
-
----
-
-### Phase 3: Remove Identity Columns from Writer
-
-**Step 3.1: Update `writer/intrinsic_accum.go`**
-
-File: `vendor/github.com/grafana/blockpack/internal/modules/blockio/writer/intrinsic_accum.go`
-
-Remove functions `computePageRefRange` and `collectDictPageRefs` (lines 702–737).
-
-In `encodePagedFlatColumn`, update the `PageMeta` literal (lines ~502–514):
 ```go
-// BEFORE:
-minRef, maxRef, refBloom := computePageRefRange(c.refs[start:end])
-pages = append(pages, shared.PageMeta{
-    Offset:   offset,
-    Length:   uint32(len(blob)),
-    RowCount: uint32(end - start),
-    Min:      minVal,
-    Max:      maxVal,
-    MinRef:   minRef,
-    MaxRef:   maxRef,
-    RefBloom: refBloom,
-})
-
-// AFTER:
-pages = append(pages, shared.PageMeta{
-    Offset:   offset,
-    Length:   uint32(len(blob)),   //nolint:gosec
-    RowCount: uint32(end - start), //nolint:gosec
-    Min:      minVal,
-    Max:      maxVal,
-})
-```
-
-In `encodePagedDictColumn`, update the `PageMeta` literal (lines ~668–681):
-```go
-// BEFORE:
-pageRefs := collectDictPageRefs(c.entries, entryRanges)
-minRef, maxRef, refBloom := computePageRefRange(pageRefs)
-pages = append(pages, shared.PageMeta{
-    ...
-    Bloom:    bloom,
-    MinRef:   minRef,
-    MaxRef:   maxRef,
-    RefBloom: refBloom,
-})
-
-// AFTER:
-pages = append(pages, shared.PageMeta{
-    ...
-    Bloom:    bloom,
-})
-```
-
-Also update the comment at the top of `encodeColumn` (line ~188-189) which references "RefBloom" in the v2 format description.
-
-**Step 3.2: Remove identity columns from `writer_block.go`**
-
-File: `vendor/github.com/grafana/blockpack/internal/modules/blockio/writer/writer_block.go`
-
-The four identity columns to remove from the intrinsic accumulator:
-- `trace:id` (traceIDColumnName) — `feedIntrinsicBytes` calls
-- `span:id` (spanIDColumnName) — `feedIntrinsicBytes` calls
-- `span:parent_id` (spanParentIDColumnName) — `feedIntrinsicBytes` calls
-- `span:status_message` (spanStatusMsgColumnName) — `feedIntrinsicString` calls
-
-The `addPresent` calls for all four columns STAY (block column payloads still need these values for field population via `forEachBlockInGroups`).
-
-Locations to change:
-
-**In `addRowFromProto` (~lines 314–402):**
-- Line 314: remove `b.feedIntrinsicBytes(traceIDColumnName, ...)`; keep `b.addPresent` on line 315
-- Lines 320–321: remove `b.feedIntrinsicBytes(spanIDColumnName, ...)`; keep `b.addPresent`
-- Lines 327–328: remove `b.feedIntrinsicBytes(spanParentIDColumnName, ...)`; keep `b.addPresent`
-- Line 400: remove `b.feedIntrinsicString(spanStatusMsgColumnName, ...)`; keep `b.addPresent`
-
-**In `addRowFromTempoProto` (~lines 504–577):**
-- Line 504: remove `b.feedIntrinsicBytes(traceIDColumnName, ...)`; keep `b.addPresent`
-- Lines 509–510: remove `b.feedIntrinsicBytes(spanIDColumnName, ...)`; keep `b.addPresent`
-- Lines 514–516: remove `b.feedIntrinsicBytes(spanParentIDColumnName, ...)`; keep `b.addPresent`
-- Line 576: remove `b.feedIntrinsicString(spanStatusMsgColumnName, ...)`; keep `b.addPresent`
-
-**In `applyTraceID` (~line 742):**
-- Remove `b.feedIntrinsicBytes("trace:id", ...)` call; keep `b.addPresent`
-
-**In `applySpanID` (~line 753):**
-- Remove `b.feedIntrinsicBytes(spanIDColumnName, ...)` call; keep `b.addPresent`
-
-**In `applySpanParentID` (~line 762):**
-- Remove `b.feedIntrinsicBytes(spanParentIDColumnName, ...)` call; keep `b.addPresent`
-
-**In `applySpanStatusMsg` (grep for spanStatusMsgColumnName in addRowFromBlock path, ~line 898):**
-- Remove `b.feedIntrinsicString(spanStatusMsgColumnName, ...)`; keep `b.addPresent`
-
-**In `feedIntrinsicsFromIndex` (~lines 1057–1132):**
-- Remove the `"trace:id"`, `spanIDColumnName`, `spanParentIDColumnName`, `spanStatusMsgColumnName` cases from the switch/if chain
-- These are the compaction path — since source files may have these in their intrinsic section (old files), `buildIntrinsicBlockIndex` would still load them, but `feedIntrinsicsFromIndex` should skip them to avoid re-adding to the new file's intrinsic accumulator
-
-**Step 3.3: Update `writer/NOTES.md`**
-
-Append a new dated entry:
-
-```markdown
-## NOTE-005: Identity Columns Removed from Intrinsic Accumulator (2026-03-29)
-*Added: 2026-03-29*
-
-**Decision:** `feedIntrinsicBytes` calls for `trace:id`, `span:id`, `span:parent_id` and
-`feedIntrinsicString` for `span:status_message` are removed from `addRowFromProto`,
-`addRowFromTempoProto`, `applyTraceID`, `applySpanID`, `applySpanParentID`, and
-`applySpanStatusMsg`. The corresponding `addPresent` calls are retained — block column
-payloads still store these values. `feedIntrinsicsFromIndex` now skips these four columns
-during compaction to avoid carrying them forward into new intrinsic accumulators.
-
-**Rationale:** These are identity/display-only columns — they are never used as predicate
-targets in the intrinsic predicate-evaluation path (`scanIntrinsicLeafRefs`). They only
-appeared in the intrinsic section to support `lookupIntrinsicFields` reverse lookups during
-field population. Since field population for Case A (plain) now uses `forEachBlockInGroups`
-(block reads), the intrinsic section entries are redundant.
-
-**Storage savings:** Removing these 4 columns shrinks the intrinsic section from 11 columns
-to 7, approximately 48% reduction in intrinsic section size (~125 MB per large file). The
-block column payloads retain these values unchanged.
-
-**Back-ref:** `writer/writer_block.go:addRowFromProto`, `writer/writer_block.go:addRowFromTempoProto`,
-`writer/writer_block.go:applyTraceID`, `writer/writer_block.go:feedIntrinsicsFromIndex`
-```
-
----
-
-### Phase 4: Update Executor — Remove `useIntrinsicLookup` Branch
-
-**Step 4.1: Update `executor/stream.go`**
-
-File: `vendor/github.com/grafana/blockpack/internal/modules/executor/stream.go`
-
-**Change 1: Remove `useIntrinsicLookup` parameter from `collectIntrinsicPlain`**
-
-Current signature (line ~782):
-```go
-func collectIntrinsicPlain(
-    r *modules_reader.Reader,
-    refs []modules_shared.BlockRef,
-    opts CollectOptions,
-    wantColumns map[string]struct{},
-    secondPassCols map[string]struct{},
-    stats *CollectStats,
-    useIntrinsicLookup bool,
-) ([]MatchedRow, error) {
-```
-
-New signature (remove `useIntrinsicLookup bool` parameter):
-```go
-func collectIntrinsicPlain(
-    r *modules_reader.Reader,
-    refs []modules_shared.BlockRef,
-    opts CollectOptions,
-    wantColumns map[string]struct{},
-    secondPassCols map[string]struct{},
-    stats *CollectStats,
-) ([]MatchedRow, error) {
-```
-
-**Change 2: Remove the `useIntrinsicLookup` branch inside `collectIntrinsicPlain`**
-
-Current code (~lines 807–820):
-```go
-if useIntrinsicLookup {
-    // Range predicate path: resolve fields from cached intrinsic blobs, zero block reads.
-    fieldMaps := lookupIntrinsicFields(r, refs, secondPassCols)
-    results := make([]MatchedRow, 0, len(refs))
-    for i, ref := range refs {
-        results = append(results, MatchedRow{
-            IntrinsicFields: &intrinsicFieldsProvider{fields: fieldMaps[i]},
-            BlockIdx:        int(ref.BlockIdx),
-            RowIdx:          int(ref.RowIdx),
-        })
+if store, prefix := getValueIndexSink(); store != nil {
+    if _, serr := tmp.Seek(0, io.SeekStart); serr == nil {
+        if r, rerr := blockpack.NewReaderFromProvider(&fileReaderProvider{f: tmp}); rerr == nil {
+            sourceRef := blockObjectKey(meta.TenantID, blockUUID.String())
+            if werr := blockpack.WriteValueIndexL0(r, store, sourceRef, meta.TenantID, prefix); werr != nil {
+                level.Warn(util_log.Logger).Log("msg", "vblockpack: value-index L0 write failed", "block", sourceRef, "err", werr)
+            }
+        }
     }
-    return results, nil
 }
 ```
 
-Delete this entire `if` block. The function body becomes the current `else` path (equality path via `forEachBlockInGroups`) for all cases.
+Replacement:
 
-Update the function comment to reflect the new behavior:
 ```go
-// collectIntrinsicPlain handles Case A: pure intrinsic + no sort.
-// All results use forEachBlockInGroups to populate MatchedRow.Block.
-// This is correct for both equality predicates (status=error, kind=server) and
-// range predicates (duration>100ms, svc=~".*"). Block reads are O(M) where M is
-// the result count — far cheaper than the previous O(N) intrinsic column scan
-// for range predicates across 3.3M entries × 7 columns per file.
+if store, prefix := getValueIndexSink(); store != nil {
+    blockKey := blockObjectKey(meta.TenantID, blockUUID.String())
+    if _, serr := tmp.Seek(0, io.SeekStart); serr != nil {
+        level.Warn(util_log.Logger).Log(
+            "msg", "vblockpack: value-index L0 skipped (seek failed)",
+            "block", blockKey,
+            "err", serr,
+        )
+    } else if r, rerr := blockpack.NewReaderFromProvider(&fileReaderProvider{f: tmp}); rerr != nil {
+        level.Warn(util_log.Logger).Log(
+            "msg", "vblockpack: value-index L0 skipped (could not open block reader)",
+            "block", blockKey,
+            "err", rerr,
+        )
+    } else if werr := blockpack.WriteValueIndexL0(r, store, blockKey, meta.TenantID, prefix); werr != nil {
+        level.Warn(util_log.Logger).Log(
+            "msg", "vblockpack: value-index L0 write failed",
+            "block", blockKey,
+            "err", werr,
+        )
+    }
+}
 ```
 
-**Change 3: Update call site**
+This also eliminates one extra `blockObjectKey` allocation (was being called
+redundantly only in the inner success path).
 
-Current call (line ~648):
+#### 1b. `tempodb/encoding/vblockpack/compactor.go`
+
+The same silent-skip exists in `tempoOutputStorage.Put` (lines ~295–302):
+
 ```go
-return collectIntrinsicPlain(r, refs, opts, wantColumns, secondPassCols, stats, hasRangePredicate(program))
+if store, prefix := getValueIndexSink(); store != nil {
+    if r, rerr := blockpack.NewReaderFromProvider(&bytesReaderProvider{data: data}); rerr == nil {
+        sourceRef := blockObjectKey(s.tenantID, uuid.UUID(newID).String())
+        if werr := blockpack.WriteValueIndexL0(r, store, sourceRef, s.tenantID, prefix); werr != nil {
+            level.Warn(util_log.Logger).Log("msg", "vblockpack: value-index L0 write failed (compaction)", "block", sourceRef, "err", werr)
+        }
+    }
+}
 ```
 
-New call:
+Replacement:
+
 ```go
-return collectIntrinsicPlain(r, refs, opts, wantColumns, secondPassCols, stats)
+if store, prefix := getValueIndexSink(); store != nil {
+    blockKey := blockObjectKey(s.tenantID, uuid.UUID(newID).String())
+    if r, rerr := blockpack.NewReaderFromProvider(&bytesReaderProvider{data: data}); rerr != nil {
+        level.Warn(util_log.Logger).Log(
+            "msg", "vblockpack: value-index L0 skipped (could not open block reader, compaction)",
+            "block", blockKey,
+            "err", rerr,
+        )
+    } else if werr := blockpack.WriteValueIndexL0(r, store, blockKey, s.tenantID, prefix); werr != nil {
+        level.Warn(util_log.Logger).Log(
+            "msg", "vblockpack: value-index L0 write failed (compaction)",
+            "block", blockKey,
+            "err", werr,
+        )
+    }
+}
 ```
 
-**Step 4.2: Update `executor/SPECS.md`**
+#### 1c. `tempodb/encoding/vblockpack/valueindex.go`
 
-Find the section describing Case A / field population (search for "lookupIntrinsicFields" or "Case A"). Update to say:
+`ConfigureValueIndex`'s startup failure currently uses `slog.Warn` (Go stdlib):
 
-```
-Case A (pure intrinsic, no sort): uses forEachBlockInGroups for field population.
-MatchedRow.Block is populated; MatchedRow.IntrinsicFields is nil.
-This applies to both equality predicates and range predicates.
-```
-
-**Step 4.3: Update `executor/NOTES.md`**
-
-Append a new dated entry. Current last note is around NOTE-050 or later — grep the file to find the last sequential ID before appending:
-
-```bash
-grep -n "## NOTE-0" /home/matt/source/tempo-mrd/vendor/github.com/grafana/blockpack/internal/modules/executor/NOTES.md | tail -5
+```go
+valueIndexConfigOnce.Do(func() {
+    client, err := newMinioForValueIndex(s3cfg)
+    if err != nil {
+        slog.Warn("vblockpack: value-index write path disabled", "err", err)
+        return
+    }
+    ...
+})
 ```
 
-New entry (assign next sequential ID after checking):
-```markdown
-## NOTE-0XX: collectIntrinsicPlain Always Uses Block Reads (2026-03-29)
-*Added: 2026-03-29*
+Replace `slog.Warn` with `level.Warn(util_log.Logger)` so the startup failure
+appears in Tempo's structured log output alongside other block-builder startup
+messages.
 
-**Decision:** Removed the `useIntrinsicLookup` branch from `collectIntrinsicPlain`. Range
-predicates (duration>X, svc=~".*") now use `forEachBlockInGroups` for field population,
-the same path as equality predicates. The `useIntrinsicLookup bool` parameter is removed.
+Required import addition: `"github.com/go-kit/log/level"` and
+`util_log "github.com/grafana/tempo/pkg/util/log"` (check if already present;
+`valueindex.go` currently imports only `log/slog` for the one Warn call).
 
-**Rationale:** The `useIntrinsicLookup` branch called `lookupIntrinsicFields` which scanned
-all N entries in all intrinsic columns to find the M result refs. For a 3.3M-span file with
-7 remaining intrinsic columns, this is O(3.3M × 7) = O(23M) operations even for a 10-result
-query. `forEachBlockInGroups` groups refs by block and reads only the blocks containing
-matched spans — O(M × block_read_cost). For M=10 results across a few blocks, this is
-O(500K) bytes read vs O(286MB) of intrinsic scans: a 500x improvement.
+After the change:
 
-**Impact on execution paths:** Case A results now always populate `MatchedRow.Block` (not
-`IntrinsicFields`). `lookupIntrinsicFields` is retained — it is still used by Case B
-(`collectIntrinsicTopK`) for timestamp-sorted top-K queries where ordering requires the
-intrinsic timestamp column, and by `stream_structural.go` for identity field resolution.
-
-**Test changes:** `execution_path_test.go` EP-01 and EP-03 assertions updated from
-IntrinsicFields→populated/Block→nil to Block→populated/IntrinsicFields→nil.
-
-Back-ref: `executor/stream.go:collectIntrinsicPlain`
+```go
+valueIndexConfigOnce.Do(func() {
+    client, err := newMinioForValueIndex(s3cfg)
+    if err != nil {
+        level.Warn(util_log.Logger).Log(
+            "msg", "vblockpack: value-index write path disabled (S3 client init failed)",
+            "err", err,
+        )
+        return
+    }
+    ...
+    level.Info(util_log.Logger).Log(
+        "msg", "vblockpack: value-index write path enabled",
+        "bucket", s3cfg.Bucket,
+        "prefix", indexPrefix,
+    )
+    ...
+})
 ```
 
-**Step 4.4: Update `executor/TESTS.md`**
+The `Info` line at the end confirms successful initialisation (useful on startup).
 
-Append or update the test plan section for EP tests:
+### Tests
 
-```markdown
-## EP-01 (updated 2026-03-29)
-Range predicates now use forEachBlockInGroups. EP-01 verifies Block is populated and
-IntrinsicFields is nil (was reversed before 2026-03-29).
+Add unit tests in `tempodb/encoding/vblockpack/valueindex_test.go` (already exists):
 
-## EP-03 (updated 2026-03-29)
-Range+equality combination also uses forEachBlockInGroups. EP-03 verifies Block populated.
-```
+- `TestConfigureValueIndex_LogsOnBadEndpoint` — call `ConfigureValueIndex` with
+  a nil or garbage S3 config and assert no panic. (Actual log line capture is not
+  required — just confirm no panic and the sink stays nil.)
+
+Add unit tests in `tempodb/encoding/vblockpack/create_test.go` (already exists):
+
+- `TestCreateBlock_ValueIndexSeekFailure` — not practical to simulate kernel seek
+  failure in unit test; note in code comment that the seek-fail path is covered by
+  the log-visible error message.
+
+No new test files required — the existing `*_test.go` files cover the surrounding
+paths; this change is logging-only.
+
+### Acceptance
+
+- `go build ./tempodb/encoding/vblockpack/...` passes
+- `go test ./tempodb/encoding/vblockpack/...` passes
+- `grep -n "slog\." tempodb/encoding/vblockpack/valueindex.go` returns no hits
+  (stdlib slog fully replaced)
+- `grep -n "level.Warn" tempodb/encoding/vblockpack/create.go` returns 2+ hits
 
 ---
 
-### Phase 5: Test and Fix Compilation
+## Task 2 (Medium Priority): VCNT Standalone `.vcnt` Files
 
-**Step 5.1: Build vendor copy**
+### Decision: Option A (no blockpack changes)
 
-```bash
-cd /home/matt/source/tempo-mrd && go build ./vendor/github.com/grafana/blockpack/... 2>&1
+**Rationale:** The `valuecounts` package lives at
+`vendor/github.com/grafana/blockpack/internal/modules/valuecounts/` and is in
+the vendored tree (`modules.txt` does **not** list it as explicitly imported by
+tempo — confirmed by grep). However, because this is a local replace directive
+(`replace github.com/grafana/blockpack => ../blockpack`), Go's `internal`
+visibility rule is scoped to the module boundary: an `internal/` package in
+module `github.com/grafana/blockpack` is **not importable** from
+`github.com/grafana/tempo`.
+
+This means tempo **cannot** directly import
+`github.com/grafana/blockpack/internal/modules/valuecounts`.
+
+**Available paths:**
+
+1. **Add a public re-export in blockpack** — add a thin public wrapper file in
+   `../blockpack/` that re-exports the `valuecounts` types/functions needed:
+   `Record`, `Sort`, `EncodeRecords`, `ColHash`, `FormatFilename`, `NewID`.
+   This is a blockpack change but extremely small (one new file, no API redesign).
+   Blockpack's `api.go` already explicitly restricts scope, but the brainstorm
+   confirms this restriction is about the *query* API — a separate
+   `valuecount.go` wrapper is consistent with `valueindex_extract.go`,
+   `valueindex_l0write.go`, and `valueindex_query.go` already living in the
+   blockpack root as thin wrapper files.
+
+2. **Copy the minimal code into tempo** — copy just the encoding functions into
+   `tempodb/encoding/vblockpack/vcntwriter.go`. This produces a fork that must be
+   kept in sync with blockpack.
+
+**Recommended: Option A.1 — add a public re-export file to blockpack.**
+
+This is the correct long-term approach (no fork, single source of truth) and
+requires only a few lines of wrapper code. The brainstorm's "Option A (simpler,
+no blockpack changes)" description was slightly wrong — blockpack *does* need a
+tiny change to export the types, but it is not a new API, only a visibility lift.
+
+### Exact Changes
+
+#### 2a. `../blockpack/vcnt.go` (new file in blockpack root)
+
+```go
+// Package blockpack — vcnt.go exposes the valuecounts types and encoding
+// functions for tempo's block-builder, which writes standalone .vcnt files
+// to S3 after each block flush.
+package blockpack
+
+import "github.com/grafana/blockpack/internal/modules/valuecounts"
+
+// VCNTRecord is one value-count row: a (column, value) pair observed in Count
+// spans within the [TimeStart, TimeEnd] unix-seconds window.
+type VCNTRecord = valuecounts.Record
+
+// VCNTChunkDirEntry is one chunk directory entry returned by EncodeVCNTRecords.
+type VCNTChunkDirEntry = valuecounts.ChunkDirEntry
+
+// SortVCNTRecords sorts records into the canonical VCNT order required by
+// EncodeVCNTRecords: (ColumnName ASC, TimeStart ASC, Value ASC, Count ASC).
+func SortVCNTRecords(records []VCNTRecord) {
+    valuecounts.Sort(records)
+}
+
+// EncodeVCNTRecords encodes a pre-sorted slice of VCNTRecords into snappy-
+// compressed chunk bytes. records MUST be sorted by SortVCNTRecords first.
+// perChunk <= 0 uses the package default (~512). Returns the raw chunk bytes
+// and the chunk directory; both are needed to write and later query the file.
+func EncodeVCNTRecords(records []VCNTRecord, perChunk int) ([]byte, []VCNTChunkDirEntry) {
+    return valuecounts.EncodeRecords(records, perChunk)
+}
+
+// VCNTColHash returns the per-column directory hash for the .vcnt object key:
+//   <prefix>/<tenant>/unique_values/<col_hash>/L0-<id>.vcnt
+func VCNTColHash(colName string) string {
+    return valuecounts.ColHash(colName)
+}
+
+// VCNTFilename returns a .vcnt filename for the given compaction level and ID.
+// Use level=0 for freshly-written L0 files. Use valuecounts.NewID() for the id.
+func VCNTFilename(level int, id string) string {
+    return valuecounts.FormatFilename(level, id)
+}
+
+// VCNTNewID returns a new unique ID suitable for use in VCNTFilename.
+func VCNTNewID() string {
+    return valuecounts.NewID()
+}
 ```
 
-Expected: clean build. Fix any remaining references to removed symbols.
+After adding this file, run `go mod vendor` from the tempo root to sync it into
+`vendor/github.com/grafana/blockpack/vcnt.go` and add the package to
+`vendor/modules.txt`.
 
-Common issues to watch for:
-- Tests in `shared/intrinsic_ref_filter_test.go` — these test the deleted functions. They must be deleted or emptied.
-- Tests in `executor/intrinsic_pruning_test.go` around `TestLookupIntrinsicFields_PageSkipping` — this calls `lookupIntrinsicFields` directly; it should still compile since `lookupIntrinsicFields` is retained.
-- Tests in `executor/execution_path_test.go` — updated in Step 1.1.
+#### 2b. `tempodb/encoding/vblockpack/vcntwriter.go` (new file in tempo)
 
-**Step 5.2: Run tests for affected packages**
+This file accumulates per-column value counts during block ingest and writes
+the resulting `.vcnt` file to S3 after `writer.Flush()`.
 
-```bash
-cd /home/matt/source/tempo-mrd && go test ./vendor/github.com/grafana/blockpack/internal/modules/blockio/shared/... -v -count=1 2>&1 | tail -30
+```go
+package vblockpack
+
+// vcntwriter.go — per-block value-count accumulator and writer (standalone .vcnt files).
+//
+// During ingest (CreateBlock), a vcntAccumulator collects the distinct string values
+// seen for each column across all traces in the block, within the block's time window.
+// After writer.Flush(), the accumulated records are encoded and written as a standalone
+// .vcnt file to object storage under:
+//   <prefix>/<tenant>/unique_values/<col_hash>/L0-<id>.vcnt
+
+import (
+    "context"
+    "fmt"
+    "strings"
+
+    "github.com/grafana/blockpack"
+    "github.com/grafana/tempo/tempodb/backend"
+)
+
+// vcntSink is process-level — same singleton pattern as valueIndexSink.
+// Set by ConfigureVCNT (not yet wired); guarded by valueIndexSinkMu (re-use).
+// For now this is a placeholder; the actual singleton wiring is Task 2c.
+
+// vcntAccumulator accumulates (column, value, timeStart, timeEnd, count) tuples
+// across all spans in one block. Columns are limited to string-valued span and
+// resource attributes; identity columns (trace:id, span:id, span:parent_id)
+// are excluded (high cardinality, no tag-autocomplete value).
+type vcntAccumulator struct {
+    // counts maps column → value → count.
+    counts map[string]map[string]int64
+    // timeStart and timeEnd are unix seconds for the block's time window.
+    // They are set from the block meta on first use.
+    timeStart uint64
+    timeEnd   uint64
+}
+
+func newVCNTAccumulator(timeStartSec, timeEndSec uint64) *vcntAccumulator {
+    return &vcntAccumulator{
+        counts:    make(map[string]map[string]int64),
+        timeStart: timeStartSec,
+        timeEnd:   timeEndSec,
+    }
+}
+
+// Add records a (column, value) observation. value must be the string
+// representation of the attribute value. column is the blockpack column name
+// (e.g. "span.http.method", "resource.service.name").
+//
+// Identity and high-cardinality columns are filtered here:
+//   - "trace:id", "span:id", "span:parent_id", "span:parent_span_id" — excluded
+//   - "span:start", "span:duration", "__embedding__" — excluded (numeric/binary)
+//
+// Value is truncated at 256 bytes to avoid unbounded memory use.
+func (a *vcntAccumulator) Add(column, value string) {
+    if isExcludedVCNTColumn(column) {
+        return
+    }
+    if len(value) > 256 {
+        value = value[:256]
+    }
+    if a.counts[column] == nil {
+        a.counts[column] = make(map[string]int64)
+    }
+    a.counts[column][value]++
+}
+
+// Records converts the accumulator into a sorted []blockpack.VCNTRecord slice,
+// ready for EncodeVCNTRecords. The caller must not use the accumulator after
+// calling Records.
+func (a *vcntAccumulator) Records() []blockpack.VCNTRecord {
+    total := 0
+    for _, vals := range a.counts {
+        total += len(vals)
+    }
+    if total == 0 {
+        return nil
+    }
+    recs := make([]blockpack.VCNTRecord, 0, total)
+    for col, vals := range a.counts {
+        for val, cnt := range vals {
+            recs = append(recs, blockpack.VCNTRecord{
+                ColumnName: col,
+                Value:      []byte(val),
+                TimeStart:  a.timeStart,
+                TimeEnd:    a.timeEnd,
+                Count:      cnt,
+            })
+        }
+    }
+    blockpack.SortVCNTRecords(recs)
+    return recs
+}
+
+// isExcludedVCNTColumn returns true for columns that should NOT be indexed in
+// the value-count file: identity, numeric/binary, and embedding columns.
+func isExcludedVCNTColumn(col string) bool {
+    switch col {
+    case "trace:id", "span:id", "span:parent_id", "span:parent_span_id",
+        "span:start", "span:duration", "__embedding__",
+        "span:status", "span:kind": // numeric
+        return true
+    }
+    // Exclude any column that starts with "__" (internal blockpack columns).
+    return strings.HasPrefix(col, "__")
+}
+
+// writeVCNTFile encodes the accumulator's records and writes one .vcnt file per
+// column group to object storage via the provided ObjectPutter.
+// Returns the number of columns written and any write error.
+// Best-effort: errors are returned but do not fail the block write.
+func writeVCNTFile(
+    ctx context.Context,
+    acc *vcntAccumulator,
+    store backend.Writer,
+    tenantID string,
+    prefix string,
+) (int, error) {
+    _ = ctx // reserved for future cancellation
+    recs := acc.Records()
+    if len(recs) == 0 {
+        return 0, nil
+    }
+
+    // Group records by column; each column gets its own .vcnt file.
+    // This mirrors how blockpack's WriteValueIndexL0 writes per-column files.
+    colRecs := groupVCNTRecordsByColumn(recs)
+    id := blockpack.VCNTNewID()
+    var firstErr error
+    written := 0
+    for col, colSlice := range colRecs {
+        data, _ := blockpack.EncodeVCNTRecords(colSlice, 0)
+        if len(data) == 0 {
+            continue
+        }
+        colHash := blockpack.VCNTColHash(col)
+        filename := blockpack.VCNTFilename(0, id)
+        // Object key: <prefix>/<tenant>/unique_values/<col_hash>/L0-<id>.vcnt
+        key := fmt.Sprintf("%s/%s/unique_values/%s/%s", prefix, tenantID, colHash, filename)
+        if err := store.Append(ctx, key, []byte(tenantID), data); err != nil {
+            if firstErr == nil {
+                firstErr = fmt.Errorf("vcnt write %s: %w", col, err)
+            }
+            continue
+        }
+        written++
+    }
+    return written, firstErr
+}
+
+// groupVCNTRecordsByColumn returns a map from column name to records for that column.
+// Input must already be sorted in canonical VCNT order (ColumnName ascending).
+func groupVCNTRecordsByColumn(recs []blockpack.VCNTRecord) map[string][]blockpack.VCNTRecord {
+    out := make(map[string][]blockpack.VCNTRecord)
+    for i := range recs {
+        col := recs[i].ColumnName
+        out[col] = append(out[col], recs[i])
+    }
+    return out
+}
 ```
 
-```bash
-cd /home/matt/source/tempo-mrd && go test ./vendor/github.com/grafana/blockpack/internal/modules/blockio/writer/... -v -count=1 2>&1 | tail -30
+**Note:** The `writeVCNTFile` function uses `store backend.Writer` as a placeholder.
+The actual storage mechanism (direct S3 minio put, same as `s3ObjectPutter`) needs
+to be wired in a follow-up step once the singleton pattern is decided. The key
+object-path format is fully determined above.
+
+#### 2c. Wiring VCNT accumulation in `create.go`
+
+The block-builder's `CreateBlock` function iterates over traces and calls
+`writer.AddTempoTrace(tr)`. To accumulate value counts, the loop needs to extract
+span attributes from each `tempopb.Trace` and call `acc.Add(col, val)`.
+
+**Problem:** `writer.AddTempoTrace(tr)` consumes a `*tempopb.Trace`. Tempo's
+`tempopb.Trace` is a protobuf type with `ResourceSpans[].Resource.Attributes` and
+`ResourceSpans[].ScopeSpans[].Spans[].Attributes`. These are accessible before
+the trace is handed off to the blockpack writer.
+
+Changes to `CreateBlock` loop body:
+
+```go
+// After: id, tr, nextErr := i.Next(ctx)
+// Before: writer.AddTempoTrace(tr)
+
+if tr != nil && acc != nil {
+    accumulateVCNTFromTrace(acc, tr)
+}
 ```
 
-```bash
-cd /home/matt/source/tempo-mrd && go test ./vendor/github.com/grafana/blockpack/internal/modules/executor/... -v -count=1 2>&1 | tail -40
+New helper function `accumulateVCNTFromTrace` in `vcntwriter.go`:
+
+```go
+// accumulateVCNTFromTrace adds all string-valued span and resource attributes
+// from a tempopb.Trace to the VCNT accumulator.
+func accumulateVCNTFromTrace(acc *vcntAccumulator, tr *tempopb.Trace) {
+    for _, rs := range tr.ResourceSpans {
+        // Resource attributes → "resource.<key>" columns.
+        if rs.Resource != nil {
+            for _, kv := range rs.Resource.Attributes {
+                if kv.Value != nil {
+                    if sv, ok := kv.Value.Value.(*v1_common.AnyValue_StringValue); ok {
+                        acc.Add("resource."+kv.Key, sv.StringValue)
+                    }
+                }
+            }
+        }
+        for _, ss := range rs.ScopeSpans {
+            for _, span := range ss.Spans {
+                // Span attributes → "span.<key>" columns.
+                for _, kv := range span.Attributes {
+                    if kv.Value != nil {
+                        if sv, ok := kv.Value.Value.(*v1_common.AnyValue_StringValue); ok {
+                            acc.Add("span."+kv.Key, sv.StringValue)
+                        }
+                    }
+                }
+                // Intrinsic string columns — add selectively.
+                if span.Name != "" {
+                    acc.Add("span:name", span.Name)
+                }
+            }
+        }
+    }
+}
 ```
 
-Expected: all pass.
+Required imports in `create.go` or `vcntwriter.go`:
 
-**Step 5.3: Build Tempo**
+- `tempopb "github.com/grafana/tempo/pkg/tempopb/trace/v1"` — check exact import path
+- `v1_common "go.opentelemetry.io/proto/otlp/common/v1"` — for `AnyValue_StringValue`
 
-```bash
-cd /home/matt/source/tempo-mrd && go build ./tempodb/... 2>&1
-```
+#### 2d. `vendor/modules.txt` update
 
-Expected: clean build (Tempo code calls blockpack public API which is unchanged).
-
-**Step 5.4: Run Tempo tests**
+After adding `vcnt.go` to `../blockpack`, run:
 
 ```bash
-cd /home/matt/source/tempo-mrd && go test ./tempodb/encoding/vblockpack/... -v -count=1 2>&1 | tail -30
+cd /home/mdurham/source/blockpack_collection/tempo && go mod vendor
 ```
+
+This adds `github.com/grafana/blockpack` (with the new `VCNTRecord`, `VCNTColHash`,
+etc. symbols) to the vendor tree and updates `modules.txt`.
+
+### What is NOT in scope for Task 2
+
+- **Querier-side `.vcnt` reader** — reading `.vcnt` files for tag autocomplete is a
+  separate feature. The writer side (accumulate + write) is Task 2's deliverable.
+- **VCNT compaction** — merging L0 `.vcnt` files into L1/L2 is also separate.
+- **Wiring the S3 singleton for VCNT** — `writeVCNTFile` has a backend.Writer
+  placeholder. The actual singleton (`ConfigureVCNT`) parallels `ConfigureValueIndex`
+  and can be added in the same PR or a follow-up. Task 2 is complete when the
+  accumulation logic and encoding are wired and the write call is in place.
+
+### Tests for Task 2
+
+New file: `tempodb/encoding/vblockpack/vcntwriter_test.go`
+
+```go
+func TestVCNTAccumulator_Basic(t *testing.T) {
+    // Add known (column, value) pairs, call Records(), assert sorted output.
+}
+
+func TestVCNTAccumulator_ExcludesIdentityColumns(t *testing.T) {
+    // Add "trace:id", "span:id" — Records() should return nil.
+}
+
+func TestVCNTAccumulator_TruncatesLongValues(t *testing.T) {
+    // Add a 300-byte value — assert stored length is 256.
+}
+
+func TestGroupVCNTRecordsByColumn(t *testing.T) {
+    // Three records for two columns — assert correct grouping.
+}
+
+func TestIsExcludedVCNTColumn(t *testing.T) {
+    // Table-driven: known-excluded and known-included columns.
+}
+```
+
+### Acceptance
+
+- `go build ./tempodb/encoding/vblockpack/...` passes
+- `go test ./tempodb/encoding/vblockpack/...` passes
+- `go build github.com/grafana/blockpack` (vendor) passes (new `vcnt.go` compiles)
+- `vcntwriter_test.go` passes with `go test -v -run TestVCNT`
 
 ---
 
-### Phase 6: Mirror Changes to Upstream Source
+## Task 3 (Low Priority): Cubes
 
-**Step 6.1: Identify divergence between vendor and upstream**
+### Decision: File a GitHub issue, skip implementation
 
-```bash
-diff -u /home/matt/source/blockpack-tempo/internal/modules/blockio/shared/constants.go \
-         /home/matt/source/tempo-mrd/vendor/github.com/grafana/blockpack/internal/modules/blockio/shared/constants.go
-```
+**Rationale:**
 
-If the upstream does not have `IntrinsicRefBloomBytes`/`IntrinsicRefBloomK`, there is nothing to remove. Apply only the changes that exist in both.
+The `cube` package lives at
+`blockpack/internal/modules/cube/` and is **not** exported in blockpack's public
+API. To use it from tempo, blockpack would need to:
 
-**Step 6.2: Apply the same changes to upstream**
+1. Export `Accumulator`, `Definition`, `SpanValues`, `ObjectPutter`, and
+   `FlushTo` in a new `cube.go` root-level wrapper file (analogous to Task 2a's
+   `vcnt.go`).
+2. Tempo needs a `SpanValues` adapter over `*tempopb.Span` + `*resource.Resource`.
+3. Tempo needs per-minute accumulator rotation in `CreateBlock`'s ingest loop.
+4. Tempo needs a `cube.Registry` startup load and per-tenant cube definition cache.
+5. The querier needs `cube.CreationTrigger.TryCreate()` wired into the search path.
 
-For each file modified in vendor:
-1. Read the current upstream file
-2. Apply the equivalent changes (adapting for any version differences)
-3. Write the updated file
+This is 5 independent changes across blockpack and tempo, each requiring test
+coverage. Total estimated effort: 3–5 days.
 
-**Step 6.3: Build upstream**
+### Action
 
-```bash
-cd /home/matt/source/blockpack-tempo && go build ./... 2>&1
-```
+File a GitHub issue in the blockpack repo titled:
+**"Export cube package for tempo block-builder integration"**
 
-Expected: clean build.
+Issue body should contain:
 
-**Step 6.4: Run upstream tests (optional but recommended)**
+- Link to `internal/modules/cube/accumulator.go` — the `SpanValues` interface
+- The accumulator usage pattern from brainstorm.md Problem 3
+- Required public API surface: `Accumulator`, `Definition`, `SpanValues`,
+  `ObjectPutter`, `Registry`, `RegistryEntry`, `CreationTrigger`
+- Estimated work: small blockpack change (export wrapper) + medium tempo work
+- Dependency: VCNT (Task 2) should be shipped first as the simpler precedent
 
-```bash
-cd /home/matt/source/blockpack-tempo && go test ./internal/modules/... -count=1 2>&1 | tail -30
-```
-
----
-
-### Phase 7: Final Verification
-
-**Step 7.1: Full build and test**
-
-```bash
-cd /home/matt/source/tempo-mrd && go build ./tempodb/... && echo "BUILD OK"
-cd /home/matt/source/blockpack-tempo && go build ./... && echo "BUILD OK"
-```
-
-**Step 7.2: Run the parity smoke test (if available)**
-
-```bash
-cd /home/matt/source/tempo-mrd && go test ./vendor/github.com/grafana/blockpack/internal/parity/... -v -count=1 2>&1 | tail -20
-```
+**No code changes for Task 3.**
 
 ---
 
-## Spec-Driven Verification Tests
+## File Change Summary
 
-### Module: `internal/modules/executor/`
-
-Source: SPECS.md and NOTES.md invariants
-
-| Invariant | Test to Verify | Test File |
-|-----------|---------------|-----------|
-| Case A always populates `MatchedRow.Block` | `TestExecutionPath_RangePredicate_BlockPopulated` | execution_path_test.go |
-| Case A never populates `MatchedRow.IntrinsicFields` | `TestExecutionPath_RangePredicate_BlockPopulated` | execution_path_test.go |
-| Range+equality combination uses Block path | `TestExecutionPath_RangeAndEquality_BlockPopulated` | execution_path_test.go |
-| Result counts unchanged (correctness invariant) | `TestExecutionPath_Correctness` (EP-05, no change needed) | execution_path_test.go |
-| `lookupIntrinsicFields` still works for TopK | `TestIntrinsicTopK_*` (no change) | stream_topk_test.go |
-
-### Module: `internal/modules/blockio/shared/`
-
-| Invariant | Test to Verify | Test File |
-|-----------|---------------|-----------|
-| Old v0x02 files still decode without error | New test: `TestDecodePageTOC_V2LegacyBackwardCompat` | shared/intrinsic_ref_filter_test.go or codec test |
-| New files encode as v0x01 (no ref-range fields) | New test: `TestEncodeDecodePageTOC_NoRefBloom` | shared test |
+| File | Change | Task |
+|------|--------|------|
+| `tempodb/encoding/vblockpack/create.go` | Add warn logging for seek/reader errors | 1a |
+| `tempodb/encoding/vblockpack/compactor.go` | Add warn logging for reader error (compaction) | 1b |
+| `tempodb/encoding/vblockpack/valueindex.go` | Replace `slog.Warn` with `level.Warn`; add info log | 1c |
+| `../blockpack/vcnt.go` | New file: public re-export of valuecounts types | 2a |
+| `tempodb/encoding/vblockpack/vcntwriter.go` | New file: accumulator + write functions | 2b |
+| `tempodb/encoding/vblockpack/create.go` | Wire VCNT accumulation in ingest loop | 2c |
+| `tempodb/encoding/vblockpack/vcntwriter_test.go` | New file: unit tests | 2 |
+| `vendor/github.com/grafana/blockpack/vcnt.go` | `go mod vendor` syncs this automatically | 2a |
 
 ---
 
-## Spec-Driven Module Updates
+## Execution Order
 
-### Module: `internal/modules/blockio/shared/`
+```
+Task 1a → Task 1b → Task 1c → build+test
+Task 2a (blockpack vcnt.go) → go mod vendor → Task 2b (vcntwriter.go) → Task 2c (wire in create.go) → build+test
+Task 3: file GitHub issue only
+```
 
-**Spec files present:** NOTES.md
-
-**Required updates:**
-- [ ] Add NOTES.md entry NOTE-007: RefBloom removal decision and backward compat story (Step 2.5)
-
-### Module: `internal/modules/blockio/writer/`
-
-**Spec files present:** NOTES.md
-
-**Required updates:**
-- [ ] Add NOTES.md entry NOTE-005: identity columns removed from intrinsic accumulator (Step 3.3)
-
-### Module: `internal/modules/executor/`
-
-**Spec files present:** SPECS.md, NOTES.md, TESTS.md, BENCHMARKS.md
-
-**Required updates:**
-- [ ] Update SPECS.md: Case A field population section — block reads always used (Step 4.2)
-- [ ] Add NOTES.md entry NOTE-0XX: collectIntrinsicPlain change rationale (Step 4.3)
-- [ ] Update TESTS.md: EP-01 and EP-03 test scenario description (Step 4.4)
-- [ ] Update BENCHMARKS.md: Case A intrinsic query I/O target reduced (O(N) → O(M)) — update Metric Targets table if it has rows for range-predicate I/O cost
-
----
-
-## Edge Cases to Handle
-
-### Edge Case 1: Old v0x02 Files on Decode
-**Scenario:** Existing blockpack files in production have RefBloom bytes in the page TOC.
-**Expected:** `DecodePageTOC` reads and discards the bytes; no panic, no data corruption.
-**Test:** `TestDecodePageTOC_V2LegacyBackwardCompat` — craft a v0x02 blob by hand and decode it.
-
-### Edge Case 2: Compaction of Old Files (feedIntrinsicsFromIndex)
-**Scenario:** Compaction source files (old format) have `trace:id`, `span:id`, `span:parent_id`, `span:status_message` in their intrinsic section. `buildIntrinsicBlockIndex` reads them; `feedIntrinsicsFromIndex` previously re-fed them.
-**Expected:** After the change, `feedIntrinsicsFromIndex` skips these four columns. New compacted files do NOT include them in the intrinsic section.
-**Test:** Existing compaction tests should cover this; verify they still pass.
-
-### Edge Case 3: lookupIntrinsicFields Still Used by TopK
-**Scenario:** Caller accidentally removes `lookupIntrinsicFields` thinking it's unused.
-**Expected:** TopK path (`collectIntrinsicTopK`) calls `lookupIntrinsicFields` after selecting refs. If removed, compilation error.
-**Mitigation:** Explicitly verify `lookupIntrinsicFields` has callers in `stream.go` and `stream_structural.go` after the change.
-
-### Edge Case 4: intrinsic_ref_filter_test.go References Deleted Types
-**Scenario:** `TestLookupRefFast`, `TestEnsureRefIndex`, etc. reference deleted functions.
-**Expected:** Compilation error if not updated.
-**Action:** Check test file content; either delete those specific test functions or replace them with backward-compat decode tests (see verification tests above).
+Task 1 and Task 2 are independent — Task 2 does not depend on Task 1.
 
 ---
 
 ## Risks
 
-### Risk 1: Test `TestExecutionPath_RangePredicate_IntrinsicFields` fails before code change
-**Risk:** If the test is updated before the implementation, it will fail for the right reason.
-**Impact:** Expected — this is the TDD pattern. The test should fail until `collectIntrinsicPlain` is changed.
-**Mitigation:** Plan explicitly calls for test update first (Phase 1), then implementation (Phases 2-4).
-
-### Risk 2: `lookupIntrinsicFields` Still Correct After Removing Identity Columns
-**Risk:** `collectIntrinsicTopK` calls `lookupIntrinsicFields(r, selected, secondPassCols)`. If `secondPassCols` contains `trace:id` or `span:id` and those are no longer in the intrinsic section, lookups return nil/zero.
-**Impact:** TopK results might have empty trace:id/span:id fields.
-**Mitigation:** After the change, `trace:id`/`span:id` are still in block column payloads (via `addPresent`). `lookupIntrinsicFields` reads from intrinsic columns — it will find nil for those names. `SpanMatchFromRow` reads from block columns when `lookupIntrinsicFields` returns nil. Verify `SpanMatchFromRow` fallback path handles nil correctly. Check `executor_test.go` EX-09 (SpanMatch.TraceID / SpanMatch.SpanID field population) passes.
-
-### Risk 3: `stream_structural.go` lookupIntrinsicFields for identity fields
-**Risk:** `stream_structural.go` line 235 calls `lookupIntrinsicFields(r, allRefs, intrinsicWant)` for identity columns (trace:id, span:id). After removing these from intrinsic section, this lookup returns empty maps.
-**Impact:** Structural queries might lose trace/span ID values.
-**Mitigation:** Check what `intrinsicWant` contains in `stream_structural.go`. If it requests trace:id/span:id, the lookup will return empty, and the code must fall back to block reads. This is a real risk — verify `stream_structural_test.go` still passes.
-
-### Risk 4: `execution_path_test.go` comment references `hasRangePredicate`
-**Risk:** The EP-01 test comment mentions `hasRangePredicate=true → lookupIntrinsicFields`. After the change this is stale.
-**Impact:** Misleading documentation only; no runtime impact.
-**Mitigation:** Update the comment in Step 1.1.
+| Risk | Severity | Mitigation |
+|------|----------|------------|
+| `internal` visibility prevents `valuecounts` import | High (blocks Task 2) | Task 2a adds blockpack re-export wrapper; this is the approved approach |
+| `go mod vendor` picks up unrelated blockpack changes | Low | Review diff after vendor; only `vcnt.go` should appear |
+| VCNT accumulation adds latency to `CreateBlock` hot path | Medium | Accumulation is O(spans × attrs); add `go test -bench=BenchmarkCreateBlock` before landing |
+| VCNT accumulation memory use for large blocks | Medium | 256-byte value truncation + column exclusion list bounds it; document expected memory |
+| `slog.Warn` → `level.Warn` changes log format | None (improvement) | Confirmed Tempo uses go-kit/log throughout; `util_log.Logger` is the right target |
+| `writeVCNTFile` uses placeholder backend.Writer | Medium | Mark with TODO; do not wire the actual S3 call until the singleton is ready |
 
 ---
 
-## Dependencies
+## Open Questions
 
-### Internal Dependencies
-- `shared/` is imported by `writer/`, `reader/`, and `executor/` — changes propagate
-- `executor/stream.go` imports `modules_reader` and `modules_shared` — unchanged
-- No new external imports needed
+1. **VCNT object key format** — the brainstorm states
+   `<tenant>/indexes/unique_values/<colHash>/L0-<id>.vcnt`. Confirm with the
+   blockpack `valuecounts/filename.go` `FormatFilename` + the value-index prefix
+   convention. The plan above uses
+   `<prefix>/<tenant>/unique_values/<colHash>/L0-<id>.vcnt` — verify this matches
+   the querier's expected key format before wiring the write call.
 
-### External Dependencies
-- None added
+2. **Protobuf import path for span attributes** — `tempopb.Trace` vs
+   `v1.ResourceSpans` path needs to be confirmed against the actual import in
+   `create.go`. Do not assume; read the imports before writing `accumulateVCNTFromTrace`.
 
----
-
-## Complexity Analysis
-
-### Modified Functions
-- `collectIntrinsicPlain`: complexity decreases (removes `if useIntrinsicLookup` branch)
-- `encodePagedFlatColumn`: complexity unchanged (removes 3 lines, not a branch)
-- `encodePagedDictColumn`: complexity unchanged
-- `addRowFromProto`: complexity unchanged (removes 4 `feedIntrinsic*` calls, no branches)
-- `feedIntrinsicsFromIndex`: complexity slightly decreases (fewer cases)
-
----
-
-## Success Criteria
-
-- [ ] `go build ./tempodb/...` passes cleanly
-- [ ] `go build ./...` in blockpack-tempo passes cleanly
-- [ ] All executor tests pass (`go test ./vendor/github.com/grafana/blockpack/internal/modules/executor/...`)
-- [ ] All shared tests pass
-- [ ] All writer tests pass
-- [ ] EP-01 and EP-03 now assert `Block != nil` and `IntrinsicFields == nil` for range predicates
-- [ ] EP-05 correctness tests unchanged (result counts unaffected)
-- [ ] TopK tests (`stream_topk_test.go`) unchanged and passing
-- [ ] Structural query tests (`stream_structural_test.go`) passing
-- [ ] Executor EX-09 (TraceID/SpanID field population) passing
-- [ ] NOTES.md updated in all three spec-driven modules
-- [ ] SPECS.md updated in executor
-- [ ] TESTS.md updated in executor
-- [ ] Old v0x02 files decode without error (backward compat test)
-
----
-
-## Notes
-
-- The `hasRangePredicate(program)` call at the `collectIntrinsicPlain` call site (line 648) is no longer needed as an argument. The function itself may still be useful elsewhere; check whether it has other callers before removing it.
-- `intrinsicFieldsProvider` struct and `IntrinsicFields` field on `MatchedRow` remain in place — they are still used by `collectIntrinsicTopK` (Case B). Only Case A's use of `IntrinsicFields` is removed.
-- The `NOTE-050` comment at stream.go line 185 (about trace intrinsic columns in `secondPassCols`) remains correct — `lookupIntrinsicFields` is still used by Case B and structural queries and still needs these columns in `secondPassCols`.
-- For the upstream mirror: if the upstream at `/home/matt/source/blockpack-tempo/` does not have `IntrinsicPageTOCVersion2`, `IntrinsicRefBloomBytes`, `IntrinsicRefBloomK`, `MinRef`, `MaxRef`, `RefBloom`, or `computePageRefRange`, those removals are no-ops. Apply only the changes that are applicable to the upstream's current state.
-
-## Questions/Uncertainties
-
-- Does `stream_structural.go`'s `lookupIntrinsicFields` call need to be replaced with a block-read for trace/span identity fields after removing them from the intrinsic section? Examine `intrinsicWant` construction in that function before finalizing.
-- Does `TestLookupIntrinsicFields_PageSkipping` in `intrinsic_pruning_test.go` use `DecodePagedColumnBlobFiltered`? If so, that test becomes invalid and needs to be removed or replaced.
+3. **VCNT write sink** — should `writeVCNTFile` use the same `s3ObjectPutter` as
+   `valueIndexSink`, or should it reuse the `backend.Writer` passed to
+   `CreateBlock`? The latter avoids a second S3 client but requires confirming the
+   backend.Writer interface supports the required object key format. Resolve before
+   landing Task 2c.

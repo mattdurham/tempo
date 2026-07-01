@@ -451,11 +451,11 @@ func (s *tempoOutputStorage) Put(_ string, data []byte) error {
 	// never fails compaction, since the index can be rebuilt from the source
 	// block. Skipped entirely when value_index_enabled is false.
 	if store, prefix := getValueIndexSink(); store != nil {
-		if r, rerr := blockpack.NewReaderFromProvider(&bytesReaderProvider{data: data}); rerr == nil {
-			sourceRef := blockObjectKey(s.tenantID, uuid.UUID(newID).String())
-			if werr := blockpack.WriteValueIndexL0(r, store, sourceRef, s.tenantID, prefix); werr != nil {
-				level.Warn(util_log.Logger).Log("msg", "vblockpack: value-index L0 write failed (compaction)", "block", sourceRef, "err", werr)
-			}
+		sourceRef := blockObjectKey(s.tenantID, uuid.UUID(newID).String())
+		if r, rerr := blockpack.NewReaderFromProvider(&bytesReaderProvider{data: data}); rerr != nil {
+			level.Warn(util_log.Logger).Log("msg", "vblockpack: value-index L0 skipped (compaction): open reader failed", "block", sourceRef, "err", rerr)
+		} else if werr := blockpack.WriteValueIndexL0(r, store, sourceRef, s.tenantID, prefix); werr != nil {
+			level.Warn(util_log.Logger).Log("msg", "vblockpack: value-index L0 write failed (compaction)", "block", sourceRef, "err", werr)
 		}
 	}
 	return nil
