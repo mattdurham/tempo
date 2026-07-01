@@ -247,7 +247,7 @@ func (cqp *cubeQueryPath) getObject(ctx context.Context, key string) ([]byte, er
 }
 
 // byDimGroupRe matches "by (\s*col1\s*,\s*col2\s*)" in a TraceQL metrics query.
-var byDimGroupRe = regexp.MustCompile(`\|\s*(?:rate|count_over_time|sum_over_time|min_over_time|max_over_time)\s*\([^)]*\)\s+by\s*\(([^)]+)\)`)
+var byDimGroupRe = regexp.MustCompile(`\|\s*(?:rate|count_over_time|sum_over_time|min_over_time|max_over_time)\s*\([^)]*\)\s*by\s*\(([^)]+)\)`)
 
 // extractGroupByDims parses dimension column names from a TraceQL metrics query's
 // "by (dim1, dim2)" clause. Returns nil when there is no group-by.
