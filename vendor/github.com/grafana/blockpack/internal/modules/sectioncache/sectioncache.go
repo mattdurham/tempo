@@ -85,10 +85,6 @@ type SectionCache interface {
 	// Adapter key: fileID + "/block/" + blockIdx (see sectioncache.BlockColumnsKey)
 	CacheBlockColumns(fileID string, blockIdx int, data []byte) error
 
-	// GetOrFetchIntrinsic fetches or returns a cached intrinsic per-column blob.
-	// Adapter key: fmt.Sprintf("%s/intrinsic/%s", fileID, name)
-	GetOrFetchIntrinsic(fileID, name string, fetch func() ([]byte, error)) ([]byte, error)
-
 	// Close releases any resources held by the cache.
 	Close() error
 }
@@ -148,10 +144,6 @@ func (nopSectionCache) GetBlockColumns(_ string, _ int) ([]byte, bool, error) {
 
 func (nopSectionCache) CacheBlockColumns(_ string, _ int, _ []byte) error {
 	return nil
-}
-
-func (nopSectionCache) GetOrFetchIntrinsic(_ string, _ string, fetch func() ([]byte, error)) ([]byte, error) {
-	return fetch()
 }
 
 func (nopSectionCache) Close() error {
@@ -266,14 +258,6 @@ func (a *FilecacheAdapter) GetBlockColumns(fileID string, blockIdx int) ([]byte,
 // CacheBlockColumns stores block column bytes in the underlying cache.
 func (a *FilecacheAdapter) CacheBlockColumns(fileID string, blockIdx int, data []byte) error {
 	return a.cache.Put(BlockColumnsKey(fileID, blockIdx), data)
-}
-
-// GetOrFetchIntrinsic delegates using the intrinsic legacy key format.
-func (a *FilecacheAdapter) GetOrFetchIntrinsic(
-	fileID, name string,
-	fetch func() ([]byte, error),
-) ([]byte, error) {
-	return a.cache.GetOrFetch(IntrinsicKey(fileID, name), fetch)
 }
 
 // Close delegates to the underlying cache's Close method.

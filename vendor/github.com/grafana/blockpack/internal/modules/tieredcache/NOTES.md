@@ -146,23 +146,35 @@ suites green under `-race`.
 Back-ref: `internal/modules/sectioncache/keys.go:V8SectionKeyFast`,
 `internal/modules/tieredcache/typed.go` (4 key builds).
 
-## NOTE-197 — batch per-file intrinsic column fetch (GetMultiIntrinsic)
+## NOTE-197 — batch per-file intrinsic column fetch (GetMultiIntrinsic) — REMOVED (NOTE-433)
 
-A metrics/search query touches several intrinsic columns per file (span:start + every
-predicate-leaf column + each group-by column). Each was previously resolved by its own
-`GetOrFetchIntrinsic`, i.e. one memcache round-trip (and under pool pressure one connection
-acquisition) per column. A querier CPU profile (2026-06-11) is dominated by kernel networking
-(`__nft_rbtree_lookup` ~23%, `sch_direct_xmit`/`veth_xmit`/`nf_hook_slow` tx softirq path) on
-these round-trips — not by decode. `GetMultiIntrinsic` collapses the per-file intrinsic fan-out
-into a single pipelined `GetMulti` (same lever NOTE-179/185 applied to V8 block columns). It
-re-keys hits by input name without a reverse-lookup map (NOTE-188 pattern) and returns
-`(nil,false,nil)` when the intrinsic sub-cache lacks batch support so callers fall back to
-per-name fetches. Misses fall through to the existing per-name path, so the result is identical.
+Superseded and removed with the IntrinsicTOC (#433). `GetMultiIntrinsic` / `GetOrFetchIntrinsic`
+batched the per-file intrinsic-column fan-out into a single pipelined `GetMulti`. Once all
+intrinsic columns moved into inner blocks (#421) and the file-level IntrinsicTOC was deleted,
+nothing read intrinsic per-column blobs: the reader's `PrefetchIntrinsicColumns` and the entire
+`intrinsic` sub-cache tier became dead. The batching lever survives where it still applies —
+V8 block columns (NOTE-179/185) and the shared `batchGetV8Section` path (NOTE-337).
 
-**Verification:** `go build ./...` clean; tieredcache + reader + executor suites green under `-race`.
+---
 
-Back-ref: `internal/modules/tieredcache/typed.go:GetMultiIntrinsic`,
-`internal/modules/blockio/reader/intrinsic_reader.go:PrefetchIntrinsicColumns`.
+## NOTE-433 — remove the intrinsic sub-cache tier and its dedicated methods
+
+The IntrinsicTOC (#433) is gone; all intrinsic columns are inner-block columns (#421), read
+through the block/TOC cache tiers via `GetOrFetchV8Section`. The dedicated intrinsic cache
+surface — `TypedConfig.Intrinsic`, the `TypedTieredCache.intrinsic` field, `SectionTypeIntrinsic`,
+the `idxIntrinsic`/`sectionIntrinsic` metric slot, the `ToCSubTypeIntrinsic` routing cases in
+`GetOrFetchV8Section`/`routeV8`, `GetOrFetchIntrinsic`, `GetMultiIntrinsic`,
+`sectioncache.IntrinsicKey`, and the `SectionCache.GetOrFetchIntrinsic` interface method — all
+became unreachable. Deadcode could not flag them: `GetOrFetchIntrinsic` was part of the exported
+`SectionCache` interface (anchored via `var sc blockpack.SectionCache = tc` in cmd/deadcode),
+which keeps all interface methods "reachable" even with zero production callers. Removed the whole
+surface. `numSections` dropped 7→6; the Prometheus `section="intrinsic"` label no longer emits.
+`ToCSubTypeIntrinsic uint32 = 4` retired per the wire-enum convention (retirement comment, not
+reused) since v2 files never emit that subtype and data is wiped (no v1 files to read).
+
+**Verification:** `go build ./...` clean; tieredcache + sectioncache + shared suites green under
+`-race`; `make precommit` green. Tempo uses only the `DefaultTypedConfig`/`TwoTierTypedConfig`
+factories (never a raw `TypedConfig{Intrinsic:...}`), so no tempo callsite change was needed.
 
 ---
 

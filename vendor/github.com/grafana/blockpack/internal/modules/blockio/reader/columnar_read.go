@@ -292,7 +292,7 @@ func (r *Reader) readBlockColumnarWithCache(
 	cs *CacheStats,
 ) ([]byte, error) {
 	// Encode blockIdx in the name field so subType=0 always, avoiding accidental
-	// collision with ToCSubTypeBloom(3), ToCSubTypeIntrinsic(4), ToCSubTypeTrace(5).
+	// collision with ToCSubTypeBloom(3), ToCSubTypeTrace(5).
 	// NOTE-189: strconv.Itoa instead of fmt.Sprintf — this runs once per block per
 	// query on the warm read path.
 	blockIdxStr := strconv.Itoa(blockIdx)

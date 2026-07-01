@@ -13,7 +13,6 @@ type TypedTieredCache struct {
 	metadata        filecache.Cache
 	traceIdx        filecache.Cache
 	block           filecache.Cache
-	intrinsic       filecache.Cache
 	sectionRequests *prometheus.CounterVec
 	sectionCounters [numSections][3]prometheus.Counter
 	sectionObs      [numSections][3]prometheus.Observer

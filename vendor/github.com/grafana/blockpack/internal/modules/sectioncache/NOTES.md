@@ -25,12 +25,14 @@ the canonical key format.
 Back-ref: `internal/modules/sectioncache/sectioncache.go:SectionCache`,
 `internal/modules/sectioncache/sectioncache.go:FilecacheAdapter`
 
-## NOTE-SC-002: BlockColumnsKey and IntrinsicKey Shared Helpers
-*Added: 2026-05-05*
+## NOTE-SC-002: BlockColumnsKey Shared Helpers
+*Added: 2026-05-05* · *Updated: 2026-06-30 (#433: IntrinsicKey and GetOrFetchIntrinsic removed)*
 
-`keys.go` provides `BlockColumnsKey` and `BlockColumnsKeyFast` for block column keys, and
-`IntrinsicKey` for intrinsic column keys. Both `FilecacheAdapter` and `TypedTieredCache`
-use these helpers to guarantee identical key strings for the same inputs.
+`keys.go` provides `BlockColumnsKey` and `BlockColumnsKeyFast` for block column keys. Both
+`FilecacheAdapter` and `TypedTieredCache` use these helpers to guarantee identical key strings
+for the same inputs. (`IntrinsicKey` + the `GetOrFetchIntrinsic` interface method were removed
+with the IntrinsicTOC in #433 — intrinsic columns are now inner-block columns keyed like any
+other block column.)
 
 `BlockColumnsKeyFast` uses `strconv.Itoa` (faster than `fmt.Sprintf` on the hot path for
 small integers). `BlockColumnsKey` uses `fmt.Sprintf` (used by `FilecacheAdapter` for

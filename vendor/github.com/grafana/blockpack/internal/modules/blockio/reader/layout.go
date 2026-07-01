@@ -68,8 +68,6 @@ func (r *Reader) fileLayoutV8() (*FileLayoutReport, error) {
 			sectionName = "section.ts_index"
 		case key.Type == shared.ToCTypeMetadata && key.SubType == shared.ToCSubTypeBloom:
 			sectionName = "section.file_bloom"
-		case key.Type == shared.ToCTypeMetadata && key.SubType == shared.ToCSubTypeIntrinsic:
-			sectionName = "intrinsic.column[" + key.Name + "]"
 		case key.Type == shared.ToCTypeMetadata && key.SubType == shared.ToCSubTypeValueIndexEntries:
 			sectionName = "section.valueindex.entries"
 		case key.Type == shared.ToCTypeMetadata && key.SubType == shared.ToCSubTypeValueIndexMeta:

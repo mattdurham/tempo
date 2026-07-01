@@ -22,12 +22,6 @@ func BlockColumnsKeyFast(fileID string, blockIdx int) string {
 	return fileID + "/block/" + strconv.Itoa(blockIdx)
 }
 
-// IntrinsicKey returns the cache key for an intrinsic per-column blob.
-// Format: fileID + "/intrinsic/" + name.
-func IntrinsicKey(fileID, name string) string {
-	return fmt.Sprintf("%s/intrinsic/%s", fileID, name)
-}
-
 // V8SectionKeyFast returns the cache key for a V8 per-column/per-index section
 // blob using string concatenation + strconv.Itoa instead of fmt.Sprintf.
 // Format: fileID + "\x00v8\x00" + tocType + "\x00" + subType + "\x00" + name.

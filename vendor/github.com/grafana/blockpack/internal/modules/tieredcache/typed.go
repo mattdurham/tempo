@@ -31,8 +31,6 @@ const (
 	SectionTypeTraceIdx
 	// SectionTypeBlockData covers /block/<decimal-integer>.
 	SectionTypeBlockData
-	// SectionTypeIntrinsic covers /intrinsic/*.
-	SectionTypeIntrinsic
 	// SectionTypeOther is reserved for future extensibility; no sub-cache is currently
 	// assigned to this type. Internal use only — value is part of the TypedConfig API.
 	SectionTypeOther
@@ -67,9 +65,6 @@ const (
 // Block caches raw block column bytes (/block/<N>).
 // Should be a MemoryCache: block reads are latency-critical (SPEC-ROOT-015).
 
-// Intrinsic caches intrinsic per-column blobs (/intrinsic/<name>).
-// Typically a MemoryCache (variable size; isolated to avoid evicting footer/bloom).
-
 // Registerer is an optional Prometheus registerer.
 // When non-nil, TypedTieredCache metrics are registered on construction:
 //   - blockpack_typed_cache_requests_total (labels: section, result)
@@ -78,25 +73,24 @@ const (
 // Nil means no metrics. Consistent with filecache.Config.Registerer.
 
 // DefaultTypedConfig returns a TypedConfig with the recommended tier mapping:
-//   - mem: Footer, TOC, Bloom, Block, Intrinsic (low-latency, high-reuse)
+//   - mem: Footer, TOC, Bloom, Block (low-latency, high-reuse)
 //   - disk: Metadata, TraceIdx (large blobs; disk round-trip acceptable)
 //
 // IMPORTANT: Bloom compact-header blobs can exceed 15 MiB per file. Size the mem budget
 // to at least 2 × maxBlobSize × maxConcurrentFiles to avoid evicting active entries.
 func DefaultTypedConfig(mem, disk filecache.Cache) TypedConfig {
 	return TypedConfig{
-		Footer:    mem,
-		TOC:       mem,
-		Bloom:     mem,
-		Metadata:  disk,
-		TraceIdx:  disk,
-		Block:     mem,
-		Intrinsic: mem,
+		Footer:   mem,
+		TOC:      mem,
+		Bloom:    mem,
+		Metadata: disk,
+		TraceIdx: disk,
+		Block:    mem,
 	}
 }
 
 // TwoTierTypedConfig returns a TypedConfig that splits caching across two remote caches:
-//   - meta: Footer, TOC, Bloom, Metadata, TraceIdx, Intrinsic — small, high-reuse entries
+//   - meta: Footer, TOC, Bloom, Metadata, TraceIdx — small, high-reuse entries
 //     that benefit from a shared cache with low eviction pressure (e.g. memcached-01).
 //   - page: Block — large column-page blobs where a separate cache avoids evicting
 //     the small metadata entries (e.g. memcached-blockpack-page-01).
@@ -105,27 +99,25 @@ func DefaultTypedConfig(mem, disk filecache.Cache) TypedConfig {
 // for metadata and memcached-blockpack-page-01 for page data.
 func TwoTierTypedConfig(meta, page filecache.Cache) TypedConfig {
 	return TypedConfig{
-		Footer:    meta,
-		TOC:       meta,
-		Bloom:     meta,
-		Metadata:  meta,
-		TraceIdx:  meta,
-		Block:     page,
-		Intrinsic: meta,
+		Footer:   meta,
+		TOC:      meta,
+		Bloom:    meta,
+		Metadata: meta,
+		TraceIdx: meta,
+		Block:    page,
 	}
 }
 
 // Section index constants for sectionObs/sectionCounters arrays.
 const (
-	numSections = 7 // footer, toc, bloom, metadata, traceIdx, block, intrinsic
+	numSections = 6 // footer, toc, bloom, metadata, traceIdx, block
 
-	idxFooter    = 0
-	idxTOC       = 1
-	idxBloom     = 2
-	idxMetadata  = 3
-	idxTraceIdx  = 4
-	idxBlock     = 5
-	idxIntrinsic = 6
+	idxFooter   = 0
+	idxTOC      = 1
+	idxBloom    = 2
+	idxMetadata = 3
+	idxTraceIdx = 4
+	idxBlock    = 5
 
 	idxHit   = 0
 	idxMiss  = 1
@@ -134,13 +126,12 @@ const (
 
 // NOTE-LINT-407: constants for the Prometheus section/result label values (goconst).
 const (
-	sectionFooter    = "footer"
-	sectionTOC       = "toc"
-	sectionBloom     = "bloom"
-	sectionMetadata  = "metadata"
-	sectionTraceIdx  = "traceIdx"
-	sectionBlock     = "block"
-	sectionIntrinsic = "intrinsic"
+	sectionFooter   = "footer"
+	sectionTOC      = "toc"
+	sectionBloom    = "bloom"
+	sectionMetadata = "metadata"
+	sectionTraceIdx = "traceIdx"
+	sectionBlock    = "block"
 
 	resultHit   = "hit"
 	resultMiss  = "miss"
@@ -152,13 +143,12 @@ const (
 
 // sectionLabel maps section index to the Prometheus label value.
 var sectionLabel = [numSections]string{
-	idxFooter:    sectionFooter,
-	idxTOC:       sectionTOC,
-	idxBloom:     sectionBloom,
-	idxMetadata:  sectionMetadata,
-	idxTraceIdx:  sectionTraceIdx,
-	idxBlock:     sectionBlock,
-	idxIntrinsic: sectionIntrinsic,
+	idxFooter:   sectionFooter,
+	idxTOC:      sectionTOC,
+	idxBloom:    sectionBloom,
+	idxMetadata: sectionMetadata,
+	idxTraceIdx: sectionTraceIdx,
+	idxBlock:    sectionBlock,
 }
 
 var resultLabel = [3]string{idxHit: resultHit, idxMiss: resultMiss, idxError: resultError}
@@ -228,13 +218,12 @@ func NewTypedTieredCache(cfg TypedConfig) *TypedTieredCache {
 		return c
 	}
 	t := &TypedTieredCache{
-		footer:    normalize(cfg.Footer),
-		toc:       normalize(cfg.TOC),
-		bloom:     normalize(cfg.Bloom),
-		metadata:  normalize(cfg.Metadata),
-		traceIdx:  normalize(cfg.TraceIdx),
-		block:     normalize(cfg.Block),
-		intrinsic: normalize(cfg.Intrinsic),
+		footer:   normalize(cfg.Footer),
+		toc:      normalize(cfg.TOC),
+		bloom:    normalize(cfg.Bloom),
+		metadata: normalize(cfg.Metadata),
+		traceIdx: normalize(cfg.TraceIdx),
+		block:    normalize(cfg.Block),
 	}
 
 	if cfg.Registerer != nil {
@@ -375,7 +364,6 @@ func (t *TypedTieredCache) GetOrFetchV8TOC(
 // GetOrFetchV8Section fetches or caches a V8 per-column or per-index blob.
 // Routes to the appropriate sub-cache based on subType:
 //   - ToCSubTypeBloom, ToCSubTypeTrace → bloom (compact/trace bloom data)
-//   - ToCSubTypeIntrinsic              → intrinsic
 //   - all others                       → toc
 func (t *TypedTieredCache) GetOrFetchV8Section(
 	fileID string,
@@ -396,12 +384,6 @@ func (t *TypedTieredCache) GetOrFetchV8Section(
 	case shared.ToCSubTypeBloom, shared.ToCSubTypeTrace:
 		sectionIdx = idxBloom
 		val, err = t.bloom.GetOrFetch(key, func() ([]byte, error) {
-			fetchCalled = true
-			return fetch()
-		})
-	case shared.ToCSubTypeIntrinsic:
-		sectionIdx = idxIntrinsic
-		val, err = t.intrinsic.GetOrFetch(key, func() ([]byte, error) {
 			fetchCalled = true
 			return fetch()
 		})
@@ -492,8 +474,6 @@ func (t *TypedTieredCache) routeV8(subType uint32) (filecache.Cache, int) {
 	switch subType {
 	case shared.ToCSubTypeBloom, shared.ToCSubTypeTrace:
 		return t.bloom, idxBloom
-	case shared.ToCSubTypeIntrinsic:
-		return t.intrinsic, idxIntrinsic
 	default:
 		return t.toc, idxTOC
 	}
@@ -692,73 +672,6 @@ func (t *TypedTieredCache) CacheBlockColumns(fileID string, blockIdx int, data [
 	return t.block.Put(sectioncache.BlockColumnsKeyFast(fileID, blockIdx), data)
 }
 
-// GetOrFetchIntrinsic fetches or caches an intrinsic per-column blob.
-func (t *TypedTieredCache) GetOrFetchIntrinsic(
-	fileID, name string,
-	fetch func() ([]byte, error),
-) ([]byte, error) {
-	var start time.Time
-	if t.sectionRequests != nil {
-		start = time.Now()
-	}
-	fetchCalled := false
-	val, err := t.intrinsic.GetOrFetch(sectioncache.IntrinsicKey(fileID, name), func() ([]byte, error) {
-		fetchCalled = true
-		return fetch()
-	})
-	t.observeSection(idxIntrinsic, start, fetchCalled, err)
-	return val, err
-}
-
-// GetMultiIntrinsic batch-fetches intrinsic per-column blobs for fileID in ONE
-// pipelined GetMulti, returning a map keyed by the input column names. Names absent
-// from the result missed the cache and must be fetched + cached by the caller via
-// GetOrFetchIntrinsic. Returns (nil, false, nil) when the intrinsic sub-cache does
-// not support batch fetch, signaling the caller to fall back to per-name fetches.
-//
-// NOTE-197: a metrics/search query touches several intrinsic columns per file
-// (every predicate leaf column + each group-by column + span:start), and each was
-// previously resolved by its own GetOrFetchIntrinsic — i.e. one memcache round-trip
-// (and, under pool pressure, one connection acquisition) per column. The querier CPU
-// profile is dominated by kernel networking (netfilter rbtree lookup + tx softirq) on
-// these round-trips, not by decode. Collapsing the per-file intrinsic column fan-out
-// into a single GetMulti — the same lever NOTE-179/185 applied to V8 block columns —
-// cuts the packet/round-trip count proportionally to the number of columns the query
-// reads. Misses fall back to the existing per-name path, so the result is identical.
-func (t *TypedTieredCache) GetMultiIntrinsic(
-	fileID string,
-	names []string,
-) (map[string][]byte, bool, error) {
-	bg, ok := t.intrinsic.(sectionBatchGetter)
-	if !ok {
-		return nil, false, nil
-	}
-
-	var start time.Time
-	if t.sectionRequests != nil {
-		start = time.Now()
-	}
-	keys := make([]string, len(names))
-	for i, name := range names {
-		keys[i] = sectioncache.IntrinsicKey(fileID, name)
-	}
-	hits, err := bg.GetMulti(keys)
-	if err != nil {
-		t.observeSection(idxIntrinsic, start, false, err)
-		return nil, true, err
-	}
-	// Re-key by input name without a reverse-lookup map: keys[i] is the full cache
-	// key for names[i] (index-aligned), so probe hits directly (NOTE-188 pattern).
-	out := make(map[string][]byte, len(hits))
-	for i, name := range names {
-		if val, found := hits[keys[i]]; found {
-			out[name] = val
-		}
-	}
-	t.observeSection(idxIntrinsic, start, false, nil)
-	return out, true, nil
-}
-
 // Close closes all sub-caches. Deduplicates by pointer to avoid double-closing
 // shared instances (e.g. DefaultTypedConfig assigns the same mem to 5 fields).
 // Safe to call on a nil *TypedTieredCache.
@@ -768,7 +681,7 @@ func (t *TypedTieredCache) Close() error {
 	if t == nil {
 		return nil
 	}
-	all := []filecache.Cache{t.footer, t.toc, t.bloom, t.metadata, t.traceIdx, t.block, t.intrinsic}
+	all := []filecache.Cache{t.footer, t.toc, t.bloom, t.metadata, t.traceIdx, t.block}
 	seen := make(map[filecache.Cache]struct{}, len(all))
 	var errs []error
 	for _, c := range all {

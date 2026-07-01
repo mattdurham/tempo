@@ -13,6 +13,5 @@ type TypedConfig struct {
 	Metadata   filecache.Cache
 	TraceIdx   filecache.Cache
 	Block      filecache.Cache
-	Intrinsic  filecache.Cache
 	Registerer prometheus.Registerer
 }

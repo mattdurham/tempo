@@ -63,10 +63,10 @@ const (
 	// ToCEntry SubType constants for ToCTypeMetadata (Type=1).
 	// SubType 1 (Range) retired 2026-06-30 (range index removed, #439); not reused.
 	// SubType 2 (Sketch) retired 2026-06-30 (KLL/column sketch index removed, #435); not reused.
-	ToCSubTypeBloom     uint32 = 3 // file-level bloom filter blob
-	ToCSubTypeIntrinsic uint32 = 4 // per-column intrinsic column blob
-	ToCSubTypeTrace     uint32 = 5 // compact trace index blob
-	ToCSubTypeTS        uint32 = 6 // timestamp index blob
+	ToCSubTypeBloom uint32 = 3 // file-level bloom filter blob
+	// SubType 4 (Intrinsic) retired 2026-06-30 (IntrinsicTOC removed, #433); not reused.
+	ToCSubTypeTrace uint32 = 5 // compact trace index blob
+	ToCSubTypeTS    uint32 = 6 // timestamp index blob
 
 	ToCSubTypeTraceChunked uint32 = 8 // range-readable chunked trace index (SPEC: issue #340)
 
