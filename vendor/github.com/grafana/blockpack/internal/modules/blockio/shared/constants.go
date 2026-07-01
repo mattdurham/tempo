@@ -1,3 +1,4 @@
+// Package shared provides common types and interfaces for the blockio packages.
 package shared
 
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
@@ -63,12 +64,12 @@ const (
 	// ToCEntry SubType constants for ToCTypeMetadata (Type=1).
 	// SubType 1 (Range) retired 2026-06-30 (range index removed, #439); not reused.
 	// SubType 2 (Sketch) retired 2026-06-30 (KLL/column sketch index removed, #435); not reused.
-	ToCSubTypeBloom uint32 = 3 // file-level bloom filter blob
+	// SubType 3 (Bloom) retired 2026-06-30 (file-level bloom removed, #422); not reused.
 	// SubType 4 (Intrinsic) retired 2026-06-30 (IntrinsicTOC removed, #433); not reused.
-	ToCSubTypeTrace uint32 = 5 // compact trace index blob
-	ToCSubTypeTS    uint32 = 6 // timestamp index blob
+	// SubType 5 (Trace) retired 2026-06-30 (compact trace index removed, #422); not reused.
+	ToCSubTypeTS uint32 = 6 // timestamp index blob
 
-	ToCSubTypeTraceChunked uint32 = 8 // range-readable chunked trace index (SPEC: issue #340)
+	// SubType 8 (TraceChunked) retired 2026-06-30 (chunked trace index removed, #422); not reused.
 
 	// SubType 9 (ColStats) retired 2026-06-29 (in-file block pruning removal); not reused.
 
@@ -130,52 +131,13 @@ const (
 	SignalTypeValueIndex  uint8 = 0x03 // file is a value index (internal/modules/valueindex)
 	SignalTypeValueCounts uint8 = 0x04 // file is a unique-value count index (internal/modules/valuecounts)
 
-	TraceIndexFmtVersion  uint8 = 0x01 // v1: block IDs + per-block span indices (legacy wire, still parsed in V8 files)
-	TraceIndexFmtVersion2 uint8 = 0x02 // v2: block IDs only — no per-block span indices
-
-	// Chunked trace index (ToCSubTypeTraceChunked) — range-readable trace index (issue #340).
-	// The section is NOT snappy-compressed as a whole (written raw, like intrinsic blobs); each
-	// chunk is independently snappy-compressed so a lookup range-reads only the relevant chunk
-	// instead of fetching + decompressing the entire trace index.
-	ChunkedTraceMagic   uint32 = 0xC01DC2DE
-	ChunkedTraceVersion uint8  = 0x01
-	// ChunkedTraceHeaderSize is the fixed leading-header size in bytes:
-	// magic[4]+version[1]+reserved[3]+block_count[4]+trace_count[4]+chunk_count[4]+
-	// entry_fmt[1]+reserved2[3]+dir_off[4]+bloom_off[4]+bloom_len[4] = 36 bytes.
-	ChunkedTraceHeaderSize = 36
-	// ChunkedTraceDirEntrySize is the size in bytes of one chunk-directory entry:
-	// first_trace_id[16]+comp_off[4]+comp_len[4] = 24 bytes.
-	ChunkedTraceDirEntrySize = 24
-	// ChunkedTraceEntriesPerChunk is the number of sorted trace entries packed into one chunk.
-	// Keeps each decompressed chunk small (a few tens of KB) so trace-by-id reads one chunk.
-	ChunkedTraceEntriesPerChunk = 4096
-
-	// CompactIndexVersion is the legacy compact index version (no trace ID bloom).
-	// Still encountered in V8 trace sections written before CompactIndexVersion2 was introduced.
-	CompactIndexVersion uint8 = 1
+	// NOTE-422: the compact/chunked trace index and the trace-ID bloom filter were
+	// removed at the v2 cutover (trace:id is now resolved via the value-index). Their
+	// wire constants (TraceIndexFmtVersion/2, ChunkedTrace*, CompactIndexVersion/2,
+	// TraceIDBloom*) were deleted — no file emits or parses those sections.
 
 	TSIndexMagic   uint32 = 0xC011FEED // per-file timestamp index section
 	TSIndexVersion uint8  = 1
-
-	// CompactIndexVersion2 is the compact trace index version that includes the trace ID bloom filter.
-	CompactIndexVersion2 uint8 = 2
-
-	// TraceIDBloomK is the number of hash functions for the trace ID bloom filter.
-	// Kirsch-Mitzenmacher double-hashing is used, so only 2 hash computations are needed.
-	TraceIDBloomK = 7
-
-	// TraceIDBloomBitsPerTrace is the number of bloom filter bits allocated per trace ID.
-	// With k=7, this yields a false-positive rate of ~0.8%.
-	TraceIDBloomBitsPerTrace = 10
-
-	// TraceIDBloomMinBytes is the minimum trace ID bloom filter size in bytes.
-	TraceIDBloomMinBytes = 128
-
-	// TraceIDBloomMaxBytes is the maximum trace ID bloom filter size in bytes (6 MiB cap).
-	// At k=7 and 6 MiB, FPR stays under 1% for up to ~7.9M traces/block, giving
-	// ≤350ms warm FindTraceByID with 59 blocks (expected 0.35 false-positive reads/lookup).
-	// Previous cap was 1 MiB, which saturated at ~875K traces (~50% FPR for 2.8M-trace blocks).
-	TraceIDBloomMaxBytes = 6 << 20
 )
 
 // Intrinsic columns section constants.

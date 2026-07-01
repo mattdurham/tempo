@@ -11,9 +11,8 @@ package valueindex
 // false positive) reads it. False positives only cost an unnecessary block read, never
 // a wrong answer, so the filter is conservative-correct.
 //
-// Unlike the trace-ID bloom (shared.AddTraceIDToBloom) which assumes 16-byte uniformly
-// random input, canonical values are variable-length and not uniformly distributed, so
-// this filter derives two independent 64-bit hashes via FNV-1a over the value bytes and
+// Because canonical values are variable-length and not uniformly distributed, this
+// filter derives two independent 64-bit hashes via FNV-1a over the value bytes and
 // a salted second pass, then applies Kirsch-Mitzenmacher double hashing.
 
 import "math"

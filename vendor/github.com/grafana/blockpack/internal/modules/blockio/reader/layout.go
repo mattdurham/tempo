@@ -60,14 +60,12 @@ func (r *Reader) fileLayoutV8() (*FileLayoutReport, error) {
 		var sectionName string
 		var colType string
 		switch {
+		// NOTE-422: bloom and trace(-chunked) sections were removed at the v2 cutover
+		// and can no longer appear in any file, so their layout labels were dropped.
 		case key.Type == shared.ToCTypeIndex && key.SubType == shared.ToCSubTypeBlockIndex:
 			sectionName = "section.block_index"
-		case key.Type == shared.ToCTypeMetadata && key.SubType == shared.ToCSubTypeTrace:
-			sectionName = "section.trace_index"
 		case key.Type == shared.ToCTypeMetadata && key.SubType == shared.ToCSubTypeTS:
 			sectionName = "section.ts_index"
-		case key.Type == shared.ToCTypeMetadata && key.SubType == shared.ToCSubTypeBloom:
-			sectionName = "section.file_bloom"
 		case key.Type == shared.ToCTypeMetadata && key.SubType == shared.ToCSubTypeValueIndexEntries:
 			sectionName = "section.valueindex.entries"
 		case key.Type == shared.ToCTypeMetadata && key.SubType == shared.ToCSubTypeValueIndexMeta:

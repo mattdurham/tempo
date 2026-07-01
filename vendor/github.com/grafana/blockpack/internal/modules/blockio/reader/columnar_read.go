@@ -291,8 +291,10 @@ func (r *Reader) readBlockColumnarWithCache(
 	wantColumns map[string]struct{},
 	cs *CacheStats,
 ) ([]byte, error) {
-	// Encode blockIdx in the name field so subType=0 always, avoiding accidental
-	// collision with ToCSubTypeBloom(3), ToCSubTypeTrace(5).
+	// Encode blockIdx in the name field so subType=0 always, keeping per-block column
+	// section keys in a distinct subType namespace from the real ToC subtypes
+	// (block_index=7, value-index entries/meta/hashindex). NOTE-422: the retired
+	// bloom/trace subtypes no longer participate in this namespace.
 	// NOTE-189: strconv.Itoa instead of fmt.Sprintf — this runs once per block per
 	// query on the warm read path.
 	blockIdxStr := strconv.Itoa(blockIdx)

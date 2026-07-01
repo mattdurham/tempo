@@ -94,34 +94,17 @@ trace-ID pruning.
 
 ---
 
-## 4. Trace-ID Bloom Filter API
+## 4. Trace-ID Bloom Filter API — REMOVED (#422)
 
-The `shared` package retains bloom filter functions for **trace-ID lookup only**. These are
-used by the compact index (`v2` format) to build a per-file bloom filter over trace IDs,
-enabling `BlocksForTraceID` to skip blocks that definitely do not contain a queried trace.
+The trace-ID bloom filter API (`TraceIDBloomSize`, `AddTraceIDToBloom`, `TestTraceIDBloom`
+and the `TraceIDBloom*` sizing constants) was removed at the v2 lean-format cutover (#422).
+The file-level bloom filter and the compact/chunked trace index sections that consumed it
+are no longer written, and the reader rejects any pre-v2 file — so no file can carry a
+trace-ID bloom. `trace:id` filtering is now handled by the value-index pipeline.
+`Reader.MayContainTraceID` stays conservatively `true`; `TraceEntries`/`TraceBloomRaw`
+return nil. See `NOTE-422` in NOTES.md.
 
-Column-name bloom (`ColumnNameBloom`) was removed on 2026-03-07. CMS subsumes it: if a
-column was never written to a block, `BlockCMS` returns nil and the planner passes
-conservatively — identical behavior to a bloom miss, but CMS also provides value-level
-pruning. See `NOTE-BLOOM-REMOVAL` in NOTES.md.
-
-### 4.1 TraceIDBloomSize
-
-```go
-func TraceIDBloomSize(traceCount int) int
-```
-
-Returns the byte size of the bloom filter for the given trace count.
-
-### 4.2 AddTraceIDToBloom / TestTraceIDBloom
-
-```go
-func AddTraceIDToBloom(bloom []byte, traceID [16]byte)
-func TestTraceIDBloom(bloom []byte, traceID [16]byte) bool
-```
-
-Standard bloom filter operations over trace IDs. `TestTraceIDBloom` returns `true` when
-the trace *may* be present; `false` only when it is definitely absent.
+Column-name bloom (`ColumnNameBloom`) was removed earlier (2026-03-07); CMS subsumed it.
 
 ---
 
@@ -232,8 +215,7 @@ SectionBlockIndex  uint8 = 0x01  // block index section
 SectionRangeIndex  uint8 = 0x02  // range index section
 SectionTraceIndex  uint8 = 0x03  // trace ID index section (combines compact + full index)
 SectionTSIndex     uint8 = 0x04  // timestamp index section
-SectionSketchIndex uint8 = 0x05  // sketch index section (HLL, TopK, bloom per column)
-SectionFileBloom   uint8 = 0x06  // file-level bloom filter section (FBLM)
+// 0x05 (SectionSketchIndex) retired #435; 0x06 (SectionFileBloom) retired #437/#422.
 
 // DirEntryKind constants distinguish the two section directory entry kinds.
 DirEntryKindType uint8 = 0x00  // type-keyed entry (one of the 6 fixed sections)

@@ -199,3 +199,12 @@ in the same tier `routeV8` picks) and `TestGetMultiV8SectionMixed_BatchHitAndMis
 `_Empty` / `_NoBatchSupport` exercise the V8SectionKey-keyed path through the shared helper.
 tieredcache suite green under `-race`; `make precommit` fully green. Pure structural
 deduplication, no behaviour change. Back-ref: `internal/modules/tieredcache/typed.go:batchGetV8Section`.
+
+## NOTE-422 — routeV8 no longer branches on subType (bloom tier dead for V8 sections)
+
+The only V8-section subtypes that ever routed to the bloom sub-cache tier were
+`ToCSubTypeBloom` and `ToCSubTypeTrace`, both retired at the v2 cutover (#422). No file
+emits them, so `routeV8` now takes no argument and returns the toc tier uniformly for
+every V8 section. `GetOrFetchV8Section` was collapsed to call `routeV8()` (dropping its
+duplicated switch). The bloom tier itself is retained only for `GetOrFetchBloom`
+(compact-header) — that path is unchanged.

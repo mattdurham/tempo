@@ -362,9 +362,9 @@ func (t *TypedTieredCache) GetOrFetchV8TOC(
 }
 
 // GetOrFetchV8Section fetches or caches a V8 per-column or per-index blob.
-// Routes to the appropriate sub-cache based on subType:
-//   - ToCSubTypeBloom, ToCSubTypeTrace → bloom (compact/trace bloom data)
-//   - all others                       → toc
+// NOTE-422: routes uniformly to the toc tier (routeV8) — v2 lean files carry only
+// the block index and value-index sections; the retired bloom/trace subtypes that
+// once routed to the bloom tier can no longer appear in any file.
 func (t *TypedTieredCache) GetOrFetchV8Section(
 	fileID string,
 	tocType, subType uint32,
@@ -377,23 +377,15 @@ func (t *TypedTieredCache) GetOrFetchV8Section(
 	}
 	key := sectioncache.V8SectionKeyFast(fileID, tocType, subType, name)
 	fetchCalled := false
-	var val []byte
-	var err error
-	var sectionIdx int
-	switch subType {
-	case shared.ToCSubTypeBloom, shared.ToCSubTypeTrace:
-		sectionIdx = idxBloom
-		val, err = t.bloom.GetOrFetch(key, func() ([]byte, error) {
-			fetchCalled = true
-			return fetch()
-		})
-	default:
-		sectionIdx = idxTOC
-		val, err = t.toc.GetOrFetch(key, func() ([]byte, error) {
-			fetchCalled = true
-			return fetch()
-		})
-	}
+	// NOTE-422: v2 lean files carry only the block index and value-index sections in
+	// their ToC (bloom/trace/traceChunked/KLL/IntrinsicTOC/SpanTree were all removed at
+	// the v2 cutover). Every subType reaching this path routes to the toc tier; the old
+	// ToCSubTypeBloom/ToCSubTypeTrace bloom-tier branch was dead and has been removed.
+	cache, sectionIdx := t.routeV8()
+	val, err := cache.GetOrFetch(key, func() ([]byte, error) {
+		fetchCalled = true
+		return fetch()
+	})
 	t.observeSection(sectionIdx, start, fetchCalled, err)
 	return val, err
 }
@@ -436,7 +428,7 @@ func batchGetV8Section[K comparable](
 	reqs []K,
 	keyFor func(K) string,
 ) (map[K][]byte, bool, error) {
-	sub, sectionIdx := t.routeV8(subType)
+	sub, sectionIdx := t.routeV8()
 	bg, ok := sub.(sectionBatchGetter)
 	if !ok {
 		return nil, false, nil
@@ -467,16 +459,13 @@ func batchGetV8Section[K comparable](
 	return out, true, nil
 }
 
-// routeV8 maps a (tocType, subType) to the sub-cache tier and metric index used
-// by every V8-section method. Routing depends only on subType today; tocType is
-// part of the cache key, not the routing decision.
-func (t *TypedTieredCache) routeV8(subType uint32) (filecache.Cache, int) {
-	switch subType {
-	case shared.ToCSubTypeBloom, shared.ToCSubTypeTrace:
-		return t.bloom, idxBloom
-	default:
-		return t.toc, idxTOC
-	}
+// routeV8 returns the sub-cache tier and metric index used by every V8-section
+// method. NOTE-422: v2 lean files carry only the block index and value-index
+// sections in their ToC; the retired bloom/trace subtypes are the only ones that
+// ever routed to the bloom tier, and no file can emit them, so every V8 section
+// now routes uniformly to the toc tier. Routing no longer depends on subType.
+func (t *TypedTieredCache) routeV8() (filecache.Cache, int) {
+	return t.toc, idxTOC
 }
 
 // GetMultiV8SectionMixed batch-fetches V8 section blobs whose keys may span
@@ -514,7 +503,7 @@ func (t *TypedTieredCache) PutV8Section(
 	name string,
 	value []byte,
 ) error {
-	sub, _ := t.routeV8(subType)
+	sub, _ := t.routeV8()
 	key := sectioncache.V8SectionKeyFast(fileID, tocType, subType, name)
 	return sub.Put(key, value)
 }
@@ -541,7 +530,7 @@ func (t *TypedTieredCache) PutMultiV8Section(
 	if len(values) == 0 {
 		return true, nil
 	}
-	sub, _ := t.routeV8(subType)
+	sub, _ := t.routeV8()
 	bp, ok := sub.(sectionBatchPutter)
 	if !ok {
 		return false, nil

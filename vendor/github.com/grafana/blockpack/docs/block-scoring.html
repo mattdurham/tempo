@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Block Scoring — Blockpack</title>
+  <link rel="stylesheet" href="/assets/css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a href="/" class="topbar-brand">Blockpack Docs</a>
+    <a href="https://github.com/grafana/blockpack" class="topbar-github">GitHub →</a>
+  </header>
+  <div class="layout">
+    <nav class="sidebar">
+  <div class="sidebar-brand">BLOCKPACK</div>
+  <div class="section-label">Overview</div>
+  <a href="/">Home</a>
+  <a href="/file-format">File Format</a>
+  <div class="section-label">Query Paths</div>
+  <a href="/query-filter">Filter Query</a>
+  <a href="/query-intrinsic">Intrinsic Fast-Path</a>
+  <a href="/query-traceid">Trace by ID</a>
+  <a href="/query-metrics">Metrics Query</a>
+  <div class="section-label">Write Path</div>
+  <a href="/write-path">Write Pipeline</a>
+  <div class="section-label">Indexes</div>
+  <a href="/kll">KLL Sketches</a>
+  <a href="/cms">Count-Min Sketch</a>
+  <a href="/topk">TopK</a>
+  <a href="/hll">HyperLogLog</a>
+  <a href="/bloom-filter">Bloom Filters</a>
+  <a href="/intrinsic-columns">Intrinsic Columns</a>
+  <div class="section-label">Blocks</div>
+  <a href="/block-scoring" class="active">Block Scoring</a>
+  <a href="/block-format">Block Format</a>
+  <div class="section-label">Performance</div>
+  <a href="/benchmarks/">Benchmarks</a>
+  <a href="/production-results">Production Results</a>
+</nav>
+    <main class="content">
+<h1>Block Scoring</h1>
+
+<a href="/interactive/block-scoring" class="demo-link">
+  <div class="demo-link-text">
+    <div class="demo-link-title">Open Interactive Demo</div>
+    <div class="demo-link-sub">Watch blocks scored by CMS frequency and HLL cardinality with early termination</div>
+  </div>
+  <div class="demo-link-arrow">&rarr;</div>
+</a>
+
+<h2>Overview</h2>
+<p>After the pruning stages (bloom filter, KLL, CMS) eliminate blocks that cannot contain matching spans, the remaining candidate blocks are scored and sorted before any I/O is issued. Higher-scored blocks are fetched first, enabling early termination when a result limit is reached.</p>
+<h2>Scoring Formula</h2>
+<pre><code>score = sum(CMS_frequency) / max(HLL_cardinality, 1)
+</code></pre>
+<ul>
+<li><strong>CMS_frequency</strong> — how many times the queried value appears in this block (Count-Min Sketch estimate)</li>
+<li><strong>HLL_cardinality</strong> — how many distinct values exist for that column in this block (HyperLogLog estimate)</li>
+<li>High frequency + low cardinality = high selectivity = block is likely to have many matches</li>
+</ul>
+<h2>Sort Order</h2>
+<p>Blocks are sorted by:</p>
+<ol>
+<li><strong>Timestamp</strong> (primary) — blocks within the query time window, in time order</li>
+<li><strong>Score descending</strong> (secondary) — within the same time bucket, higher-scoring blocks first</li>
+</ol>
+<p>Implementation: <code>queryplanner/planner.go:setToSortedByScore</code></p>
+<h2>Early Termination</h2>
+<p>If the query has a result limit (e.g. limit=10), blockpack stops fetching blocks once the limit is satisfied. Lower-scored blocks that were never fetched cost zero I/O. For highly selective queries (e.g. a specific trace ID or rare service), often only 1-2 blocks are read regardless of how many passed the pruning stages.</p>
+<h2>Example</h2>
+<p>Using the query <code>{ span.service.name = &quot;auth&quot; &amp;&amp; duration &gt; 100ms }</code> against 5 blocks after pruning leaves blk-001 and blk-003:</p>
+<table>
+<thead>
+<tr><th>Block</th><th>CMS("auth")</th><th>HLL(service.name)</th><th>Score</th><th>Fetch order</th></tr>
+</thead>
+<tbody>
+<tr><td>blk-003</td><td>420</td><td>1</td><td>420.0</td><td>1st</td></tr>
+<tr><td>blk-001</td><td>312</td><td>2</td><td>156.0</td><td>2nd</td></tr>
+</tbody>
+</table>
+<p>With limit=10: blk-003 returns 7 spans, blk-001 returns 3 spans → total 10, stop. blk-005 is never fetched.</p>
+<h2>Source</h2>
+<table>
+<thead>
+<tr><th>File</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/queryplanner/scoring.go"><code>internal/modules/queryplanner/scoring.go</code></a></td><td>Score formula implementation</td></tr>
+<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/queryplanner/planner.go"><code>internal/modules/queryplanner/planner.go</code></a></td><td><code>setToSortedByScore</code> — sorts candidates</td></tr>
+<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/executor/stream.go"><code>internal/modules/executor/stream.go</code></a></td><td>Early termination on result limit</td></tr>
+</tbody>
+</table>
+<h2>Related</h2>
+<ul>
+<li><a href="/topk">TopK</a> — top-K values contribute to CMS frequency</li>
+<li><a href="/hll">HyperLogLog</a> — cardinality denominator</li>
+<li><a href="/cms">Count-Min Sketch</a> — frequency numerator</li>
+</ul>
+
+    </main>
+  </div>
+</body>
+</html>

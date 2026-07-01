@@ -2565,3 +2565,19 @@ dst, never silently truncates), `DecodeBlockFileRef(src) (BlockFileRef,error)`,
 lossless. Purely additive — no read/write path consumes it yet (wired up by
 #419/#421/#423), so deadcode reachability comes from the shared package being a
 library surface; no perf signal expected from this commit alone.
+
+## NOTE-422 — remove retired bloom / trace-index / trace-chunked / trace-ID-bloom wire constants
+
+Issue #422 (child of the v2 lean-format epic #417): in v2 files the file-level bloom
+filter, compact trace index, chunked trace index, and traceID DFS index sections are
+no longer written, and the reader rejects any pre-v2 (FooterV8) file — so no file can
+ever carry those sections. The wire constants that described them (`ToCSubTypeBloom`=3,
+`ToCSubTypeTrace`=5, `ToCSubTypeTraceChunked`=8, `TraceIndexFmtVersion`/`2`,
+`ChunkedTrace*`, `CompactIndexVersion`/`2`, `TraceIDBloom*`) and the trace-ID bloom
+builder (`bloom.go`: `TraceIDBloomSize`/`AddTraceIDToBloom`/`TestTraceIDBloom`) had zero
+production callers and were deleted. SubTypes 3/5/8 are retired (not reused) per the
+wire-enum convention; only `ToCSubTypeTS`(6) and `ToCSubTypeBlockIndex`(7) remain live
+metadata/index subtypes alongside the value-index subtypes. trace:id is resolved via the
+value-index now (`MayContainTraceID` stays conservatively true, `TraceEntries` nil,
+`TraceBloomRaw` nil — graceful no-op stubs). No perf change: pure dead-code removal of
+sections that were already never emitted.
