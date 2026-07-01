@@ -127,15 +127,17 @@ func (b *blockpackBlock) tryIndexFetch(
 	cache := vr.cacheFor(b.meta.TenantID)
 	src, ok, err := blockpack.BuildValueIndexSource(ctx, cache, vr.store, prog, minSec, maxSec)
 	if err != nil {
-		level.Debug(util_log.Logger).Log("msg", "vblockpack: index fetch: build source error",
+		level.Warn(util_log.Logger).Log("msg", "vblockpack: index fetch: build source error",
 			"block", b.meta.BlockID, "err", err)
 		return nil, false, stats
 	}
 	if !ok {
-		level.Debug(util_log.Logger).Log("msg", "vblockpack: index fetch: no coverage",
+		level.Info(util_log.Logger).Log("msg", "vblockpack: index fetch: no coverage",
 			"block", b.meta.BlockID, "tenant", b.meta.TenantID, "minSec", minSec, "maxSec", maxSec)
 		return nil, false, stats
 	}
+	level.Info(util_log.Logger).Log("msg", "vblockpack: index fetch: coverage found",
+		"block", b.meta.BlockID, "tenant", b.meta.TenantID, "files", src.Stats().FilesRead)
 	// Capture the build-time I/O even if the query later declines: those bytes were
 	// spent and are worth reporting (issue #465).
 	bs := src.Stats()
