@@ -545,3 +545,36 @@ Back-refs:
 - `internal/modules/valueindex/bucketbloom.go` (ValueBloomSize, AddValueToBloom, TestValueBloom)
 - `internal/modules/valueindex/bucketmerge.go` (MergeBucketFiles, SplitIntoBlocks)
 - `internal/modules/valueindex/bucketquery.go` (DecodeBucketFooter, LookupValue, MayContainValue)
+
+## NOTE-VI-044 — v2 querier direct block fetch (issue #424)
+
+A value-index hit (`LookupResult`) carries `(SourceRef, BlockRef, TraceID)`. In a v2
+blockpack file every inner block is self-contained (all columns, identity included) and
+page-aligned, so `BlockRef` (NOTE-VI-027) names the exact byte range of one block. That
+means a hit resolves with a single ranged GET — **no TOC fetch** is required, unlike the v1
+path (`search_trace_vi.go`) which resolves `BlockID → offset` through the reader's TOC.
+
+`blockfetch.go` implements the I/O-planning half of that lookup path:
+
+- `GroupHitsBySource(results)` — partitions `[]LookupResult` by `SourceRef` (one S3 object
+  per file). Sorted by SourceRef; input order preserved within a group; empty-SourceRef
+  hits dropped (not fetchable).
+- `CoalesceBlockRefs(refs, cfg)` — merges adjacent/overlapping `BlockRef` byte ranges within
+  one file into as few `BlockRefRead`s (ranged GETs) as possible. Same gap/waste/max-read
+  policy as `reader.CoalesceBlocks` (uses `shared.CoalesceConfig`, e.g.
+  `shared.AggressiveCoalesceConfig`), but operates on page-addressed refs rather than
+  TOC-resolved offsets. Input need not be sorted; exact-duplicate refs collapse to one.
+- `FetchBlocks(fetcher, sourceRef, hits, cfg)` — drives a caller-supplied `BlockFetcher`
+  (ranged-GET half of the storage backend) over the coalesced reads and slices each response
+  back into per-block byte slices (`FetchedBlock{Ref, Data}`), deduplicated by BlockRef and
+  copied into independent allocations so the merged read buffer can be released. A short read
+  is a hard error (truncated file / out-of-range ref would silently drop spans).
+
+Block decode + in-block traceID lookup stays with the caller (executor/reader): a v2 block
+decodes standalone from its raw bytes (`Reader.ParseBlockFromBytes` uses only `meta.Offset`
+as a cache key and the block's own span count), then the caller binary-searches the sorted
+`trace:id` column to assemble matching spans.
+
+Back-refs:
+- `internal/modules/valueindex/blockfetch.go` (GroupHitsBySource, CoalesceBlockRefs,
+  BlockFetcher, FetchBlocks, BlockRefRead, SourceHits, FetchedBlock)
