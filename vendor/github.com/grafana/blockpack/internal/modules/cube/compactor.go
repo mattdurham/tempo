@@ -202,9 +202,11 @@ func (c *Compactor) ShouldEvict(lastQueriedSec uint64) bool {
 	return lastQueriedSec < threshold
 }
 
-// newXID returns a short unique ID string for object keys (uses the cube Filename helper).
+// newXID returns a short unique ID string for object keys.
 func newXID() string {
-	// Filename produces "<tenant>/cubes/<hexID>/L0-<xid>.cube"; extract the xid portion.
-	// We want just the xid — use the same xid library directly.
-	return Filename("t", [16]byte{})[len("t/cubes/0000000000000000/L0-") : len("t/cubes/0000000000000000/L0-")+20]
+	// Filename produces "t/cubes/<32-hex>/L0-<20-char-xid>.cube".
+	// Extract the 20-char xid from the end, before ".cube".
+	f := Filename("t", [16]byte{})
+	// f ends with "/L0-<xid>.cube", xid is 20 chars before ".cube"
+	return f[len(f)-len(".cube")-20 : len(f)-len(".cube")]
 }
