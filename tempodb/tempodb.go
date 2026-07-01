@@ -280,6 +280,8 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 		for _, tenantID := range cfg.Block.Blockpack.CubeTenants {
 			vblockpack.ConfigureCubeManager(true, cfg.S3, tenantID)
 		}
+		// Wire cube query path on querier targets.
+		vblockpack.ConfigureCubeQueryPath(true, cfg.S3)
 	}
 	// Querier-side index-driven query path (blockpack issue #461). Only when
 	// enabled and backed by S3 — the value index lives in the same bucket as the

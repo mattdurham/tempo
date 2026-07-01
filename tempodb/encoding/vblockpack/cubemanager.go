@@ -24,8 +24,8 @@ import (
 	commonpbv1 "github.com/grafana/tempo/pkg/tempopb/common/v1"
 	resourcepbv1 "github.com/grafana/tempo/pkg/tempopb/resource/v1"
 	tracepbv1 "github.com/grafana/tempo/pkg/tempopb/trace/v1"
-	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
 	util_log "github.com/grafana/tempo/pkg/util/log"
+	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
 	minio "github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 )
@@ -39,7 +39,7 @@ type cubeManager struct {
 	mu          sync.Mutex
 	defs        []blockpack.CubeDefinition
 	accs        []*blockpack.CubeAccumulator // one per def, same index
-	currentMin  uint32                   // wall-clock minute of current accumulators
+	currentMin  uint32                       // wall-clock minute of current accumulators
 	lastRefresh time.Time
 }
 

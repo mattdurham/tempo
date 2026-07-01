@@ -70,6 +70,39 @@ func OpenReader(path string) (*Reader, error) {
 	}, nil
 }
 
+// OpenReaderFromBytes opens a cube Reader from in-memory bytes (e.g. downloaded from S3).
+func OpenReaderFromBytes(data []byte) (*Reader, error) {
+	if len(data) < HeaderSize+FooterSize {
+		return nil, fmt.Errorf("cube: file too short (%d bytes)", len(data))
+	}
+	header, err := DecodeHeader(data[:HeaderSize])
+	if err != nil {
+		return nil, fmt.Errorf("cube: decode header: %w", err)
+	}
+	footerStart := len(data) - FooterSize
+	footer, err := DecodeFooter(data[footerStart:])
+	if err != nil {
+		return nil, fmt.Errorf("cube: decode footer: %w", err)
+	}
+	dictEnd := footer.ChunksOffset
+	if footer.DictOffset >= uint64(len(data)) || dictEnd > uint64(len(data)) {
+		return nil, fmt.Errorf("cube: dictionary offsets out of bounds")
+	}
+	dict, err := DecodeDictionary(data[footer.DictOffset:dictEnd])
+	if err != nil {
+		return nil, fmt.Errorf("cube: decode dictionary: %w", err)
+	}
+	dirEnd := uint64(footerStart) //nolint:gosec
+	if footer.DirOffset >= uint64(len(data)) || dirEnd > uint64(len(data)) {
+		return nil, fmt.Errorf("cube: chunk directory offsets out of bounds")
+	}
+	dir, err := DecodeChunkDirectory(data[footer.DirOffset:dirEnd])
+	if err != nil {
+		return nil, fmt.Errorf("cube: decode chunk directory: %w", err)
+	}
+	return &Reader{data: data, header: header, dict: dict, dir: dir, chunksStart: footer.ChunksOffset}, nil
+}
+
 // GetCell returns the count for (minute, dim1, dim2), or (0, false) if not present.
 // IMPORTANT: Uses Dictionary reverse maps (O(1)) for dim-ID lookup, not linear scan.
 func (r *Reader) GetCell(minute uint32, dim1, dim2 string) (uint32, bool) {

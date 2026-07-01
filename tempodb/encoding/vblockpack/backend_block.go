@@ -324,6 +324,15 @@ func (b *blockpackBlock) QueryRange(ctx context.Context, req *tempopb.QueryRange
 		}
 	}
 
+	// Cube query path: try answering from pre-aggregated cube files before
+	// falling through to the full block scan.
+	if cqp := getCubeQueryPath(); cqp != nil {
+		if cubeResp, ok := cqp.tryQueryFromCube(ctx, b.meta.TenantID, req); ok {
+			span.SetAttributes(attribute.Bool("cube.used", true))
+			return cubeResp, nil
+		}
+	}
+
 	result, err := blockpack.ExecuteMetricsTraceQL(ctx, r, req.Query, opts)
 	if err != nil {
 		return nil, fmt.Errorf("blockpack QueryRange: %w", err)
