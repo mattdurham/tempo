@@ -274,6 +274,12 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 	if cfg.Block != nil && cfg.Block.Blockpack.ValueIndexEnabled &&
 		cfg.Backend == backend.S3 && cfg.S3 != nil {
 		vblockpack.ConfigureValueIndex(true, cfg.S3, cfg.Block.Blockpack.ValueIndexPrefix)
+		// Wire cube ingest manager alongside value-index (same S3 bucket, same gate).
+		// The manager loads the cube registry at startup and accumulates per-minute
+		// span counts for every active cube definition.
+		for _, tenantID := range cfg.Block.Blockpack.CubeTenants {
+			vblockpack.ConfigureCubeManager(true, cfg.S3, tenantID)
+		}
 	}
 	// Querier-side index-driven query path (blockpack issue #461). Only when
 	// enabled and backed by S3 — the value index lives in the same bucket as the

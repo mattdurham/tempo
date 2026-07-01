@@ -163,6 +163,13 @@ type BlockpackConfig struct {
 	// value_index_query.index_prefix and the compactor index_prefix
 	// (default: "indexes").
 	ValueIndexPrefix string `yaml:"value_index_prefix"`
+
+	// CubeTenants is the list of tenant IDs for which the cube ingest manager
+	// should be configured on writer targets (block-builder, backend-worker).
+	// The manager loads each tenant's cube registry at startup and accumulates
+	// per-minute span counts for all active cubes. Requires ValueIndexEnabled.
+	// An empty list disables cube ingest. Typical value: ["11638"].
+	CubeTenants []string `yaml:"cube_tenants"`
 }
 
 // ValueIndexQueryConfig configures the querier-side index-driven query path.

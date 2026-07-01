@@ -104,10 +104,14 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 		return nil, fmt.Errorf("failed to create blockpack writer: %w", err)
 	}
 
-	// Accumulate VCNT counts in parallel with block writing.
+	// Accumulate VCNT counts and cube counts in parallel with block writing.
 	var vcntAcc *vcntAccumulator
 	if getVCNTSink() != nil {
 		vcntAcc = newVCNTAccumulator()
+	}
+	cm := getCubeManager()
+	if cm != nil {
+		cm.maybeRefresh()
 	}
 
 	var traceCount int
@@ -133,6 +137,9 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 		}
 		if vcntAcc != nil {
 			vcntAcc.addTrace(tr)
+		}
+		if cm != nil {
+			cm.addTrace(tr)
 		}
 
 		traceCount++
@@ -180,6 +187,9 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 		startSec := uint64(meta.StartTime.UnixNano()) / ns
 		endSec := uint64(meta.EndTime.UnixNano()) / ns
 		vcntAcc.flush(getVCNTSink(), meta.TenantID, defaultValueIndexPref, startSec, endSec)
+	}
+	if cm != nil {
+		cm.flush(meta.TenantID)
 	}
 
 	// blockpack NOTE-VI-042 (issue #464): synchronously write per-column L0
