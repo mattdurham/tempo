@@ -791,6 +791,7 @@ github.com/grafana/blockpack/internal/modules/blockio/reader
 github.com/grafana/blockpack/internal/modules/blockio/shared
 github.com/grafana/blockpack/internal/modules/blockio/writer
 github.com/grafana/blockpack/internal/modules/chaincache
+github.com/grafana/blockpack/internal/modules/cube
 github.com/grafana/blockpack/internal/modules/embedder
 github.com/grafana/blockpack/internal/modules/executor
 github.com/grafana/blockpack/internal/modules/filecache
@@ -801,6 +802,7 @@ github.com/grafana/blockpack/internal/modules/queryplanner
 github.com/grafana/blockpack/internal/modules/rw
 github.com/grafana/blockpack/internal/modules/sectioncache
 github.com/grafana/blockpack/internal/modules/tieredcache
+github.com/grafana/blockpack/internal/modules/valuecounts
 github.com/grafana/blockpack/internal/modules/valueindex
 github.com/grafana/blockpack/internal/modules/valueindexcompactor
 github.com/grafana/blockpack/internal/modules/valueindexconsumer

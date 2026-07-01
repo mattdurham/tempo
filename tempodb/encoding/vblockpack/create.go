@@ -104,6 +104,12 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 		return nil, fmt.Errorf("failed to create blockpack writer: %w", err)
 	}
 
+	// Accumulate VCNT counts in parallel with block writing.
+	var vcntAcc *vcntAccumulator
+	if getVCNTSink() != nil {
+		vcntAcc = newVCNTAccumulator()
+	}
+
 	var traceCount int
 
 	for {
@@ -124,6 +130,9 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 
 		if addErr := writer.AddTempoTrace(tr); addErr != nil {
 			return nil, fmt.Errorf("failed to add trace to blockpack: %w", addErr)
+		}
+		if vcntAcc != nil {
+			vcntAcc.addTrace(tr)
 		}
 
 		traceCount++
@@ -161,6 +170,16 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 
 	if err := to.WriteBlockMeta(ctx, meta); err != nil {
 		return nil, fmt.Errorf("failed to write block metadata: %w", err)
+	}
+
+	// Write VCNT value-count files — one .vcnt per column with (col, value, count)
+	// for tag autocomplete and cardinality queries. Best-effort; skipped when
+	// value_index_enabled is false.
+	if vcntAcc != nil {
+		const ns = 1_000_000_000
+		startSec := uint64(meta.StartTime.UnixNano()) / ns
+		endSec := uint64(meta.EndTime.UnixNano()) / ns
+		vcntAcc.flush(getVCNTSink(), meta.TenantID, defaultValueIndexPref, startSec, endSec)
 	}
 
 	// blockpack NOTE-VI-042 (issue #464): synchronously write per-column L0

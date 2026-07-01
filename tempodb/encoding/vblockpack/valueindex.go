@@ -69,6 +69,10 @@ var (
 	valueIndexSinkMu      sync.RWMutex
 	valueIndexConfigOnce  sync.Once
 	defaultValueIndexPref = "indexes"
+
+	// vcntSink is set alongside valueIndexSink — same S3 client, same bucket.
+	// VCNT files go under <tenant>/indexes/unique_values/<colHash>/L0-<id>.vcnt
+	vcntSink blockpack.ObjectPutter
 )
 
 // ConfigureValueIndex installs the process-level value-index write sink. Call once
@@ -94,9 +98,18 @@ func ConfigureValueIndex(enabled bool, s3cfg *s3backend.Config, indexPrefix stri
 		valueIndexSinkMu.Lock()
 		valueIndexSink = &s3ObjectPutter{client: client, bucket: s3cfg.Bucket}
 		valueIndexPrefix = indexPrefix
+		vcntSink = &s3ObjectPutter{client: client, bucket: s3cfg.Bucket}
 		valueIndexSinkMu.Unlock()
-		level.Info(util_log.Logger).Log("msg", "vblockpack: value-index write path configured", "bucket", s3cfg.Bucket, "prefix", indexPrefix)
+		level.Info(util_log.Logger).Log("msg", "vblockpack: value-index + vcnt write path configured", "bucket", s3cfg.Bucket, "prefix", indexPrefix)
 	})
+}
+
+// getVCNTSink returns the configured object store for VCNT .vcnt files.
+// Nil when value_index_enabled is false.
+func getVCNTSink() blockpack.ObjectPutter {
+	valueIndexSinkMu.RLock()
+	defer valueIndexSinkMu.RUnlock()
+	return vcntSink
 }
 
 // getValueIndexSink returns the configured object store and index prefix for the
