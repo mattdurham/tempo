@@ -16,9 +16,16 @@ import (
 // List must return full object keys (not just the leaf names) so the caller can
 // Get/Delete them directly. Listing semantics are "all keys whose name begins
 // with prefix"; the compactor groups results by directory itself.
+//
+// ListDirs must return only the immediate child directory prefixes (each ending
+// in "/") one level below prefix, non-recursively. It is used by compactTenant
+// to walk the col-hash and type levels without loading the full file listing.
 type IndexStore interface {
 	// List returns the full keys of all objects whose name begins with prefix.
 	List(ctx context.Context, prefix string) ([]string, error)
+	// ListDirs returns the immediate child directory prefixes (ending in "/")
+	// one level below prefix, without recursing into them.
+	ListDirs(ctx context.Context, prefix string) ([]string, error)
 	// Get reads the entire object at key.
 	Get(ctx context.Context, key string) ([]byte, error)
 	// Put writes data to key, creating or overwriting it.

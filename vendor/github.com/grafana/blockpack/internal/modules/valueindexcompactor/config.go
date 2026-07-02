@@ -60,6 +60,14 @@ type Config struct {
 	MaxOutputBytes int64 `yaml:"max_output_bytes"`
 	// Enabled turns the compactor on. When false the service does nothing.
 	Enabled bool `yaml:"enabled"`
+	// ShardCount is the total number of compactor replicas sharing work. When > 1
+	// each replica processes only the columns whose hash maps to its ShardIndex,
+	// splitting the column space evenly. 0 or 1 means no sharding (all columns).
+	ShardCount int `yaml:"shard_count"`
+	// ShardIndex is the zero-based index of this replica (0 .. ShardCount-1).
+	// Columns are assigned by: int(colHash[0:2], 16) % ShardCount == ShardIndex.
+	// Typically injected via the SHARD_INDEX environment variable.
+	ShardIndex int `yaml:"shard_index"`
 }
 
 // withDefaults returns a copy of c with empty/zero fields filled in.

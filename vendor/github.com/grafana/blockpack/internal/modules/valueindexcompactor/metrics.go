@@ -2,6 +2,7 @@ package valueindexcompactor
 
 import (
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -11,11 +12,10 @@ import (
 // Any changes to this file must be reflected there.
 
 // NOTE-VI-023: Prometheus metric/label name constants for the compactor.
-// Repeated label keys/values are pulled out as constants so golangci-lint's
-// goconst does not flag them and the spelling is enforced in one place.
 const (
 	compactorLabelStatus = "status"
 	compactorLabelOp     = "op"
+	compactorLabelLevel  = "level"
 
 	compactorStatusSuccess = "success"
 	compactorStatusError   = "error"
@@ -26,43 +26,80 @@ const (
 	compactorOpDelete = "delete"
 )
 
+// runDurationBuckets covers the expected range for a full pass over 1000+
+// columns: sub-second (warm cache) through 30 minutes (first cold pass).
+var runDurationBuckets = []float64{
+	1, 5, 15, 30, 60, 120, 300, 600, 900, 1800,
+}
+
+// mergeDurationBuckets covers per-column merge time: milliseconds through
+// several minutes for very large L0 sets.
+var mergeDurationBuckets = []float64{
+	0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60, 120, 300,
+}
+
 // compactorMetrics holds the Prometheus collectors for the value-index
-// compactor service. A nil *compactorMetrics is safe: every method becomes a
-// no-op, so a disabled or nil-Registerer config costs nothing (NOTE-VI-023).
-//
-// The run-duration and merge-duration histograms are pre-resolved at
-// construction so the hot path is a single Observe with no label allocation,
-// matching the cache layer pattern (memcache durGetHit etc.).
+// compactor service. A nil *compactorMetrics is safe: every method is a no-op.
 type compactorMetrics struct {
-	runs            *prometheus.CounterVec // status
-	errors          *prometheus.CounterVec // op
+	// Pass-level counters / histograms.
+	runs    *prometheus.CounterVec // {status}
+	errors  *prometheus.CounterVec // {op}
+	runDur  prometheus.Observer
+	lastRun prometheus.Gauge // unix timestamp of last completed pass
+
+	// Per-merge counters / histograms.
+	mergeDur        prometheus.Observer
 	filesRead       prometheus.Counter
 	filesWritten    prometheus.Counter
 	filesDeleted    prometheus.Counter
+	filesSkipped    prometheus.Counter // unparseable / wrong-magic files
 	entriesRetained prometheus.Counter
 	entriesDropped  prometheus.Counter
-	runDur          prometheus.Observer
-	mergeDur        prometheus.Observer
+
+	// Columns that had at least one level compacted in the pass.
+	columnsCompacted *prometheus.CounterVec // {level}
+
+	// Backlog: L0 files observed at scan time (gauge, set each pass).
+	backlogL0Files *prometheus.GaugeVec // {tenant}
 }
 
-// newCompactorMetrics builds and registers the compactor collectors against
-// reg. When reg is nil it returns nil so the service runs with all-no-op
-// metrics. Registration tolerates AlreadyRegisteredError so multiple compactor
-// instances (or a co-located consumer) can share one global registry without
-// panicking.
 func newCompactorMetrics(reg prometheus.Registerer) *compactorMetrics {
 	if reg == nil {
 		return nil
 	}
 	m := &compactorMetrics{}
+
+	// ── pass-level ───────────────────────────────────────────────────────────
 	m.runs = compactorRegisterCounterVec(reg, prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "blockpack_value_index_compactor_runs_total",
-		Help: "Completed compaction passes, by status (success, error).",
+		Help: "Completed compaction passes by status (success|error).",
 	}, []string{compactorLabelStatus}))
+
 	m.errors = compactorRegisterCounterVec(reg, prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "blockpack_value_index_compactor_errors_total",
 		Help: "Errors by operation (list, get, put, delete).",
 	}, []string{compactorLabelOp}))
+
+	m.lastRun = compactorRegisterGauge(reg, prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "blockpack_value_index_compactor_last_run_timestamp_seconds",
+		Help: "Unix timestamp of the last completed compaction pass (success or error). " +
+			"Alert if this is stale.",
+	}))
+
+	runH := compactorRegisterHistogram(reg, prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "blockpack_value_index_compactor_run_duration_seconds",
+		Help:    "Wall time for one full compaction pass over all tenants and columns.",
+		Buckets: runDurationBuckets,
+	}))
+	m.runDur = runH
+
+	// ── per-merge ─────────────────────────────────────────────────────────────
+	mergeH := compactorRegisterHistogram(reg, prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "blockpack_value_index_compactor_merge_duration_seconds",
+		Help:    "Wall time to merge one level's files for one (tenant, column) pair.",
+		Buckets: mergeDurationBuckets,
+	}))
+	m.mergeDur = mergeH
 
 	m.filesRead = compactorRegisterCounter(reg, prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "blockpack_value_index_compactor_files_read_total",
@@ -70,41 +107,40 @@ func newCompactorMetrics(reg prometheus.Registerer) *compactorMetrics {
 	}))
 	m.filesWritten = compactorRegisterCounter(reg, prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "blockpack_value_index_compactor_files_written_total",
-		Help: "Output files written.",
+		Help: "Output files written (L1+).",
 	}))
 	m.filesDeleted = compactorRegisterCounter(reg, prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "blockpack_value_index_compactor_files_deleted_total",
-		Help: "Input files deleted after successful merge.",
+		Help: "Input files deleted after a successful merge.",
+	}))
+	m.filesSkipped = compactorRegisterCounter(reg, prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "blockpack_value_index_compactor_files_skipped_total",
+		Help: "Files skipped because their name could not be parsed (wrong magic / old format).",
 	}))
 	m.entriesRetained = compactorRegisterCounter(reg, prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "blockpack_value_index_compactor_entries_retained_total",
-		Help: "Entries written to output (source still exists).",
+		Help: "Posting-list entries propagated to output (source block still exists).",
 	}))
 	m.entriesDropped = compactorRegisterCounter(reg, prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "blockpack_value_index_compactor_entries_dropped_total",
-		Help: "Entries dropped due to retention (source deleted).",
+		Help: "Posting-list entries dropped because their source block was deleted by retention.",
 	}))
 
-	runH := compactorRegisterHistogram(reg, prometheus.NewHistogram(prometheus.HistogramOpts{
-		Name:                            "blockpack_value_index_compactor_run_duration_seconds",
-		Help:                            "Duration of one full compaction pass.",
-		NativeHistogramBucketFactor:     1.1,
-		NativeHistogramMaxBucketNumber:  100,
-		NativeHistogramMinResetDuration: 15 * time.Minute,
-	}))
-	mergeH := compactorRegisterHistogram(reg, prometheus.NewHistogram(prometheus.HistogramOpts{
-		Name:                            "blockpack_value_index_compactor_merge_duration_seconds",
-		Help:                            "Time to merge one level's files for one column.",
-		NativeHistogramBucketFactor:     1.1,
-		NativeHistogramMaxBucketNumber:  100,
-		NativeHistogramMinResetDuration: 15 * time.Minute,
-	}))
-	m.runDur = runH
-	m.mergeDur = mergeH
+	m.columnsCompacted = compactorRegisterCounterVec(reg, prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "blockpack_value_index_compactor_columns_compacted_total",
+		Help: "Column directories where at least one level was merged, by input level.",
+	}, []string{compactorLabelLevel}))
+
+	// ── backlog ───────────────────────────────────────────────────────────────
+	m.backlogL0Files = compactorRegisterGaugeVec(reg, prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "blockpack_value_index_compactor_backlog_l0_files",
+		Help: "Number of L0 index files still awaiting compaction, observed at the start of each pass. " +
+			"A rising value means the compactor is falling behind ingestion.",
+	}, []string{"tenant"}))
+
 	return m
 }
 
-// incRun records one completed compaction pass by status.
 func (m *compactorMetrics) incRun(status string) {
 	if m == nil {
 		return
@@ -112,7 +148,6 @@ func (m *compactorMetrics) incRun(status string) {
 	m.runs.WithLabelValues(status).Inc()
 }
 
-// incError records one error for the given operation.
 func (m *compactorMetrics) incError(op string) {
 	if m == nil {
 		return
@@ -120,15 +155,14 @@ func (m *compactorMetrics) incError(op string) {
 	m.errors.WithLabelValues(op).Inc()
 }
 
-// observeRun records the duration of one full compaction pass.
 func (m *compactorMetrics) observeRun(d time.Duration) {
 	if m == nil {
 		return
 	}
 	m.runDur.Observe(d.Seconds())
+	m.lastRun.SetToCurrentTime()
 }
 
-// observeMerge records the duration of one level's merge for one column.
 func (m *compactorMetrics) observeMerge(d time.Duration) {
 	if m == nil {
 		return
@@ -136,7 +170,6 @@ func (m *compactorMetrics) observeMerge(d time.Duration) {
 	m.mergeDur.Observe(d.Seconds())
 }
 
-// addMergeCounts records the file- and entry-level outcome of one merge.
 func (m *compactorMetrics) addMergeCounts(read, written, deleted, retained, dropped int) {
 	if m == nil {
 		return
@@ -158,8 +191,29 @@ func (m *compactorMetrics) addMergeCounts(read, written, deleted, retained, drop
 	}
 }
 
-// compactorRegisterCounterVec registers cv, returning the existing collector on
-// AlreadyRegisteredError instead of panicking.
+func (m *compactorMetrics) incSkipped(n int) {
+	if m == nil || n == 0 {
+		return
+	}
+	m.filesSkipped.Add(float64(n))
+}
+
+func (m *compactorMetrics) incColumnsCompacted(level int) {
+	if m == nil {
+		return
+	}
+	m.columnsCompacted.WithLabelValues(fmt.Sprintf("%d", level)).Inc()
+}
+
+func (m *compactorMetrics) setBacklogL0(tenant string, n int) {
+	if m == nil {
+		return
+	}
+	m.backlogL0Files.WithLabelValues(tenant).Set(float64(n))
+}
+
+// ── registration helpers ─────────────────────────────────────────────────────
+
 func compactorRegisterCounterVec(reg prometheus.Registerer, cv *prometheus.CounterVec) *prometheus.CounterVec {
 	if err := reg.Register(cv); err != nil {
 		var are prometheus.AlreadyRegisteredError
@@ -172,8 +226,6 @@ func compactorRegisterCounterVec(reg prometheus.Registerer, cv *prometheus.Count
 	return cv
 }
 
-// compactorRegisterCounter registers c, returning the existing collector on
-// AlreadyRegisteredError instead of panicking.
 func compactorRegisterCounter(reg prometheus.Registerer, c prometheus.Counter) prometheus.Counter {
 	if err := reg.Register(c); err != nil {
 		var are prometheus.AlreadyRegisteredError
@@ -186,8 +238,6 @@ func compactorRegisterCounter(reg prometheus.Registerer, c prometheus.Counter) p
 	return c
 }
 
-// compactorRegisterHistogram registers h, returning the existing collector on
-// AlreadyRegisteredError instead of panicking.
 func compactorRegisterHistogram(reg prometheus.Registerer, h prometheus.Histogram) prometheus.Histogram {
 	if err := reg.Register(h); err != nil {
 		var are prometheus.AlreadyRegisteredError
@@ -198,4 +248,28 @@ func compactorRegisterHistogram(reg prometheus.Registerer, h prometheus.Histogra
 		}
 	}
 	return h
+}
+
+func compactorRegisterGauge(reg prometheus.Registerer, g prometheus.Gauge) prometheus.Gauge {
+	if err := reg.Register(g); err != nil {
+		var are prometheus.AlreadyRegisteredError
+		if errors.As(err, &are) {
+			if existing, ok := are.ExistingCollector.(prometheus.Gauge); ok {
+				return existing
+			}
+		}
+	}
+	return g
+}
+
+func compactorRegisterGaugeVec(reg prometheus.Registerer, gv *prometheus.GaugeVec) *prometheus.GaugeVec {
+	if err := reg.Register(gv); err != nil {
+		var are prometheus.AlreadyRegisteredError
+		if errors.As(err, &are) {
+			if existing, ok := are.ExistingCollector.(*prometheus.GaugeVec); ok {
+				return existing
+			}
+		}
+	}
+	return gv
 }

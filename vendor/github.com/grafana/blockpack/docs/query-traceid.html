@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Trace by ID — Blockpack</title>
+  <link rel="stylesheet" href="/assets/css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a href="/" class="topbar-brand">Blockpack Docs</a>
+    <a href="https://github.com/grafana/blockpack" class="topbar-github">GitHub &rarr;</a>
+  </header>
+  <div class="layout">
+    <nav class="sidebar">
+  <div class="sidebar-brand">BLOCKPACK</div>
+  <div class="section-label">Overview</div>
+  <a href="/">Home</a>
+  <a href="/file-format">File Format</a>
+  <div class="section-label">Query Paths</div>
+  <a href="/query-filter">Filter Query</a>
+  <a href="/query-intrinsic">Intrinsic Fast-Path</a>
+  <a href="/query-traceid" class="active">Trace by ID</a>
+  <a href="/query-metrics">Metrics Query</a>
+  <div class="section-label">Write Path</div>
+  <a href="/write-path">Write Pipeline</a>
+  <div class="section-label">Indexes</div>
+  <a href="/kll">KLL Sketches</a>
+  <a href="/cms">Count-Min Sketch</a>
+  <a href="/topk">TopK</a>
+  <a href="/hll">HyperLogLog</a>
+  <a href="/bloom-filter">Bloom Filters</a>
+  <a href="/intrinsic-columns">Intrinsic Columns</a>
+  <div class="section-label">Blocks</div>
+  <a href="/block-scoring">Block Scoring</a>
+  <a href="/block-format">Block Format</a>
+  <div class="section-label">Performance</div>
+  <a href="/benchmarks/">Benchmarks</a>
+  <a href="/production-results">Production Results</a>
+</nav>
+    <main class="content">
+
+<h1>Trace by ID Lookup</h1>
+<p>The fastest query path in blockpack. A TraceID lookup uses the compact trace index to jump directly to the exact blocks containing spans for a given trace &mdash; no scanning, no pruning pipeline.</p>
+
+<a href="/interactive/query-traceid" class="demo-link">
+  <div class="demo-link-text">
+    <div class="demo-link-title">Open Interactive Demo</div>
+    <div class="demo-link-sub">Watch O(log N) trace index lookup with block selection animation</div>
+  </div>
+  <div class="demo-link-arrow">&rarr;</div>
+</a>
+
+<h2>How It Works</h2>
+<p>The blockpack footer (V4 format) contains an offset to the <strong>compact trace index</strong> &mdash; a binary-sorted array that maps each 16-byte TraceID to a list of <code>[]uint16</code> block IDs. When a trace lookup arrives, a binary search on the sorted TraceID array finds the exact block IDs in <strong>O(log N)</strong> time. No bloom filters, no KLL range checks, no scanning &mdash; just a direct index lookup followed by targeted block reads.</p>
+
+<h2>Why Multiple Blocks?</h2>
+<p>A single trace can span multiple blocks because blockpack uses <strong>MinHash clustering</strong> at write time. MinHash groups spans by attribute similarity &mdash; spans with similar resource attributes (same service, same region) land in the same block for better compression. But a single trace often contains spans from different services (frontend, auth, database), which have different MinHash signatures and land in different blocks. The trace index tracks exactly which blocks contain spans for each TraceID, so all blocks are found regardless of how they were clustered.</p>
+
+<h2>Performance</h2>
+<ul>
+  <li><strong>Index lookup:</strong> O(log N) binary search on the sorted TraceID array. For a file with 1 million traces, this is ~20 comparisons on 16-byte keys.</li>
+  <li><strong>Block reads:</strong> Typically 1&ndash;5 blocks per trace. Each block is read in a single <code>GetBlockWithBytes</code> call &mdash; one HTTP request to object storage.</li>
+  <li><strong>End-to-end:</strong> Entire traces reconstructed in milliseconds. No wasted I/O on blocks that don&rsquo;t contain the trace.</li>
+  <li><strong>Compared to filter queries:</strong> No pruning pipeline needed. The trace index replaces all of file bloom, time range, KLL, block bloom, and CMS stages with a single index lookup.</li>
+</ul>
+
+<h2>Key Invariant</h2>
+<blockquote><strong>The compact trace index maps every TraceID to ALL blocks containing its spans. No scanning required &mdash; the index is complete and authoritative.</strong></blockquote>
+
+    </main>
+  </div>
+</body>
+</html>

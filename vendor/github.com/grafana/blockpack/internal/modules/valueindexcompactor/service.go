@@ -2,6 +2,7 @@ package valueindexcompactor
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"path"
@@ -81,6 +82,10 @@ func (s *Service) Run(ctx context.Context) error {
 func (s *Service) RunOnce(ctx context.Context) error {
 	runStart := s.now()
 
+	// Snapshot backlog before we start compacting so the gauge reflects the
+	// queue depth at pass start, not after partial compaction.
+	s.snapshotBacklog(ctx)
+
 	tenants, err := s.resolveTenants(ctx)
 	if err != nil {
 		s.metrics.observeRun(s.now().Sub(runStart))
@@ -109,6 +114,65 @@ func (s *Service) RunOnce(ctx context.Context) error {
 	return firstErr
 }
 
+// ownsShard reports whether a column (identified by its 32-char hex hash) belongs
+// to this compactor instance. The first byte of the hash (two hex digits) is
+// decoded to a uint8 and mapped: byte % ShardCount == ShardIndex. If the column
+// name is not a valid hex string, the column is always owned (fail-safe).
+func (s *Service) ownsShard(colHash string) bool {
+	if len(colHash) < 2 {
+		return true
+	}
+	b, err := hex.DecodeString(colHash[:2])
+	if err != nil || len(b) == 0 {
+		return true
+	}
+	return int(b[0])%s.cfg.ShardCount == s.cfg.ShardIndex
+}
+
+// snapshotBacklog counts L0 files per tenant and records them as the backlog
+// gauge. It uses the same ListDirs walk as compactTenant but only counts L0
+// filenames rather than reading content, so it is cheap (no Get calls).
+// Errors are silently swallowed — a failed snapshot is non-fatal.
+func (s *Service) snapshotBacklog(ctx context.Context) {
+	tenants, err := s.resolveTenants(ctx)
+	if err != nil {
+		return
+	}
+	for _, tenant := range tenants {
+		tenantPrefix := path.Join(tenant, s.cfg.IndexPrefix) + "/"
+		colDirs, err := s.store.ListDirs(ctx, tenantPrefix)
+		if err != nil {
+			continue
+		}
+		var l0Count int
+		for _, colDir := range colDirs {
+			if s.cfg.ShardCount > 1 {
+				colName := path.Base(strings.TrimSuffix(colDir, "/"))
+				if !s.ownsShard(colName) {
+					continue
+				}
+			}
+			typeDirs, err := s.store.ListDirs(ctx, colDir)
+			if err != nil {
+				continue
+			}
+			for _, typeDir := range typeDirs {
+				keys, err := s.store.List(ctx, typeDir)
+				if err != nil {
+					continue
+				}
+				for _, key := range keys {
+					level, _, err := valueindex.ParseFilename(path.Base(key))
+					if err == nil && level == 0 {
+						l0Count++
+					}
+				}
+			}
+		}
+		s.metrics.setBacklogL0(tenant, l0Count)
+	}
+}
+
 // resolveTenants returns the tenant IDs to compact. For an explicit list it
 // returns the list verbatim; for "*" it discovers tenants by listing the index
 // prefix and extracting the first path segment after the prefix.
@@ -117,18 +181,19 @@ func (s *Service) resolveTenants(ctx context.Context) ([]string, error) {
 		return s.cfg.Tenants, nil
 	}
 
-	prefix := s.cfg.IndexPrefix + "/"
-	keys, err := s.store.List(ctx, prefix)
+	// Key layout is <tenant>/<indexPrefix>/..., so tenant dirs sit at the root.
+	// List the top-level dirs (non-recursive) and return those whose names do not
+	// equal the index prefix itself (which would be a misconfigured flat layout).
+	topDirs, err := s.store.ListDirs(ctx, "")
 	if err != nil {
 		s.metrics.incError(compactorOpList)
 		return nil, err
 	}
 	seen := make(map[string]struct{})
 	var tenants []string
-	for _, key := range keys {
-		rest := strings.TrimPrefix(key, prefix)
-		seg, _, ok := strings.Cut(rest, "/")
-		if !ok || seg == "" {
+	for _, dir := range topDirs {
+		seg := strings.TrimSuffix(dir, "/")
+		if seg == "" || seg == s.cfg.IndexPrefix {
 			continue
 		}
 		if _, dup := seen[seg]; dup {
@@ -141,30 +206,73 @@ func (s *Service) resolveTenants(ctx context.Context) ([]string, error) {
 	return tenants, nil
 }
 
-// compactTenant compacts every column directory for one tenant. The first error
-// is returned but all columns are still attempted.
+// compactTenant compacts every column directory for one tenant. Rather than
+// issuing one giant recursive list of all tenant files (which can be millions
+// of objects and takes many minutes), it walks the two-level
+// <col-hash>/<type>/ hierarchy with three cheap non-recursive directory
+// listings: one for col-hash dirs, one per col-hash for type dirs, and one per
+// (col-hash, type) for the actual index files. This keeps each individual S3
+// list call small and lets compaction start within seconds.
+//
+// The first error is returned but all columns are still attempted.
 func (s *Service) compactTenant(ctx context.Context, tenant string) error {
-	tenantPrefix := path.Join(s.cfg.IndexPrefix, tenant) + "/"
-	keys, err := s.store.List(ctx, tenantPrefix)
+	// Key layout written by WriteValueIndexL0: <tenant>/<indexPrefix>/<colHash>/<type>/...
+	// Match that order here so we list the right prefix.
+	tenantPrefix := path.Join(tenant, s.cfg.IndexPrefix) + "/"
+
+	// List immediate column-hash subdirs (non-recursive).
+	colDirs, err := s.store.ListDirs(ctx, tenantPrefix)
 	if err != nil {
 		s.metrics.incError(compactorOpList)
 		return fmt.Errorf("valueindexcompactor: list tenant %q: %w", tenant, err)
 	}
 
-	// Group keys by column directory.
-	byColumn := make(map[string][]string)
-	for _, key := range keys {
-		dir := path.Dir(key)
-		byColumn[dir] = append(byColumn[dir], key)
-	}
-
 	var firstErr error
-	for colDir, colKeys := range byColumn {
+	for _, colDir := range colDirs {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := s.compactColumn(ctx, colDir, colKeys); err != nil && firstErr == nil {
-			firstErr = err
+
+		// Sharding: skip columns that belong to a different shard.
+		// The column dir name is the 32-char hex col hash; read the first byte
+		// (two hex chars) and assign by: byte % ShardCount == ShardIndex.
+		if s.cfg.ShardCount > 1 {
+			colName := path.Base(strings.TrimSuffix(colDir, "/"))
+			if !s.ownsShard(colName) {
+				continue
+			}
+		}
+
+		// List immediate type subdirs (int64, string, bool, …) under each col-hash.
+		typeDirs, err := s.store.ListDirs(ctx, colDir)
+		if err != nil {
+			s.metrics.incError(compactorOpList)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("valueindexcompactor: list col %q: %w", colDir, err)
+			}
+			continue
+		}
+
+		for _, typeDir := range typeDirs {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+
+			// List the actual index files under <col-hash>/<type>/.
+			keys, err := s.store.List(ctx, typeDir)
+			if err != nil {
+				s.metrics.incError(compactorOpList)
+				if firstErr == nil {
+					firstErr = fmt.Errorf("valueindexcompactor: list type dir %q: %w", typeDir, err)
+				}
+				continue
+			}
+
+			// typeDir is already the exact column directory for compactColumn.
+			trimmed := strings.TrimSuffix(typeDir, "/")
+			if err := s.compactColumn(ctx, trimmed, keys); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 	return firstErr
@@ -183,14 +291,17 @@ type levelFile struct {
 func (s *Service) compactColumn(ctx context.Context, colDir string, keys []string) error {
 	// Parse levels, group by level.
 	byLevel := make(map[int][]levelFile)
+	var skipped int
 	for _, key := range keys {
 		level, _, err := valueindex.ParseFilename(path.Base(key))
 		if err != nil {
 			// Not a value index file (or malformed) — skip it.
+			skipped++
 			continue
 		}
 		byLevel[level] = append(byLevel[level], levelFile{key: key, level: level})
 	}
+	s.metrics.incSkipped(skipped)
 
 	// Find the lowest level that meets the threshold.
 	levels := make([]int, 0, len(byLevel))
@@ -204,7 +315,11 @@ func (s *Service) compactColumn(ctx context.Context, colDir string, keys []strin
 		if len(files) < s.cfg.CompactThresholdFiles {
 			continue
 		}
-		return s.mergeLevel(ctx, colDir, files)
+		if err := s.mergeLevel(ctx, colDir, files); err != nil {
+			return err
+		}
+		s.metrics.incColumnsCompacted(lvl)
+		return nil
 	}
 	return nil
 }

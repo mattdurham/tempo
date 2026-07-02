@@ -12,10 +12,13 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/go-kit/log/level"
 	"github.com/grafana/dskit/services"
+	"github.com/grafana/tempo/pkg/util/log"
 	s3cfg "github.com/grafana/tempo/tempodb/backend/s3"
 	common "github.com/grafana/tempo/tempodb/encoding/common"
 	minio "github.com/minio/minio-go/v7"
@@ -62,14 +65,37 @@ func toVICConsumerCfg(cfg common.ValueIndexConsumerConfig) vicconsumer.Config {
 
 // toVICCompactorCfg converts the Tempo config struct to the blockpack compactor config.
 func toVICCompactorCfg(cfg common.ValueIndexCompactorConfig) viccompactor.Config {
-	return viccompactor.Config{
+	out := viccompactor.Config{
 		Enabled:               cfg.Enabled,
 		IndexPrefix:           cfg.IndexPrefix,
 		Tenants:               cfg.Tenants,
 		CompactInterval:       cfg.CompactInterval,
 		CompactThresholdFiles: cfg.CompactThresholdFiles,
 		MaxOutputBytes:        cfg.MaxOutputBytes,
+		ShardCount:            cfg.ShardCount,
+		ShardIndex:            cfg.ShardIndex,
 	}
+	// Allow SHARD_COUNT env var (set on the Deployment) to enable sharding.
+	if v, err := strconv.Atoi(os.Getenv("SHARD_COUNT")); err == nil && v > 0 {
+		out.ShardCount = v
+	}
+	// SHARD_INDEX can be set explicitly, or derived from POD_NAME (injected via
+	// the Kubernetes Downward API) so every pod in a Deployment gets a stable,
+	// unique shard assignment without needing a StatefulSet.
+	if v, err := strconv.Atoi(os.Getenv("SHARD_INDEX")); err == nil && v >= 0 {
+		out.ShardIndex = v
+	} else if out.ShardCount > 1 {
+		// StatefulSet pods are named <name>-<ordinal> (e.g. value-index-compactor-3).
+		// Parse the ordinal suffix as the shard index — guaranteed unique 0..N-1.
+		if name := os.Getenv("POD_NAME"); name != "" {
+			if idx := strings.LastIndex(name, "-"); idx >= 0 {
+				if v, err := strconv.Atoi(name[idx+1:]); err == nil && v >= 0 {
+					out.ShardIndex = v % out.ShardCount
+				}
+			}
+		}
+	}
+	return out
 }
 
 // ── value-index consumer ──────────────────────────────────────────────────────
@@ -144,7 +170,11 @@ func (t *App) initValueIndexCompactor() (services.Service, error) {
 				if viErr != nil {
 					return fmt.Errorf("value-index-compactor: %w", viErr)
 				}
-				go func() { _ = viSvc.Run(ctx) }()
+				go func() {
+					if err := viSvc.Run(ctx); err != nil && err != context.Canceled {
+						level.Error(log.Logger).Log("msg", "value-index-compactor exited", "err", err)
+					}
+				}()
 			}
 			// Cube compactor loop — runs inside the same service.
 			if bp.CubeCompactorEnabled && len(bp.CubeTenants) > 0 {
@@ -268,6 +298,25 @@ func (s *tempoVCCStore) List(ctx context.Context, prefix string) ([]string, erro
 		keys = append(keys, obj.Key)
 	}
 	return keys, nil
+}
+
+// ListDirs returns the immediate child "directory" prefixes one level below
+// prefix using a non-recursive S3 list with delimiter "/". This avoids
+// loading millions of file keys when only the directory names are needed.
+func (s *tempoVCCStore) ListDirs(ctx context.Context, prefix string) ([]string, error) {
+	var dirs []string
+	for obj := range s.client.ListObjects(ctx, s.bucket,
+		minio.ListObjectsOptions{Prefix: prefix, Recursive: false}) {
+		if obj.Err != nil {
+			return nil, obj.Err
+		}
+		// With Recursive: false minio returns common prefixes in obj.Key with a
+		// trailing "/" and obj.Size == 0; actual objects have non-zero size.
+		if strings.HasSuffix(obj.Key, "/") {
+			dirs = append(dirs, obj.Key)
+		}
+	}
+	return dirs, nil
 }
 
 func (s *tempoVCCStore) Get(ctx context.Context, key string) ([]byte, error) {

@@ -3,7 +3,7 @@
 Date: 2026-06-25
 
 The compactor is the third and final stage of the value-index pipeline (publisher NOTE-VI-015
-#397, consumer NOTE-VI-016 #398, compactor #399). It periodically merges the many small L0
+# 397, consumer NOTE-VI-016 #398, compactor #399). It periodically merges the many small L0
 value index files the consumer writes into fewer, larger L1/L2 files per (tenant, column), and
 drops entries whose originating blockpack file has been deleted by retention.
 
@@ -35,6 +35,24 @@ the old inputs in place; the next pass recompacts and the duplicate entries are 
 merge's dedup. Because outputs use fresh IDs and inputs are only deleted after a successful
 write, multiple compactor instances are safe — at worst they produce redundant outputs that the
 next pass dedups. No persistent state is kept between passes.
+
+### Two-level directory walk (NOTE-VI-017-b)
+
+`compactTenant` previously issued a single recursive `List` of the entire tenant prefix, which
+loads all file keys into memory in one shot. With 1.7 M+ VI files per tenant this call takes
+many minutes and effectively blocks the compactor indefinitely.
+
+The fix replaces that one giant list with a **three-step walk**:
+
+1. `ListDirs(indexes/<tenant>/)` — non-recursive, returns only col-hash subdirs (O(1000) entries).
+2. For each col-hash: `ListDirs(indexes/<tenant>/<hash>/)` — returns type subdirs (e.g. `string/`, `int64/`).
+3. For each type dir: `List(indexes/<tenant>/<hash>/<type>/)` — recursive within that single leaf
+   directory (~2000 files at most), passed directly to `compactColumn`.
+
+Each individual S3 call is cheap; the compactor starts producing L1 files within seconds of
+startup instead of hanging for minutes. `IndexStore` gains a `ListDirs` method (non-recursive,
+returns only directory prefixes ending in `/`); both the in-memory test store and the
+production minio-backed store implement it.
 
 ### Per-(tenant, column) isolation, best-effort pass
 

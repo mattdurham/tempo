@@ -354,4 +354,10 @@ type ValueIndexCompactorConfig struct {
 	CompactInterval       time.Duration `yaml:"compact_interval"`
 	CompactThresholdFiles int           `yaml:"compact_threshold_files"`
 	MaxOutputBytes        int64         `yaml:"max_output_bytes"`
+	// ShardCount and ShardIndex partition the column space across replicas.
+	// Each replica only compacts columns where colHash[0] % ShardCount == ShardIndex.
+	// When ShardCount <= 1 all columns are processed (no sharding).
+	// Typically injected via SHARD_COUNT / SHARD_INDEX environment variables.
+	ShardCount int `yaml:"shard_count"`
+	ShardIndex int `yaml:"shard_index"`
 }
