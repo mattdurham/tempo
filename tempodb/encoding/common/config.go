@@ -143,6 +143,10 @@ type BlockpackConfig struct {
 	// (-target=value-index-compactor). Disabled by default.
 	ValueIndexCompactor ValueIndexCompactorConfig `yaml:"value_index_compactor"`
 
+	// ValueCountCompactor configures the value-counts (VCNT) compactor, bundled as a
+	// goroutine inside the value-index-compactor Tempo target. Disabled by default.
+	ValueCountCompactor ValueCountCompactorConfig `yaml:"value_count_compactor"`
+
 	// ValueIndexQuery configures the querier-side index-driven query path
 	// (blockpack issue #461). When enabled, the blockpack querier discovers and
 	// downloads value-index files to answer search/metrics queries with block-level
@@ -358,6 +362,30 @@ type ValueIndexCompactorConfig struct {
 	// Each replica only compacts columns where colHash[0] % ShardCount == ShardIndex.
 	// When ShardCount <= 1 all columns are processed (no sharding).
 	// Typically injected via SHARD_COUNT / SHARD_INDEX environment variables.
+	ShardCount        int   `yaml:"shard_count"`
+	ShardIndex        int   `yaml:"shard_index"`
+	CompactBatchBytes int64 `yaml:"compact_batch_bytes"`
+	// CompactConcurrency and CompactMaxInputFiles mirror valueindexcompactor.Config's
+	// same-named fields (defaults: 1 and 150, applied by blockpack's own withDefaults()
+	// when <= 0 — not repeated here).
+	CompactConcurrency   int `yaml:"compact_concurrency"`
+	CompactMaxInputFiles int `yaml:"compact_max_input_files"`
+}
+
+// ValueCountCompactorConfig configures the value-counts (VCNT) compactor, bundled as a
+// goroutine inside the value-index-compactor Tempo target (parallel to how the cube
+// compactor is bundled — no dedicated StatefulSet).
+// Mirrors valuecountscompactor.Config for YAML decoding without a direct blockpack import.
+type ValueCountCompactorConfig struct {
+	Enabled               bool          `yaml:"enabled"`
+	IndexPrefix           string        `yaml:"index_prefix"`
+	Tenants               []string      `yaml:"tenants"`
+	CompactInterval       time.Duration `yaml:"compact_interval"`
+	CompactThresholdFiles int           `yaml:"compact_threshold_files"`
+	CompactBatchBytes     int64         `yaml:"compact_batch_bytes"`
+	MaxRecordsPerMerge    int           `yaml:"max_records_per_merge"`
+	// ShardCount and ShardIndex partition the column space across replicas, same
+	// convention as ValueIndexCompactorConfig above.
 	ShardCount int `yaml:"shard_count"`
 	ShardIndex int `yaml:"shard_index"`
 }

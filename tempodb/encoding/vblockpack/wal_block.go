@@ -6,6 +6,7 @@ import (
 	"encoding/hex" //nolint:depguard
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -256,7 +257,7 @@ func (w *walBlock) Clear() error {
 
 // FindTraceByID finds a trace by ID in the WAL block.
 // It snapshots the current writer state and queries blockpack for the given trace.
-func (w *walBlock) FindTraceByID(_ context.Context, id common.ID, _ common.SearchOptions) (*tempopb.TraceByIDResponse, error) {
+func (w *walBlock) FindTraceByID(ctx context.Context, id common.ID, _ common.SearchOptions) (*tempopb.TraceByIDResponse, error) {
 	if len(id) != 16 {
 		return nil, fmt.Errorf("trace ID must be 16 bytes, got %d", len(id))
 	}
@@ -314,7 +315,12 @@ func (w *walBlock) FindTraceByID(_ context.Context, id common.ID, _ common.Searc
 	}
 
 	traceIDHex := hex.EncodeToString(id)
-	matches, err := blockpack.GetTraceByID(r, traceIDHex)
+	// A WAL block is freshly-ingested data that has not been flushed to the backend, let
+	// alone consumed by valueindexconsumer or compacted by valueindexcompactor — it can
+	// never have trace-index coverage. Permanently pass a nil lister so GetTraceByID skips
+	// straight to its full-scan fallback; do not "fix" this by wiring in a lister later, it
+	// would only ever miss and cost a wasted DiscoverIndexFiles List call.
+	matches, err := blockpack.GetTraceByID(ctx, r, traceIDHex, nil, "", "", 0, math.MaxUint64)
 	if err != nil {
 		return nil, fmt.Errorf("walBlock FindTraceByID: GetTraceByID: %w", err)
 	}

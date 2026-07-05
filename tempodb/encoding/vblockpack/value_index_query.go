@@ -158,11 +158,23 @@ func (b *blockpackBlock) tryIndexFetch(
 
 // nanoWindowToSec converts a [startNano, endNano] window to whole seconds for
 // value-index file discovery. A zero bound is treated as unbounded.
+//
+// minSec is floored to the same 60-second (minute) alignment as blockpack's
+// write-side TimeSec truncation (valueindex_extract.go:buildSpanStartSecByRef,
+// (v/1e9)/60*60) — this is a mandatory, coordinated invariant, not an
+// independent optimization: if the two sides disagree on granularity, a span
+// whose minute-floored TimeSec falls before a non-aligned minSec is silently
+// dropped by LookupValue's exact inclusion filter, with no fallback
+// (TestNanoWindowToSec_MinuteFloorAlignsWithWriteSide is the regression test).
+// maxSec needs no equivalent widening: flooring only ever reduces TimeSec
+// relative to the true span second, so TimeSec <= true_span_sec <= maxSec
+// holds regardless of alignment (proven algebraically, not just asserted).
 func nanoWindowToSec(startNano, endNano uint64) (uint64, uint64) {
 	const nanosPerSec = 1_000_000_000
+	const secondsPerMinute = 60
 	minSec := uint64(0)
 	if startNano > 0 {
-		minSec = startNano / nanosPerSec
+		minSec = (startNano / nanosPerSec) / secondsPerMinute * secondsPerMinute
 	}
 	maxSec := ^uint64(0)
 	if endNano > 0 {
@@ -171,9 +183,11 @@ func nanoWindowToSec(startNano, endNano uint64) (uint64, uint64) {
 	return minSec, maxSec
 }
 
-// minioVIStore satisfies both blockpack.Lister (List) and
-// blockpack.ValueIndexFileStore (Size + ReadAt) over a minio client. The value
-// index lives in the same bucket as the trace blocks.
+// minioVIStore satisfies blockpack.Lister (List), blockpack.ValueIndexFileStore
+// (Size + ReadAt), and blockpack.LookupStore (List + Get) over a minio client. The
+// search/metrics path uses Lister+ValueIndexFileStore; the trace-by-ID path (issue
+// #468) uses LookupStore. The value index lives in the same bucket as the trace
+// blocks.
 type minioVIStore struct {
 	client *minio.Client
 	bucket string
@@ -207,6 +221,28 @@ func mapNotFound(err error) error {
 		return blockpack.ErrValueIndexFileNotFound
 	}
 	return err
+}
+
+// Get fetches the full bytes of the object at key, satisfying the fetch half of
+// blockpack.LookupStore (the trace-by-ID index lookup surface, blockpack issue
+// #468). Trace-by-ID index files are a single column directory's merged postings —
+// small enough to read whole into memory, the same assumption Size/ReadAt make for
+// the search/metrics path. A 404 maps to blockpack.ErrValueIndexFileNotFound so a
+// retention/compaction race (a key the listing cache still names but object storage
+// has already deleted) is treated as a benign miss, not a lookup error.
+func (s *minioVIStore) Get(ctx context.Context, key string) ([]byte, error) {
+	obj, err := s.client.GetObject(ctx, s.bucket, key, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, mapNotFound(err)
+	}
+	defer func() { _ = obj.Close() }()
+	// minio's GetObject is lazy: a 404 surfaces on the first read, not on the
+	// GetObject call, so map the read error too.
+	data, err := io.ReadAll(obj)
+	if err != nil {
+		return nil, mapNotFound(err)
+	}
+	return data, nil
 }
 
 // Size returns the byte length of the object at key.

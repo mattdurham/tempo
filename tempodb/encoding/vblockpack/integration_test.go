@@ -355,6 +355,73 @@ func TestBackendBlockFindTraceByID(t *testing.T) {
 	}
 }
 
+// TestBlockpackBlock_FindTraceByID_StillFullScansWithoutIndexWiring pins the Stage 6
+// v1 behavior: blockpack.GetTraceByID's new signature adds a lister/tenant/indexPrefix
+// for its trace-by-ID index fast path, but backend_block.go's FindTraceByID currently
+// passes nil/""/"" for those (real Lister wiring is a separate, un-started follow-up —
+// see blockpack issue #428 Stage 6 plan). This must remain a correctness-neutral,
+// always-full-scan call: FindTraceByID must still find a trace end-to-end with no index
+// coverage at all, exactly as it did before the signature change.
+func TestBlockpackBlock_FindTraceByID_StillFullScansWithoutIndexWiring(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	rawReader, rawWriter, _, err := local.New(&local.Config{Path: tmpDir})
+	if err != nil {
+		t.Fatalf("failed to create local backend: %v", err)
+	}
+	reader := backend.NewReader(rawReader)
+	writer := backend.NewWriter(rawWriter)
+
+	traceIDBytes := []byte{9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9}
+	trace := &tempopb.Trace{
+		ResourceSpans: []*tempotrace.ResourceSpans{{
+			ScopeSpans: []*tempotrace.ScopeSpans{{
+				Spans: []*tempotrace.Span{{
+					TraceId:           traceIDBytes,
+					SpanId:            []byte{1, 1, 1, 1, 1, 1, 1, 1},
+					Name:              "no-index-span",
+					StartTimeUnixNano: uint64(time.Now().UnixNano()),
+					EndTimeUnixNano:   uint64(time.Now().Add(time.Second).UnixNano()),
+				}},
+			}},
+		}},
+	}
+
+	iter := &testIterator{
+		traces: []struct {
+			id    common.ID
+			trace *tempopb.Trace
+		}{{id: common.ID(traceIDBytes), trace: trace}},
+	}
+
+	meta := backend.NewBlockMeta("test-tenant", uuid.New(), VersionString)
+	cfg := &common.BlockConfig{RowGroupSizeBytes: 10000}
+
+	ctx := context.Background()
+	resultMeta, err := CreateBlock(ctx, cfg, meta, iter, reader, writer)
+	if err != nil {
+		t.Fatalf("failed to create block: %v", err)
+	}
+
+	backendBlock := newBackendBlock(resultMeta, reader)
+
+	response, err := backendBlock.FindTraceByID(ctx, common.ID(traceIDBytes), common.SearchOptions{})
+	if err != nil {
+		t.Fatalf("FindTraceByID failed: %v", err)
+	}
+	if response == nil || response.Trace == nil {
+		t.Fatalf("expected trace to be found via full scan (no index coverage exists)")
+	}
+	if len(response.Trace.ResourceSpans) == 0 ||
+		len(response.Trace.ResourceSpans[0].ScopeSpans) == 0 ||
+		len(response.Trace.ResourceSpans[0].ScopeSpans[0].Spans) == 0 {
+		t.Fatalf("expected the found trace to contain the span")
+	}
+	if got := response.Trace.ResourceSpans[0].ScopeSpans[0].Spans[0].Name; got != "no-index-span" {
+		t.Errorf("expected span name 'no-index-span', got %q", got)
+	}
+}
+
 // TestSearchTags tests SearchTags functionality
 func TestSearchTags(t *testing.T) {
 	tmpDir := t.TempDir()

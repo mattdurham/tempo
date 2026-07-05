@@ -1,681 +1,840 @@
-# Implementation Plan: Value-Index Logging, VCNT, and Cubes
+# Implementation Plan: Bounded-Concurrency Fix for `vibuilder` Value-Index Downloads
 
-*Created: 2026-07-01*
-*Based on: brainstorm.md*
-*Priority order: Task 1 → Task 2 → Task 3*
+*Created: 2026-07-02*
+*Based on: brainstorm.md, section "Investigation: TraceQL search timeouts on
+tempo-dev-test-03 — 'whole file vs. internal block' fetch hypothesis"*
+*Repo: `/home/mdurham/source/blockpack_collection/blockpack` (source of truth).
+Work happens directly on `main`. No new branches. No push. No PR without being
+asked.*
+*Vendor sync into tempo-mrd (`/home/mdurham/source/blockpack_collection/tempo`,
+branch `agentic-tempo`) is a separate, later step — not part of this plan's
+task list, since the constraints call for planning the blockpack-side fix
+first.*
 
----
+## Overview
 
-## Task 1 (High Priority, Low Effort): Fix Silent Value-Index Write Failures
+`vibuilder.downloadAll` (`internal/modules/vibuilder/builder.go:412-440`)
+downloads value-index files in a fully serial loop, each file costing two
+sequential round trips (`Size` then `ReadAt`). With `files=465` typical per
+query this produces up to ~930 sequential S3 calls and is the confirmed root
+cause of 33s-2m38s TraceQL search timeouts on tempo-dev-test-03. This plan
+replaces the serial loop with a bounded-concurrency fan-out
+(`golang.org/x/sync/errgroup`, already a dependency), applies the same
+treatment to `BuildSource`'s leaf loop and `lookupColumnAll`'s type-bucket
+loop, and adds a mutex to `executor.SliceValueIndexSource` — which this
+investigation confirms is **not** currently safe for concurrent writers —
+as a required prerequisite.
 
-### Background
+## Investigation Finding (Step 1.5 / Open Question Resolution)
 
-`tempodb/encoding/vblockpack/create.go` lines 171–178 contain two silent-skip
-patterns that make value-index L0 write failures invisible in logs:
+**Is `SliceValueIndexSource` safe for concurrent writers today? NO — confirmed by code read.**
 
-```go
-if store, prefix := getValueIndexSink(); store != nil {
-    if _, serr := tmp.Seek(0, io.SeekStart); serr == nil {   // ← silent skip
-        if r, rerr := blockpack.NewReaderFromProvider(&fileReaderProvider{f: tmp}); rerr == nil {  // ← silent skip
-            sourceRef := blockObjectKey(meta.TenantID, blockUUID.String())
-            if werr := blockpack.WriteValueIndexL0(r, store, sourceRef, meta.TenantID, prefix); werr != nil {
-                level.Warn(util_log.Logger).Log(...)  // ← only this path logs
-            }
-        }
-    }
-}
-```
-
-The same `NewReaderFromProvider` silent-skip exists in `compactor.go`'s
-`tempoOutputStorage.Put` (lines ~295–302).
-
-`ConfigureValueIndex` in `valueindex.go` calls `slog.Warn` when the minio client
-fails — but `slog.Warn` writes to the default Go `slog` handler, **not** to Tempo's
-`go-kit/log` structured logger. On a block-builder startup this produces a log line
-that may not be captured or correlated with the block-builder's own logs.
-
-### Exact Changes
-
-#### 1a. `tempodb/encoding/vblockpack/create.go`
-
-**Add logging for the two silent-skip guards** (lines 171–178). The seek failure
-and reader-open failure both need `level.Warn` log lines.
-
-Current code (lines 171–178):
+Read `internal/modules/executor/metrics_trace.go:1207-1298`:
 
 ```go
-if store, prefix := getValueIndexSink(); store != nil {
-    if _, serr := tmp.Seek(0, io.SeekStart); serr == nil {
-        if r, rerr := blockpack.NewReaderFromProvider(&fileReaderProvider{f: tmp}); rerr == nil {
-            sourceRef := blockObjectKey(meta.TenantID, blockUUID.String())
-            if werr := blockpack.WriteValueIndexL0(r, store, sourceRef, meta.TenantID, prefix); werr != nil {
-                level.Warn(util_log.Logger).Log("msg", "vblockpack: value-index L0 write failed", "block", sourceRef, "err", werr)
-            }
-        }
+type SliceValueIndexSource struct {
+    data map[string]map[modules_shared.ColumnType][]VILookupResult
+    stats ValueIndexBuildStats
+}
+
+func (s *SliceValueIndexSource) RecordFileIO(filesRead int, bytesRead int64) {
+    s.stats.FilesRead += filesRead   // unsynchronized read-modify-write
+    s.stats.BytesRead += bytesRead   // unsynchronized read-modify-write
+}
+
+func (s *SliceValueIndexSource) Add(colName string, colType modules_shared.ColumnType, results []VILookupResult) {
+    byType, ok := s.data[colName]    // unsynchronized map read
+    if !ok {
+        byType = make(map[modules_shared.ColumnType][]VILookupResult)
+        s.data[colName] = byType     // unsynchronized map write
     }
+    byType[colType] = append(byType[colType], results...)
 }
 ```
 
-Replacement:
-
-```go
-if store, prefix := getValueIndexSink(); store != nil {
-    blockKey := blockObjectKey(meta.TenantID, blockUUID.String())
-    if _, serr := tmp.Seek(0, io.SeekStart); serr != nil {
-        level.Warn(util_log.Logger).Log(
-            "msg", "vblockpack: value-index L0 skipped (seek failed)",
-            "block", blockKey,
-            "err", serr,
-        )
-    } else if r, rerr := blockpack.NewReaderFromProvider(&fileReaderProvider{f: tmp}); rerr != nil {
-        level.Warn(util_log.Logger).Log(
-            "msg", "vblockpack: value-index L0 skipped (could not open block reader)",
-            "block", blockKey,
-            "err", rerr,
-        )
-    } else if werr := blockpack.WriteValueIndexL0(r, store, blockKey, meta.TenantID, prefix); werr != nil {
-        level.Warn(util_log.Logger).Log(
-            "msg", "vblockpack: value-index L0 write failed",
-            "block", blockKey,
-            "err", werr,
-        )
-    }
-}
-```
-
-This also eliminates one extra `blockObjectKey` allocation (was being called
-redundantly only in the inner success path).
-
-#### 1b. `tempodb/encoding/vblockpack/compactor.go`
-
-The same silent-skip exists in `tempoOutputStorage.Put` (lines ~295–302):
-
-```go
-if store, prefix := getValueIndexSink(); store != nil {
-    if r, rerr := blockpack.NewReaderFromProvider(&bytesReaderProvider{data: data}); rerr == nil {
-        sourceRef := blockObjectKey(s.tenantID, uuid.UUID(newID).String())
-        if werr := blockpack.WriteValueIndexL0(r, store, sourceRef, s.tenantID, prefix); werr != nil {
-            level.Warn(util_log.Logger).Log("msg", "vblockpack: value-index L0 write failed (compaction)", "block", sourceRef, "err", werr)
-        }
-    }
-}
-```
-
-Replacement:
-
-```go
-if store, prefix := getValueIndexSink(); store != nil {
-    blockKey := blockObjectKey(s.tenantID, uuid.UUID(newID).String())
-    if r, rerr := blockpack.NewReaderFromProvider(&bytesReaderProvider{data: data}); rerr != nil {
-        level.Warn(util_log.Logger).Log(
-            "msg", "vblockpack: value-index L0 skipped (could not open block reader, compaction)",
-            "block", blockKey,
-            "err", rerr,
-        )
-    } else if werr := blockpack.WriteValueIndexL0(r, store, blockKey, s.tenantID, prefix); werr != nil {
-        level.Warn(util_log.Logger).Log(
-            "msg", "vblockpack: value-index L0 write failed (compaction)",
-            "block", blockKey,
-            "err", werr,
-        )
-    }
-}
-```
-
-#### 1c. `tempodb/encoding/vblockpack/valueindex.go`
-
-`ConfigureValueIndex`'s startup failure currently uses `slog.Warn` (Go stdlib):
-
-```go
-valueIndexConfigOnce.Do(func() {
-    client, err := newMinioForValueIndex(s3cfg)
-    if err != nil {
-        slog.Warn("vblockpack: value-index write path disabled", "err", err)
-        return
-    }
-    ...
-})
-```
-
-Replace `slog.Warn` with `level.Warn(util_log.Logger)` so the startup failure
-appears in Tempo's structured log output alongside other block-builder startup
-messages.
-
-Required import addition: `"github.com/go-kit/log/level"` and
-`util_log "github.com/grafana/tempo/pkg/util/log"` (check if already present;
-`valueindex.go` currently imports only `log/slog` for the one Warn call).
-
-After the change:
-
-```go
-valueIndexConfigOnce.Do(func() {
-    client, err := newMinioForValueIndex(s3cfg)
-    if err != nil {
-        level.Warn(util_log.Logger).Log(
-            "msg", "vblockpack: value-index write path disabled (S3 client init failed)",
-            "err", err,
-        )
-        return
-    }
-    ...
-    level.Info(util_log.Logger).Log(
-        "msg", "vblockpack: value-index write path enabled",
-        "bucket", s3cfg.Bucket,
-        "prefix", indexPrefix,
-    )
-    ...
-})
-```
-
-The `Info` line at the end confirms successful initialisation (useful on startup).
-
-### Tests
-
-Add unit tests in `tempodb/encoding/vblockpack/valueindex_test.go` (already exists):
-
-- `TestConfigureValueIndex_LogsOnBadEndpoint` — call `ConfigureValueIndex` with
-  a nil or garbage S3 config and assert no panic. (Actual log line capture is not
-  required — just confirm no panic and the sink stays nil.)
-
-Add unit tests in `tempodb/encoding/vblockpack/create_test.go` (already exists):
-
-- `TestCreateBlock_ValueIndexSeekFailure` — not practical to simulate kernel seek
-  failure in unit test; note in code comment that the seek-fail path is covered by
-  the log-visible error message.
-
-No new test files required — the existing `*_test.go` files cover the surrounding
-paths; this change is logging-only.
-
-### Acceptance
-
-- `go build ./tempodb/encoding/vblockpack/...` passes
-- `go test ./tempodb/encoding/vblockpack/...` passes
-- `grep -n "slog\." tempodb/encoding/vblockpack/valueindex.go` returns no hits
-  (stdlib slog fully replaced)
-- `grep -n "level.Warn" tempodb/encoding/vblockpack/create.go` returns 2+ hits
-
----
-
-## Task 2 (Medium Priority): VCNT Standalone `.vcnt` Files
-
-### Decision: Option A (no blockpack changes)
-
-**Rationale:** The `valuecounts` package lives at
-`vendor/github.com/grafana/blockpack/internal/modules/valuecounts/` and is in
-the vendored tree (`modules.txt` does **not** list it as explicitly imported by
-tempo — confirmed by grep). However, because this is a local replace directive
-(`replace github.com/grafana/blockpack => ../blockpack`), Go's `internal`
-visibility rule is scoped to the module boundary: an `internal/` package in
-module `github.com/grafana/blockpack` is **not importable** from
-`github.com/grafana/tempo`.
-
-This means tempo **cannot** directly import
-`github.com/grafana/blockpack/internal/modules/valuecounts`.
-
-**Available paths:**
-
-1. **Add a public re-export in blockpack** — add a thin public wrapper file in
-   `../blockpack/` that re-exports the `valuecounts` types/functions needed:
-   `Record`, `Sort`, `EncodeRecords`, `ColHash`, `FormatFilename`, `NewID`.
-   This is a blockpack change but extremely small (one new file, no API redesign).
-   Blockpack's `api.go` already explicitly restricts scope, but the brainstorm
-   confirms this restriction is about the *query* API — a separate
-   `valuecount.go` wrapper is consistent with `valueindex_extract.go`,
-   `valueindex_l0write.go`, and `valueindex_query.go` already living in the
-   blockpack root as thin wrapper files.
-
-2. **Copy the minimal code into tempo** — copy just the encoding functions into
-   `tempodb/encoding/vblockpack/vcntwriter.go`. This produces a fork that must be
-   kept in sync with blockpack.
-
-**Recommended: Option A.1 — add a public re-export file to blockpack.**
-
-This is the correct long-term approach (no fork, single source of truth) and
-requires only a few lines of wrapper code. The brainstorm's "Option A (simpler,
-no blockpack changes)" description was slightly wrong — blockpack *does* need a
-tiny change to export the types, but it is not a new API, only a visibility lift.
-
-### Exact Changes
-
-#### 2a. `../blockpack/vcnt.go` (new file in blockpack root)
-
-```go
-// Package blockpack — vcnt.go exposes the valuecounts types and encoding
-// functions for tempo's block-builder, which writes standalone .vcnt files
-// to S3 after each block flush.
-package blockpack
-
-import "github.com/grafana/blockpack/internal/modules/valuecounts"
-
-// VCNTRecord is one value-count row: a (column, value) pair observed in Count
-// spans within the [TimeStart, TimeEnd] unix-seconds window.
-type VCNTRecord = valuecounts.Record
-
-// VCNTChunkDirEntry is one chunk directory entry returned by EncodeVCNTRecords.
-type VCNTChunkDirEntry = valuecounts.ChunkDirEntry
-
-// SortVCNTRecords sorts records into the canonical VCNT order required by
-// EncodeVCNTRecords: (ColumnName ASC, TimeStart ASC, Value ASC, Count ASC).
-func SortVCNTRecords(records []VCNTRecord) {
-    valuecounts.Sort(records)
-}
-
-// EncodeVCNTRecords encodes a pre-sorted slice of VCNTRecords into snappy-
-// compressed chunk bytes. records MUST be sorted by SortVCNTRecords first.
-// perChunk <= 0 uses the package default (~512). Returns the raw chunk bytes
-// and the chunk directory; both are needed to write and later query the file.
-func EncodeVCNTRecords(records []VCNTRecord, perChunk int) ([]byte, []VCNTChunkDirEntry) {
-    return valuecounts.EncodeRecords(records, perChunk)
-}
-
-// VCNTColHash returns the per-column directory hash for the .vcnt object key:
-//   <prefix>/<tenant>/unique_values/<col_hash>/L0-<id>.vcnt
-func VCNTColHash(colName string) string {
-    return valuecounts.ColHash(colName)
-}
-
-// VCNTFilename returns a .vcnt filename for the given compaction level and ID.
-// Use level=0 for freshly-written L0 files. Use valuecounts.NewID() for the id.
-func VCNTFilename(level int, id string) string {
-    return valuecounts.FormatFilename(level, id)
-}
-
-// VCNTNewID returns a new unique ID suitable for use in VCNTFilename.
-func VCNTNewID() string {
-    return valuecounts.NewID()
-}
-```
-
-After adding this file, run `go mod vendor` from the tempo root to sync it into
-`vendor/github.com/grafana/blockpack/vcnt.go` and add the package to
-`vendor/modules.txt`.
-
-#### 2b. `tempodb/encoding/vblockpack/vcntwriter.go` (new file in tempo)
-
-This file accumulates per-column value counts during block ingest and writes
-the resulting `.vcnt` file to S3 after `writer.Flush()`.
-
-```go
-package vblockpack
-
-// vcntwriter.go — per-block value-count accumulator and writer (standalone .vcnt files).
-//
-// During ingest (CreateBlock), a vcntAccumulator collects the distinct string values
-// seen for each column across all traces in the block, within the block's time window.
-// After writer.Flush(), the accumulated records are encoded and written as a standalone
-// .vcnt file to object storage under:
-//   <prefix>/<tenant>/unique_values/<col_hash>/L0-<id>.vcnt
-
-import (
-    "context"
-    "fmt"
-    "strings"
-
-    "github.com/grafana/blockpack"
-    "github.com/grafana/tempo/tempodb/backend"
-)
-
-// vcntSink is process-level — same singleton pattern as valueIndexSink.
-// Set by ConfigureVCNT (not yet wired); guarded by valueIndexSinkMu (re-use).
-// For now this is a placeholder; the actual singleton wiring is Task 2c.
-
-// vcntAccumulator accumulates (column, value, timeStart, timeEnd, count) tuples
-// across all spans in one block. Columns are limited to string-valued span and
-// resource attributes; identity columns (trace:id, span:id, span:parent_id)
-// are excluded (high cardinality, no tag-autocomplete value).
-type vcntAccumulator struct {
-    // counts maps column → value → count.
-    counts map[string]map[string]int64
-    // timeStart and timeEnd are unix seconds for the block's time window.
-    // They are set from the block meta on first use.
-    timeStart uint64
-    timeEnd   uint64
-}
-
-func newVCNTAccumulator(timeStartSec, timeEndSec uint64) *vcntAccumulator {
-    return &vcntAccumulator{
-        counts:    make(map[string]map[string]int64),
-        timeStart: timeStartSec,
-        timeEnd:   timeEndSec,
-    }
-}
-
-// Add records a (column, value) observation. value must be the string
-// representation of the attribute value. column is the blockpack column name
-// (e.g. "span.http.method", "resource.service.name").
-//
-// Identity and high-cardinality columns are filtered here:
-//   - "trace:id", "span:id", "span:parent_id", "span:parent_span_id" — excluded
-//   - "span:start", "span:duration", "__embedding__" — excluded (numeric/binary)
-//
-// Value is truncated at 256 bytes to avoid unbounded memory use.
-func (a *vcntAccumulator) Add(column, value string) {
-    if isExcludedVCNTColumn(column) {
-        return
-    }
-    if len(value) > 256 {
-        value = value[:256]
-    }
-    if a.counts[column] == nil {
-        a.counts[column] = make(map[string]int64)
-    }
-    a.counts[column][value]++
-}
-
-// Records converts the accumulator into a sorted []blockpack.VCNTRecord slice,
-// ready for EncodeVCNTRecords. The caller must not use the accumulator after
-// calling Records.
-func (a *vcntAccumulator) Records() []blockpack.VCNTRecord {
-    total := 0
-    for _, vals := range a.counts {
-        total += len(vals)
-    }
-    if total == 0 {
-        return nil
-    }
-    recs := make([]blockpack.VCNTRecord, 0, total)
-    for col, vals := range a.counts {
-        for val, cnt := range vals {
-            recs = append(recs, blockpack.VCNTRecord{
-                ColumnName: col,
-                Value:      []byte(val),
-                TimeStart:  a.timeStart,
-                TimeEnd:    a.timeEnd,
-                Count:      cnt,
-            })
-        }
-    }
-    blockpack.SortVCNTRecords(recs)
-    return recs
-}
-
-// isExcludedVCNTColumn returns true for columns that should NOT be indexed in
-// the value-count file: identity, numeric/binary, and embedding columns.
-func isExcludedVCNTColumn(col string) bool {
-    switch col {
-    case "trace:id", "span:id", "span:parent_id", "span:parent_span_id",
-        "span:start", "span:duration", "__embedding__",
-        "span:status", "span:kind": // numeric
-        return true
-    }
-    // Exclude any column that starts with "__" (internal blockpack columns).
-    return strings.HasPrefix(col, "__")
-}
-
-// writeVCNTFile encodes the accumulator's records and writes one .vcnt file per
-// column group to object storage via the provided ObjectPutter.
-// Returns the number of columns written and any write error.
-// Best-effort: errors are returned but do not fail the block write.
-func writeVCNTFile(
-    ctx context.Context,
-    acc *vcntAccumulator,
-    store backend.Writer,
-    tenantID string,
-    prefix string,
-) (int, error) {
-    _ = ctx // reserved for future cancellation
-    recs := acc.Records()
-    if len(recs) == 0 {
-        return 0, nil
-    }
-
-    // Group records by column; each column gets its own .vcnt file.
-    // This mirrors how blockpack's WriteValueIndexL0 writes per-column files.
-    colRecs := groupVCNTRecordsByColumn(recs)
-    id := blockpack.VCNTNewID()
-    var firstErr error
-    written := 0
-    for col, colSlice := range colRecs {
-        data, _ := blockpack.EncodeVCNTRecords(colSlice, 0)
-        if len(data) == 0 {
-            continue
-        }
-        colHash := blockpack.VCNTColHash(col)
-        filename := blockpack.VCNTFilename(0, id)
-        // Object key: <prefix>/<tenant>/unique_values/<col_hash>/L0-<id>.vcnt
-        key := fmt.Sprintf("%s/%s/unique_values/%s/%s", prefix, tenantID, colHash, filename)
-        if err := store.Append(ctx, key, []byte(tenantID), data); err != nil {
-            if firstErr == nil {
-                firstErr = fmt.Errorf("vcnt write %s: %w", col, err)
-            }
-            continue
-        }
-        written++
-    }
-    return written, firstErr
-}
-
-// groupVCNTRecordsByColumn returns a map from column name to records for that column.
-// Input must already be sorted in canonical VCNT order (ColumnName ascending).
-func groupVCNTRecordsByColumn(recs []blockpack.VCNTRecord) map[string][]blockpack.VCNTRecord {
-    out := make(map[string][]blockpack.VCNTRecord)
-    for i := range recs {
-        col := recs[i].ColumnName
-        out[col] = append(out[col], recs[i])
-    }
-    return out
-}
-```
-
-**Note:** The `writeVCNTFile` function uses `store backend.Writer` as a placeholder.
-The actual storage mechanism (direct S3 minio put, same as `s3ObjectPutter`) needs
-to be wired in a follow-up step once the singleton pattern is decided. The key
-object-path format is fully determined above.
-
-#### 2c. Wiring VCNT accumulation in `create.go`
-
-The block-builder's `CreateBlock` function iterates over traces and calls
-`writer.AddTempoTrace(tr)`. To accumulate value counts, the loop needs to extract
-span attributes from each `tempopb.Trace` and call `acc.Add(col, val)`.
-
-**Problem:** `writer.AddTempoTrace(tr)` consumes a `*tempopb.Trace`. Tempo's
-`tempopb.Trace` is a protobuf type with `ResourceSpans[].Resource.Attributes` and
-`ResourceSpans[].ScopeSpans[].Spans[].Attributes`. These are accessible before
-the trace is handed off to the blockpack writer.
-
-Changes to `CreateBlock` loop body:
-
-```go
-// After: id, tr, nextErr := i.Next(ctx)
-// Before: writer.AddTempoTrace(tr)
-
-if tr != nil && acc != nil {
-    accumulateVCNTFromTrace(acc, tr)
-}
-```
-
-New helper function `accumulateVCNTFromTrace` in `vcntwriter.go`:
-
-```go
-// accumulateVCNTFromTrace adds all string-valued span and resource attributes
-// from a tempopb.Trace to the VCNT accumulator.
-func accumulateVCNTFromTrace(acc *vcntAccumulator, tr *tempopb.Trace) {
-    for _, rs := range tr.ResourceSpans {
-        // Resource attributes → "resource.<key>" columns.
-        if rs.Resource != nil {
-            for _, kv := range rs.Resource.Attributes {
-                if kv.Value != nil {
-                    if sv, ok := kv.Value.Value.(*v1_common.AnyValue_StringValue); ok {
-                        acc.Add("resource."+kv.Key, sv.StringValue)
-                    }
-                }
-            }
-        }
-        for _, ss := range rs.ScopeSpans {
-            for _, span := range ss.Spans {
-                // Span attributes → "span.<key>" columns.
-                for _, kv := range span.Attributes {
-                    if kv.Value != nil {
-                        if sv, ok := kv.Value.Value.(*v1_common.AnyValue_StringValue); ok {
-                            acc.Add("span."+kv.Key, sv.StringValue)
-                        }
-                    }
-                }
-                // Intrinsic string columns — add selectively.
-                if span.Name != "" {
-                    acc.Add("span:name", span.Name)
-                }
-            }
-        }
-    }
-}
-```
-
-Required imports in `create.go` or `vcntwriter.go`:
-
-- `tempopb "github.com/grafana/tempo/pkg/tempopb/trace/v1"` — check exact import path
-- `v1_common "go.opentelemetry.io/proto/otlp/common/v1"` — for `AnyValue_StringValue`
-
-#### 2d. `vendor/modules.txt` update
-
-After adding `vcnt.go` to `../blockpack`, run:
-
-```bash
-cd /home/mdurham/source/blockpack_collection/tempo && go mod vendor
-```
-
-This adds `github.com/grafana/blockpack` (with the new `VCNTRecord`, `VCNTColHash`,
-etc. symbols) to the vendor tree and updates `modules.txt`.
-
-### What is NOT in scope for Task 2
-
-- **Querier-side `.vcnt` reader** — reading `.vcnt` files for tag autocomplete is a
-  separate feature. The writer side (accumulate + write) is Task 2's deliverable.
-- **VCNT compaction** — merging L0 `.vcnt` files into L1/L2 is also separate.
-- **Wiring the S3 singleton for VCNT** — `writeVCNTFile` has a backend.Writer
-  placeholder. The actual singleton (`ConfigureVCNT`) parallels `ConfigureValueIndex`
-  and can be added in the same PR or a follow-up. Task 2 is complete when the
-  accumulation logic and encoding are wired and the write call is in place.
-
-### Tests for Task 2
-
-New file: `tempodb/encoding/vblockpack/vcntwriter_test.go`
-
-```go
-func TestVCNTAccumulator_Basic(t *testing.T) {
-    // Add known (column, value) pairs, call Records(), assert sorted output.
-}
-
-func TestVCNTAccumulator_ExcludesIdentityColumns(t *testing.T) {
-    // Add "trace:id", "span:id" — Records() should return nil.
-}
-
-func TestVCNTAccumulator_TruncatesLongValues(t *testing.T) {
-    // Add a 300-byte value — assert stored length is 256.
-}
-
-func TestGroupVCNTRecordsByColumn(t *testing.T) {
-    // Three records for two columns — assert correct grouping.
-}
-
-func TestIsExcludedVCNTColumn(t *testing.T) {
-    // Table-driven: known-excluded and known-included columns.
-}
-```
-
-### Acceptance
-
-- `go build ./tempodb/encoding/vblockpack/...` passes
-- `go test ./tempodb/encoding/vblockpack/...` passes
-- `go build github.com/grafana/blockpack` (vendor) passes (new `vcnt.go` compiles)
-- `vcntwriter_test.go` passes with `go test -v -run TestVCNT`
-
----
-
-## Task 3 (Low Priority): Cubes
-
-### Decision: File a GitHub issue, skip implementation
-
-**Rationale:**
-
-The `cube` package lives at
-`blockpack/internal/modules/cube/` and is **not** exported in blockpack's public
-API. To use it from tempo, blockpack would need to:
-
-1. Export `Accumulator`, `Definition`, `SpanValues`, `ObjectPutter`, and
-   `FlushTo` in a new `cube.go` root-level wrapper file (analogous to Task 2a's
-   `vcnt.go`).
-2. Tempo needs a `SpanValues` adapter over `*tempopb.Span` + `*resource.Resource`.
-3. Tempo needs per-minute accumulator rotation in `CreateBlock`'s ingest loop.
-4. Tempo needs a `cube.Registry` startup load and per-tenant cube definition cache.
-5. The querier needs `cube.CreationTrigger.TryCreate()` wired into the search path.
-
-This is 5 independent changes across blockpack and tempo, each requiring test
-coverage. Total estimated effort: 3–5 days.
-
-### Action
-
-File a GitHub issue in the blockpack repo titled:
-**"Export cube package for tempo block-builder integration"**
-
-Issue body should contain:
-
-- Link to `internal/modules/cube/accumulator.go` — the `SpanValues` interface
-- The accumulator usage pattern from brainstorm.md Problem 3
-- Required public API surface: `Accumulator`, `Definition`, `SpanValues`,
-  `ObjectPutter`, `Registry`, `RegistryEntry`, `CreationTrigger`
-- Estimated work: small blockpack change (export wrapper) + medium tempo work
-- Dependency: VCNT (Task 2) should be shipped first as the simpler precedent
-
-**No code changes for Task 3.**
-
----
-
-## File Change Summary
-
-| File | Change | Task |
-|------|--------|------|
-| `tempodb/encoding/vblockpack/create.go` | Add warn logging for seek/reader errors | 1a |
-| `tempodb/encoding/vblockpack/compactor.go` | Add warn logging for reader error (compaction) | 1b |
-| `tempodb/encoding/vblockpack/valueindex.go` | Replace `slog.Warn` with `level.Warn`; add info log | 1c |
-| `../blockpack/vcnt.go` | New file: public re-export of valuecounts types | 2a |
-| `tempodb/encoding/vblockpack/vcntwriter.go` | New file: accumulator + write functions | 2b |
-| `tempodb/encoding/vblockpack/create.go` | Wire VCNT accumulation in ingest loop | 2c |
-| `tempodb/encoding/vblockpack/vcntwriter_test.go` | New file: unit tests | 2 |
-| `vendor/github.com/grafana/blockpack/vcnt.go` | `go mod vendor` syncs this automatically | 2a |
-
----
-
-## Execution Order
-
-```
-Task 1a → Task 1b → Task 1c → build+test
-Task 2a (blockpack vcnt.go) → go mod vendor → Task 2b (vcntwriter.go) → Task 2c (wire in create.go) → build+test
-Task 3: file GitHub issue only
-```
-
-Task 1 and Task 2 are independent — Task 2 does not depend on Task 1.
-
----
-
-## Risks
-
-| Risk | Severity | Mitigation |
-|------|----------|------------|
-| `internal` visibility prevents `valuecounts` import | High (blocks Task 2) | Task 2a adds blockpack re-export wrapper; this is the approved approach |
-| `go mod vendor` picks up unrelated blockpack changes | Low | Review diff after vendor; only `vcnt.go` should appear |
-| VCNT accumulation adds latency to `CreateBlock` hot path | Medium | Accumulation is O(spans × attrs); add `go test -bench=BenchmarkCreateBlock` before landing |
-| VCNT accumulation memory use for large blocks | Medium | 256-byte value truncation + column exclusion list bounds it; document expected memory |
-| `slog.Warn` → `level.Warn` changes log format | None (improvement) | Confirmed Tempo uses go-kit/log throughout; `util_log.Logger` is the right target |
-| `writeVCNTFile` uses placeholder backend.Writer | Medium | Mark with TODO; do not wire the actual S3 call until the singleton is ready |
-
----
-
-## Open Questions
-
-1. **VCNT object key format** — the brainstorm states
-   `<tenant>/indexes/unique_values/<colHash>/L0-<id>.vcnt`. Confirm with the
-   blockpack `valuecounts/filename.go` `FormatFilename` + the value-index prefix
-   convention. The plan above uses
-   `<prefix>/<tenant>/unique_values/<colHash>/L0-<id>.vcnt` — verify this matches
-   the querier's expected key format before wiring the write call.
-
-2. **Protobuf import path for span attributes** — `tempopb.Trace` vs
-   `v1.ResourceSpans` path needs to be confirmed against the actual import in
-   `create.go`. Do not assume; read the imports before writing `accumulateVCNTFromTrace`.
-
-3. **VCNT write sink** — should `writeVCNTFile` use the same `s3ObjectPutter` as
-   `valueIndexSink`, or should it reuse the `backend.Writer` passed to
-   `CreateBlock`? The latter avoids a second S3 client but requires confirming the
-   backend.Writer interface supports the required object key format. Resolve before
-   landing Task 2c.
+Both `data` (a plain Go map) and `stats` (plain int/int64 fields with `+=`)
+have zero synchronization. Concurrent `Add`/`RecordFileIO` calls from
+parallel leaf goroutines would race on the map (a real `fatal error:
+concurrent map writes` risk, not just a benign data race) and silently lose
+counter updates. **A mutex must be added to `SliceValueIndexSource` before
+any leaf-loop parallelization lands** (Task 2 below is a hard prerequisite
+for Tasks 4-5).
+
+`executor/` is a **mature spec-driven module** — it has `SPECS.md`,
+`NOTES.md`, `TESTS.md`, and `BENCHMARKS.md` (confirmed via
+`internal/modules/executor/*.md`). The mutex fix must go through the full
+spec-doc workflow for this module (see "Spec-Driven Module Updates" below),
+not just a NOTES.md entry.
+
+## Spec-Driven Modules in Scope
+
+| Module | Docs present | Treatment |
+|---|---|---|
+| `internal/modules/executor/` | `SPECS.md`, `NOTES.md`, `TESTS.md`, `BENCHMARKS.md` (mature) | Full spec-doc update required for the `SliceValueIndexSource` mutex change |
+| `internal/modules/vibuilder/` | `NOTES.md` only (brand-new, added 2026-06-30) | NOTES.md dated entry only — see "Open Question: vibuilder doc maturity" below |
+
+**Do not read SPECS.md/NOTES.md/TESTS.md/BENCHMARKS.md directly** — per this
+repo's CLAUDE.md, spawn/consult the persistent `spec-oracle` agent (or use
+`blockpack_search_modules` / `blockpack_lookup_requirement`) for all
+spec/note/test/benchmark reads and writes during execution. This plan's IDs
+(SPEC-/NOTE-/TEST- numbers) below are **placeholders based on the highest
+existing IDs found in this planning pass** (`NOTE-VI-047` was the highest
+global `NOTE-VI-*` ID found repo-wide at plan time) — the coder MUST re-verify
+the next free ID via the spec-oracle/MCP tool immediately before writing any
+spec entry, since other concurrent work may have advanced the sequence.
+
+## Open Question: vibuilder doc maturity (flagged, not resolved)
+
+The task brief asks whether `vibuilder`'s sibling modules' convention implies
+it should grow a full `SPECS.md`/`TESTS.md`/`BENCHMARKS.md` suite. Findings:
+
+- `internal/modules/valueindexcompactor/` and
+  `internal/modules/valuecountscompactor/` (standalone, independently
+  deployable compactor services) both have the **full four-doc suite**.
+- `internal/modules/valueindex/` — vibuilder's closest architectural sibling
+  and direct dependency (predicates, `QueryBucketFiles`, `IndexFileCache`) —
+  has **only `NOTES.md`**, same as vibuilder. `internal/modules/valueindex/`
+  does NOT have SPECS.md/TESTS.md/BENCHMARKS.md either (confirmed via glob).
+
+This is a mixed convention: standalone compactor *services* get the full
+suite; internal orchestration/library packages consumed by the querier
+(`valueindex`, `vibuilder`) currently get NOTES.md only. Given `vibuilder`'s
+closest sibling (`valueindex`) has not graduated to a full suite, **this plan
+does not add SPECS.md/TESTS.md/BENCHMARKS.md to vibuilder** — it adds a dated
+NOTES.md entry only, consistent with `valueindex`'s current maturity level.
+**This remains an open question for a human/maintainer decision, not an
+assumption to build on long-term** — if `valueindex` graduates to a full
+suite in the future, `vibuilder` likely should too.
+
+## Files to Modify
+
+1. `internal/modules/executor/metrics_trace.go` — add `sync.Mutex` to
+   `SliceValueIndexSource`; guard `Add`, `RecordFileIO`, `Stats`,
+   `LookupResults`, `AllResults`.
+2. `internal/modules/executor/metrics_trace_vi_test.go` — add a
+   `-race`-covered concurrent-access test.
+3. `internal/modules/executor/SPECS.md`, `NOTES.md`, `TESTS.md` — spec-doc
+   updates for the concurrency-safety invariant (via spec-oracle).
+4. `internal/modules/vibuilder/builder.go` — bounded-concurrency rewrite of
+   `downloadAll`, `BuildSource`'s leaf loop, `lookupColumnAll`'s bucket loop;
+   new concurrency-bound constants; new imports
+   (`golang.org/x/sync/errgroup`, `time` only if needed for tests).
+5. `internal/modules/vibuilder/builder_test.go` — regression/scaling test
+   (fake latency store), concurrency-preservation tests for leaf loop and
+   bucket loop ordering, updated/added `-race` coverage.
+6. `internal/modules/vibuilder/NOTES.md` — new dated entry documenting the
+   concurrency fix and chosen bounds.
+
+No new files are required.
+
+## Implementation Steps
+
+### Phase 1: Tests First (TDD)
+
+**Step 1.1: Read current `SliceValueIndexSource` and `builder_test.go` fakes (already done in planning; coder re-confirms)**
+- [ ] Re-open `internal/modules/executor/metrics_trace.go:1207-1298` and
+  `internal/modules/vibuilder/builder_test.go` to confirm line numbers
+  haven't shifted since this plan was written.
+
+**Step 1.2: Write the concurrency-safety race test for `SliceValueIndexSource` FIRST**
+- [ ] In `internal/modules/executor/metrics_trace_vi_test.go`, add
+  `TestSliceValueIndexSource_ConcurrentAddAndRecordFileIO_NoRace`:
+  spawn ~50 goroutines, each calling `src.Add(col, colType, results)` and
+  `src.RecordFileIO(1, 100)` on a shared `*SliceValueIndexSource` (mix of a
+  few distinct column names so map-write contention is exercised, not just
+  counter contention), then call `src.Stats()` and `src.AllResults()` after
+  `wg.Wait()` and assert the totals equal `numGoroutines * perGoroutineAdds`.
+- [ ] Run `go test -race -run TestSliceValueIndexSource_ConcurrentAddAndRecordFileIO_NoRace ./internal/modules/executor/...`
+  and confirm it **fails** (`fatal error: concurrent map writes` or a race
+  report) against the current unmodified code. This is the required
+  "verify tests fail first" step — if it doesn't fail, the test isn't
+  actually exercising concurrent access; fix the test before proceeding.
+
+**Step 1.3: Write the `downloadAll` serial-timing regression test FIRST**
+- [ ] In `internal/modules/vibuilder/builder_test.go`, extend `fakeStore`
+  with an injected-latency wrapper (do not modify `fakeStore` itself if
+  other tests share it — add a new `latencyStore` type wrapping a
+  `*fakeStore`):
+  ```go
+  type latencyStore struct {
+      inner   *fakeStore
+      latency time.Duration
+  }
+  func (s *latencyStore) Size(key string) (int64, error) {
+      time.Sleep(s.latency)
+      return s.inner.Size(key)
+  }
+  func (s *latencyStore) ReadAt(key string, p []byte, off int64) (int, error) {
+      time.Sleep(s.latency)
+      return s.inner.ReadAt(key, p, off)
+  }
+  ```
+- [ ] Add `TestDownloadAll_BoundedConcurrencyScaling`: build N=30 small
+  value-index-shaped byte slices (content doesn't need to parse — `downloadAll`
+  only reads bytes, it doesn't call `valueindex.QueryBucketFiles`), latency
+  15ms per call (2 calls/key = 30ms/key serial). Call `downloadAll(store,
+  keys)`, measure wall-clock via `time.Now()`/`time.Since`. Assert:
+  - `elapsed < 400ms` (generous upper bound: with `downloadConcurrency=24`,
+    expected ~2 batches × 30ms = 60ms; 400ms gives large CI slack while still
+    being far below the ~900ms serial cost).
+  - Also assert `err == nil`, `len(files) == 30`, `totalBytes` matches
+    expected sum — this doubles as a correctness check, not just timing.
+- [ ] Run this test against the **current, unmodified** `downloadAll`.
+  Confirm it **fails** (serial cost ≈ 30 × 30ms = 900ms, exceeding the 400ms
+  bound). Record the actual observed serial duration in the PR description
+  later as evidence.
+
+**Step 1.4: Write ordering/correctness tests for the concurrent rewrites FIRST**
+
+These assert behavior that only matters once the loops are parallel — write
+them now so Phase 2 has a clear target, and confirm they compile (they will
+fail to compile or fail at runtime against the pre-fix serial code only in
+the sense that the *behavior* they check doesn't yet risk breaking — these
+tests mostly need to pass both before and after the fix since they test
+*semantics*, not timing; write them now so no invariant gets lost during the
+rewrite):
+
+- [ ] `TestDownloadAll_PreservesNotFoundSkipSemantics` (if not already
+  covered by existing `TestBuildSource_NotFoundFileIsSkippedNotFailed` /
+  `TestBuildSource_AllFilesNotFoundIsCoveredEmpty` at the `BuildSource`
+  level — check first; add a `downloadAll`-level unit test only if those
+  don't already pin the behavior at this lower layer). Verify a 404 among
+  several keys is dropped from the result while non-404 keys' bytes/order
+  are otherwise preserved.
+- [ ] `TestDownloadAll_NonNotFoundErrorAbortsAndReturnsError` — same as
+  `TestBuildSource_NonNotFoundDownloadErrorStillFails` but exercised
+  directly against `downloadAll` with several keys where one (not
+  necessarily the first) errors with a non-404 error; assert `downloadAll`
+  returns a non-nil error and does not partially apply.
+- [ ] `TestDownloadAll_LegitimatelyEmptyFileIsKeptDistinctFromSkippedFile` —
+  **important edge case found during planning**: `readWhole` returns
+  `(nil, nil)` both for a zero-byte object (`store.Size(key) <= 0`) AND
+  conceptually could be confused with a "skipped" slot if the concurrent
+  rewrite uses a naive `[]byte` sentinel. Build a `fakeStore` with one
+  legitimately-zero-length file and one 404 file among several keys; assert
+  `len(files)` returned by `downloadAll` equals `(number of keys) - (number
+  of 404s)`, i.e., the empty-but-present file counts as a slot and the 404
+  does not. This test only passes if the rewrite uses an explicit
+  `keep bool` (or equivalent) per-slot marker rather than a `nil`-means-skip
+  convention (see Task 4 design below).
+- [ ] `TestLookupColumnAll_PreservesFirstTypeOrdering` — construct a column
+  with files present under two different type buckets (e.g. both
+  `ColumnTypeString` and `ColumnTypeInt64`) such that, under the *original*
+  serial iteration order (`allTypeBuckets()`: String, Int64, Uint64,
+  Float64, Bool, Bytes, UUID), `ColumnTypeString` is the first bucket with
+  results. Assert the parallel rewrite still returns `firstType ==
+  ColumnTypeString` deterministically (run the test with `-count=20` in CI
+  or locally to catch nondeterminism from a naive "first goroutine to
+  finish wins" implementation).
+
+**Step 1.5: Run `go test ./internal/modules/vibuilder/... ./internal/modules/executor/...` and confirm the new tests fail/compile-fail as expected, old tests still pass**
+- [ ] `go test ./internal/modules/vibuilder/...` — new timing test fails,
+  everything else passes.
+- [ ] `go test -race ./internal/modules/executor/...` — new race test fails
+  (or panics), everything else passes.
+
+### Phase 2: Implementation
+
+**Step 2.1: Add mutex to `SliceValueIndexSource` (prerequisite for Tasks 4-5)**
+- [ ] In `internal/modules/executor/metrics_trace.go`, add a `sync.Mutex`
+  field to `SliceValueIndexSource` (the `sync` package is already imported
+  in this file for `compositeKeyScratchPool`, so no new import needed):
+  ```go
+  type SliceValueIndexSource struct {
+      mu   sync.Mutex
+      data map[string]map[modules_shared.ColumnType][]VILookupResult
+      stats ValueIndexBuildStats
+  }
+  ```
+- [ ] Guard `RecordFileIO` with `s.mu.Lock(); defer s.mu.Unlock()`.
+- [ ] Guard `Add` with `s.mu.Lock(); defer s.mu.Unlock()`.
+- [ ] Guard `Stats` (reads `s.stats` and iterates `s.data`) with
+  `s.mu.Lock(); defer s.mu.Unlock()`.
+- [ ] Guard `LookupResults` (reads `s.data`) with the same pattern.
+- [ ] Guard `AllResults` (reads `s.data`) with the same pattern.
+- [ ] Keep `NewSliceValueIndexSource` unchanged (zero-value mutex is ready
+  to use).
+- [ ] Run `go vet ./internal/modules/executor/...` to confirm no
+  copy-of-mutex issues (the type is always used via pointer receiver
+  already, per the existing method set — confirm no code anywhere copies a
+  `SliceValueIndexSource` by value; `grep -rn "SliceValueIndexSource{" .`
+  outside the constructor).
+
+**Step 2.2: Verify the race test now passes**
+- [ ] `go test -race -run TestSliceValueIndexSource_ConcurrentAddAndRecordFileIO_NoRace ./internal/modules/executor/...`
+  — must pass cleanly with no race report.
+- [ ] `go test -race ./internal/modules/executor/...` — full package race
+  run, confirm no new races introduced elsewhere.
+
+**Step 2.3: Add concurrency-bound constants to `builder.go`**
+- [ ] Near the top of `internal/modules/vibuilder/builder.go` (after the
+  `ErrFileNotFound` var block), add:
+  ```go
+  // downloadConcurrency bounds how many value-index files downloadAll fetches
+  // in parallel for one column's file set (issue #<TBD — file/find the
+  // tracking issue number before landing>). Chosen conservatively within the
+  // brainstormed 16-32 range to bound peak S3/minio connections per column
+  // download while still cutting the ~465-serial-round-trip cost by an order
+  // of magnitude.
+  const downloadConcurrency = 24
+
+  // leafConcurrency bounds how many predicate leaf columns BuildSource
+  // downloads in parallel. Kept smaller than downloadConcurrency because each
+  // leaf's own downloadAll can itself fan out up to downloadConcurrency
+  // downloads — worst case simultaneous connections for one query is
+  // leafConcurrency * downloadConcurrency, so this stays conservative
+  // (multi-leaf queries are the less common case; 1-2 leaves is typical).
+  const leafConcurrency = 4
+  ```
+  (`lookupColumnAll`'s bucket loop has a small, fixed 7-entry bucket list —
+  bound it with `len(buckets)`, i.e. effectively unbounded within that small
+  set; no separate constant needed, see Step 2.6.)
+- [ ] Add the import: `"golang.org/x/sync/errgroup"` (already a module
+  dependency per `go.mod:22`, no `go mod tidy` needed).
+
+**Step 2.4: Rewrite `downloadAll` with bounded concurrency, preserving order and skip/abort semantics**
+- [ ] Replace the body of `downloadAll` (`builder.go:412-440`) with:
+  ```go
+  func downloadAll(store FileStore, keys []string) ([][]byte, int64, error) {
+      if len(keys) == 0 {
+          return nil, 0, nil
+      }
+      type dlSlot struct {
+          data []byte
+          keep bool // false for a skipped (404) key; zero-value default
+      }
+      slots := make([]dlSlot, len(keys))
+      g, gctx := errgroup.WithContext(context.Background())
+      g.SetLimit(downloadConcurrency)
+      for i, key := range keys {
+          i, key := i, key
+          g.Go(func() error {
+              if gctx.Err() != nil {
+                  // Another key already hit a real (non-404) error; do not
+                  // start new work, but do not report a spurious error either
+                  // — the goroutine that found the real error reports it.
+                  return nil
+              }
+              data, err := readWhole(store, key)
+              if err != nil {
+                  if errors.Is(err, ErrFileNotFound) {
+                      return nil // skip: slots[i] stays keep=false
+                  }
+                  return fmt.Errorf("vibuilder: download %s: %w", key, err)
+              }
+              slots[i] = dlSlot{data: data, keep: true}
+              return nil
+          })
+      }
+      if err := g.Wait(); err != nil {
+          return nil, 0, err
+      }
+      files := make([][]byte, 0, len(keys))
+      var totalBytes int64
+      for _, s := range slots {
+          if !s.keep {
+              continue
+          }
+          files = append(files, s.data)
+          totalBytes += int64(len(s.data))
+      }
+      return files, totalBytes, nil
+  }
+  ```
+  **Design notes for the coder:**
+  - `dlSlot.keep` (not `data != nil`) is the skip/keep discriminator — this
+    is required because `readWhole` legitimately returns `(nil, nil)` for a
+    zero-byte object (`builder.go:450-452`), which must still be counted as
+    a present (empty) file, distinct from a 404-skipped key. Using `data !=
+    nil` as the sentinel would silently drop legitimately-empty files —
+    this was caught during planning (see Step 1.4's dedicated test) and
+    must not regress.
+  - `errgroup.WithContext` gives best-effort early-exit: once a real error
+    is found, goroutines not yet scheduled by `SetLimit`'s semaphore skip
+    their work via the `gctx.Err() != nil` check. Goroutines already
+    in-flight when the error occurs still complete their (wasted) I/O —
+    this is an acceptable, bounded cost (at most `downloadConcurrency`
+    extra in-flight calls), not a correctness issue, since `FileStore.Size`/
+    `ReadAt` have no context parameter to cancel the underlying I/O itself
+    (changing that interface is explicitly out of scope — see "Out of
+    Scope" below).
+  - The reduction loop after `g.Wait()` runs single-threaded (no goroutines
+    active), so it is race-free by construction — no atomics needed for
+    `totalBytes`.
+
+**Step 2.5: Rewrite `BuildSource`'s leaf loop with bounded concurrency**
+- [ ] Replace the leaf loop in `BuildSource` (`builder.go:115-137`). Keep
+  the fast, non-I/O `buildPredicate` call synchronous (it's pure CPU, no
+  benefit to parallelizing, and keeping it serial simplifies the "which
+  leaves are unindexable" bookkeeping):
+  ```go
+  leaves := collectLeaves(preds.Nodes)
+  type leafWork struct {
+      col     string
+      colType modules_shared.ColumnType
+      pred    valueindex.Predicate
+  }
+  var work []leafWork
+  for i := range leaves {
+      pred, colType, ok := buildPredicate(&leaves[i])
+      if !ok {
+          continue
+      }
+      work = append(work, leafWork{col: leaves[i].col, colType: colType, pred: pred})
+  }
+  if len(work) > 0 {
+      g, gctx := errgroup.WithContext(ctx)
+      g.SetLimit(leafConcurrency)
+      for _, w := range work {
+          w := w
+          g.Go(func() error {
+              results, filesRead, bytesRead, err := lookupColumn(gctx, disc, store, w.col, w.colType, w.pred, timeRange)
+              if err != nil {
+                  return err
+              }
+              // Record the download I/O for this leaf so the querier can report
+              // it on its OTel span (issue #465); a covered-but-empty column
+              // still counts the bytes of any files we read deciding it was
+              // empty. src is now mutex-protected (Task 2.1) — safe from
+              // concurrent leaves.
+              src.RecordFileIO(filesRead, bytesRead)
+              // Add even when empty: a covered-but-empty column is coverage,
+              // not fallback (NOTE-VI-033).
+              src.Add(w.col, w.colType, results)
+              return nil
+          })
+      }
+      if err := g.Wait(); err != nil {
+          return nil, false, err
+      }
+      added = true
+  }
+  ```
+  - Note `lookupColumn` is called with `gctx` (the errgroup's derived
+    context) instead of the original `ctx` — this lets `disc.FilesForTimeRange`
+    (which already accepts a `context.Context`) observe cancellation once a
+    sibling leaf fails, giving real (not just best-effort) early-exit for
+    the discovery half of a not-yet-started leaf. This is a strict
+    improvement over `downloadAll`'s best-effort-only cancellation, since
+    `FileDiscoverer.FilesForTimeRange` already takes a context (no interface
+    change needed here).
+  - Delete the old sequential `for i := range leaves { ... }` block and the
+    standalone `added := false` / `added = true` line that preceded it if
+    now redundant — keep `added` declared once before this block, defaulting
+    `false`, exactly as today, just set from the new block.
+
+**Step 2.6: Rewrite `lookupColumnAll`'s bucket loop with bounded concurrency, preserving `firstType` determinism**
+- [ ] Replace the body of `lookupColumnAll` (`builder.go:356-395`):
+  ```go
+  func lookupColumnAll(
+      ctx context.Context,
+      disc FileDiscoverer,
+      store FileStore,
+      col string,
+      timeRange *[2]uint64,
+  ) ([]modules_executor.VILookupResult, modules_shared.ColumnType, int, int64, error) {
+      colHash := valueindex.ColHash(col)
+      buckets := allTypeBuckets()
+      type bucketResult struct {
+          results   []modules_executor.VILookupResult
+          filesRead int
+          bytesRead int64
+          hasResults bool
+      }
+      slots := make([]bucketResult, len(buckets))
+      g, gctx := errgroup.WithContext(ctx)
+      g.SetLimit(len(buckets)) // small fixed set (7); no separate constant needed
+      for i, colType := range buckets {
+          i, colType := i, colType
+          g.Go(func() error {
+              colTypeName := valueindex.ColTypeName(colType)
+              keys, err := disc.FilesForTimeRange(gctx, colHash, colTypeName, timeRange[0], timeRange[1])
+              if err != nil {
+                  return fmt.Errorf("vibuilder: discover-all %s: %w", col, err)
+              }
+              if len(keys) == 0 {
+                  return nil
+              }
+              files, bytesRead, err := downloadAll(store, keys)
+              if err != nil {
+                  return err
+              }
+              // A nil predicate matches every entry (Reader.Lookup treats nil as
+              // match-all), so the universe of indexed spans for this column is
+              // returned.
+              lrs, err := valueindex.QueryBucketFiles(nil, timeRange, files...)
+              if err != nil {
+                  return fmt.Errorf("vibuilder: query-all %s: %w", col, err)
+              }
+              slots[i] = bucketResult{
+                  results:    toVILookupResults(lrs),
+                  filesRead:  len(files),
+                  bytesRead:  bytesRead,
+                  hasResults: len(lrs) > 0,
+              }
+              return nil
+          })
+      }
+      if err := g.Wait(); err != nil {
+          return nil, 0, 0, 0, err
+      }
+      var all []modules_executor.VILookupResult
+      var firstType modules_shared.ColumnType
+      var totalFiles int
+      var totalBytes int64
+      firstSet := false
+      for i, s := range slots {
+          totalFiles += s.filesRead
+          totalBytes += s.bytesRead
+          if !s.hasResults {
+              continue
+          }
+          if !firstSet {
+              firstType = buckets[i] // deterministic: first bucket in allTypeBuckets() order with results, matching original serial semantics exactly
+              firstSet = true
+          }
+          all = append(all, s.results...)
+      }
+      return all, firstType, totalFiles, totalBytes, nil
+  }
+  ```
+  - **Critical semantic preserved:** `firstType` selection is based on
+    `buckets` iteration order (`i` index into the pre-sized `slots` array),
+    NOT on goroutine completion order — this is what
+    `TestLookupColumnAll_PreservesFirstTypeOrdering` (Step 1.4) pins.
+
+**Step 2.7: Update `lookupColumn`'s call sites for the new `gctx` threading (if any signature mismatch)**
+- [ ] Confirm `lookupColumn`'s signature (`builder.go:323-331`) already
+  accepts `ctx context.Context` as its first parameter — it does; no
+  signature change needed, only the caller (Step 2.5) now passes `gctx`
+  instead of the outer `ctx`.
+
+### Phase 3: Verification
+
+**Step 3.1: Run all new and existing tests**
+- [ ] `go test ./internal/modules/vibuilder/...` — all tests pass, including
+  the timing test (Step 1.3, now within bound) and ordering tests (Step 1.4).
+- [ ] `go test -race ./internal/modules/vibuilder/... ./internal/modules/executor/...`
+  — no race reports.
+- [ ] `go test -race -count=20 -run TestLookupColumnAll_PreservesFirstTypeOrdering ./internal/modules/vibuilder/...`
+  — repeat run to catch nondeterminism from the reduction logic.
+- [ ] Full existing `vibuilder` suite (`builder_test.go`'s pre-existing
+  tests: `TestBuildSource_SingleEqualityLeafResolves`,
+  `TestBuildSource_ANDTwoLeavesBothResolved`,
+  `TestBuildSource_NotFoundFileIsSkippedNotFailed`,
+  `TestBuildSource_NonNotFoundDownloadErrorStillFails`,
+  `TestBuildSource_StatsRecordFileIO`,
+  `TestBuildSource_StatsCountFilesEvenWhenEmpty`, etc.) must all still pass
+  unmodified — these pin the exact coverage/abort/skip contract this plan
+  must not regress.
+
+**Step 3.2: Code quality**
+- [ ] `make precommit` (from `blockpack/` root) — runs gofumpt, golines,
+  golangci-lint (gocritic, gocyclo, staticcheck, revive), betteralign,
+  nilaway, build, tests, deadcode, staticcheck. Must pass with zero
+  tolerance per this repo's CLAUDE.md.
+- [ ] Confirm cyclomatic complexity stays `< 30` for the rewritten
+  `downloadAll`, `BuildSource`, and `lookupColumnAll` (gocyclo is part of
+  `make precommit`; the errgroup rewrites are flatter than the original
+  serial loops, so complexity should stay the same or drop, but verify).
+- [ ] `blockpack_precommit_checklist` MCP tool as a secondary confirmation.
+
+**Step 3.3: Manual/log-level sanity check (optional, not blocking)**
+- [ ] If a local minio/S3-backed integration environment is available,
+  re-run the `builder_test.go` fake-store scaling test with a higher
+  latency (e.g. 80ms, matching the brainstorm's observed S3 round-trip
+  latency) and N=465 to sanity-check the projected wall-clock improvement
+  (~930 round trips × 80ms serial ≈ 74s → ~40 batches at
+  `downloadConcurrency=24` ≈ 3.2s). This is illustrative, not a required
+  CI test (465 × 80ms would make the *serial* baseline assertion too slow
+  for routine CI; keep the checked-in test at the smaller N=30/15ms scale
+  from Step 1.3).
+
+## Spec-Driven Verification Tests
+
+### Module: `internal/modules/executor/`
+
+**Source:** Code-read invariant (Investigation Finding above) — `SliceValueIndexSource` must be safe under concurrent `Add`/`RecordFileIO` for the vibuilder leaf-loop parallelization to be correct.
+
+| Invariant | Test to Verify | Test File |
+|---|---|---|
+| `Add`/`RecordFileIO` are safe for concurrent callers | `TestSliceValueIndexSource_ConcurrentAddAndRecordFileIO_NoRace` | `internal/modules/executor/metrics_trace_vi_test.go` |
+| `Stats()`/`AllResults()`/`LookupResults()` return correct totals after concurrent writes | Same test, assertions after `wg.Wait()` | same file |
+
+### Module: `internal/modules/vibuilder/`
+
+**Source:** NOTES.md invariants NOTE-VI-036 (coverage contract), NOTE-VI-039 (stats accumulate regardless of Add ordering), NOTE-VI-041 (404-skip vs abort-on-real-error).
+
+| Invariant | Test to Verify | Test File |
+|---|---|---|
+| A non-404 download error still aborts the whole build | `TestDownloadAll_NonNotFoundErrorAbortsAndReturnsError` (new, `downloadAll`-level) + existing `TestBuildSource_NonNotFoundDownloadErrorStillFails` (must still pass unmodified) | `builder_test.go` |
+| A 404 file is skipped, not a build failure | `TestDownloadAll_PreservesNotFoundSkipSemantics` (new, if not already pinned at this layer) + existing `TestBuildSource_NotFoundFileIsSkippedNotFailed` (must still pass unmodified) | `builder_test.go` |
+| A legitimately-empty (zero-byte) file is kept, not confused with a skipped 404 | `TestDownloadAll_LegitimatelyEmptyFileIsKeptDistinctFromSkippedFile` (new) | `builder_test.go` |
+| `lookupColumnAll`'s `firstType` matches the deterministic bucket-order semantics of the original serial loop | `TestLookupColumnAll_PreservesFirstTypeOrdering` (new) | `builder_test.go` |
+| Stats accumulate correctly regardless of leaf completion order (NOTE-VI-039) | Existing `TestBuildSource_StatsRecordFileIO`, `TestBuildSource_StatsCountFilesEvenWhenEmpty` (must still pass unmodified after leaf-loop parallelization) | `builder_test.go` |
+
+These tests MUST be written first (Phase 1) and MUST pass after implementation (Phase 2/3).
+
+## Spec-Driven Module Updates
+
+### Module: `internal/modules/executor/` (full suite: SPECS.md, NOTES.md, TESTS.md, BENCHMARKS.md)
+
+**Required updates (route through spec-oracle / MCP tools, do not hand-edit blind):**
+- [ ] Add a `SPECS.md` entry documenting the new invariant: "`SliceValueIndexSource`'s `Add`, `RecordFileIO`, `Stats`, `LookupResults`, and `AllResults` are safe for concurrent callers (mutex-protected)." Assign the next free `SPEC-` ID via `blockpack_lookup_requirement`/spec-oracle — do not invent one (highest ID observed in this planning pass in this file was `SPEC-005`, but re-verify).
+- [ ] Add a dated `NOTES.md` entry (next free `NOTE-VI-` ID, `NOTE-VI-048` as a placeholder pending re-verification — highest ID found repo-wide at plan time was `NOTE-VI-047`) explaining *why*: vibuilder's leaf-loop parallelization (this fix) requires the source to tolerate concurrent writers; document that the mutex adds negligible overhead relative to the I/O it guards.
+- [ ] Update `TESTS.md` with the new test's scenario/setup/assertions:
+  `TestSliceValueIndexSource_ConcurrentAddAndRecordFileIO_NoRace` — goroutine
+  count, what's asserted, why `-race` is required to catch a regression.
+- [ ] `BENCHMARKS.md`: no update needed — this is a correctness fix, not a
+  performance-sensitive hot path change at the `executor` layer (the mutex
+  is held only briefly per `Add`/`RecordFileIO` call, not per-span).
+
+### Module: `internal/modules/vibuilder/` (NOTES.md only, per the Open Question above)
+
+**Required updates:**
+- [ ] Add a new dated `NOTES.md` entry (`NOTE-VI-04X`, next free ID after the
+  executor one above — verify via spec-oracle so the two new entries don't
+  collide) titled something like "Bounded-concurrency downloads: `downloadAll`,
+  `BuildSource` leaves, `lookupColumnAll` buckets (tempo timeout incident)".
+  Content must cover:
+  - The root cause (serial downloads, ~930 round trips at `files=465`).
+  - The chosen bounds: `downloadConcurrency=24`, `leafConcurrency=4`, bucket
+    loop bounded by its fixed 7-entry set.
+  - Explicit confirmation that NOTE-VI-036/039/041's contracts (coverage
+    semantics, stats accumulation, 404-skip-vs-abort) are unchanged —
+    concurrency only changes I/O scheduling, not decision logic.
+  - The `SliceValueIndexSource` mutex prerequisite and a back-reference to
+    the `executor/NOTES.md` entry above.
+  - A note that `FileStore.Size`/`ReadAt` still lack context parameters
+    (Approach 2, out of scope here) so cancellation on error is best-effort
+    for in-flight downloads, exact for not-yet-scheduled ones.
+
+## Edge Cases to Handle
+
+### Edge Case 1: Legitimately empty (zero-byte) value-index file vs. a skipped 404
+**Scenario:** `readWhole` returns `(nil, nil)` for a real zero-byte object,
+which is bitwise indistinguishable from a naive "skip" sentinel.
+**Expected:** The empty file counts as a present, empty slot in `downloadAll`'s
+output; a 404 does not appear at all.
+**Test:** `TestDownloadAll_LegitimatelyEmptyFileIsKeptDistinctFromSkippedFile` (Step 1.4).
+
+### Edge Case 2: Two leaves resolving the same (column, type) pair concurrently
+**Scenario:** A query with duplicate leaf predicates on the same column
+(per `collectLeaves`'s comment, this is possible and intentional — each
+leaf keeps its own predicate). Under the parallel leaf loop, two goroutines
+could call `src.Add(sameCol, sameType, ...)` concurrently.
+**Expected:** Both calls succeed without data loss (mutex serializes the
+`append`); result *order* across the two leaves' appended slices may differ
+run-to-run, which is acceptable because downstream consumers treat this as
+an unordered coverage set, not an ordered list (confirmed by `AllResults`'s
+map-based dedup and `LookupResults`'s flatten-all-types behavior, neither of
+which depends on append order for correctness).
+**Test:** Covered incidentally by `TestBuildSource_ANDTwoLeavesBothResolved`
+continuing to pass; add an explicit duplicate-column case only if that
+existing test doesn't already exercise it — check before adding a new test
+to avoid duplication.
+
+### Edge Case 3: All leaves fail to build a predicate (nothing to parallelize)
+**Scenario:** Every leaf's `buildPredicate` returns `ok=false` (e.g. all
+vector predicates).
+**Expected:** `work` stays empty, the `errgroup` block is skipped entirely
+(`len(work) > 0` guard), `added` stays `false`, behavior identical to today.
+**Test:** Existing `TestBuildSource_VectorPredicateLeavesColumnUncovered` —
+must still pass unmodified.
+
+### Edge Case 4: `keys` slice is empty for `downloadAll`
+**Scenario:** A column's discovery returns zero files.
+**Expected:** Early return `(nil, 0, nil)` before spawning any errgroup —
+unchanged from the current code's first two lines.
+**Test:** Existing `TestBuildSource_NoFilesStillCovered` — must still pass.
+
+### Edge Case 5: Context cancellation from the caller (querier-side deadline)
+**Scenario:** The outer `ctx` passed into `BuildSource` is canceled/expires
+mid-flight (this is, after all, the exact production scenario — context
+deadline exceeded).
+**Expected:** `disc.FilesForTimeRange` calls (which do accept `ctx`) will
+observe cancellation and return promptly; `downloadAll`'s `FileStore.Size`/
+`ReadAt` calls do NOT observe the outer `ctx` (interface has no context
+param — unchanged, out of scope). This plan does not change this behavior;
+it only reduces total round-trip count so the deadline is far less likely
+to be hit in practice.
+**Test:** Not newly tested here (would require an integration-level test
+with a real slow store); flagged as expected residual risk, not a gap this
+plan must close (Approach 2's `FileStore` context-plumbing would be needed
+for full cancellation, and is explicitly out of scope).
+
+## Risks/Concerns
+
+### Risk 1: Peak connection pressure against S3/minio backend
+**Risk:** `leafConcurrency(4) * downloadConcurrency(24) = 96` worst-case
+simultaneous connections for one multi-leaf query, multiplied further across
+concurrently-sharded blocks in a real search request.
+**Impact:** Could exhaust minio/S3 client connection pool or trigger
+backend-side throttling under load.
+**Mitigation:** Bounds chosen conservatively within the brainstormed 16-32
+range for `downloadConcurrency`; `leafConcurrency` kept small (4) since
+multi-leaf queries are less common than single-leaf. Flagged in the
+`vibuilder/NOTES.md` entry as a value to reconsider after load-testing
+against tempo-dev-test-03's actual backend (out of scope for this plan —
+this is Approach 1 only; connection-pool tuning is a follow-up if
+production metrics show pressure after rollout).
+
+### Risk 2: Losing the exact abort-on-error ordering
+**Risk:** With concurrent downloads, the "first" error returned by
+`errgroup.Wait()` may not be the same key that would have errored first
+under the old strictly-sequential loop (order is now a race).
+**Impact:** Error messages in logs may cite a different key than before for
+the same underlying failure (e.g. "connection reset on key X" vs "on key
+Y") — cosmetic, not a correctness issue, since ALL non-404 errors abort the
+whole build either way and the caller falls back to a full scan regardless
+of which specific key's error message is surfaced.
+**Mitigation:** Document this explicitly in the `vibuilder/NOTES.md` entry
+so it isn't mistaken for a regression during future debugging. No code
+mitigation needed — `NOTE-VI-041`'s contract is "any non-404 error aborts",
+not "the first-encountered non-404 error in key order is reported".
+
+### Risk 3: `betteralign`/struct-size lint on `SliceValueIndexSource`
+**Risk:** Adding a `sync.Mutex` field changes the struct's memory layout;
+`betteralign` (part of `make precommit`) checks field alignment/ordering.
+**Impact:** Possible lint failure if the mutex isn't placed per betteralign's
+preferred ordering.
+**Mitigation:** Run `make precommit` (Step 3.2) before considering the task
+done; reorder fields if betteralign flags it (conventionally, put `sync.Mutex`
+first, which is also idiomatic Go and matches the plan's example above).
+
+### Risk 4: `nilaway` false positives on errgroup closures
+**Risk:** `nilaway` (part of `make precommit`) sometimes flags closures
+capturing loop variables or interface values in ways it can't prove
+non-nil.
+**Impact:** Possible CI-only failure not caught by a quick local `go build`.
+**Mitigation:** Run the full `make precommit` locally before considering
+the task done, not just `go build`/`go test`.
+
+## Dependencies
+
+### Internal Dependencies
+- `internal/modules/executor` — `SliceValueIndexSource`, `VILookupResult`,
+  `ValueIndexBuildStats` (existing, being modified in Task 2.1).
+- `internal/modules/valueindex` — `QueryBucketFiles`, `ColHash`,
+  `ColTypeName`, predicates (existing, unmodified).
+- `internal/vm` — `Program`, `RangeNode` (existing, unmodified).
+
+### External Dependencies
+- `golang.org/x/sync/errgroup` — already a `go.mod` dependency
+  (`golang.org/x/sync v0.20.0`, confirmed via `go.mod:22`), already used
+  elsewhere in this repo (`reader.go:482-483`, per the `NOTE-291` pattern
+  this plan's `downloadAll`/leaf-loop rewrites deliberately mirror: bounded
+  `errgroup.Group` + `SetLimit` + pre-sized index-addressed result slice).
+  No new dependency, no license check needed.
+
+### No New Dependencies
+
+## Out of Scope (explicitly, per brainstorm.md's recommendation)
+
+- **Approach 2** (merging `Size()`+`ReadAt()` into a single `GetObject`
+  call) — touches the `FileStore`/`ValueIndexFileStore` public API surface
+  (aliased in `valueindex_query.go`); flagged as a fast-follow requiring
+  explicit user permission before implementing, per this repo's "no new
+  public API surface without explicit permission" rule. Not a task in this
+  plan.
+- **Approach 3** (investigating whether the 465-files/query figure reflects
+  a value-index-compactor L0→L1/L2 backlog) — a separate investigation
+  track, not a code change. Not a task in this plan.
+- **Vendor bump into tempo-mrd** — happens after this fix lands and passes
+  `make precommit` in the blockpack repo; not part of this plan's task list
+  (per the task's own framing: "target the blockpack repo's
+  `internal/modules/vibuilder/` package as the primary fix location").
+- **Threading `context.Context` through `FileStore.Size`/`ReadAt`** — would
+  enable true cancellation of in-flight downloads on error/deadline, but is
+  an interface change bundled conceptually with Approach 2; not done here.
+
+## Complexity Analysis
+
+### `downloadAll` (rewritten)
+**Estimated complexity:** ~6 (single loop, one nested error check, one
+reduction loop) — lower than the original serial version's effective
+complexity once the reduction is separated from the download logic.
+
+### `BuildSource` (leaf-loop section only, rewritten)
+**Estimated complexity:** ~5 for the new leaf block, added to the existing
+function's complexity elsewhere (match-all branch untouched by this plan).
+Overall function complexity should stay well under the repo's `< 30` gocyclo
+limit — verify with `gocyclo -over 30 internal/modules/vibuilder/` as part
+of Step 3.2.
+
+### `lookupColumnAll` (rewritten)
+**Estimated complexity:** ~7 (loop + 3 early-return error checks inside the
+goroutine + reduction loop) — comparable to the original.
+
+None of these approach the repo's complexity limit; no further decomposition
+needed.
+
+## Test Coverage Goals
+
+- New/modified code in `vibuilder/builder.go`: **100%** of the new
+  concurrency branches (skip-on-404, abort-on-error, empty-vs-skip
+  distinction, firstType ordering) — these are exactly the invariants this
+  plan's tests are designed to pin.
+- `executor/metrics_trace.go`'s mutex-guarded methods: covered by the
+  existing non-concurrent tests (unchanged behavior) plus the new
+  `-race` concurrent test.
+- Package-wide: must stay above this repo's enforced **>70%** coverage
+  threshold (`internal/modules/vibuilder/` and
+  `internal/modules/executor/`) — `make precommit`/CI enforces this.
+
+## Success Criteria
+
+- [ ] All new tests (Phase 1) fail against the pre-fix code, confirming
+  they exercise real behavior.
+- [ ] All new tests pass after the fix (Phase 2/3).
+- [ ] All pre-existing `vibuilder` and `executor` tests continue to pass
+  unmodified — no regression to `NOTE-VI-036/039/041`'s documented
+  contracts.
+- [ ] `go test -race ./internal/modules/vibuilder/... ./internal/modules/executor/...`
+  passes with zero race reports.
+- [ ] `make precommit` passes cleanly (gofumpt, golines, golangci-lint incl.
+  gocyclo `<30`, betteralign, nilaway, build, tests, deadcode, staticcheck).
+- [ ] `internal/modules/executor/SPECS.md`, `NOTES.md`, `TESTS.md` updated
+  (via spec-oracle/MCP, correct next-free IDs verified at implementation
+  time, not assumed from this plan's placeholders).
+- [ ] `internal/modules/vibuilder/NOTES.md` updated with a dated entry.
+- [ ] No changes to `FileStore`/`ValueIndexFileStore` public API surface.
+- [ ] No changes on the `blockio`/trace-block read path (untouched,
+  confirmed out of scope by the brainstorm).
+- [ ] Work stays on `main` in the blockpack repo; no branch created, no
+  push, no PR opened without being explicitly asked.
+
+## Notes
+
+- This plan deliberately mirrors the existing `errgroup.Group` + `SetLimit`
+  + pre-sized-slice-by-index pattern already used in this repo at
+  `reader.go:476-503` (`parseMatchingBlocks`, documented under `NOTE-291`)
+  for consistency with an established, precommit-clean concurrency idiom in
+  this codebase, rather than introducing a new pattern.
+- The concurrency bounds (`downloadConcurrency=24`, `leafConcurrency=4`) are
+  starting values based on the brainstorm's 16-32 recommendation and a
+  conservative multiplicative-pressure estimate; they are not required to be
+  configurable/tunable-from-tempo for this fix to land — that can be a
+  follow-up if load testing shows the fixed constants need adjustment per
+  environment.
+
+## Questions/Uncertainties
+
+1. **vibuilder doc maturity** (see dedicated section above) — should
+   `vibuilder` eventually get a full `SPECS.md`/`TESTS.md`/`BENCHMARKS.md`
+   suite? Not resolved here; deferred as an open question since its closest
+   sibling (`valueindex`) hasn't graduated either.
+2. **Exact next-free `SPEC-`/`NOTE-VI-`/`TEST-` IDs** — this plan's IDs
+   (`SPEC-006`?, `NOTE-VI-048`, `NOTE-VI-049`) are placeholders based on the
+   highest IDs found during this planning pass; the coder MUST re-verify via
+   spec-oracle/MCP tooling immediately before writing, since concurrent work
+   elsewhere in the repo may have advanced the sequence.
+3. **Whether `leafConcurrency=4` is the right value** — chosen conservatively
+   to bound `leafConcurrency * downloadConcurrency` connection pressure;
+   revisit after production rollout metrics/load testing (Risk 1) if
+   multi-leaf queries turn out to be more common than assumed here.
+4. **Tracking issue number** for the `downloadConcurrency` constant's doc
+   comment (placeholder "`issue #<TBD>`" in Step 2.3) — fill in the real
+   tempo/blockpack issue number if one exists for this incident before
+   landing, consistent with this codebase's convention of citing issue
+   numbers in comments (e.g. `issue #461`, `issue #465`, `issue #399`).

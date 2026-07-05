@@ -635,11 +635,16 @@ this back-reference originally cited `/home/mdurham/source/tempo-mrd` — a sepa
 the same `mattdurham/tempo` repo that exists alongside the correct one — as the location where
 Stage 6's work landed; that was a checkout-naming mixup discovered after the fact. The actual
 Stage 6 changes are in `/home/mdurham/source/blockpack_collection/tempo`. `tempodb/encoding/
-vblockpack/backend_block.go` (`(*blockpackBlock).FindTraceByID`) passes a real `nil`-safe
-lister for v1 (compile-correct, zero behavior change — real `Lister`/`indexPrefix` wiring into
-the querier is tracked as a required, separate tempo-repo follow-up, not yet done, before this
-fix has any production effect there) using the block's own `BlockMeta.StartTime`/`EndTime` as
-the time hint; `tempodb/encoding/vblockpack/wal_block.go` (`(*walBlock).FindTraceByID`)
+vblockpack/backend_block.go` (`(*blockpackBlock).FindTraceByID`) now wires a real
+`LookupStore`/`indexPrefix` from the querier's configured value-index query reader
+(`getValueIndexQueryReader()`, the same singleton the search/metrics index path uses) when
+`value_index_query.enabled`, using the block's own `BlockMeta.StartTime`/`EndTime` as the time
+hint; the store is `nil` (behaviour-neutral full scan) when the path is disabled. The
+LookupStore interface is re-exported at the root as `blockpack.LookupStore` /
+`blockpack.TraceIndexGetter` (NOTE-ROOT-021, issue #468) precisely because tempo cannot import
+blockpack's internal `valueindex` package. **This completes steps 1–3 of issue #468; steps 4–5
+(prove index-hit == full-scan against real dev/prod data, then remove `getTraceByIDFullScan`)
+remain deliberately out of scope — the fallback stays until proven redundant.** `tempodb/encoding/vblockpack/wal_block.go` (`(*walBlock).FindTraceByID`)
 permanently passes `nil`/`""` since WAL data can never have index coverage. Any other external
 caller of `GetTraceByID` not enumerated here will fail to compile against the new signature —
 loudly, at

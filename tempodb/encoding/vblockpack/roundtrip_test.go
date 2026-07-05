@@ -87,6 +87,45 @@ func TestWALToBackend_Iterator(t *testing.T) {
 	require.NotNil(t, resp, "FindTraceByID must find the trace promoted from WAL")
 }
 
+// TestWalBlock_FindTraceByID_PermanentlySkipsIndex pins the Stage 6 v1 behavior for
+// walBlock: a WAL block is freshly-ingested data that has never been consumed by
+// valueindexconsumer or compacted by valueindexcompactor, so it can never have
+// trace-index coverage. FindTraceByID's lister/tenant/indexPrefix parameters are
+// PERMANENTLY nil/""/"" here (not an interim v1 shortcut — see the code comment at the
+// call site). This test confirms an active, unflushed WAL block still finds a trace
+// correctly via GetTraceByID's full-scan fallback.
+func TestWalBlock_FindTraceByID_PermanentlySkipsIndex(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	walMeta := backend.NewBlockMeta("test-tenant", uuid.New(), VersionString)
+	wal := createWALBlock(walMeta, tmpDir, 0)
+
+	traceID := []byte{2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}
+	now := uint64(time.Now().UnixNano())
+	tr := &tempopb.Trace{
+		ResourceSpans: []*tempotrace.ResourceSpans{{
+			ScopeSpans: []*tempotrace.ScopeSpans{{
+				Spans: []*tempotrace.Span{{
+					TraceId:           traceID,
+					SpanId:            []byte{2, 0, 0, 0, 0, 0, 0, 2},
+					Name:              "wal-no-index-span",
+					StartTimeUnixNano: now,
+					EndTimeUnixNano:   now + uint64(50*time.Millisecond),
+				}},
+			}},
+		}},
+	}
+	startSec := uint32(time.Now().Unix())
+	require.NoError(t, wal.AppendTrace(nil, tr, startSec, startSec+1, false))
+
+	resp, err := wal.FindTraceByID(ctx, traceID, common.SearchOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, resp, "FindTraceByID must find a trace in an active WAL block via the full-scan fallback")
+	require.NotNil(t, resp.Trace)
+	require.NotEmpty(t, resp.Trace.ResourceSpans)
+}
+
 func TestRoundTrip_WriteAndReadBlock(t *testing.T) {
 	t.Log("Testing write then read roundtrip")
 

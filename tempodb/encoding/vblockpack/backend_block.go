@@ -416,13 +416,24 @@ func (b *blockpackBlock) FindTraceByID(ctx context.Context, id common.ID, _ comm
 
 	// common.SearchOptions carries no time-range field, so the block's own wall-clock range
 	// (tighter than "whole retention") is used as the index discovery window.
-	// TODO(follow-up): pass a real valueindex.LookupStore + indexPrefix here once tempo
-	// wires a querier-side value-index source (see blockpack issue #428 Stage 6 plan) --
-	// this is the one call site where the index would actually activate, since only
-	// compacted backend blocks are index-eligible. Until then this is a nil-lister,
-	// behavior-neutral (always full-scan) call.
+	//
+	// Index-first trace-by-ID (blockpack issue #468): when the value-index query path is
+	// configured (value_index_query.enabled), pass the configured LookupStore + index prefix
+	// so GetTraceByID consults the trace-by-ID value index for exact block+row addressing
+	// before falling back to a full block scan. The index is a hint, never authoritative for
+	// absence -- any miss/decode-error/skew falls back to the identical full-scan result
+	// (SPEC-ROOT-018). When the path is disabled the lister is nil and this is byte-identical
+	// to the prior full-scan-only behaviour. Only compacted backend blocks are index-eligible;
+	// WAL blocks (wal_block.go) permanently pass nil since freshly-ingested data is not yet
+	// consumed by the async indexer.
+	var lister blockpack.LookupStore
+	indexPrefix := ""
+	if vr := getValueIndexQueryReader(); vr != nil {
+		lister = vr.store
+		indexPrefix = vr.indexPrefix
+	}
 	matches, err := blockpack.GetTraceByID(
-		ctx, r, traceIDHex, nil, b.meta.TenantID, "",
+		ctx, r, traceIDHex, lister, b.meta.TenantID, indexPrefix,
 		uint64(b.meta.StartTime.Unix()), //nolint:gosec // block start times are always positive
 		uint64(b.meta.EndTime.Unix()),   //nolint:gosec // block end times are always positive
 	)

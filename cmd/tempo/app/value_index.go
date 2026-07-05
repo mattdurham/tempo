@@ -29,6 +29,7 @@ import (
 	"github.com/grafana/blockpack/blockevents"
 	viccompactor "github.com/grafana/blockpack/valueindexcompactor"
 	vicconsumer "github.com/grafana/blockpack/valueindexconsumer"
+	vcntcompactor "github.com/grafana/blockpack/valuecountscompactor"
 	vblockpack "github.com/grafana/tempo/tempodb/encoding/vblockpack"
 )
 
@@ -74,6 +75,9 @@ func toVICCompactorCfg(cfg common.ValueIndexCompactorConfig) viccompactor.Config
 		MaxOutputBytes:        cfg.MaxOutputBytes,
 		ShardCount:            cfg.ShardCount,
 		ShardIndex:            cfg.ShardIndex,
+		CompactBatchBytes:     cfg.CompactBatchBytes,
+		CompactConcurrency:    cfg.CompactConcurrency,
+		CompactMaxInputFiles:  cfg.CompactMaxInputFiles,
 	}
 	// Allow SHARD_COUNT env var (set on the Deployment) to enable sharding.
 	if v, err := strconv.Atoi(os.Getenv("SHARD_COUNT")); err == nil && v > 0 {
@@ -87,6 +91,39 @@ func toVICCompactorCfg(cfg common.ValueIndexCompactorConfig) viccompactor.Config
 	} else if out.ShardCount > 1 {
 		// StatefulSet pods are named <name>-<ordinal> (e.g. value-index-compactor-3).
 		// Parse the ordinal suffix as the shard index — guaranteed unique 0..N-1.
+		if name := os.Getenv("POD_NAME"); name != "" {
+			if idx := strings.LastIndex(name, "-"); idx >= 0 {
+				if v, err := strconv.Atoi(name[idx+1:]); err == nil && v >= 0 {
+					out.ShardIndex = v % out.ShardCount
+				}
+			}
+		}
+	}
+	return out
+}
+
+// toVCNTCompactorCfg converts the Tempo config struct to the blockpack VCNT compactor config.
+func toVCNTCompactorCfg(cfg common.ValueCountCompactorConfig) vcntcompactor.Config {
+	out := vcntcompactor.Config{
+		Enabled:               cfg.Enabled,
+		IndexPrefix:           cfg.IndexPrefix,
+		Tenants:               cfg.Tenants,
+		CompactInterval:       cfg.CompactInterval,
+		CompactThresholdFiles: cfg.CompactThresholdFiles,
+		CompactBatchBytes:     cfg.CompactBatchBytes,
+		MaxRecordsPerMerge:    cfg.MaxRecordsPerMerge,
+		ShardCount:            cfg.ShardCount,
+		ShardIndex:            cfg.ShardIndex,
+	}
+	// Same SHARD_COUNT/SHARD_INDEX env var convention as toVICCompactorCfg, so a VCNT
+	// column and a VI column with the same name land on the same shard index when both
+	// compactors share ShardCount/ShardIndex (byte-identical ColHash construction).
+	if v, err := strconv.Atoi(os.Getenv("SHARD_COUNT")); err == nil && v > 0 {
+		out.ShardCount = v
+	}
+	if v, err := strconv.Atoi(os.Getenv("SHARD_INDEX")); err == nil && v >= 0 {
+		out.ShardIndex = v
+	} else if out.ShardCount > 1 {
 		if name := os.Getenv("POD_NAME"); name != "" {
 			if idx := strings.LastIndex(name, "-"); idx >= 0 {
 				if v, err := strconv.Atoi(name[idx+1:]); err == nil && v >= 0 {
@@ -147,8 +184,9 @@ func (t *App) initValueIndexConsumer() (services.Service, error) {
 func (t *App) initValueIndexCompactor() (services.Service, error) {
 	bp := t.cfg.StorageConfig.Trace.Block.Blockpack
 	vccCfg := toVICCompactorCfg(bp.ValueIndexCompactor)
+	vcntCfg := toVCNTCompactorCfg(bp.ValueCountCompactor)
 
-	if !vccCfg.Enabled && !bp.CubeCompactorEnabled {
+	if !vccCfg.Enabled && !bp.CubeCompactorEnabled && !vcntCfg.Enabled {
 		return services.NewIdleService(nil, nil), nil
 	}
 
@@ -160,6 +198,7 @@ func (t *App) initValueIndexCompactor() (services.Service, error) {
 	bucket := t.cfg.StorageConfig.Trace.S3.Bucket
 	store := &tempoVCCStore{client: s3Client, bucket: bucket}
 	exister := &tempoVCCExister{client: s3Client, bucket: bucket}
+	vcntStore := &tempoVCNTStore{store: store}
 
 	return services.NewIdleService(
 		func(ctx context.Context) error {
@@ -182,6 +221,23 @@ func (t *App) initValueIndexCompactor() (services.Service, error) {
 					s3Client, bucket, bp.CubeTenants, bp.CubeCompactorInterval,
 				)
 				go cubeSvc.Run(ctx)
+			}
+			// VCNT (value-counts) compactor loop — bundled the same way as cube above,
+			// no dedicated StatefulSet. See blockpack valuecountscompactor NOTE-VC-005/009
+			// for why this has no SourceExister (retention is Compact's own net-sum rule)
+			// and why delete failures are retried with a dedicated metric rather than
+			// treated as fully safe (Compact sums by key, unlike VI's identity-deduped merge).
+			if vcntCfg.Enabled {
+				vcntCfg.Registerer = prometheus.DefaultRegisterer
+				vcntSvc, vcntErr := vcntcompactor.NewService(vcntCfg, vcntStore)
+				if vcntErr != nil {
+					return fmt.Errorf("value-count-compactor: %w", vcntErr)
+				}
+				go func() {
+					if err := vcntSvc.Run(ctx); err != nil && err != context.Canceled {
+						level.Error(log.Logger).Log("msg", "value-count-compactor exited", "err", err)
+					}
+				}()
 			}
 			<-ctx.Done()
 			return nil
@@ -288,16 +344,32 @@ type tempoVCCStore struct {
 	bucket string
 }
 
-func (s *tempoVCCStore) List(ctx context.Context, prefix string) ([]string, error) {
-	var keys []string
-	for obj := range s.client.ListObjects(ctx, s.bucket,
-		minio.ListObjectsOptions{Prefix: prefix, Recursive: true}) {
-		if obj.Err != nil {
-			return nil, obj.Err
-		}
-		keys = append(keys, obj.Key)
+func (s *tempoVCCStore) Peek(ctx context.Context, key string, n int) ([]byte, error) {
+	opts := minio.GetObjectOptions{}
+	_ = opts.SetRange(0, int64(n)-1)
+	obj, err := s.client.GetObject(ctx, s.bucket, key, opts)
+	if err != nil {
+		return nil, err
 	}
-	return keys, nil
+	defer func() { _ = obj.Close() }()
+	buf := make([]byte, n)
+	nr, err := io.ReadFull(obj, buf)
+	if err != nil && err != io.ErrUnexpectedEOF {
+		return nil, err
+	}
+	return buf[:nr], nil
+}
+
+func (s *tempoVCCStore) List(ctx context.Context, prefix string) ([]viccompactor.IndexObject, error) {
+	var objs []viccompactor.IndexObject
+	for o := range s.client.ListObjects(ctx, s.bucket,
+		minio.ListObjectsOptions{Prefix: prefix, Recursive: true}) {
+		if o.Err != nil {
+			return nil, o.Err
+		}
+		objs = append(objs, viccompactor.IndexObject{Key: o.Key, Size: o.Size})
+	}
+	return objs, nil
 }
 
 // ListDirs returns the immediate child "directory" prefixes one level below
@@ -338,6 +410,49 @@ func (s *tempoVCCStore) Put(ctx context.Context, key string, data []byte) error 
 
 func (s *tempoVCCStore) Delete(ctx context.Context, key string) error {
 	return s.client.RemoveObject(ctx, s.bucket, key, minio.RemoveObjectOptions{})
+}
+
+// ── S3 Store adapter for VCNT compactor ──────────────────────────────────────
+
+// tempoVCNTStore adapts tempoVCCStore to valuecountscompactor.Store. It cannot embed
+// tempoVCCStore directly and rely on Go's structural typing to satisfy the interface for
+// free: tempoVCCStore.List returns []viccompactor.IndexObject, but Store.List requires
+// []valuecountscompactor.Object — two distinct named struct types with identical fields
+// (blockpack NOTE-VC-005/SPEC-VC-1, from today's earlier value-index-compactor fix #33,
+// which found the same "these look structurally identical but Go doesn't treat named
+// types that way" mistake in blockpack's own doc comments). Get/Put/Delete/ListDirs have
+// plain string/[]byte/error signatures with no divergent named type, so those are reused
+// directly from the embedded *tempoVCCStore; only List needs a converting wrapper.
+type tempoVCNTStore struct {
+	store *tempoVCCStore
+}
+
+func (s *tempoVCNTStore) List(ctx context.Context, prefix string) ([]vcntcompactor.Object, error) {
+	objs, err := s.store.List(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]vcntcompactor.Object, 0, len(objs))
+	for _, o := range objs {
+		out = append(out, vcntcompactor.Object{Key: o.Key, Size: o.Size})
+	}
+	return out, nil
+}
+
+func (s *tempoVCNTStore) ListDirs(ctx context.Context, prefix string) ([]string, error) {
+	return s.store.ListDirs(ctx, prefix)
+}
+
+func (s *tempoVCNTStore) Get(ctx context.Context, key string) ([]byte, error) {
+	return s.store.Get(ctx, key)
+}
+
+func (s *tempoVCNTStore) Put(ctx context.Context, key string, data []byte) error {
+	return s.store.Put(ctx, key, data)
+}
+
+func (s *tempoVCNTStore) Delete(ctx context.Context, key string) error {
+	return s.store.Delete(ctx, key)
 }
 
 // ── S3 SourceExister for compactor ───────────────────────────────────────────

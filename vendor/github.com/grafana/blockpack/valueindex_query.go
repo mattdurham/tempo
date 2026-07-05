@@ -40,6 +40,20 @@ import (
 // already satisfy it.
 type Lister = valueindex.Lister
 
+// TraceIndexGetter fetches the full bytes of a discovered trace-by-ID index file
+// by its full object key. It is the fetch half of the LookupStore GetTraceByID
+// needs. Re-exported at the root so external consumers (tempo's vblockpack S3
+// adapter) can implement it without importing blockpack's internal packages
+// (NOTE-ROOT-021, issue #468).
+type TraceIndexGetter = valueindex.TraceIndexGetter
+
+// LookupStore is the read-only object-storage surface GetTraceByID consults to
+// resolve a trace via the trace-by-ID value index: list candidate index files
+// (Lister) and fetch a candidate's bytes (TraceIndexGetter). Re-exported at the
+// root so external consumers can pass a real, non-nil store into GetTraceByID
+// without importing blockpack's internal packages (NOTE-ROOT-021, issue #468).
+type LookupStore = valueindex.LookupStore
+
 // IndexFileCache caches the per-(colHash, colType) value-index file listing so the
 // querier does not perform an S3 LIST on every query (issue #462). One instance
 // per querier process; call Background(ctx) once to start the periodic refresh.

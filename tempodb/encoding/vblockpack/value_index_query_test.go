@@ -10,6 +10,18 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// minioVIStore must satisfy all three blockpack read-side interfaces: Lister and
+// ValueIndexFileStore drive the search/metrics index path; LookupStore (List + Get)
+// drives the trace-by-ID index path (issue #468). A drift in any of these root
+// interfaces breaks the build here, at the store's single definition, rather than
+// silently at a distant call site.
+var (
+	_ blockpack.Lister              = (*minioVIStore)(nil)
+	_ blockpack.ValueIndexFileStore = (*minioVIStore)(nil)
+	_ blockpack.LookupStore         = (*minioVIStore)(nil)
+	_ blockpack.TraceIndexGetter    = (*minioVIStore)(nil)
+)
+
 // mapNotFound translates a minio 404 / NoSuchKey into
 // blockpack.ErrValueIndexFileNotFound so the index builder skips a file the
 // compactor deleted out from under a stale listing (blockpack issue #399 point 5),
@@ -53,4 +65,39 @@ func TestMapNotFound(t *testing.T) {
 		got := mapNotFound(err)
 		assert.False(t, errors.Is(got, blockpack.ErrValueIndexFileNotFound))
 	})
+}
+
+// TestNanoWindowToSec_MinuteFloorAlignsWithWriteSide is the regression test for
+// the cross-repo correctness coupling documented in blockpack's
+// valueindex_extract.go:buildSpanStartSecByRef (NOTE-VI-05x): VI's TimeSec
+// entries are floored to the minute ((startNano/1e9)/60*60, blockpack
+// valueindex_extract.go:179) at write time. If the query-side minSec bound
+// here is NOT floored to the same alignment, a genuinely in-range span whose
+// minute-floored TimeSec falls just below a non-minute-aligned query start is
+// silently dropped by valueindex.BucketFile.LookupValue's exact-inclusion
+// filter (bucketquery.go:89), with no fallback (the index path reports
+// "coverage found" and answers the query incompletely). This test proves the
+// false-negative scenario is closed.
+func TestNanoWindowToSec_MinuteFloorAlignsWithWriteSide(t *testing.T) {
+	// Query window starts 45s past a minute boundary: epoch nanosecond
+	// ...045_000_000_000. A span at ...050s (5s later, genuinely inside the
+	// query window) minute-floors to TimeSec = ...000 (the minute boundary)
+	// at write time, per buildSpanStartSecByRef's (v/1e9)/60*60 formula.
+	const minuteBoundary = 120 * 1_000_000_000                  // an arbitrary whole minute, in ns
+	queryStartNano := uint64(minuteBoundary + 45*1_000_000_000) // ...045
+	queryEndNano := uint64(minuteBoundary + 90*1_000_000_000)   // ...090, unbounded-max not exercised here
+
+	minSec, _ := nanoWindowToSec(queryStartNano, queryEndNano)
+
+	// The write-side formula, duplicated here deliberately (not imported) so
+	// this test fails loudly if either side's formula changes without the
+	// other — see blockpack valueindex_extract.go:179.
+	spanStartNano := uint64(minuteBoundary + 50*1_000_000_000) // ...050, inside the query window
+	spanTimeSec := (spanStartNano / 1_000_000_000) / 60 * 60   // write-side minute floor
+
+	assert.LessOrEqual(t, minSec, spanTimeSec,
+		"query-side minSec must be floored to the same minute alignment as write-side "+
+			"TimeSec, or a genuinely in-range span (spanTimeSec=%d) is dropped by "+
+			"LookupValue's exact minSec<=TimeSec<=maxSec filter when minSec=%d > spanTimeSec",
+		spanTimeSec, minSec)
 }

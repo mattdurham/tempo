@@ -183,10 +183,7 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 	// for tag autocomplete and cardinality queries. Best-effort; skipped when
 	// value_index_enabled is false.
 	if vcntAcc != nil {
-		const ns = 1_000_000_000
-		startSec := uint64(meta.StartTime.UnixNano()) / ns
-		endSec := uint64(meta.EndTime.UnixNano()) / ns
-		vcntAcc.flush(getVCNTSink(), meta.TenantID, defaultValueIndexPref, startSec, endSec)
+		vcntAcc.flush(getVCNTSink(), meta.TenantID, defaultValueIndexPref)
 	}
 	if cm != nil {
 		cm.flush(meta.TenantID)

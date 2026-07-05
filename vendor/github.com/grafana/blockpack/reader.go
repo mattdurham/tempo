@@ -338,7 +338,9 @@ func NewReaderForProgram(prog *vm.Program, provider ReaderProvider, fileID strin
 // traceIDHex must be a 32-character hex string (16 bytes); upper or lower case is accepted.
 // Returns an empty slice (not an error) when the trace is not found.
 //
-// When lister is non-nil and tenant is non-empty, GetTraceByID first consults the
+// lister is a LookupStore (re-exported at the root as blockpack.LookupStore for
+// external consumers — NOTE-ROOT-021). When it is non-nil and tenant is non-empty,
+// GetTraceByID first consults the
 // TraceGroup trace-by-ID index (internal/modules/valueindex/traceindex.go) for exact
 // block+row addressing, avoiding a full-file scan for any trace the index covers.
 // queryMinSec/queryMaxSec scope the index file discovery window; pass (0, math.MaxUint64)
@@ -357,7 +359,7 @@ func GetTraceByID(
 	ctx context.Context,
 	r *Reader,
 	traceIDHex string,
-	lister valueindex.LookupStore,
+	lister LookupStore,
 	tenant, indexPrefix string,
 	queryMinSec, queryMaxSec uint64,
 ) (results []SpanMatch, err error) {
@@ -396,7 +398,7 @@ func getTraceByIDViaIndex(
 	ctx context.Context,
 	r *Reader,
 	traceID [16]byte,
-	lister valueindex.LookupStore,
+	lister LookupStore,
 	tenant, indexPrefix string,
 	queryMinSec, queryMaxSec uint64,
 ) ([]SpanMatch, bool) {
@@ -433,7 +435,7 @@ func getTraceByIDViaIndex(
 // trace:id re-verify already provide the safety net for any stale reference in the result.
 func findTraceGroupInCandidates(
 	ctx context.Context,
-	lister valueindex.LookupStore,
+	lister LookupStore,
 	keys []string,
 	traceID [16]byte,
 ) (valueindex.TraceGroup, bool) {
