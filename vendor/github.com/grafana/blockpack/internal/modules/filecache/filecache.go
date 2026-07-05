@@ -505,9 +505,11 @@ func (c *FileCache) pathFor(key string) string {
 	return filepath.Join(c.dir, hexStr[:2], hexStr+".bin")
 }
 
-// writeFile writes a cache entry to disk atomically via a uniquely named temp file.
-// Using os.CreateTemp (rather than a deterministic "<path>.tmp") avoids a race
-// where two goroutines writing the same key would clobber each other's temp file.
+// writeFile writes a cache entry to disk via a uniquely named temp file that is
+// atomically renamed into place. Using os.CreateTemp (rather than a deterministic
+// "<path>.tmp") avoids a race where two goroutines writing the same key would
+// clobber each other's temp file. The write is NOT fsync'd (see NOTE-FC-003):
+// the rename gives atomic visibility, and lost-on-crash entries are re-fetchable.
 // Format: [4B magic][4B keyLen LE][key][value]
 func writeFile(path, key string, value []byte) error {
 	// Enforce the same key-length constraint that readFileHeader validates,
@@ -548,11 +550,14 @@ func writeFile(path, key string, value []byte) error {
 		_ = os.Remove(tmp) //nolint:gosec
 		return err
 	}
-	if err = f.Sync(); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmp) //nolint:gosec
-		return err
-	}
+	// NOTE-FC-003: no fsync — this is a cache, not primary storage. A synchronous
+	// f.Sync() per entry serializes concurrent writers against the disk (a single
+	// full-scan trace-by-id burst put ~30% of all querier goroutines to sleep in
+	// Fsync). The os.Rename below still gives atomic visibility within the process
+	// (a concurrent Get sees either no file or the fully-written one), and load()
+	// validates+removes any corrupt/partial .bin at startup, so an OS crash that
+	// loses an un-synced entry is self-healing: the entry is simply re-fetched
+	// from the source block. Durability buys nothing for re-derivable cache data.
 	if err = f.Close(); err != nil {
 		_ = os.Remove(tmp) //nolint:gosec
 		return err

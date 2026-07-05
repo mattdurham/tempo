@@ -34,3 +34,32 @@ S3 paths) to fixed-length, filesystem-safe filenames.
 scheme requires migrating existing cache files.
 
 Back-ref: `internal/modules/filecache/filecache.go`
+
+## NOTE-FC-003: No fsync on Cache Writes
+*Added: 2026-07-05*
+
+**Decision:** `writeFile` does NOT call `f.Sync()` (fsync) before renaming the temp
+file into place. Writes are made visible via `os.Rename` only.
+
+**Why:** The FileCache is a cache, not primary storage — every entry is
+re-derivable from the source block. A synchronous per-entry `fsync()` serializes
+concurrent writers against the disk. Live diagnosis on tempo-dev-test-03 (issue #470)
+showed a single full-scan trace-by-id burst parked ~30% of all querier goroutines
+(229 of 775) blocked in `syscall.Fsync` via this exact path, hanging an interactive
+`GET /api/traces/{id}` for 90+ seconds. Removing fsync eliminates that serialization
+for every write path (search/metrics block reads too), not just trace-by-id.
+
+**Why it is safe:**
+- `os.Rename` gives atomic visibility *within the process*: a concurrent `Get`
+  observes either no file or the fully-written file, never a torn one.
+- On restart, `load()` re-reads and validates every `.bin` via `readFileHeader`
+  and removes any corrupt/partial entry, so an OS crash that loses an un-synced
+  entry is self-healing — the entry is simply re-fetched from the source block.
+- Durability buys nothing for re-derivable cache data; the only cost of a lost
+  entry is one cache miss.
+
+**How to apply:** Do not re-add `f.Sync()` / `fdatasync` here. If a future cache
+tier stores non-re-derivable data, that is a different durability decision and must
+not be conflated with this re-fetchable block-column cache.
+
+Back-ref: `internal/modules/filecache/filecache.go` (`writeFile`)
