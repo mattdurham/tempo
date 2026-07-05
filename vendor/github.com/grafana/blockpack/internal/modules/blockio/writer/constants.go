@@ -189,7 +189,6 @@ const (
 	KindSparsePrefixBytes     = shared.KindSparsePrefixBytes
 	KindDeltaDictionary       = shared.KindDeltaDictionary
 	KindSparseDeltaDictionary = shared.KindSparseDeltaDictionary
-	KindVectorF32             = shared.KindVectorF32
 
 	// AllPresent encoding kinds — re-exported from shared (NOTE-AP-001).
 	KindDictionaryAllPresent      = shared.KindDictionaryAllPresent

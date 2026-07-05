@@ -11,9 +11,6 @@ import (
 // Each method corresponds to one value type; implementations ignore types that don't
 // match the column's declared type. The present flag distinguishes null from non-null rows.
 
-// addVectorF32 stores a float32 vector for the current row.
-// Non-vector builders implement this as a no-op.
-
 // buildData returns the wire-format column blob:
 // enc_version[1]=3 + encoding_kind[1] + payload (per SPECS §8.4, V14).
 // Internal sub-segments are raw bytes (no zstd); outer snappy is applied by the block writer.
@@ -65,8 +62,6 @@ func newColumnBuilder(typ shared.ColumnType, colName string, initCap int) column
 			values:  make([][]byte, 0, initCap),
 			present: make([]bool, 0, initCap),
 		}
-	case shared.ColumnTypeVectorF32:
-		return &vectorF32ColumnBuilder{}
 	default:
 		return &stringColumnBuilder{
 			colName: colName,

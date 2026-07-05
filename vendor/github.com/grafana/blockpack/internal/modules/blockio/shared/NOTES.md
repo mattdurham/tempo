@@ -248,8 +248,18 @@ raw float32 slice. Old readers (pre-VectorF32) that encounter type 13 fall throu
 default unknown-type path, which skips the column — backward-compatible by design.
 
 Back-ref: `internal/modules/blockio/shared/types.go:ColumnTypeVectorF32`,
-`internal/modules/blockio/shared/constants.go:VectorIndexMagic`,
-`internal/modules/blockio/shared/constants.go:EmbeddingColumnName`
+`internal/modules/blockio/shared/constants.go:VectorIndexMagic`
+
+**UPDATE (NOTE-480, issue #472, 2026-07-05):** The embedder integration and the
+VECTOR_AI()/VECTOR_ALL() query functions were fully removed. The `EmbeddingColumnName` /
+`EmbeddingTextColumnName` / `EmbeddingAllColumnName` / `EmbeddingAllTextColumnName` constants
+were deleted (no live consumer remained). `ColumnTypeVectorF32` (=13), `KindVectorF32` (=14),
+the reader-side `decodeVectorF32` / `Column.VectorF32Value`, and the `VectorIndexMagic` /
+`VectorIndexVersion` footer constants are KEPT so that blocks previously written with a
+`__embedding__` column still decode without error (proven by
+`reader/legacy_vectorf32_test.go`). The WRITER no longer emits VectorF32 columns; the
+compaction/merge path silently drops any legacy VectorF32 source column instead of
+re-emitting it.
 
 ---
 

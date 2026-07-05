@@ -164,8 +164,6 @@ var errLimitReached = errors.New("limit reached")
 // without reading full blocks. The caller should use this for field lookups
 // when Block is nil.
 
-// Score is the cosine similarity for VECTOR() queries. Zero for non-vector queries.
-
 // Collect selects candidate blocks via queryplanner and evaluates program.ColumnPredicate
 // against each block's spans, collecting all matched rows into a slice.
 //
@@ -387,24 +385,16 @@ func Collect(
 		},
 	})
 
-	// Vector post-processing: select global top-K across all blocks by score.
-	// Scoring is already done per-block in scanBlocks via VectorScorer.
-	if program.VectorScorer != nil {
-		results = vectorTopKFromScoredRows(results, program.VectorLimit)
-	}
-
 	qs.TotalDuration = time.Since(queryStart)
 	return results, qs, nil
 }
 
 // shouldUseTopKPath returns true when a heap-sorted timestamp top-K scan should be used.
-// VECTOR() queries are excluded: cosine-similarity top-K and timestamp top-K are
-// semantically incompatible — both would restrict results but by different criteria.
-func shouldUseTopKPath(opts CollectOptions, program *vm.Program) bool {
+func shouldUseTopKPath(opts CollectOptions, _ *vm.Program) bool {
 	// NOTE-472 (issue #393): gate on WantSort, not TimestampColumn. TimestampColumn may be
 	// set even for unsorted queries (as the match-all ref source / time-filter column), so
 	// the topK heap scan only fires when the caller actually wants timestamp ordering.
-	return opts.WantSort && opts.TimestampColumn != "" && opts.Limit > 0 && !program.HasVector
+	return opts.WantSort && opts.TimestampColumn != "" && opts.Limit > 0
 }
 
 // scanBlocks iterates over selectedBlocks in order, concurrently fetching coalesced groups
@@ -534,24 +524,6 @@ func scanBlocks(
 						modules_reader.ReleaseInternMap(internPtr)
 						return fmt.Errorf("ParseBlockFromBytes (second pass) block %d: %w", blockIdx, parseErr)
 					}
-				}
-
-				// Vector post-filter: when the query has a VectorScorer, score only the candidate
-				// rows (survivors of ColumnPredicate + intrinsic filter) via point lookup.
-				// Non-vector queries take the streamSortedRows path unchanged.
-				if program.VectorScorer != nil {
-					scoredRows := applyVectorScorerToBlock(bwb.Block, program, rowSet)
-					releaseBlockColumnProvider(provider)
-					modules_reader.ReleaseInternMap(internPtr)
-					for _, sr := range scoredRows {
-						*results = append(*results, MatchedRow{
-							Block:    bwb.Block,
-							BlockIdx: blockIdx,
-							RowIdx:   sr.RowIdx,
-							Score:    sr.Score,
-						})
-					}
-					return nil
 				}
 
 				// NOTE: rowSet is not used after ToSlice() — safe to sort in-place without clone.

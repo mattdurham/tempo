@@ -9,7 +9,6 @@ type columnBuilder interface {
 	addFloat64(val float64, present bool)
 	addBool(val, present bool)
 	addBytes(val []byte, present bool)
-	addVectorF32(val []float32, present bool)
 	rowCount() int
 	nullCount() int
 	colType() shared.ColumnType

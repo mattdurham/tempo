@@ -1575,3 +1575,22 @@ through `compaction.Config.OmitIntrinsicTOC` so the v1→v2 rewrite pass (#425) 
 `pickBytesEncoding` no longer consults `shared.SemanticBytesOverride` (a stub that always
 returned None after the intrinsic concept was removed). Every column — intrinsic-named or
 not — is selected by the same cost-based estimator with the demoted name-suffix tiebreak.
+
+## NOTE-480 — embedder integration + VectorF32 write path removed (issue #472)
+
+The auto-embedding write path (`Config.Embedder` / `Config.EmbeddingFields` /
+`Config.VectorDimension`, `embed_spans.go`, the per-block `vectorAccumulator` and the VectorIndex
+footer section) was fully removed. The `__embedding__` VectorF32 column is no longer produced:
+the `vectorF32ColumnBuilder`, the `addVectorF32` columnBuilder method, `addVectorPresent`,
+`extractBlockVectors`, and the `__embedding__`/`__embedding_text__` span-attribute handling in
+`addSpanAttr` are all deleted.
+
+**Legacy-block correctness:** the READER still decodes `ColumnTypeVectorF32` (see shared
+NOTE-480), so pre-existing blocks with a `__embedding__` column stay queryable. The compaction
+merge path (`addRowFromBlock`) now SKIPS a legacy VectorF32 source column rather than
+re-emitting it — new blocks never carry the column, old blocks still read.
+
+**Back-ref:** `internal/modules/blockio/writer/config.go:Config`,
+`internal/modules/blockio/writer/writer.go:flushBlocks`,
+`internal/modules/blockio/writer/writer_block.go:addRowFromBlock`/`addSpanAttr`,
+`internal/modules/blockio/reader/legacy_vectorf32_test.go`.

@@ -245,15 +245,11 @@ func collectLeaves(nodes []vm.RangeNode) []leaf {
 
 // buildPredicate turns a leaf RangeNode into a valueindex.Predicate plus the
 // column type it operates on. Returns ok=false when the leaf cannot be expressed
-// against the value index (vector predicate, present-only, or an unsupported
-// value type), in which case the caller leaves the column uncovered.
+// against the value index (present-only or an unsupported value type), in which
+// case the caller leaves the column uncovered.
 func buildPredicate(l *leaf) (valueindex.Predicate, modules_shared.ColumnType, bool) {
 	n := l.node
 	switch {
-	case len(n.QueryVector) > 0:
-		// Vector similarity is not a value-index predicate.
-		return nil, 0, false
-
 	case len(n.Values) > 0:
 		// Equality / point lookup. Multiple values are OR'd; the value index
 		// supports a single equality predicate per file pass, so we only build the

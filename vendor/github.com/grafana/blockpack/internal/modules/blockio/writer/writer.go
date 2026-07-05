@@ -40,10 +40,6 @@ type Writer struct {
 	// reducing AddRowFromReader from O(N^2) to O(N) per block.
 	addRowIntrinsicCache map[addRowCacheKey]intrinsicRowFields
 
-	// vectorAccum accumulates per-block vector data for building the VectorIndex section.
-	// Nil when cfg.VectorDimension == 0 (no vector support requested).
-	vectorAccum *vectorAccumulator
-
 	// dedicatedCols is the pre-built set of full column names (e.g. "span.http.method")
 	// configured as dedicated in cfg.DedicatedColumns. Built once in NewWriterWithConfig
 	// and passed to each buildBlock call so attribute loops can feed matching columns
@@ -145,22 +141,6 @@ func NewWriterWithConfig(cfg Config) (*Writer, error) {
 	if cfg.MaxBufferedSpans == 0 {
 		cfg.MaxBufferedSpans = 5 * cfg.MaxBlockSpans
 	}
-	// Auto-detect vector dimension from the embedder when one is configured but
-	// VectorDimension is not explicitly set. A probe embedding of a short string
-	// determines the actual output dimension; this avoids requiring callers to
-	// hard-code the dimension when using an embedder.
-	if cfg.Embedder != nil && cfg.VectorDimension == 0 {
-		probeVec, probeErr := cfg.Embedder.Embed("probe")
-		if probeErr != nil {
-			return nil, fmt.Errorf("writer: embedder probe failed: %w", probeErr)
-		}
-		cfg.VectorDimension = len(probeVec)
-	}
-
-	var va *vectorAccumulator
-	if cfg.VectorDimension > 0 {
-		va = newVectorAccumulator(cfg.VectorDimension)
-	}
 	var dedicatedCols map[string]struct{}
 	if len(cfg.DedicatedColumns) > 0 {
 		dedicatedCols = make(map[string]struct{}, len(cfg.DedicatedColumns))
@@ -174,7 +154,6 @@ func NewWriterWithConfig(cfg Config) (*Writer, error) {
 		cfg:           cfg,
 		out:           countingWriter{w: cfg.OutputStream},
 		uuidColumns:   make(map[string]bool),
-		vectorAccum:   va,
 		dedicatedCols: dedicatedCols,
 		// Pre-allocate pending to MaxBufferedSpans to avoid growslice on the hot path.
 		// After each flushBlocks(), w.pending is reset to length 0 (capacity retained).
@@ -407,11 +386,6 @@ func (w *Writer) Flush() (int64, error) {
 	// Intrinsic accumulator is closed and nil'd by the deferred cleanup at the top of Flush()
 	// (NOTE-461); the next write lazily re-creates it via ensureIntrinsicAccum.
 
-	// Reset vector accumulator for reuse.
-	if w.vectorAccum != nil {
-		w.vectorAccum = newVectorAccumulator(w.cfg.VectorDimension)
-	}
-
 	return total, nil
 }
 
@@ -542,21 +516,6 @@ func (w *Writer) flushBlocks() error {
 		return err
 	}
 
-	// Pre-compute embedding vectors for all pending spans when auto-embedding is enabled.
-	// This runs sequentially before the parallel block-build phase because Embed() is
-	// typically a network/compute call that must not be parallelised without external
-	// fan-in coordination. The result is a flat slice parallel to w.pending; each block
-	// goroutine receives its own subslice (no per-goroutine allocation needed).
-	var allSpanVectors [][]float32
-	if w.cfg.Embedder != nil {
-		var embedErr error
-		allSpanVectors, embedErr = w.embedPendingSpans(w.pending)
-		if embedErr != nil {
-			w.clearPendingState()
-			return fmt.Errorf("writer: embed spans: %w", embedErr)
-		}
-	}
-
 	results := make([]builtBlock, len(slices))
 
 	// Parallel build phase: each goroutine builds one block independently.
@@ -565,16 +524,6 @@ func (w *Writer) flushBlocks() error {
 	for i, s := range slices {
 		i, s := i, s // capture loop variables
 		g.Go(func() error {
-			// Compute the vector subslice for this block. When allSpanVectors is nil
-			// (no embedder configured), blockVecs is nil and buildBlock skips injection.
-			var blockVecs [][]float32
-			if allSpanVectors != nil {
-				spanOffset := 0
-				for j := 0; j < i; j++ {
-					spanOffset += len(slices[j].spans)
-				}
-				blockVecs = allSpanVectors[spanOffset : spanOffset+len(s.spans)]
-			}
 			bb, _ := w.bbPool.Get().(*blockBuilder)
 			built, bb, err := buildBlock(
 				s.spans,
@@ -582,18 +531,12 @@ func (w *Writer) flushBlocks() error {
 				emittedBlockVersion(),
 				nil, // intrinsicAccum removed in #433/#436
 				s.blockID,
-				blockVecs,
 				w.dedicatedCols,
 				true, // always page-aligned (v2 unconditional)
 			)
 			if err != nil {
 				w.bbPool.Put(bb)
 				return fmt.Errorf("writer: block %d finalize: %w", s.blockID, err)
-			}
-			// Extract vectors from bb BEFORE returning it to the pool.
-			// extractBlockVectors reads bb.columns which will be reset on pool reuse.
-			if w.vectorAccum != nil {
-				built.blockVectors = extractBlockVectors(bb)
 			}
 			results[i] = built
 			// Put bb AFTER results[i] is written — traceRows and colMinMax inside built
@@ -667,17 +610,7 @@ func (w *Writer) mergeBuiltBlock(i int, s blockSlice, results []builtBlock) erro
 	// Release payload memory immediately after writing to bound peak RSS.
 	results[i].payload = nil
 
-	if err := w.spillBlockAccumulators(i, s, results); err != nil {
-		return err
-	}
-
-	// Accumulate vectors for PQ training (serial to avoid concurrent map writes).
-	if w.vectorAccum != nil && len(built.blockVectors) > 0 {
-		w.vectorAccum.accumulateBlock(s.blockID, built.blockVectors)
-		results[i].blockVectors = nil // release memory after accumulation
-	}
-
-	return nil
+	return w.spillBlockAccumulators(i, s, results)
 }
 
 // spillBlockAccumulators is a no-op after the IntrinsicTOC (#433) and SpanTree (#434)

@@ -371,8 +371,3 @@ func CompactBlocksStreaming(
 	paths, _, err := modules_compaction.CompactBlocksStreaming(ctx, providers, cfg, output)
 	return paths, err
 }
-
-// NOTE-370: The HTTP embedder write-path constructor (formerly Embedder,
-// EmbedderHTTPConfig, NewHTTPEmbedder here) was moved to the dedicated
-// importable subpackage github.com/grafana/blockpack/embedder to remove it
-// from blockpack's general storage API surface (issue #346).

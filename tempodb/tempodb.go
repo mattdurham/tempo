@@ -263,9 +263,6 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 			bp.MemoryCacheBytes,
 		)
 	}
-	if cfg.Block != nil && cfg.Block.Blockpack.EmbeddingURL != "" {
-		vblockpack.ConfigureEmbedding(cfg.Block.Blockpack.EmbeddingURL, cfg.Block.Blockpack.EmbeddingConcurrentBatches, cfg.Block.Blockpack.EmbeddingBatchSize, cfg.Block.Blockpack.EmbeddingMaxTextLength)
-	}
 	// Writer-side synchronous value-index write path (blockpack NOTE-VI-042,
 	// issue #464). On writer targets (block-builder, backend-worker) with S3, the
 	// block-builder and compactor write L0 value-index files after each flush.

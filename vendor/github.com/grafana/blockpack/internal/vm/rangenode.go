@@ -2,17 +2,15 @@ package vm
 
 // RangeNode is a blockpack data type.
 type RangeNode struct {
-	Min             *Value
-	Max             *Value
-	Column          string
-	Pattern         string
-	Values          []Value
-	Children        []RangeNode
-	QueryVector     []float32
-	VectorThreshold float32
-	MinInclusive    bool
-	MaxInclusive    bool
-	IsOR            bool
+	Min          *Value
+	Max          *Value
+	Column       string
+	Pattern      string
+	Values       []Value
+	Children     []RangeNode
+	MinInclusive bool
+	MaxInclusive bool
+	IsOR         bool
 	// RequirePresent marks a leaf that can match only rows where Column is present
 	// (non-null). Set for "!= \"\"" predicates, which cannot be expressed as a value
 	// range but still require the attribute to exist. Used by the executor's ColStats

@@ -124,11 +124,6 @@ func getColumnZstdEncoder() *zstd.Encoder {
 // construction. Nil when buildBlock is called without a localAccum (legacy path
 // or test helpers). Merged into w.intrinsicAccum during the serial post-build pass.
 
-// blockVectors holds the extracted float32 vectors from the __embedding__ column.
-// Populated during the parallel build phase (before bb is returned to the pool)
-// and consumed by vectorAccum.accumulateBlock in the serial merge pass.
-// Nil when VectorDimension == 0 or no embedding column was present.
-
 // reset clears the blockBuilder for reuse with the next block.
 // Attribute column builders are moved to builderCache for reuse by addColumn.
 // Column name caches (spanColNames, etc.) are preserved across blocks.
@@ -158,14 +153,11 @@ func (b *blockBuilder) reset(spanHint int) {
 // If bb is non-nil it is reset and reused; otherwise a new blockBuilder is created.
 // intrinsicAccum is the file-level intrinsic accumulator; may be nil (no accumulation).
 // blockID is the 0-based block index used as BlockIdx in intrinsic refs.
-// spanVectors, when non-nil, is parallel to pending: spanVectors[i] is the pre-computed
-// embedding vector for pending[i]. A nil element means no embedding for that span.
-// When spanVectors is nil, no embedding injection is performed (cfg.Embedder == nil path).
 // dedicatedCols is the set of full column names to be written into the intrinsic section
 // as dedicated columns (in addition to the standard block column write). May be nil.
 func buildBlock(
 	pending []pendingSpan, bb *blockBuilder, blockVersion uint8,
-	_ interface{}, blockID int, spanVectors [][]float32, // intrinsicAccum removed in #433
+	_ interface{}, blockID int, // intrinsicAccum removed in #433
 	dedicatedCols map[string]struct{}, v2IdentityInBlock bool,
 ) (builtBlock, *blockBuilder, error) {
 	if bb != nil {
@@ -230,16 +222,6 @@ func buildBlock(
 			bb.addRowFromTempoProto(ps, rowIdx)
 		default:
 			bb.addRowFromProto(ps, rowIdx)
-		}
-
-		// Inject pre-computed embedding vector if auto-embedding is active.
-		// spanVectors[rowIdx] is nil when the span produced no text or the embedder
-		// returned an empty vector; in both cases we skip injection to preserve the
-		// existing behavior (no __embedding__ column for that row).
-		if spanVectors != nil {
-			if vec := spanVectors[rowIdx]; len(vec) > 0 {
-				bb.addVectorPresent(rowIdx, shared.EmbeddingColumnName, vec)
-			}
 		}
 	}
 	payload, err := bb.finalize(blockVersion)
@@ -985,11 +967,11 @@ func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx
 			continue
 		}
 
-		// Vector columns: use addVectorPresent instead of addPresent.
+		// NOTE-480 (issue #472): VectorF32 columns (legacy __embedding__) are no longer
+		// written — the embedder integration was removed. Legacy source blocks may still
+		// carry a VectorF32 column; drop it during merge rather than re-emitting it. The
+		// reader still decodes VectorF32 so existing blocks remain queryable.
 		if baseType == shared.ColumnTypeVectorF32 {
-			if bv, ok := col.BytesValue(srcRowIdx); ok && len(bv) > 0 && len(bv)%4 == 0 {
-				b.addVectorPresent(dstRowIdx, colKey.Name, bytesToFloat32LE(bv))
-			}
 			continue
 		}
 
@@ -1681,107 +1663,13 @@ func appendUint64LE(buf []byte, v uint64) []byte {
 	return append(buf, tmp[:]...)
 }
 
-// extractBlockVectors extracts all present float32 vectors from the __embedding__ column
-// of the given block builder. Returns nil if no such column exists or has no present rows.
-// Called in buildAndWriteBlock before the block builder is reset.
-// Only present (non-nil) vectors are returned; absent rows are skipped.
-func extractBlockVectors(bb *blockBuilder) [][]float32 {
-	key := shared.ColumnKey{Name: shared.EmbeddingColumnName, Type: shared.ColumnTypeVectorF32}
-	cb, ok := bb.columns[key]
-	if !ok {
-		return nil
-	}
-	vb, ok := cb.(*vectorF32ColumnBuilder)
-	if !ok {
-		return nil
-	}
-	var out [][]float32
-	for _, v := range vb.values {
-		if v == nil {
-			continue
-		}
-		cp := make([]float32, len(v))
-		copy(cp, v)
-		out = append(out, cp)
-	}
-	return out
-}
-
-// addVectorPresent marks rowIdx in the named VectorF32 column as present with the given vec.
 // addSpanAttr routes one span KeyValue attribute to the appropriate column.
-// Embedding columns (__embedding__, __embedding_text__) are stored without prefix;
-// all other span attributes are interned with "span." prefix.
+// All span attributes are interned with the "span." prefix.
 func (b *blockBuilder) addSpanAttr(rowIdx int, kv *commonv1.KeyValue) {
-	// Detect __embedding__ and __embedding_text__: stored under their own column names
-	// (no prefix) as ColumnTypeVectorF32 / ColumnTypeString respectively.
-	if kv.Key == shared.EmbeddingColumnName {
-		if bv := protoAttrBytes(kv.Value); len(bv) > 0 && len(bv)%4 == 0 {
-			b.addVectorPresent(rowIdx, shared.EmbeddingColumnName, bytesToFloat32LE(bv))
-		}
-		return
-	}
-	if kv.Key == shared.EmbeddingTextColumnName {
-		if s := protoAttrString(kv.Value); s != "" {
-			b.addPresent(rowIdx, shared.EmbeddingTextColumnName, shared.ColumnTypeString,
-				shared.AttrValue{Type: shared.ColumnTypeString, Str: s})
-		}
-		return
-	}
 	name := b.internColName(kv.Key, b.spanColNames, "span.")
 	val := protoToAttrValue(kv.Value)
 	b.addPresent(rowIdx, name, val.Type, val)
 	b.feedDedicatedAttrValue(name, val, rowIdx)
-}
-
-// If the column was pre-allocated by prepare(), sets the existing slot at rowIdx directly
-// (without appending) so that len(b.present) == spanHint is preserved.
-func (b *blockBuilder) addVectorPresent(rowIdx int, colName string, vec []float32) {
-	key := shared.ColumnKey{Name: colName, Type: shared.ColumnTypeVectorF32}
-	cb, ok := b.columns[key]
-	if !ok {
-		cb = b.addColumn(colName, shared.ColumnTypeVectorF32)
-	}
-	vb, ok := cb.(*vectorF32ColumnBuilder)
-	if !ok {
-		return
-	}
-	vb.setVectorAt(rowIdx, vec)
-}
-
-// protoAttrBytes extracts bytes from an OTLP AnyValue. Returns nil if not bytes type.
-func protoAttrBytes(v *commonv1.AnyValue) []byte {
-	if v == nil {
-		return nil
-	}
-	bv, ok := v.Value.(*commonv1.AnyValue_BytesValue)
-	if !ok {
-		return nil
-	}
-	return bv.BytesValue
-}
-
-// protoAttrString extracts a string from an OTLP AnyValue. Returns "" if not string type.
-func protoAttrString(v *commonv1.AnyValue) string {
-	if v == nil {
-		return ""
-	}
-	sv, ok := v.Value.(*commonv1.AnyValue_StringValue)
-	if !ok {
-		return ""
-	}
-	return sv.StringValue
-}
-
-// bytesToFloat32LE decodes a byte slice (LE float32 array) into a []float32.
-// Assumes len(b) is a multiple of 4.
-func bytesToFloat32LE(b []byte) []float32 {
-	n := len(b) / 4
-	out := make([]float32, n)
-	for i := range n {
-		bits := binary.LittleEndian.Uint32(b[i*4:])
-		out[i] = math.Float32frombits(bits)
-	}
-	return out
 }
 
 // encodeRangeKey encodes a column value as a range key for min/max tracking in colMinMax.

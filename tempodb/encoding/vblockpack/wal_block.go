@@ -114,10 +114,6 @@ func (w *walBlock) initWriter() error {
 		OutputStream:  w.buf,
 		MaxBlockSpans: 2000,
 	}
-	// Pass embedder if configured — blockpack handles field assembly + embedding internally.
-	if emb := getProcessEmbedder(configuredEmbedURL); emb != nil {
-		cfg.Embedder = emb
-	}
 	if w.meta != nil && len(w.meta.DedicatedColumns) > 0 {
 		cfg.DedicatedColumns = dedicatedColumnsToBlockpack(w.meta.DedicatedColumns)
 	}
@@ -281,9 +277,6 @@ func (w *walBlock) FindTraceByID(ctx context.Context, id common.ID, _ common.Sea
 			OutputStream:  w.buf,
 			MaxBlockSpans: 2000,
 		}
-		if emb := getProcessEmbedder(configuredEmbedURL); emb != nil {
-			cfg.Embedder = emb
-		}
 		if w.meta != nil && len(w.meta.DedicatedColumns) > 0 {
 			cfg.DedicatedColumns = dedicatedColumnsToBlockpack(w.meta.DedicatedColumns)
 		}
@@ -374,9 +367,6 @@ func (w *walBlock) Fetch(ctx context.Context, req traceql.FetchSpansRequest, opt
 			OutputStream:  w.buf,
 			MaxBlockSpans: 2000,
 		}
-		if emb := getProcessEmbedder(configuredEmbedURL); emb != nil {
-			cfg.Embedder = emb
-		}
 		if w.meta != nil && len(w.meta.DedicatedColumns) > 0 {
 			cfg.DedicatedColumns = dedicatedColumnsToBlockpack(w.meta.DedicatedColumns)
 		}
@@ -423,9 +413,6 @@ func (w *walBlock) Fetch(ctx context.Context, req traceql.FetchSpansRequest, opt
 		Limit:     opts.MaxTraces,
 		StartNano: req.StartTimeUnixNanos,
 		EndNano:   req.EndTimeUnixNanos,
-	}
-	if e := getProcessEmbedder(configuredEmbedURL); e != nil {
-		walQueryOpts.Embedder = e
 	}
 	matches, _, fetchErr := blockpack.QueryTraceQL(ctx, r, query, walQueryOpts)
 	if fetchErr != nil {

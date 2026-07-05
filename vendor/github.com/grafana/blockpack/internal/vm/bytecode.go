@@ -38,14 +38,6 @@ type RowCallback func(rowIdx int) bool
 // Returns number of matches and any error
 type StreamingColumnPredicate func(provider ColumnDataProvider, callback RowCallback) (int, error)
 
-// Vector search constants.
-const (
-	// DefaultVectorLimit is the default top-K results returned by a VECTOR() predicate.
-	DefaultVectorLimit = 10
-	// DefaultVectorThreshold is the minimum cosine similarity for a span to be included.
-	DefaultVectorThreshold float32 = 0.3
-)
-
 // RangeNode is a node in the block-pruning predicate tree.
 //
 // Leaf node (len(Children) == 0): Column names the fully-scoped column to look up.
@@ -53,7 +45,6 @@ const (
 //   - Values non-empty: equality / point-lookup (values are OR'd together).
 //   - Min or Max non-nil: interval lookup for range predicates (>, >=, <, <=).
 //   - Pattern non-empty: regex pattern; buildPredicates extracts a literal prefix.
-//   - QueryVector non-nil: VECTOR() ranking predicate — centroid pruning in planBlocks.
 //
 // Composite node (len(Children) > 0): IsOR controls combination semantics.
 //   - IsOR=false (AND): block must satisfy ALL children.
@@ -72,12 +63,6 @@ const (
 
 // equality lookup values; multiple values are OR'd
 
-// QueryVector is non-nil for VECTOR() ranking predicates.
-// When set, planBlocks uses centroid distance to prune entire files/blocks.
-
-// VectorThreshold is the minimum cosine similarity for centroid pruning.
-// Only meaningful when QueryVector is non-nil.
-
 // MinInclusive is true when Min comes from >= (>= x) rather than > (> x).
 // Used by the intrinsic flat-column scan to decide inclusive vs exclusive lower bound.
 
@@ -94,37 +79,14 @@ const (
 // Used by ProgramWantColumns to select columns for the first-pass block decode.
 // Includes columns from negation predicates that cannot appear in Nodes.
 
-// TextEmbedder is the interface for converting text to embedding vectors.
-// This keeps the VM decoupled from the embedder implementation — callers provide
-// any implementation (HTTP backend, yzma, mock, etc.) via CompileOptions.
-//
-// This interface is intentionally narrower than shared.TextEmbedder (which also
-// has EmbedBatch): the VM only needs single-text Embed() for VECTOR_AI() query
-// compilation. Any value that satisfies shared.TextEmbedder also satisfies this
-// interface via Go structural typing — no explicit declaration is needed.
-//
-// NOTE: Do not widen this interface to include EmbedBatch without updating all
-// callers — the narrow surface is part of the public API contract.
-
-// ScoredRow holds a row index and its cosine similarity score from vector scoring.
-
-// VectorScorer is a compiled vector-scoring closure that runs AFTER traditional
-// predicates have produced a candidate RowSet. It accepts a point-lookup accessor
-// for the embedding column and the candidate set, and returns scored rows at or
-// above the query threshold sorted by score descending.
-//
-// getVec(rowIdx) returns the embedding vector for a row and whether it is present.
-// Only candidate rows (those in candidates) are scored — non-candidates are skipped.
-type VectorScorer func(getVec func(rowIdx int) ([]float32, bool), candidates RowSet) []ScoredRow
-
 // NeedsColumnData reports whether this program requires full column data access
-// (column predicates, streaming predicates, or vector scoring).
+// (column predicates or streaming predicates).
 // A nil Program returns false — lean reader is sufficient for trace-index-only lookups.
 func (p *Program) NeedsColumnData() bool {
 	if p == nil {
 		return false
 	}
-	return p.ColumnPredicate != nil || p.StreamingColumnPredicate != nil || p.VectorScorer != nil
+	return p.ColumnPredicate != nil || p.StreamingColumnPredicate != nil
 }
 
 // Program represents a compiled TraceQL or SQL expression
@@ -134,20 +96,4 @@ func (p *Program) NeedsColumnData() bool {
 // Streaming version for aggregation (avoids RowSet)
 // Extracted predicates for block-level pruning
 
-// VectorScorer is set when the query contains a VECTOR_AI() or VECTOR_ALL() predicate.
-// It runs after ColumnPredicate produces candidates, scoring only those rows.
-// When nil, no vector scoring is applied.
-
 // Original TraceQL query (optional, for debugging)
-
-// VectorColumn is the block column name that VectorScorer reads via point lookup.
-// "__embedding__" for VECTOR_AI, "__embedding_all__" for VECTOR_ALL.
-
-// Vector search fields — non-zero when the query contains a VECTOR() predicate.
-// QueryVector is pre-computed from the VECTOR() query text at compile time.
-
-// VectorLimit is the top-K result count (default: DefaultVectorLimit).
-
-// HasVector is true when the query contains a VECTOR_AI() or VECTOR_ALL() predicate.
-
-// VectorAll is true for VECTOR_ALL() — ranks by stored all-fields embedding (no query vector needed).

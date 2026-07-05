@@ -7,7 +7,6 @@ import (
 // MatchedRow is a blockpack data type.
 type MatchedRow struct {
 	Block    *modules_reader.Block
-	Score    float32
 	BlockIdx int
 	RowIdx   int
 }

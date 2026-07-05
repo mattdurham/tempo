@@ -601,21 +601,13 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 	// re-building the regex DFA (coregex.CompileWithConfig) for each blockpack file —
 	// Tempo issues one Fetch call per file, so compiling once here positions
 	// the API for future per-request program caching.
-	// Pass the embedder so VECTOR_AI() queries compile with the correct embedder baked
-	// in; without it, compileVectorAI returns a no-match predicate (not an error) and
-	// the pre-compiled program silently returns zero spans for VECTOR_AI queries.
 	// Fallback to the string-based QueryTraceQL path when compilation fails (e.g.
 	// structural or pipeline queries that reach Fetch — those are not filter expressions
 	// and CompileTraceQL returns an error for them).
 	//
 	// NOTE-049: compile-once design; SPEC-VM-001: *Program is immutable and reusable.
-	embedder := getProcessEmbedder(configuredEmbedURL)
 	var compiledProgram *blockpack.Program
-	compileOpts := blockpack.QueryOptions{}
-	if embedder != nil {
-		compileOpts.Embedder = embedder
-	}
-	if prog, compileErr := blockpack.CompileTraceQL(query, compileOpts); compileErr == nil {
+	if prog, compileErr := blockpack.CompileTraceQL(query, blockpack.QueryOptions{}); compileErr == nil {
 		compiledProgram = prog
 	} else {
 		slog.Debug("vblockpack CompileTraceQL: falling back to string API", "query", query, "err", compileErr)
@@ -707,11 +699,6 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 		wantedCols = nil // nil = no filtering (match-all queries)
 	}
 
-	// Build QueryOptions and set Embedder only when non-nil. Assigning a typed nil
-	// (*bpembedder.Embedder)(nil) directly to the vm.TextEmbedder interface field creates
-	// a non-nil interface containing a nil pointer, causing a nil dereference panic inside
-	// CompileTraceQLFilterWithOptions when it calls embedder.Embed(). Checking the pointer
-	// before assigning keeps the interface nil when no embedder is configured.
 	queryOpts := blockpack.QueryOptions{
 		Limit:         spanLimit,
 		MostRecent:    common.TraceQLMostRecent(ctx),
@@ -722,9 +709,6 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 		// row groups, not blockpack internal blocks. Passing TotalPages=1 as BlockCount
 		// would scan only 1 internal block out of potentially hundreds. Blockpack files
 		// are already one job per file at the Tempo level, so scan all internal blocks.
-	}
-	if embedder != nil {
-		queryOpts.Embedder = embedder
 	}
 	var fetchErr error
 	var matches []blockpack.SpanMatch

@@ -96,31 +96,6 @@ type BlockpackConfig struct {
 	// retained here. Defaults to 32MB.
 	LRUCacheBytes int64 `yaml:"lru_cache_bytes"`
 
-	// EmbeddingURL is the base URL of an embedding server (e.g. HuggingFace TEI).
-	// When set, spans are embedded at block creation time and VECTOR_AI()/VECTOR_ALL()
-	// queries are supported. Leave empty to disable embedding.
-	EmbeddingURL string `yaml:"embedding_url"`
-
-	// VectorDimension is the expected embedding vector dimension (e.g. 768 for nomic-embed-text-v1.5).
-	// Required when EmbeddingURL is set. Controls the writer's VectorIndex section.
-	VectorDimension int `yaml:"vector_dimension"`
-
-	// EmbeddingConcurrentBatches is the number of concurrent POST /embed requests sent to the
-	// embedding server during block creation. Higher values saturate more server pods.
-	// Defaults to the blockpack default (4) when 0.
-	EmbeddingConcurrentBatches int `yaml:"embedding_concurrent_batches"`
-
-	// EmbeddingBatchSize is the number of texts sent in a single POST /embed request.
-	// Larger values reduce HTTP round trips when span texts are short.
-	// Must not exceed the embedding server's max-batch-tokens / avg tokens per text.
-	// Defaults to the blockpack default (32) when 0.
-	EmbeddingBatchSize int `yaml:"embedding_batch_size"`
-
-	// EmbeddingMaxTextLength is the maximum character length of assembled span text sent to the
-	// embedding server. Shorter limits reduce token count for long spans (error messages, stack
-	// traces), improving GPU throughput. Defaults to 24000 (~8192 tokens) when 0.
-	EmbeddingMaxTextLength int `yaml:"embedding_max_text_length"`
-
 	// MemCacheServers is a list of memcache server addresses for raw block data
 	// (ToCTypeBlock entries — large, primarily benefits pod-local disk/memory cache).
 	// Leave empty to disable the remote memcache tier for block data.

@@ -43,13 +43,6 @@ type StepStats = modules_executor.StepStats
 
 // QueryOptions configures query execution.
 
-// Embedder enables VECTOR_AI() predicates in TraceQL filter queries. When non-nil,
-// a VECTOR_AI("query text") expression is embedded at compile time and matched against
-// spans by cosine similarity. If nil and the query contains VECTOR_AI(), QueryTraceQL
-// returns an error. Any type implementing vm.TextEmbedder is accepted — this keeps
-// blockpack decoupled from the concrete embedder implementation.
-// VECTOR_ALL() does not require an Embedder.
-
 // SelectColumns limits which column names appear in SpanMatch.Fields.
 // When non-empty, only columns whose names are present in this slice are
 // returned by GetField and IterateFields. nil or empty means all columns
@@ -145,12 +138,6 @@ func CompileTraceQL(traceqlQuery string, opts QueryOptions) (*Program, error) {
 			"CompileTraceQL: only filter expressions are supported, got %T",
 			parsed,
 		)
-	}
-	if opts.Embedder != nil || opts.Limit != 0 {
-		return vm.CompileTraceQLFilterWithOptions(fe, vm.CompileOptions{
-			Embedder: opts.Embedder,
-			Limit:    opts.Limit,
-		})
 	}
 	return vm.CompileTraceQLFilter(fe)
 }
@@ -258,16 +245,7 @@ func QueryTraceQLFromIndex(
 		return nil, false, nil
 	}
 
-	var program *vm.Program
-	var compileErr error
-	if opts.Embedder != nil {
-		program, compileErr = vm.CompileTraceQLFilterWithOptions(filterExpr, vm.CompileOptions{
-			Embedder: opts.Embedder,
-			Limit:    opts.Limit,
-		})
-	} else {
-		program, compileErr = vm.CompileTraceQLFilter(filterExpr)
-	}
+	program, compileErr := vm.CompileTraceQLFilter(filterExpr)
 	if compileErr != nil {
 		return nil, false, fmt.Errorf("compile TraceQL filter: %w", compileErr)
 	}

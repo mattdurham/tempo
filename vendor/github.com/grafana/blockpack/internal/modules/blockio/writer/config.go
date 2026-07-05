@@ -6,18 +6,7 @@ import (
 	"io"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/reader"
-	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
-
-// TextEmbedder is the canonical embedding interface, defined in the shared package.
-// Aliased here for backwards compatibility within this package.
-type TextEmbedder = shared.TextEmbedder
-
-// EmbeddingFieldConfig describes one span field to include in auto-embedding text.
-
-// Name is the column name (e.g. "span.name", "resource.service.name").
-
-// Weight controls ordering: "primary" (first, plain text), "context" (key=value), "secondary" (last).
 
 // DedicatedColumn describes one attribute column to be written into the intrinsic section
 // in addition to the standard block columns. Dedicated columns enable the zero-block-read
@@ -38,16 +27,6 @@ type TextEmbedder = shared.TextEmbedder
 // Field order is optimized for struct alignment (betteralign).
 type Config struct {
 	OutputStream io.Writer
-
-	// Embedder enables automatic embedding of spans during block building.
-	// When non-nil, the writer assembles text from each span's fields (using
-	// EmbeddingFields or all fields by default), calls Embedder.Embed(), and
-	// stores the vector as the __embedding__ column. VectorDimension is set
-	// automatically from the first embedding result.
-	//
-	// When nil, the writer only stores vectors that are explicitly provided
-	// as __embedding__ span attributes (the current behavior).
-	Embedder TextEmbedder
 
 	// NOTE: EnableV2Format removed (2026-06-29). V2 lean format is now unconditional:
 	// all blocks are page-aligned, FooterV9 always, no in-file pruning sections.
@@ -71,11 +50,6 @@ type Config struct {
 	// staged output block, keeping all of compaction's disk I/O on the configured scratch
 	// volume rather than the default /tmp.
 	ScratchDir string
-
-	// EmbeddingFields configures which span fields are included in the auto-embedding
-	// text. If empty and Embedder is non-nil, all fields are included using the
-	// default priority ordering (AssembleAllFields).
-	EmbeddingFields []EmbeddingFieldConfig
 
 	// DedicatedColumns lists span and resource attribute columns to be written into
 	// the intrinsic section as well as the standard block columns. Writing a column
@@ -121,12 +95,6 @@ type Config struct {
 	// The auto-flush path preserves all NOTES §17 invariants: metadata, header,
 	// and footer are written only at the final Flush().
 	MaxBufferedSpans int
-
-	// VectorDimension is the expected float32 vector dimension for __embedding__ columns.
-	// 0 means no vector support — the writer will not build a VectorIndex section.
-	// When > 0, vectors encountered during block building are accumulated and a V5 footer
-	// is written at Flush time. Typical value: 768 (nomic-embed-text-v1.5).
-	VectorDimension int
 
 	// DisableAllPresentEncoding turns off selection of the AllPresent encoding kinds
 	// (NOTE-AP-001). When false (the default), fully-present dense columns are written

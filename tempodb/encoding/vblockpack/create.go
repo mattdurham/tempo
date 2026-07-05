@@ -19,8 +19,6 @@ import (
 // CreateBlock creates a new blockpack block from an iterator.
 // Writes blockpack data to a temp file to avoid buffering the entire block in
 // memory, then streams the file to backend storage with a known size.
-// When cfg.Blockpack.VectorDimension > 0, the writer builds a VectorIndex
-// section in the V5 footer for any __embedding__ columns present in the data.
 func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.BlockMeta,
 	i common.Iterator, _ backend.Reader, to backend.Writer,
 ) (*backend.BlockMeta, error) {
@@ -32,13 +30,6 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 		cfg.Blockpack.MemoryCacheBytes,
 	)
 	ConfigureLRU(cfg.Blockpack.LRUCacheBytes)
-	// Only update the process-level embedding URL when cfg provides one explicitly.
-	// Calling ConfigureEmbedding("") would overwrite the URL that tempodb.go set at
-	// startup via storage.trace.block.blockpack.embedding_url — causing the block-builder
-	// (whose block_builder.block section has no embedding_url) to lose the embedder.
-	if cfg.Blockpack.EmbeddingURL != "" {
-		ConfigureEmbedding(cfg.Blockpack.EmbeddingURL, cfg.Blockpack.EmbeddingConcurrentBatches, cfg.Blockpack.EmbeddingBatchSize, cfg.Blockpack.EmbeddingMaxTextLength)
-	}
 
 	// Write to a temp file so we get a known size for StreamWriter and avoid
 	// holding the entire encoded block in RAM.
@@ -71,20 +62,6 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 		// The reader's SpanTree identity fallback is unconditional and was added in the same
 		// change, so enabling this here is safe (this binary's reader understands omit blocks).
 		OmitIntrinsicIdentityColumns: true,
-	}
-	// Pass embedder to blockpack writer — it handles field assembly and embedding internally.
-	// Must guard against nil *Embedder assigned to interface (Go nil interface trap).
-	// Fall back to configuredEmbedURL (set at startup from storage.trace.block) when
-	// cfg.Blockpack.EmbeddingURL is empty (e.g. block-builder's block_builder.block section).
-	embedURL := cfg.Blockpack.EmbeddingURL
-	if embedURL == "" {
-		embedURL = configuredEmbedURL
-	}
-	if emb := getProcessEmbedder(embedURL); emb != nil {
-		writerCfg.Embedder = emb
-	}
-	if cfg.Blockpack.VectorDimension > 0 {
-		writerCfg.VectorDimension = cfg.Blockpack.VectorDimension
 	}
 	// Map Tempo dedicated columns to blockpack dedicated columns.
 	// span-scope → "span." prefix; resource-scope → "resource." prefix.

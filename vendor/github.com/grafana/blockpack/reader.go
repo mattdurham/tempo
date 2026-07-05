@@ -759,7 +759,7 @@ func NewWriter(output io.Writer, maxSpansPerBlock int) (*Writer, error) {
 }
 
 // NewWriterWithConfig creates a Writer with full configuration control.
-// Use this when VectorDimension or other advanced settings are needed.
+// Use this when advanced settings are needed.
 func NewWriterWithConfig(cfg WriterConfig) (*Writer, error) {
 	return modules_blockio.NewWriterWithConfig(cfg)
 }

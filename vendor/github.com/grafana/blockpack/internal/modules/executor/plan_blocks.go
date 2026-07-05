@@ -12,7 +12,6 @@ import (
 // planBlocks runs the full block-selection pipeline for a query:
 //  1. BuildPredicates — converts vm.Program predicates into planner predicates
 //  2. PlanWithOptions — applies time-range filtering
-//  3. fileLevelVectorPrune — VECTOR() centroid reject (when present)
 //
 // NOTE-436: column-level block pruning is handled by the value-index pipeline
 // upstream; there is no in-file intrinsic-TOC pruning step.
@@ -32,17 +31,6 @@ func planBlocks(
 	//
 	// NOTE: File-level bloom reject removed (2026-06-29, in-file block pruning removal).
 	// Value index is now the authoritative source for pruning.
-
-	// File-level and block-level vector centroid reject (VECTOR() predicates only).
-	// If the file centroid is too distant from the query vector, skip the entire file.
-	// If only some blocks are distant, prune those blocks.
-	if program != nil && program.HasVector {
-		plan.SelectedBlocks = fileLevelVectorPrune(r, program, plan.SelectedBlocks)
-		if len(plan.SelectedBlocks) == 0 {
-			plan.Explain = "file-level reject: vector centroid too distant"
-			return plan
-		}
-	}
 
 	// NOTE-436: intrinsic-TOC block pruning removed — there is no intrinsic section.
 	// All column-level block pruning is now done by the value-index pipeline upstream.
@@ -66,74 +54,3 @@ func planBlocks(
 // NOTE: colStatsRejectsInt64 removed (2026-06-29, in-file block pruning removal).
 
 // NOTE: colStatsRejectsFloat64 removed (2026-06-29, in-file block pruning removal).
-
-// fileLevelVectorPrune prunes blocks using VECTOR() centroid distances.
-// If the file centroid is too distant (similarity < threshold), all blocks are pruned.
-// Otherwise, blocks whose centroid is too distant are pruned individually.
-// Returns the surviving block indices.
-func fileLevelVectorPrune(r *modules_reader.Reader, program *vm.Program, selectedBlocks []int) []int {
-	if !program.HasVector || len(program.QueryVector) == 0 {
-		return selectedBlocks
-	}
-
-	vi, err := r.VectorIndex()
-	if err != nil || vi == nil {
-		// No vector index — cannot prune; keep all blocks.
-		return selectedBlocks
-	}
-
-	// Determine threshold: use the minimum VectorThreshold from VECTOR() nodes.
-	threshold := findVectorThreshold(program.Predicates)
-
-	// File-level check: if the file centroid is too distant, skip all blocks.
-	fileSim := float32(1.0) - vi.FileCentroidDistance(program.QueryVector)
-	if fileSim < threshold {
-		return nil
-	}
-
-	// Block-level check: prune blocks whose centroid is too distant.
-	if len(vi.BlockCentroids) == 0 {
-		return selectedBlocks
-	}
-	filtered := make([]int, 0, len(selectedBlocks))
-	for _, bi := range selectedBlocks {
-		if bi >= len(vi.BlockCentroids) {
-			// No centroid for this block index — keep it.
-			filtered = append(filtered, bi)
-			continue
-		}
-		blockSim := float32(1.0) - vi.BlockCentroidDistance(bi, program.QueryVector)
-		if blockSim >= threshold {
-			filtered = append(filtered, bi)
-		}
-	}
-	return filtered
-}
-
-// findVectorThreshold returns the minimum VectorThreshold from VECTOR() RangeNodes.
-// Falls back to DefaultVectorThreshold if no node is found.
-func findVectorThreshold(preds *vm.QueryPredicates) float32 {
-	if preds == nil {
-		return vm.DefaultVectorThreshold
-	}
-	threshold := findVectorThresholdNodes(preds.Nodes)
-	if threshold == 0 {
-		return vm.DefaultVectorThreshold
-	}
-	return threshold
-}
-
-func findVectorThresholdNodes(nodes []vm.RangeNode) float32 {
-	for _, n := range nodes {
-		if len(n.Children) > 0 {
-			if t := findVectorThresholdNodes(n.Children); t > 0 {
-				return t
-			}
-			continue
-		}
-		if len(n.QueryVector) > 0 && n.VectorThreshold > 0 {
-			return n.VectorThreshold
-		}
-	}
-	return 0
-}

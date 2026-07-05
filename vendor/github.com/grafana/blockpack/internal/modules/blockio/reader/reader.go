@@ -4,7 +4,6 @@ package reader
 
 import (
 	"fmt"
-	"math"
 	"reflect"
 	"sync"
 
@@ -46,8 +45,6 @@ func (w WantColumns) toInternalMap() map[string]struct{} {
 // Reader reads and decodes a blockpack file.
 type Reader struct {
 	provider rw.ReaderProvider
-	// vectorIndexErr holds any error from lazy vector index parsing.
-	vectorIndexErr error
 	// cache is the typed cache used for footer/header/metadata/block reads.
 	// Never nil: defaults to sectioncache.NopSectionCache when no cache is configured.
 	// Assigned directly from Options.Cache; nil is normalized to NopSectionCache.
@@ -71,9 +68,6 @@ type Reader struct {
 	// Guarded by preDecodedMu.
 	preCompressedColumns map[preDecodedKey][]byte
 
-	// vectorIndexParsed is the lazily parsed VectorIndex. Access via VectorIndex().
-	vectorIndexParsed *VectorIndex
-
 	// tocMap is the decoded unified ToC (V8 format).
 	tocMap map[shared.ToCKey]shared.ToCEntry
 
@@ -94,8 +88,6 @@ type Reader struct {
 
 	fileSize int64
 
-	vectorIndexOffset uint64
-
 	// Unified-ToC footer fields (FooterV9, the only supported footer).
 	// v8ToCOffset and v8ToCLen point to the snappy-compressed unified ToC blob.
 	v8ToCOffset uint64
@@ -104,17 +96,11 @@ type Reader struct {
 	v8TSOnce sync.Once
 	// NOTE: v8ColStatsOnce removed (2026-06-29, in-file block pruning removal).
 
-	// vectorIndexOnce guards lazy parsing of the vector index section.
-	vectorIndexOnce sync.Once
-
 	// preDecodedMu guards preCompressedColumns. ReadGroupColumnar (which populates it) runs
 	// concurrently across blockGroupPipeline workers on the same *Reader, while the parse
 	// (which reads it) runs on the sequential consumer goroutine — and a read of group N+1
 	// can race the parse of group N. NOTE-212.
 	preDecodedMu sync.Mutex
-
-	// vectorIndexLen is parsed from the agentic v5 footer.
-	vectorIndexLen uint32
 
 	v8ToCLen uint32
 
@@ -446,47 +432,6 @@ func (r *Reader) MayContainTraceID(_ [16]byte) bool { return true }
 
 // NOTE: FooterVersion() and IsV2Format() removed (2026-06-29, v2 lean format unconditional).
 // All files are FooterV9 (v2 lean format); there is no longer a version to branch on.
-
-// VectorIndexRaw reads the raw vector index section bytes (for caller caching).
-// Returns nil for V3/V4 footer files or files with no vector index section.
-func (r *Reader) VectorIndexRaw() ([]byte, error) {
-	if r.vectorIndexOffset == 0 || r.vectorIndexLen == 0 {
-		return nil, nil
-	}
-	if r.vectorIndexLen > math.MaxInt32 {
-		return nil, fmt.Errorf("VectorIndexRaw: vectorIndexLen %d exceeds MaxInt32", r.vectorIndexLen)
-	}
-	//nolint:gosec // vectorIndexLen comes from a trusted file footer; overflow checked above
-	buf := make([]byte, r.vectorIndexLen)
-	// vectorIndexOffset fits in int64: file size is bounded by object storage limits (< 2^63).
-	vecOff := int64(r.vectorIndexOffset) //nolint:gosec
-	n, err := r.provider.ReadAt(buf, vecOff, rw.DataTypeMetadata)
-	if err != nil {
-		return nil, fmt.Errorf("VectorIndexRaw: ReadAt: %w", err)
-	}
-	if n != int(r.vectorIndexLen) {
-		return nil, fmt.Errorf("VectorIndexRaw: short read: %d of %d bytes", n, r.vectorIndexLen)
-	}
-	return buf, nil
-}
-
-// VectorIndex returns the lazily-parsed VectorIndex for this file.
-// Returns nil, nil for files with no vector index section.
-// Safe for concurrent use after the first call.
-func (r *Reader) VectorIndex() (*VectorIndex, error) {
-	r.vectorIndexOnce.Do(func() {
-		raw, err := r.VectorIndexRaw()
-		if err != nil {
-			r.vectorIndexErr = err
-			return
-		}
-		if raw == nil {
-			return
-		}
-		r.vectorIndexParsed, r.vectorIndexErr = parseVectorIndexSection(raw)
-	})
-	return r.vectorIndexParsed, r.vectorIndexErr
-}
 
 // AddColumnsToBlock decodes additional columns from an already-loaded BlockWithBytes.
 // No additional I/O is performed.

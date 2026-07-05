@@ -401,17 +401,6 @@ const (
 	ScopeSchemaURL          = "scope:schema_url"
 )
 
-// Well-known vector column names. Double-underscore prefix signals internal/synthetic columns.
-// VECTOR_AI queries search __embedding__; VECTOR_ALL queries search __embedding_all__.
-const (
-	// EmbeddingColumnName is the vector column for VECTOR_AI (custom field config).
-	EmbeddingColumnName     = "__embedding__"
-	EmbeddingTextColumnName = "__embedding_text__"
-	// EmbeddingAllColumnName is the vector column for VECTOR_ALL (auto-assembled all fields).
-	EmbeddingAllColumnName     = "__embedding_all__"
-	EmbeddingAllTextColumnName = "__embedding_all_text__"
-)
-
 // Value index constants (internal/modules/valueindex/SPECS.md).
 const (
 	// Value index file section magic numbers.

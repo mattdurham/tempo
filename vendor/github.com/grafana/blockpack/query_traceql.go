@@ -29,17 +29,7 @@ func streamFilterQuery(
 	opts QueryOptions,
 	fn spanMatchFn,
 ) (QueryStats, error) {
-	var program *vm.Program
-	var compileErr error
-	if opts.Embedder != nil {
-		compileOpts := vm.CompileOptions{
-			Embedder: opts.Embedder,
-			Limit:    opts.Limit,
-		}
-		program, compileErr = vm.CompileTraceQLFilterWithOptions(filterExpr, compileOpts)
-	} else {
-		program, compileErr = vm.CompileTraceQLFilter(filterExpr)
-	}
+	program, compileErr := vm.CompileTraceQLFilter(filterExpr)
 	if compileErr != nil {
 		return QueryStats{}, fmt.Errorf("compile TraceQL filter: %w", compileErr)
 	}
