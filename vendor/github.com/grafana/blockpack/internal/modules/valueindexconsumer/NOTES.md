@@ -506,4 +506,213 @@ not whole spans) — span identity (SpanID/RowIdx) + page-aligned BlockRef drive
 direct addressing, not TraceID. A write failure is returned for the caller to log
 but must NOT fail the block write: the index can always be rebuilt from the source.
 
+
+**Addendum (2026-07-04):** the claim above ("TraceID is the zero value... the extractor walks
+columns, not whole spans") is now stale as a statement about `ExtractValueIndexEntries` itself.
+Stage 5 of the `traceindex.go` wiring effort fixed a real bug: `extractBlockColumns` now
+populates `TraceID` on every yielded entry via a `traceIDCol` lookup, exactly mirroring the
+existing `spanIDCol`/`parentSpanIDCol` per-block lookups (`valueindexconsumer/SPECS.md`
+SPEC-VI-3).
+
+**Second addendum (2026-07-04, same day):** the first addendum above initially reported
+`WriteValueIndexL0` itself as unchanged ("still hardcodes a local zero `traceID`... not a live
+bug"). That assessment was incomplete: further investigation found the hardcoded zero was a
+**real, independent data-loss bug**, not merely stale documentation — see NOTE-VI-069 for the
+mechanism (TraceID as a compaction dedup/merge key) and the fix (now landed: all three
+`AddEntry`/`AddEntryV2`/`AddEntryV4` call sites pass `e.TraceID`). The doc comment quoted above
+has also been corrected in the source to describe the current, fixed behavior.
+
+**Third addendum (2026-07-05):** the "not a live bug" framing in both prior addenda rested on
+an incorrect premise — that `WriteValueIndexL0` has zero production callers. It does not:
+`/home/mdurham/source/blockpack_collection/tempo`'s `tempodb/encoding/vblockpack/compactor.go`
+and `create.go` both call it on every block write/compaction when `value_index_enabled` is
+true (`valueindex.go:ConfigureValueIndex`). The original "zero callers" grep only checked
+`/home/mdurham/source/tempo-mrd`, a separate, apparently-inactive checkout of the same repo.
+**Both the TraceID dedup-collision bug (NOTE-VI-069) and the still-open `trace:id`
+format-collision gap (`valueindexconsumer/SPECS.md` SPEC-VI-2's corrected caveat) were/are live
+for any tenant with `value_index_enabled=true`, not merely latent.** Flagged to the team;
+outside this spec-oracle's remit to fix in code.
+
 Back-refs: `valueindex_l0write.go`, `valueindex_extract.go` (ExtractValueIndexEntries).
+
+## NOTE-VI-060 — `ParentSpanID` field addition (issue #428 wiring, Stage 1)
+
+Date: 2026-07-04
+
+Added `ParentSpanID [8]byte` to `ColumnEntry` (alongside the existing `SpanID [8]byte`,
+NOTE-VI-029) as a same-cost extension of the root package's `extractBlockColumns` walk, which
+already reads the block's `span:id` column per row (see root `valueindex_extract.go`). Zero for
+a root span or when the source block lacks a `span:parent_id` column entirely (pre-identity-
+column legacy format) — mirrors `SpanID`'s own nil-column fallback exactly.
+
+This is the enabling change for the trace-group buffer/flush path (NOTE-VI-061): a
+`valueindex.SpanEntry` needs `SpanID` *and* `ParentSpanID` together per row to support tree
+assembly (`AssembleTrace`, `internal/modules/valueindex/traceindex.go`), which the prior
+per-column extraction shape could not produce without an awkward cross-column join.
+
+Back-refs: `internal/modules/valueindexconsumer/consumer.go:ColumnEntry`,
+`cmd/value-index-consumer/main.go:columnEntryFromValueIndexEntry`.
+See `SPECS.md` SPEC-VI-1.
+
+## NOTE-VI-061 — Trace-group flush path fires unconditionally on `span:id`, independent of the column allowlist (issue #428 wiring, Stage 2)
+
+Date: 2026-07-04
+
+`ingest`'s existing per-column allowlist filter (`if len(s.columns) > 0 { ... }`, NOTE-VI-016)
+was deliberately left untouched — but a **new, separate, unconditional** branch was added
+ahead of it, firing on the `span:id` sentinel column regardless of what an operator configured
+in `s.columns`. Trace-by-id coverage is a correctness-adjacent feature (it exists to prevent
+the `GetTraceByID` full-scan OOM this whole effort was built around) and must not silently
+degrade or disappear based on an operator's unrelated attribute-indexing configuration choice.
+This is why it is a second, parallel buffer/flush path (`traceGroupBuffer`/`flushTraceGroups`,
+`traceflush.go`) rather than a mode of the existing per-column path — the two have genuinely
+different gating rules and it would be more surprising, not less, to overload one code path
+with two different allowlist semantics.
+
+One buffer per **tenant**, not per-column like `columnBuffer` — a tenant has exactly one
+trace-index colDir (`hash("trace:id")`), unlike the N per-tenant colDirs the standard path
+manages.
+
+`resolvePendingAcks` was extracted from `flushColumn`'s own ack-bookkeeping tail into a shared
+`Service` method so both buffer kinds (per-column, per-tenant-trace-group) use one consistent
+decrement/ack-ready contract rather than two copies of the same logic — a refactor motivated
+directly by this feature, not a pre-existing gap.
+
+Back-refs: `internal/modules/valueindexconsumer/service.go:ingest`, `:resolvePendingAcks`,
+`internal/modules/valueindexconsumer/traceflush.go`. See `SPECS.md` SPEC-VI-2.
+
+## NOTE-VI-062 — Dedup-within-a-flush-window deliberately deferred to compaction (issue #428 wiring, Stage 2)
+
+Date: 2026-07-04
+
+`flushTraceGroups` groups spilled rows by `TraceID` only; it does not deduplicate
+`(TraceID, SpanID)` pairs observed twice within one flush window. This is a deliberate design
+choice, not an oversight: `valueindex.MergeTraceGroups` (`internal/modules/valueindex/
+traceindex.go`, NOTE-VI-038) already owns exactly this dedup contract for compaction-time
+merges ("`(TraceID, SpanID)` pairs are deduplicated — first occurrence wins"). Duplicating that
+logic in the flush path would create two divergent copies of the same rule with no benefit —
+L0 files are expected to be compacted promptly, and an L0 file with a handful of duplicate
+`SpanEntry`s for the same span is not incorrect (querier-side `AssembleTrace`/materialization
+code does not assume single-occurrence-per-SpanID within a raw, uncompacted `TraceGroup`), just
+transiently slightly larger than strictly necessary.
+
+**Note for future readers:** `.bob/state/plan.md`'s own Stage 2 TDD item 5 wording is
+internally self-contradictory on this point (it describes asserting "exactly one SpanEntry...
+not two" in the same sentence that recommends deferring dedup to compaction). This entry and
+`TestFlushTraceGroups_DedupWithinOneFlushWindow` (see `TESTS.md` TEST-VI-3) are the resolved,
+authoritative statement of the actual decision: the plan's own explicit recommendation (defer
+to compaction) was followed, not the contradictory assertion text.
+
+Back-ref: `internal/modules/valueindexconsumer/traceflush.go:readTraceGroups`. See `SPECS.md`
+SPEC-VI-2, `TESTS.md` TEST-VI-3.
+
+## NOTE-VI-067 — `TraceID` was always zero in production until Stage 5 caught it (issue #428 wiring, Stage 5)
+
+Date: 2026-07-04
+
+`extractBlockColumns` (root `valueindex_extract.go`) already looked up `spanIDCol` and
+`parentSpanIDCol` once per block to stamp `SpanID`/`ParentSpanID` onto every yielded entry
+(NOTE-VI-060), but had no equivalent `traceIDCol` lookup — every `ValueIndexEntry.TraceID` (and
+therefore every `ColumnEntry.TraceID`) was silently the zero value for every real block ever
+processed, across every column, not just the trace-group path. Both fields had existed in
+their respective structs for some time; nothing was ever wrong with their *declaration*, only
+with `extractBlockColumns` never actually populating one of them.
+
+This went undetected because the only code that ever set `TraceID` to a real value was
+hand-built test fixtures constructing `ValueIndexEntry`/`ColumnEntry` literals directly — no
+test exercised the real extraction path's `TraceID` output end-to-end until Stage 5's full
+pipeline integration test (`TestTraceIndexPipeline_ExtractFlushCompactQuery`,
+root-package `traceindex_pipeline_test.go`) needed `readTraceGroups`' per-`TraceID` grouping
+(`traceflush.go`) to actually receive distinct, correct trace IDs to group by. Before this fix,
+every trace-group buffer in the entire system would have grouped every observed span under a
+single zero `TraceID`, producing one giant, wrong "trace" per flush window instead of one
+`TraceGroup` per real trace — a correctness bug that would have made the whole trace-by-ID
+index effort (Stages 1-4) silently useless in production despite every individual stage's own
+unit tests passing (each stage's own tests supplied `TraceID` values by hand, masking the gap
+exactly the way the pre-fix production code never could).
+
+Fix: a `traceIDCol` lookup was added to `extractBlockColumns` (root `valueindex_extract.go`),
+identical in shape to the existing `spanIDCol`/`parentSpanIDCol` lookups, and threaded through
+`columnEntryFromValueIndexEntry` (`cmd/value-index-consumer/main.go`) exactly as those two
+fields already were.
+
+Back-refs: root `valueindex_extract.go:extractBlockColumns`,
+`cmd/value-index-consumer/main.go:columnEntryFromValueIndexEntry`. See `SPECS.md` SPEC-VI-3.
+Regression test: `valueindex_extract_test.go:TestExtractValueIndexEntries_YieldsTraceID`.
+
+## NOTE-VI-068 — `trace:id` excluded from standard buffering: a necessary corollary to the compactor's format-dispatch fix (issue #428 wiring, Stage 5)
+
+Date: 2026-07-04
+
+Finding 2 (`valueindexcompactor/NOTES.md` NOTE-VI-065) fixed the compactor side of a format
+collision: the `vbg2Magic` purge loop must not run against a trace-index colDir, or it would
+delete every genuine `TraceGroup` file as junk. Stage 5 caught the mirror-image gap on the
+*producer* side: nothing had ever stopped the standard per-column path from writing a
+`BucketGroup`-format `trace:id` L0 file into that exact same colDir in the first place — the
+extraction layer is deliberately policy-free (NOTE-VI-027, "indexes every column, no built-in
+denylist") and `ingest`'s `s.columns` allowlist is operator-configured, so an operator adding
+`trace:id` to their allowlist (deliberately, or by copy-pasting a broad config from elsewhere)
+would have produced exactly the file the compactor's dispatch fix was written to protect
+against. `mergeTraceLevel`'s corrupt-input handling (NOTE-VI-066) would have *contained* the
+resulting damage (the misrouted file would fail to decode and simply sit at L0 forever,
+excluded from future merge attempts, rather than corrupting other data) — but containment is
+not the same as prevention, and a permanently-stuck orphan file is itself an undesirable,
+silently-accumulating outcome.
+
+Fix: `ingest` now excludes `ColName == shared.TraceIDColumnName` from the standard buffering
+path unconditionally, checked before the `s.columns` allowlist so no configuration choice can
+re-enable it. This is the same "trace:id gets special, sentinel-driven handling, independent of
+operator configuration" pattern already established for the trace-group buffer itself
+(NOTE-VI-061) — the two decisions (buffer trace:id's data specially, and never buffer it via
+the generic path) are two halves of one coherent design, not independent choices.
+
+Back-ref: `internal/modules/valueindexconsumer/service.go:ingest`. See `SPECS.md` SPEC-VI-4,
+`valueindexcompactor/NOTES.md` NOTE-VI-065/NOTE-VI-066 (the compactor-side half of this same
+concern).
+
+## NOTE-VI-069 — `WriteValueIndexL0`'s hardcoded zero TraceID was a real dedup-key collision bug, not just stale docs (issue #428 wiring, Stage 5 follow-up)
+
+Date: 2026-07-04
+
+Reported by tidx-coder-a as a follow-up to the SPEC-VI-3/NOTE-VI-067 TraceID population fix.
+`WriteValueIndexL0` (root `valueindex_l0write.go`) previously passed a hardcoded local
+`var traceID [16]byte` (always zero) to every `AddEntry`/`AddEntryV2`/`AddEntryV4` call,
+regardless of the real `TraceID` `ExtractValueIndexEntries` now correctly surfaces per entry
+(NOTE-VI-067). This was initially flagged (SPEC-VI-3's original caveat, NOTE-VI-042's first
+addendum) as cosmetic — a stale doc comment on a function with zero production callers, hence
+no live query-path impact.
+
+**That assessment was incomplete, twice over.** `SpanRef.TraceID` is not a cosmetic identity
+field on the compaction path — `bucketmerge.go`/`stream_compaction.go`'s merge logic
+groups/dedups `SpanRef`s partly by `TraceID` within a `(SourceRef, BlockRef)` key. A hardcoded
+zero `TraceID` meant **two distinct traces observed at the same `(SourceRef, BlockRef)` would
+silently collide under one shared merge key on the first compaction pass**, losing one trace's
+span data entirely — a genuine data-loss bug in `WriteValueIndexL0`'s own write path.
+
+**Correction (2026-07-05):** this was originally assessed as latent-but-not-harmless, reasoning
+that it "would have activated... the moment any future caller wired `WriteValueIndexL0` up" —
+on the incorrect premise that no caller existed yet. That premise was wrong:
+`/home/mdurham/source/blockpack_collection/tempo`'s `tempodb/encoding/vblockpack/compactor.go`
+and `create.go` already call `WriteValueIndexL0` on every block write/compaction when
+`value_index_enabled` is true, and have since NOTE-VI-042 was written (2026-06-30) — well
+before this bug was found and fixed (2026-07-04). **This means the collision bug was live and
+active in production for any tenant with that flag enabled for the entire period between
+2026-06-30 and this fix landing**, not merely a risk that "would have" activated later.
+Whether any tenant actually had `value_index_enabled=true` during that window, and therefore
+whether real historical data loss occurred, is an operational question this spec-oracle cannot
+answer from source code alone — flagged to the team for follow-up investigation.
+
+**Fix:** all three call sites now pass `e.TraceID` instead of the hardcoded zero; the function's
+doc comment was corrected to describe current behavior instead of the stale "TraceID is not
+surfaced" reasoning.
+
+**Regression test:** `TestWriteValueIndexL0_TraceIDPopulated`
+(`valueindex_l0write_test.go`) constructs two spans sharing the same value (`"svc-a"`, forcing
+the same `(SourceRef, BlockRef)` key) but with **distinct** `TraceID`s, and asserts both survive
+as separate `SpanRef` entries after the write — confirmed red against the pre-fix code (both
+spans collapsed into one zero-TraceID entry) and green after.
+
+Back-refs: `valueindex_l0write.go:WriteValueIndexL0`,
+`valueindex_l0write_test.go:TestWriteValueIndexL0_TraceIDPopulated`. See `SPECS.md` SPEC-VI-3
+(Caveat, resolved), NOTE-VI-042 (second addendum), NOTE-VI-067 (the upstream `TraceID`
+population fix this bug depended on being fixed first).

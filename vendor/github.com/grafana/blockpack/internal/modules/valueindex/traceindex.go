@@ -16,6 +16,7 @@ package valueindex
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"sort"
@@ -53,6 +54,12 @@ type TraceGroup struct {
 // spanEntryWireSize is the per-span byte size on the wire:
 // span_id[8] + parent_span_id[8] + source_ref_idx[2] + block_ref[5] + row_idx[2].
 const spanEntryWireSize = 8 + 8 + 2 + BlockRefSize + 2
+
+// minGroupWireSize is the fixed per-group header cost on the wire, before any
+// span data: time_sec[8] + trace_id[16] + span_count[4]. Used to bounds-check
+// an untrusted on-disk groupCount against the remaining buffer before
+// allocating (DecodeTraceGroups) -- the minimum any group could possibly cost.
+const minGroupWireSize = 8 + 16 + 4
 
 // EncodeTraceGroups encodes a slice of TraceGroups into a snappy-compressed
 // payload with a leading string table. Groups are sorted by (TimeSec ASC,
@@ -146,6 +153,17 @@ func DecodeTraceGroups(compressed []byte) ([]TraceGroup, error) {
 	groupCount := int(binary.LittleEndian.Uint32(raw[pos : pos+4]))
 	pos += 4
 
+	// Bounds-check groupCount against the remaining buffer BEFORE allocating
+	// (mirrors the spanCount check below): an untrusted/corrupted on-disk
+	// groupCount must not drive a large allocation before the per-iteration
+	// truncation check would otherwise catch it.
+	if groupCount < 0 || pos+groupCount*minGroupWireSize > len(raw) {
+		return nil, fmt.Errorf(
+			"valueindex: trace index group count %d implausible for remaining %d bytes",
+			groupCount, len(raw)-pos,
+		)
+	}
+
 	groups := make([]TraceGroup, 0, groupCount)
 	for gi := range groupCount {
 		if pos+8+16+4 > len(raw) {
@@ -211,25 +229,28 @@ func less8(a, b [8]byte) bool {
 	return bytes.Compare(a[:], b[:]) < 0
 }
 
-// SourceExists reports whether a data blockpack SourceRef still exists. During
-// compaction the compactor supplies this (one HEAD per unique SourceRef, cached)
-// so spans whose source was deleted by retention are dropped rather than
-// propagated. A nil checker keeps every span (no retention check).
-type SourceExists func(sourceRef string) bool
-
 // MergeTraceGroups merges TraceGroups from multiple input files into a deduplicated
 // output, suitable for compaction (issue #428 acceptance):
 //
 //   - Groups for the same TraceID are merged into one TraceGroup.
 //   - (TraceID, SpanID) pairs are deduplicated; the first occurrence wins.
-//   - A span whose SourceRef no longer exists (per exists) is dropped.
+//   - A span whose SourceRef is no longer live (per checker) is dropped.
 //   - A group whose every span is dropped is removed entirely.
 //   - The merged group's TimeSec is the minimum TimeSec across its inputs
 //     (the earliest bucket the trace was seen in).
 //
-// A nil exists checker skips the retention drop (keeps all spans).
+// A nil checker skips the retention drop (keeps all spans). checker matches
+// the RefChecker shape every other compaction code path in this package
+// already uses (e.g. StreamCompactBucketFiles), rather than a bespoke
+// func(string) bool, so callers thread the same context-aware, cacheable
+// checker through both formats.
+//
 // Output is sorted by (TimeSec ASC, TraceID ASC).
-func MergeTraceGroups(exists SourceExists, inputs ...[]TraceGroup) []TraceGroup {
+func MergeTraceGroups(
+	ctx context.Context,
+	checker RefChecker,
+	inputs ...[]TraceGroup,
+) ([]TraceGroup, error) {
 	type merged struct {
 		seenSpan map[[8]byte]struct{}
 		spans    []SpanEntry
@@ -249,8 +270,18 @@ func MergeTraceGroups(exists SourceExists, inputs ...[]TraceGroup) []TraceGroup 
 			}
 			for si := range g.Spans {
 				s := g.Spans[si]
-				if exists != nil && !exists(s.SourceRef) {
-					continue
+				if checker != nil {
+					live, err := checker.IsLive(ctx, s.SourceRef)
+					if err != nil {
+						return nil, fmt.Errorf(
+							"valueindex: MergeTraceGroups: RefChecker.IsLive(%q): %w",
+							s.SourceRef,
+							err,
+						)
+					}
+					if !live {
+						continue
+					}
 				}
 				if _, dup := m.seenSpan[s.SpanID]; dup {
 					continue
@@ -273,7 +304,7 @@ func MergeTraceGroups(exists SourceExists, inputs ...[]TraceGroup) []TraceGroup 
 		})
 	}
 	sortTraceGroups(out)
-	return out
+	return out, nil
 }
 
 // SpanNode is one node in an assembled trace tree.

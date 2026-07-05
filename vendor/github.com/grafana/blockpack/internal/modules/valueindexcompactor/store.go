@@ -8,6 +8,12 @@ import (
 // NOTE-VI-017: see internal/modules/valueindexcompactor/NOTES.md.
 // Any changes to this file must be reflected there.
 
+// IndexObject is a key+size pair returned by IndexStore.List.
+type IndexObject struct {
+	Key  string
+	Size int64
+}
+
 // IndexStore is the object-storage surface the compactor needs: list keys under
 // a prefix, read and write whole objects, and delete compacted inputs. It is
 // exported so external callers (tempo) can supply their object store through the
@@ -21,11 +27,15 @@ import (
 // in "/") one level below prefix, non-recursively. It is used by compactTenant
 // to walk the col-hash and type levels without loading the full file listing.
 type IndexStore interface {
-	// List returns the full keys of all objects whose name begins with prefix.
-	List(ctx context.Context, prefix string) ([]string, error)
+	// List returns the full keys and sizes of all objects whose name begins
+	// with prefix.
+	List(ctx context.Context, prefix string) ([]IndexObject, error)
 	// ListDirs returns the immediate child directory prefixes (ending in "/")
 	// one level below prefix, without recursing into them.
 	ListDirs(ctx context.Context, prefix string) ([]string, error)
+	// Peek reads the first n bytes of the object at key without fetching the
+	// whole object. Used to inspect the magic bytes before a full Get.
+	Peek(ctx context.Context, key string, n int) ([]byte, error)
 	// Get reads the entire object at key.
 	Get(ctx context.Context, key string) ([]byte, error)
 	// Put writes data to key, creating or overwriting it.

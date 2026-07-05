@@ -3687,3 +3687,49 @@ Tests verify:
 - `TestStartBlockSpan_Attributes`: `blockpack.block` span name is correct and `blockpack.block.index` is set.
 - `TestCollect_ContextCancellation`: canceled context causes `Collect` to return `ctx.Err()`.
 - `TestCollect_BackgroundContext`: Collect works correctly with a valid context (covers the ctx-threading path).
+
+---
+
+## EX-VIS-01: TestSliceValueIndexSource_ConcurrentAddAndRecordFileIO_NoRace
+
+*Added: 2026-07-02*
+
+**Scenario:** Concurrent `Add`/`RecordFileIO` calls from multiple goroutines do not race and
+do not lose data (SPEC-VIS-1, NOTE-VI-048).
+
+**Setup:** `internal/modules/executor/metrics_trace_vi_test.go`. 50 goroutines, each adding 3
+`VILookupResult`s (150 total) with distinct TraceIDs — mixed across 5 column names
+(`col-a`..`col-e`, `i % 5`) to force map-write contention on `SliceValueIndexSource.data` —
+then calling `RecordFileIO(1, 100)`. Each goroutine's results use a distinct TraceID
+(`combined := i*perGoroutineResults + j`) because `AllResults` dedups by
+`(SourceRef, BlockPage, RowIdx, TraceID)`, not `SpanID` (NOTE-VI-045) — reusing TraceIDs
+across goroutines would collapse results and mask a real data-loss bug as a passing test.
+
+**Assertions (after `wg.Wait()`):**
+
+- `Stats().FilesRead == 50` (one per goroutine's `RecordFileIO` call).
+- `Stats().BytesRead == 50*100`.
+- `Stats().Hits == 50*3` (150 — every concurrently `Add`ed result counted).
+- `AllResults()` returns `ok == true` and `len(all) == 150` (no results lost to concurrent map
+  writes).
+
+**Must run with `-race`:** this test only reliably catches a regression (missing mutex) under
+`go test -race`; without `-race` a lost update on the unsynchronized map may not manifest as a
+length mismatch on every run.
+
+Back-ref: `internal/modules/executor/metrics_trace_vi_test.go:TestSliceValueIndexSource_ConcurrentAddAndRecordFileIO_NoRace`.
+
+## EX-VIS-02: TestSliceValueIndexSource_StatsAccumulate
+
+**Scenario:** `RecordFileIO` accumulates `FilesRead`/`BytesRead` across repeated calls, and
+`Stats().Hits` is derived from stored `Add`ed results at read time regardless of call order
+(NOTE-VI-039).
+
+**Setup:** `internal/modules/executor/metrics_trace_vi_test.go`. Sequential calls to `Add` and
+`RecordFileIO` in varying order; `Stats()` called after each to verify running totals.
+
+**Assertions:** `FilesRead`/`BytesRead` sum across all `RecordFileIO` calls; `Hits` always
+equals the total count of stored results regardless of the order `Add`/`RecordFileIO` were
+called in.
+
+Back-ref: `internal/modules/executor/metrics_trace_vi_test.go:TestSliceValueIndexSource_StatsAccumulate`.

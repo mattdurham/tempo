@@ -96,9 +96,10 @@ type Service struct {
 	extractor Extractor
 	store     ObjectPutter
 
-	buffers    map[bufferKey]*columnBuffer // keyed by (column name, column type)
-	pendingCol map[string]int              // message ID → count of buffers still holding its entries
-	columns    map[string]struct{}
+	buffers      map[bufferKey]*columnBuffer  // keyed by (column name, column type)
+	traceBuffers map[string]*traceGroupBuffer // keyed by tenant (Stage 2, traceindex.go wiring)
+	pendingCol   map[string]int               // message ID → count of buffers still holding its entries
+	columns      map[string]struct{}
 
 	metrics *consumerMetrics // nil when Config.Registerer is nil (no-op)
 	logger  *slog.Logger     // never nil — defaults to slog.Default() (NOTE-VI-028)
@@ -119,16 +120,17 @@ func NewService(cfg Config, consumer Consumer, extractor Extractor, store Object
 		logger = slog.Default()
 	}
 	return &Service{
-		consumer:   consumer,
-		extractor:  extractor,
-		store:      store,
-		buffers:    make(map[bufferKey]*columnBuffer),
-		pendingCol: make(map[string]int),
-		cfg:        cfg,
-		columns:    cfg.columnSet(),
-		metrics:    newConsumerMetrics(cfg.Registerer),
-		logger:     logger,
-		now:        time.Now,
+		consumer:     consumer,
+		extractor:    extractor,
+		store:        store,
+		buffers:      make(map[bufferKey]*columnBuffer),
+		traceBuffers: make(map[string]*traceGroupBuffer),
+		pendingCol:   make(map[string]int),
+		cfg:          cfg,
+		columns:      cfg.columnSet(),
+		metrics:      newConsumerMetrics(cfg.Registerer),
+		logger:       logger,
+		now:          time.Now,
 	}, nil
 }
 
@@ -212,6 +214,7 @@ func (s *Service) observeQueueState(ctx context.Context) {
 // silent pod is observable while burning CPU on a large block.
 func (s *Service) ingest(ctx context.Context, msg Message) error {
 	touched := make(map[bufferKey]struct{})
+	touchedTrace := make(map[string]struct{}) // tenant → touched this ingest call
 	perColumn := make(map[string]int)
 
 	s.logger.Info("value-index consumer job claimed", "file", msg.Event.Path, "msg_id", msg.ID)
@@ -226,6 +229,30 @@ func (s *Service) ingest(ctx context.Context, msg Message) error {
 	extractStart := s.now()
 	err := s.extractor.Extract(ctx, msg.Event, func(e ColumnEntry) error {
 		totalEntries++
+		// Unconditional trace-by-id buffering (Stage 2, traceindex.go wiring):
+		// fires on the span:id sentinel column regardless of the configured
+		// column allowlist below -- trace-by-id coverage must not depend on
+		// which attribute columns an operator chose to index.
+		if e.ColName == shared.SpanIDColumnName {
+			if terr := s.bufferTraceRow(e, msg.ID, touchedTrace); terr != nil {
+				return terr
+			}
+		}
+		// trace:id is excluded from the standard per-column value-index path
+		// (Stage 2, traceindex.go wiring): both paths key their L0 files under
+		// the SAME colHash("trace:id")/uuid/ directory (Stage 2's design reuses
+		// that exact convention so DiscoverIndexFiles needs no changes), so
+		// indexing trace:id as an ordinary searchable column would silently mix
+		// BucketGroup-format files into a directory the compactor's
+		// format-dispatch (Finding 2) treats as 100% TraceGroup format, causing
+		// every genuine BucketGroup file there to be misrouted into
+		// mergeTraceLevel, fail DecodeTraceGroups, and be stuck at L0 forever.
+		// No code anywhere queries trace:id via the standard value-index scan
+		// (the dedicated TraceGroup index exists precisely to serve that need),
+		// so this exclusion has no user-visible cost.
+		if e.ColName == shared.TraceIDColumnName {
+			return nil
+		}
 		if len(s.columns) > 0 {
 			if _, ok := s.columns[e.ColName]; !ok {
 				return nil
@@ -286,9 +313,18 @@ func (s *Service) ingest(ctx context.Context, msg Message) error {
 			return fmt.Errorf("valueindexconsumer: flush spill buffer %q: %w", buf.colName, ferr)
 		}
 	}
+	for tenant := range touchedTrace {
+		buf := s.traceBuffers[tenant]
+		if ferr := buf.bw.Flush(); ferr != nil {
+			s.metrics.incError(consumerOpExtract)
+			return fmt.Errorf("valueindexconsumer: flush trace spill buffer %q: %w", buf.tenant, ferr)
+		}
+	}
 
-	if len(touched) == 0 {
-		// No configured column touched: the file is fully handled by this ack.
+	totalTouched := len(touched) + len(touchedTrace)
+	if totalTouched == 0 {
+		// No configured column and no trace-buffer row touched: the file is
+		// fully handled by this ack.
 		if ackErr := s.consumer.Ack(ctx, msg.ID); ackErr != nil {
 			s.metrics.incError(consumerOpAck)
 			s.logger.Error("value-index consumer ack failed", "file", msg.Event.Path, "msg_id", msg.ID, "err", ackErr)
@@ -298,7 +334,7 @@ func (s *Service) ingest(ctx context.Context, msg Message) error {
 		s.logger.Info("value-index consumer job acked", "file", msg.Event.Path, "msg_id", msg.ID, "ok", true)
 		return nil
 	}
-	s.pendingCol[msg.ID] = len(touched)
+	s.pendingCol[msg.ID] = totalTouched
 	return nil
 }
 
@@ -342,6 +378,15 @@ func (s *Service) flushAll(ctx context.Context) error {
 			continue
 		}
 		if err := s.flushColumn(ctx, buf); err != nil {
+			return err
+		}
+		flushed++
+	}
+	for _, buf := range s.traceBuffers {
+		if !buf.hasData {
+			continue
+		}
+		if err := s.flushTraceGroups(ctx, buf); err != nil {
 			return err
 		}
 		flushed++
@@ -452,14 +497,7 @@ func (s *Service) flushColumn(ctx context.Context, buf *columnBuffer) error {
 		"elapsed", colElapsed)
 
 	// Ack messages whose entries are now all on S3.
-	var ackIDs []string
-	for id := range buf.pendingIDs {
-		s.pendingCol[id]--
-		if s.pendingCol[id] <= 0 {
-			delete(s.pendingCol, id)
-			ackIDs = append(ackIDs, id)
-		}
-	}
+	ackIDs := s.resolvePendingAcks(buf.pendingIDs)
 	buf.pendingIDs = make(map[string]struct{})
 	buf.hasData = false
 
@@ -490,9 +528,30 @@ func (s *Service) flushColumn(ctx context.Context, buf *columnBuffer) error {
 	return nil
 }
 
+// resolvePendingAcks decrements s.pendingCol for every message ID in
+// pendingIDs and returns the subset that have now reached zero (fully
+// processed by every buffer -- column or trace-group -- they touched) and are
+// ready to ack. Shared by flushColumn and flushTraceGroups so the two buffer
+// kinds participate in one consistent ack-bookkeeping contract.
+func (s *Service) resolvePendingAcks(pendingIDs map[string]struct{}) []string {
+	var ackIDs []string
+	for id := range pendingIDs {
+		s.pendingCol[id]--
+		if s.pendingCol[id] <= 0 {
+			delete(s.pendingCol, id)
+			ackIDs = append(ackIDs, id)
+		}
+	}
+	return ackIDs
+}
+
 // closeAllBuffers removes all temp spill files on shutdown.
 func (s *Service) closeAllBuffers() {
 	for _, buf := range s.buffers {
+		_ = buf.file.Close()
+		_ = os.Remove(buf.file.Name()) //nolint:gosec // G703: name comes from os.CreateTemp, not user input
+	}
+	for _, buf := range s.traceBuffers {
 		_ = buf.file.Close()
 		_ = os.Remove(buf.file.Name()) //nolint:gosec // G703: name comes from os.CreateTemp, not user input
 	}

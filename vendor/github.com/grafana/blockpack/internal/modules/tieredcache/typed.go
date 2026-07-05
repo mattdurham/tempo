@@ -73,19 +73,19 @@ const (
 // Nil means no metrics. Consistent with filecache.Config.Registerer.
 
 // DefaultTypedConfig returns a TypedConfig with the recommended tier mapping:
-//   - mem: Footer, TOC, Bloom, Block (low-latency, high-reuse)
-//   - disk: Metadata, TraceIdx (large blobs; disk round-trip acceptable)
+//   - hot: Footer, TOC, Bloom, Block (low-latency, high-reuse small blobs)
+//   - warm: Metadata, TraceIdx (large blobs; disk round-trip acceptable)
 //
-// IMPORTANT: Bloom compact-header blobs can exceed 15 MiB per file. Size the mem budget
-// to at least 2 × maxBlobSize × maxConcurrentFiles to avoid evicting active entries.
-func DefaultTypedConfig(mem, disk filecache.Cache) TypedConfig {
+// #466 removed the in-process memory tier, so both slots are typically a disk FileCache
+// and/or a remote MemCache chain rather than an in-process LRU.
+func DefaultTypedConfig(hot, warm filecache.Cache) TypedConfig {
 	return TypedConfig{
-		Footer:   mem,
-		TOC:      mem,
-		Bloom:    mem,
-		Metadata: disk,
-		TraceIdx: disk,
-		Block:    mem,
+		Footer:   hot,
+		TOC:      hot,
+		Bloom:    hot,
+		Metadata: warm,
+		TraceIdx: warm,
+		Block:    hot,
 	}
 }
 

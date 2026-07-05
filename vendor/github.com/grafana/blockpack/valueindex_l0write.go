@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"path"
 
+	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/grafana/blockpack/internal/modules/valueindex"
 )
 
@@ -85,6 +86,19 @@ func WriteValueIndexL0(r *Reader, store ObjectPutter, sourceRef, tenant, indexPr
 	// nil denylist indexes every column (NOTE-VI-027, issue #414): the value index
 	// is policy-free; the querier decides which columns are useful at read time.
 	err := ExtractValueIndexEntries(r, nil, func(e ValueIndexEntry) error {
+		// trace:id is excluded from the standard per-column value-index path
+		// (SPEC-VI-4/NOTE-VI-068, mirrors the same exclusion in
+		// valueindexconsumer's ingest()): both this path and the dedicated
+		// TraceGroup index key their L0 files under the identical
+		// colHash("trace:id")/uuid/ directory, which the compactor's
+		// format-dispatch (Finding 2) treats as 100% TraceGroup format. A
+		// genuine BucketGroup-format trace:id file landing there would be
+		// silently misrouted into mergeTraceLevel, fail to decode, and be
+		// stuck at L0 forever. No code anywhere queries trace:id via the
+		// standard value-index scan, so this exclusion has no user-visible cost.
+		if e.ColName == modules_shared.TraceIDColumnName {
+			return nil
+		}
 		typeName := valueindex.ColTypeName(e.ColType)
 		if typeName == "" {
 			// Unindexable type (NOTE-VI-024): skip rather than bucket under an
@@ -101,20 +115,21 @@ func WriteValueIndexL0(r *Reader, store ObjectPutter, sourceRef, tenant, indexPr
 			}
 			groups[key] = g
 		}
-		// TraceID is not surfaced by ExtractValueIndexEntries (the extractor walks
-		// columns, not whole spans), so it is the zero value here. AddEntryV4/V2
-		// accept a zero TraceID; span identity (SpanID/RowIdx) and the page-aligned
-		// BlockRef are what the querier uses for direct addressing.
-		var traceID [16]byte
+		// TraceID is stamped per row by ExtractValueIndexEntries (Stage 5,
+		// traceindex.go wiring plan) and must be threaded through here: bucket
+		// stream-compaction merge/dedup keys SpanRefs by TraceID
+		// (bucketmerge.go/stream_compaction.go), so a hardcoded zero would make
+		// every distinct trace observed at the same (SourceRef, BlockRef) collide
+		// under one shared key and silently lose spans on the first compaction.
 		switch {
 		case e.BlockRef.PageNum > 0 || e.BlockRef.LenPages > 0:
 			if e.SpanID != ([8]byte{}) {
 				rowIdx := uint16(e.RowIdx) //nolint:gosec // RowIdx bounded by MaxBlockSpans ≤ 65534
-				return g.writer.AddEntryV4(e.Value, traceID, sourceRef, e.BlockRef, e.TimeSec, e.SpanID, rowIdx)
+				return g.writer.AddEntryV4(e.Value, e.TraceID, sourceRef, e.BlockRef, e.TimeSec, e.SpanID, rowIdx)
 			}
-			return g.writer.AddEntryV2(e.Value, traceID, sourceRef, e.BlockRef, e.TimeSec)
+			return g.writer.AddEntryV2(e.Value, e.TraceID, sourceRef, e.BlockRef, e.TimeSec)
 		default:
-			return g.writer.AddEntry(e.Value, traceID, sourceRef, e.BlockID, e.TimeSec)
+			return g.writer.AddEntry(e.Value, e.TraceID, sourceRef, e.BlockID, e.TimeSec)
 		}
 	})
 	if err != nil {

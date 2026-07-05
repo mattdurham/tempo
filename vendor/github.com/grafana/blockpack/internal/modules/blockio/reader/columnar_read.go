@@ -315,15 +315,11 @@ func (r *Reader) readBlockColumnarWithCache(
 		err     error
 	)
 	if mf, ok := r.cache.(sectionMixedFetcher); ok && len(wantColumns) > 0 {
-		// NOTE-214: prune already-decoded columns from the combined fetch. The cached
-		// per-block name->colType mapping (populated at first ToC parse) lets us probe
-		// parsedV8ColumnCache before building the GetMulti and stash the LIVE snapshot
-		// of any column already decoded, so its compressed blob is never requested from
-		// memcache. The sizing pass below (NOTE-213) finds it already stashed and excludes
-		// it from the buffer/copy. On the first query against a block (colTypes-cache miss)
-		// fetchCols == wantColumns and everything is fetched as before.
-		fetchCols := r.prunePreDecodedFromFetch(blockOff, wantColumns)
-		toc, preHits = r.fetchTocAndColumnsCombined(mf, tocKey, blockIdxStr, fetchCols)
+		// Combined ToC+columns GetMulti (NOTE-185): the ToC key and every wanted column's
+		// key live in the same sub-cache and are derivable from the column name alone, so
+		// they are requested in one pipelined batch. #466 removed the in-process decoded-
+		// column cache, so every wanted column is fetched from the remote/disk tiers here.
+		toc, preHits = r.fetchTocAndColumnsCombined(mf, tocKey, blockIdxStr, wantColumns)
 	}
 
 	// Phase 1: ToC — cached. NOTE-154: read a ToC large enough to hold the full
@@ -353,20 +349,13 @@ func (r *Reader) readBlockColumnarWithCache(
 		cs.Hits[CacheStatsSectionToc]++
 	}
 
-	// NOTE-241: reuse the per-block parsed ToC if it was cached by an earlier read. The
-	// metas + tocEnd are deterministic for a block, so re-running parseBlockHeader +
-	// parseColumnMetadataArray on every warm read — allocating one string(name) per column
-	// plus the entries slice — is pure per-query waste. On a hit we skip both parses and use
-	// the shared read-only metas. On a miss we parse, cache, and proceed as before. The
-	// fetched ToC bytes are still needed (for the assembled-buffer prefix copy + parser), so
-	// only the parse is elided, not the fetch.
+	// Parse the block header + column-metadata array from the fetched ToC bytes. #466
+	// removed the in-process parsed-ToC cache, so this parse runs on every read.
 	var (
 		metas  []colMetaEntry
 		tocEnd int
 	)
-	if cached := r.getCachedBlockToc(blockOff); cached != nil {
-		metas, tocEnd = cached.metas, cached.tocEnd
-	} else {
+	{
 		hdr, hdrErr := parseBlockHeader(toc)
 		if hdrErr != nil {
 			// Fallback: full block read (same as readBlockColumnar's fallback).
@@ -381,13 +370,9 @@ func (r *Reader) readBlockColumnarWithCache(
 		if err != nil {
 			return r.readFullBlockFallback(blockOff, blockLen, blockIdx)
 		}
-		// NOTE-214/241: record this block's parsed ToC so a subsequent warm query can both
-		// prune already-decoded columns from the combined fetch and skip this parse.
-		r.cacheBlockColTypes(blockOff, metas, tocEnd)
 	}
 
-	// NOTE-213: a SINGLE pass over metas both (a) detects already-decoded columns
-	// (stashing their live snapshot and excluding them entirely) and (b) sizes the
+	// NOTE-213: a SINGLE pass over metas sizes the
 	// assembled buffer to span ONLY the columns that still need their compressed bytes
 	// copied in. Previously bufSize was computed over ALL wanted columns before the
 	// NOTE-212 skip loop ran, so a fully-warm wide query (every wanted column already in
@@ -397,8 +382,8 @@ func (r *Reader) readBlockColumnarWithCache(
 	// shrink to just the ToC prefix on the fully-warm path, the dominant remaining
 	// assembled-buffer allocation/copy cost the prior notes targeted.
 	//
-	// keepCols collects the wanted columns NOT served from the decoded cache. bufSize
-	// grows only for those, so unwanted and pre-decoded columns never inflate it.
+	// keepCols collects the wanted columns whose compressed blob was NOT returned by the
+	// combined GetMulti. bufSize grows only for those, so unwanted columns never inflate it.
 	bufSize := int64(tocEnd) //nolint:gosec
 	keepCols := make([]colMetaEntry, 0, len(metas))
 	for _, m := range metas {
@@ -412,21 +397,9 @@ func (r *Reader) readBlockColumnarWithCache(
 			// can access all column data safely.
 			return r.readFullBlockFallback(blockOff, blockLen, blockIdx)
 		}
-		// NOTE-212: if this column's DECODED snapshot is already in the process-level
-		// parsedV8ColumnCache (NOTE-200), the parser will serve it from there and never
-		// read rawBytes[m.dataOffset:colEnd]. Copying the compressed blob into the
-		// assembled buffer would be pure dead work — and on a wide warm metrics query that
-		// per-column memmove (plus the assembled-buffer churn) is the dominant warm-path
-		// CPU/GC cost. Stash the LIVE snapshot pointer on the Reader and skip the copy; the
-		// parser consumes it from r.preDecodedColumns (no re-probe, no eviction race).
-		// Pre-decoded columns are also excluded from bufSize (NOTE-213): their extent is
-		// never written nor read, so the buffer need not span them.
-		if r.stashPreDecodedColumn(blockOff, m) {
-			continue
-		}
-		// NOTE-234: the column's DECODED snapshot is NOT cached (the NOTE-212 stash above
-		// failed), but its COMPRESSED blob came back from the combined ToC+columns GetMulti.
-		// Stash that blob on the Reader and let the parser decode straight from it, skipping
+		// NOTE-234: the column's COMPRESSED blob came back from the combined ToC+columns
+		// GetMulti. Stash that blob on the Reader and let the parser decode straight from it,
+		// skipping
 		// both the copy into the assembled buffer and that column's contribution to bufSize.
 		// Previously the blob was copied into assembled[colStart:colEnd] only for the parser
 		// to sub-slice it right back out and snappy-decode — a pure warm-path memmove plus
@@ -565,32 +538,6 @@ func (r *Reader) readFullBlockFallback(blockOff, blockLen int64, blockIdx int) (
 	return full, nil
 }
 
-// stashPreDecodedColumn probes the process-level parsedV8ColumnCache (NOTE-200) for column
-// m of the block at blockOff. On a hit it stashes the LIVE decoded snapshot in
-// r.preDecodedColumns and returns true, signaling readBlockColumnarWithCache to SKIP
-// copying the column's compressed blob into the assembled buffer (the parser will serve it
-// from the stashed snapshot and never read those bytes — NOTE-212). Returns false when there
-// is no fileID or the snapshot is absent, so the caller falls through to the copy path. The
-// column's TRUE (name, type) is used because the cache and parser key on type, and one block
-// can carry the same name with different types. preDecodedMu guards the map because
-// ReadGroupColumnar runs concurrently across blockGroupPipeline workers on the same *Reader.
-func (r *Reader) stashPreDecodedColumn(blockOff int64, m colMetaEntry) bool {
-	if r.fileID == "" {
-		return false
-	}
-	snap := parsedV8ColumnCache.Get(v8ColumnCacheKey(r.fileID, uint64(blockOff), m.name, m.colType)) //nolint:gosec
-	if snap == nil {
-		return false
-	}
-	r.preDecodedMu.Lock()
-	if r.preDecodedColumns == nil {
-		r.preDecodedColumns = make(map[preDecodedKey]*Column)
-	}
-	r.preDecodedColumns[preDecodedKey{blockOffset: uint64(blockOff), name: m.name, colType: m.colType}] = snap //nolint:gosec
-	r.preDecodedMu.Unlock()
-	return true
-}
-
 // stashPreCompressedColumn records column m's compressed blob (from the combined
 // ToC+columns GetMulti) on the Reader so the parser can decode straight from it instead of
 // the assembled buffer (NOTE-234). blob aliases the memcache GetMulti result, which the
@@ -606,108 +553,6 @@ func (r *Reader) stashPreCompressedColumn(blockOff int64, m colMetaEntry, blob [
 	}
 	r.preCompressedColumns[preDecodedKey{blockOffset: uint64(blockOff), name: m.name, colType: m.colType}] = blob //nolint:gosec
 	r.preDecodedMu.Unlock()
-}
-
-// prunePreDecodedFromFetch consults the cached per-block name->colType mapping (NOTE-214)
-// to drop already-decoded columns from the combined ToC+columns GetMulti. For each wanted
-// column whose type is known from the cached mapping AND whose decoded snapshot is present
-// in parsedV8ColumnCache, it stashes the LIVE snapshot (same mechanism as the NOTE-212
-// sizing-pass skip) and removes the column from the fetch set, so its compressed blob is
-// never requested from memcache. Returns the pruned wantColumns set to pass to the combined
-// fetch. The returned set aliases wantColumns when nothing was pruned (no allocation on the
-// cold/cache-miss path); otherwise it is a fresh map. On a colTypes-cache miss it returns
-// wantColumns unchanged, so the first query against a block fetches everything (and the
-// mapping is populated after the ToC parse for subsequent queries).
-//
-// Correctness mirrors stashPreDecodedColumn: the LIVE snapshot pointer is held on the
-// Reader so the parser consumes it without a re-probe (no eviction race), and the column's
-// TRUE (name, type) keys the stash so the parser's preDecodedLookup matches. A column that
-// is pruned here is byte-for-byte equivalent to one skipped by the sizing pass — the parser
-// serves it from r.preDecodedColumns and never touches the (now-unfetched) compressed bytes.
-func (r *Reader) prunePreDecodedFromFetch(blockOff int64, wantColumns map[string]struct{}) map[string]struct{} {
-	if r.fileID == "" {
-		return wantColumns
-	}
-	ct := blockColTypesCache.Get(blockColTypesCacheKey(r.fileID, uint64(blockOff))) //nolint:gosec
-	if ct == nil {
-		return wantColumns
-	}
-	var pruned map[string]struct{}
-	var typeBuf [4]shared.ColumnType
-	for name := range wantColumns {
-		types := ct.typesFor(name, &typeBuf)
-		if len(types) == 0 {
-			continue
-		}
-		for _, t := range types {
-			if r.stashPreDecodedColumn(blockOff, colMetaEntry{name: name, colType: t}) {
-				if pruned == nil {
-					// Lazily clone wantColumns only when at least one column is pruned.
-					pruned = make(map[string]struct{}, len(wantColumns))
-					for n := range wantColumns {
-						pruned[n] = struct{}{}
-					}
-				}
-				delete(pruned, name)
-				break
-			}
-		}
-	}
-	if pruned == nil {
-		return wantColumns
-	}
-	return pruned
-}
-
-// getCachedBlockToc returns the block's previously-parsed ToC (metas + tocEnd) if present.
-// The returned metas slice is READ-ONLY and shared across queries — callers must not mutate
-// it. Returns nil on a miss or when there is no fileID. NOTE-241.
-func (r *Reader) getCachedBlockToc(blockOff int64) *blockColTypes {
-	if r.fileID == "" {
-		return nil
-	}
-	return blockColTypesCache.Get(blockColTypesCacheKey(r.fileID, uint64(blockOff))) //nolint:gosec
-}
-
-// cacheBlockColTypes records the block's fully-parsed ToC (metas + tocEnd) in
-// blockColTypesCache so a subsequent warm query can both prune already-decoded columns from
-// the combined fetch BEFORE re-parsing (NOTE-214) and skip parseColumnMetadataArray entirely
-// (NOTE-241). Idempotent: a no-op if the block is already cached. No-op when there is no
-// fileID. Called once per block read after parseColumnMetadataArray.
-//
-// The cached metas are shared read-only across queries, so any inline column's inlineData —
-// which sub-slices the transient ToC buffer — is deep-copied into a private backing array to
-// avoid aliasing memcache-owned bytes that may be recycled after this read.
-func (r *Reader) cacheBlockColTypes(blockOff int64, metas []colMetaEntry, tocEnd int) {
-	cacheParsedBlockColTypes(r.fileID, uint64(blockOff), metas, tocEnd) //nolint:gosec
-}
-
-// cacheParsedBlockColTypes stores the block's fully-parsed ToC (metas + tocEnd) in
-// blockColTypesCache, keyed by fileID+blockOffset. Idempotent: a no-op if already cached or
-// when fileID is empty / metas is empty. Shared by the columnar-read path (NOTE-241) and the
-// parser (NOTE-242) so both populate the same cache on a first parse and either may serve a
-// later warm read from it. The cached metas are shared READ-ONLY across queries, so any inline
-// column's inlineData — which sub-slices the transient ToC buffer — is deep-copied into a private
-// backing array to avoid aliasing memcache-owned bytes that may be recycled after this read.
-func cacheParsedBlockColTypes(fileID string, blockOff uint64, metas []colMetaEntry, tocEnd int) {
-	if fileID == "" || len(metas) == 0 {
-		return
-	}
-	key := blockColTypesCacheKey(fileID, blockOff)
-	if blockColTypesCache.Get(key) != nil {
-		return // already cached for this block
-	}
-	cached := make([]colMetaEntry, len(metas))
-	copy(cached, metas)
-	for i := range cached {
-		if cached[i].inlineData != nil {
-			// Deep-copy inline bytes: the source aliases the transient ToC buffer.
-			b := make([]byte, len(cached[i].inlineData))
-			copy(b, cached[i].inlineData)
-			cached[i].inlineData = b
-		}
-	}
-	_ = blockColTypesCache.Put(key, &blockColTypes{metas: cached, tocEnd: tocEnd})
 }
 
 // sectionBatchFetcher is the optional interface a section cache may implement to

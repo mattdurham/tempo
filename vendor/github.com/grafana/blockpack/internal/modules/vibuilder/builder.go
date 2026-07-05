@@ -32,6 +32,8 @@ import (
 	"fmt"
 	"io"
 
+	"golang.org/x/sync/errgroup"
+
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
 	modules_executor "github.com/grafana/blockpack/internal/modules/executor"
 	"github.com/grafana/blockpack/internal/modules/valueindex"
@@ -52,6 +54,30 @@ import (
 // FileStore implementations signal a 404 by returning an error that satisfies
 // errors.Is(err, ErrFileNotFound) from either Size or ReadAt.
 var ErrFileNotFound = errors.New("vibuilder: value-index file not found")
+
+// downloadConcurrency bounds how many value-index files downloadAll fetches in
+// parallel for one column's file set. The original 16-32 range was sized only
+// for S3/minio connection pressure, on the assumption this work was I/O-wait
+// bound. A live CPU profile on tempo-dev-test-03 after deploying that version
+// showed otherwise: each downloaded file is immediately snappy-decoded and
+// merge-sorted in the same goroutine (valueindex.DecodeBucketFile,
+// executor.viSortDedup/viMatchSpans), so downloadConcurrency actually bounds
+// concurrent CPU-bound work, not just concurrent sockets. The querier runs
+// under a 5-core CPU limit; the original value of 24 (worst case 96 with
+// leafConcurrency) oversubscribed that by roughly 19x and caused queries to
+// time out on CPU contention even though each individual block's work was
+// fast in isolation. Lowered to roughly track available cores instead
+// (NOTE-VI, tempo-dev-test-03 TraceQL search timeout incident, CPU-bound
+// follow-up).
+const downloadConcurrency = 4
+
+// leafConcurrency bounds how many predicate leaf columns BuildSource downloads
+// in parallel. Kept smaller than downloadConcurrency because each leaf's own
+// downloadAll can itself fan out up to downloadConcurrency downloads — worst
+// case simultaneous CPU-bound goroutines for one query is
+// leafConcurrency * downloadConcurrency. See downloadConcurrency's comment for
+// why this bounds CPU work, not just I/O.
+const leafConcurrency = 2
 
 // FileStore downloads a single value-index file by its full object key. It is the
 // read half of the storage backend the querier already holds (tempo's S3 reader,
@@ -113,26 +139,55 @@ func BuildSource(
 	added := false
 
 	// Leaf predicates: each contributes a constrained per-column result set.
+	// buildPredicate is pure CPU (no I/O) and stays synchronous; only the
+	// downstream discovery+download+query work fans out.
 	leaves := collectLeaves(preds.Nodes)
+	type leafWork struct {
+		pred    valueindex.Predicate
+		col     string
+		colType modules_shared.ColumnType
+	}
+	var work []leafWork
 	for i := range leaves {
-		col := leaves[i].col
 		pred, colType, ok := buildPredicate(&leaves[i])
 		if !ok {
 			// Unindexable predicate for this leaf — leave the column uncovered so
 			// the executor falls back.
 			continue
 		}
-		results, filesRead, bytesRead, err := lookupColumn(ctx, disc, store, col, colType, pred, timeRange)
-		if err != nil {
+		work = append(work, leafWork{col: leaves[i].col, colType: colType, pred: pred})
+	}
+	if len(work) > 0 {
+		g, gctx := errgroup.WithContext(ctx)
+		g.SetLimit(leafConcurrency)
+		for _, w := range work {
+			g.Go(func() error {
+				results, filesRead, bytesRead, err := lookupColumn(
+					gctx,
+					disc,
+					store,
+					w.col,
+					w.colType,
+					w.pred,
+					timeRange,
+				)
+				if err != nil {
+					return err
+				}
+				// Record the download I/O for this leaf so the querier can report it
+				// on its OTel span (issue #465); a covered-but-empty column still
+				// counts the bytes of any files we read deciding it was empty. src is
+				// mutex-protected, safe from concurrent leaves.
+				src.RecordFileIO(filesRead, bytesRead)
+				// Add even when empty: a covered-but-empty column is coverage, not
+				// fallback (NOTE-VI-033).
+				src.Add(w.col, w.colType, results)
+				return nil
+			})
+		}
+		if err := g.Wait(); err != nil {
 			return nil, false, err
 		}
-		// Record the download I/O for this leaf so the querier can report it on its
-		// OTel span (issue #465); a covered-but-empty column still counts the bytes
-		// of any files we read deciding it was empty.
-		src.RecordFileIO(filesRead, bytesRead)
-		// Add even when empty: a covered-but-empty column is coverage, not
-		// fallback (NOTE-VI-033).
-		src.Add(col, colType, results)
 		added = true
 	}
 
@@ -361,35 +416,72 @@ func lookupColumnAll(
 	timeRange *[2]uint64,
 ) ([]modules_executor.VILookupResult, modules_shared.ColumnType, int, int64, error) {
 	colHash := valueindex.ColHash(col)
+	buckets := allTypeBuckets()
+	type bucketResult struct {
+		results    []modules_executor.VILookupResult
+		filesRead  int
+		bytesRead  int64
+		hasResults bool
+	}
+	slots := make([]bucketResult, len(buckets))
+	g, gctx := errgroup.WithContext(ctx)
+	// Bounded by leafConcurrency, not len(buckets) (7) — each bucket goroutine
+	// itself calls downloadAll, which fans out up to downloadConcurrency more
+	// CPU-bound work (decode+sort), so the effective worst case here is
+	// leafConcurrency * downloadConcurrency, matching BuildSource's leaf loop.
+	g.SetLimit(leafConcurrency)
+	for i, colType := range buckets {
+		g.Go(func() error {
+			colTypeName := valueindex.ColTypeName(colType)
+			keys, err := disc.FilesForTimeRange(gctx, colHash, colTypeName, timeRange[0], timeRange[1])
+			if err != nil {
+				return fmt.Errorf("vibuilder: discover-all %s: %w", col, err)
+			}
+			if len(keys) == 0 {
+				return nil
+			}
+			files, bytesRead, err := downloadAll(store, keys)
+			if err != nil {
+				return err
+			}
+			// A nil predicate matches every entry (Reader.Lookup treats nil as
+			// match-all), so the universe of indexed spans for this column is
+			// returned.
+			lrs, err := valueindex.QueryBucketFiles(nil, timeRange, files...)
+			if err != nil {
+				return fmt.Errorf("vibuilder: query-all %s: %w", col, err)
+			}
+			slots[i] = bucketResult{
+				results:    toVILookupResults(lrs),
+				filesRead:  len(files),
+				bytesRead:  bytesRead,
+				hasResults: len(lrs) > 0,
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, 0, 0, 0, err
+	}
 	var all []modules_executor.VILookupResult
 	var firstType modules_shared.ColumnType
 	var totalFiles int
 	var totalBytes int64
-	for _, colType := range allTypeBuckets() {
-		colTypeName := valueindex.ColTypeName(colType)
-		keys, err := disc.FilesForTimeRange(ctx, colHash, colTypeName, timeRange[0], timeRange[1])
-		if err != nil {
-			return nil, 0, 0, 0, fmt.Errorf("vibuilder: discover-all %s: %w", col, err)
-		}
-		if len(keys) == 0 {
+	firstSet := false
+	for i, s := range slots {
+		totalFiles += s.filesRead
+		totalBytes += s.bytesRead
+		if !s.hasResults {
 			continue
 		}
-		files, bytesRead, err := downloadAll(store, keys)
-		if err != nil {
-			return nil, 0, 0, 0, err
+		if !firstSet {
+			// Deterministic: first bucket in allTypeBuckets() order with
+			// results, matching original serial semantics exactly — not
+			// goroutine completion order.
+			firstType = buckets[i]
+			firstSet = true
 		}
-		totalFiles += len(files)
-		totalBytes += bytesRead
-		// A nil predicate matches every entry (Reader.Lookup treats nil as
-		// match-all), so the universe of indexed spans for this column is returned.
-		lrs, err := valueindex.QueryBucketFiles(nil, timeRange, files...)
-		if err != nil {
-			return nil, 0, 0, 0, fmt.Errorf("vibuilder: query-all %s: %w", col, err)
-		}
-		if len(all) == 0 {
-			firstType = colType
-		}
-		all = append(all, toVILookupResults(lrs)...)
+		all = append(all, s.results...)
 	}
 	return all, firstType, totalFiles, totalBytes, nil
 }
@@ -421,20 +513,45 @@ func downloadAll(store FileStore, keys []string) ([][]byte, int64, error) {
 	if len(keys) == 0 {
 		return nil, 0, nil
 	}
+	type dlSlot struct {
+		data []byte
+		keep bool // false for a skipped (404) key; zero-value default
+	}
+	slots := make([]dlSlot, len(keys))
+	g, gctx := errgroup.WithContext(context.Background())
+	g.SetLimit(downloadConcurrency)
+	for i, key := range keys {
+		g.Go(func() error {
+			if gctx.Err() != nil {
+				// Another key already hit a real (non-404) error; do not start
+				// new work, but do not report a spurious error either — the
+				// goroutine that found the real error reports it.
+				return nil //nolint:nilerr // intentional: gctx.Err() belongs to a sibling goroutine's failure, not this one's
+			}
+			data, err := readWhole(store, key)
+			if err != nil {
+				if errors.Is(err, ErrFileNotFound) {
+					// Retention/compaction deleted this file out from under a
+					// stale listing — treat as an empty miss and skip it.
+					return nil
+				}
+				return fmt.Errorf("vibuilder: download %s: %w", key, err)
+			}
+			slots[i] = dlSlot{data: data, keep: true}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, 0, err
+	}
 	files := make([][]byte, 0, len(keys))
 	var totalBytes int64
-	for _, key := range keys {
-		data, err := readWhole(store, key)
-		if err != nil {
-			if errors.Is(err, ErrFileNotFound) {
-				// Retention/compaction deleted this file out from under a stale
-				// listing — treat as an empty miss and skip it.
-				continue
-			}
-			return nil, 0, fmt.Errorf("vibuilder: download %s: %w", key, err)
+	for _, s := range slots {
+		if !s.keep {
+			continue
 		}
-		totalBytes += int64(len(data))
-		files = append(files, data)
+		files = append(files, s.data)
+		totalBytes += int64(len(s.data))
 	}
 	return files, totalBytes, nil
 }

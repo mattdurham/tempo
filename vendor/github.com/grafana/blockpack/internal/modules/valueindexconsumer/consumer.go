@@ -61,16 +61,17 @@ type StaleReclaimReporter interface {
 
 // ColumnEntry is one extracted observation for one configured column.
 type ColumnEntry struct {
-	Value     any
-	ColName   string
-	SourceRef string
-	TimeSec   uint64
-	BlockRef  valueindex.BlockRef // v2+: direct page reference
-	BlockID   uint32              // v1: zero-based block index
-	RowIdx    uint16              // v4+: row index within block
-	TraceID   [16]byte
-	SpanID    [8]byte // v4+: span identity (NOTE-VI-029, #428)
-	ColType   shared.ColumnType
+	Value        any
+	ColName      string
+	SourceRef    string
+	TimeSec      uint64
+	BlockRef     valueindex.BlockRef // v2+: direct page reference
+	BlockID      uint32              // v1: zero-based block index
+	RowIdx       uint16              // v4+: row index within block
+	TraceID      [16]byte
+	SpanID       [8]byte // v4+: span identity (NOTE-VI-029, #428)
+	ParentSpanID [8]byte // parent span identity; zero for a root span or absent column
+	ColType      shared.ColumnType
 }
 
 // Extractor reads a blockpack file and streams per-column entries to a callback.

@@ -59,34 +59,16 @@ type Reader struct {
 	// Range index removed in #439.
 	// IntrinsicTOC removed in #433/#436 — all columns are inner-block columns.
 
-	// preDecodedColumns holds LIVE decoded-column snapshots that
-	// readBlockColumnarWithCache observed already present in the process-level
-	// parsedV8ColumnCache (NOTE-200) at read time, keyed by (block offset, name, type).
-	// NOTE-212: when a wanted column's decoded snapshot is already cached, the reader skips
-	// copying its compressed blob into the assembled buffer (the warm-path memmove) because
-	// the parser satisfies it from the decoded cache and never reads the compressed bytes.
-	// Storing the LIVE pointer lets the parser consume it without re-probing the cache,
-	// closing the eviction race a bare probe-then-skip would open (the snapshot could be
-	// LRU-evicted between the reader's check and the parser's lookup, leaving the parser to
-	// decompress stale assembled-buffer bytes). The map holds strong references for the
-	// Reader's lifetime (one querier call), so its entries cannot be evicted out from under
-	// the parse. Nil until the first hit on the warm columnar read path. Guarded by
-	// preDecodedMu.
-	preDecodedColumns map[preDecodedKey]*Column
-
 	// preCompressedColumns holds LIVE compressed column blobs that the combined
-	// ToC+columns GetMulti (NOTE-185) returned from memcache but whose DECODED snapshot was
-	// NOT in the process-level parsedV8ColumnCache (so preDecodedColumns does not cover
-	// them). NOTE-234: instead of copying each such blob into the assembled buffer (a warm-
-	// path memmove) only for the parser to sub-slice it straight back out and snappy-decode,
-	// the reader stashes the blob here and the parser uses it directly as the column's
-	// compressed bytes — eliminating both the copy and that column's contribution to the
-	// assembled buffer's size. The blob aliases the memcache GetMulti result, which the
-	// section cache owns for the Reader's lifetime (one querier call); the parser copies all
-	// data out during decode, so no longer-lived alias is created. Keyed by (block offset,
-	// name, type) like preDecodedColumns. Nil until the first such hit. Guarded by
-	// preDecodedMu (shared with preDecodedColumns — both populated on the warm columnar read
-	// path and read by the parser).
+	// ToC+columns GetMulti (NOTE-185) returned from memcache. NOTE-234: instead of copying
+	// each such blob into the assembled buffer (a warm-path memmove) only for the parser to
+	// sub-slice it straight back out and snappy-decode, the reader stashes the blob here and
+	// the parser uses it directly as the column's compressed bytes — eliminating both the
+	// copy and that column's contribution to the assembled buffer's size. The blob aliases
+	// the memcache GetMulti result, which the section cache owns for the Reader's lifetime
+	// (one querier call); the parser copies all data out during decode, so no longer-lived
+	// alias is created. Keyed by (block offset, name, type). Nil until the first such hit.
+	// Guarded by preDecodedMu.
 	preCompressedColumns map[preDecodedKey][]byte
 
 	// vectorIndexParsed is the lazily parsed VectorIndex. Access via VectorIndex().
@@ -125,7 +107,7 @@ type Reader struct {
 	// vectorIndexOnce guards lazy parsing of the vector index section.
 	vectorIndexOnce sync.Once
 
-	// preDecodedMu guards preDecodedColumns. ReadGroupColumnar (which populates it) runs
+	// preDecodedMu guards preCompressedColumns. ReadGroupColumnar (which populates it) runs
 	// concurrently across blockGroupPipeline workers on the same *Reader, while the parse
 	// (which reads it) runs on the sequential consumer goroutine — and a read of group N+1
 	// can race the parse of group N. NOTE-212.
@@ -379,7 +361,6 @@ func (r *Reader) ParseBlockFromBytes(
 		meta,
 		localIntern,
 		r.fileID,
-		r.preDecodedLookup(),
 		r.preCompressedLookup(),
 	)
 	if err != nil {
@@ -409,7 +390,6 @@ func (r *Reader) ParseBlockFromBytesWithIntern(
 		meta,
 		intern,
 		r.fileID,
-		r.preDecodedLookup(),
 		r.preCompressedLookup(),
 	)
 	if err != nil {
@@ -418,28 +398,10 @@ func (r *Reader) ParseBlockFromBytesWithIntern(
 	return &BlockWithBytes{Block: blk, RawBytes: rawBytes}, nil
 }
 
-// preDecodedLookup returns a function that resolves a reader-pre-resolved decoded-column
-// snapshot under preDecodedMu (NOTE-212), or nil when no columns were pre-resolved so the
-// parser pays no lock or call on the common path. The lock is required because reads of
-// later groups (which populate the map) run concurrently with the parse of earlier groups.
-func (r *Reader) preDecodedLookup() func(preDecodedKey) *Column {
-	r.preDecodedMu.Lock()
-	empty := len(r.preDecodedColumns) == 0
-	r.preDecodedMu.Unlock()
-	if empty {
-		return nil
-	}
-	return func(k preDecodedKey) *Column {
-		r.preDecodedMu.Lock()
-		defer r.preDecodedMu.Unlock()
-		return r.preDecodedColumns[k]
-	}
-}
-
 // preCompressedLookup returns a function resolving a reader-stashed compressed column blob
 // (NOTE-234) under preDecodedMu, or nil when none were stashed so the parser pays no lock or
-// call on the common path. Mirrors preDecodedLookup; the lock guards concurrent population by
-// later block-group reads while earlier groups parse.
+// call on the common path. The lock guards concurrent population by later block-group reads
+// while earlier groups parse.
 func (r *Reader) preCompressedLookup() func(preDecodedKey) []byte {
 	r.preDecodedMu.Lock()
 	empty := len(r.preCompressedColumns) == 0

@@ -13,6 +13,7 @@ func Sort(records []Record) {
 }
 
 // Compact merges records across files via delta accounting (NOTE-VC-001, issue #400):
+// SPEC-VC-1: group-sum-drop-nonpositive retention semantics.
 //
 //   - records are grouped by (ColumnName, TimeStart, TimeEnd, Value)
 //   - Count is summed per group

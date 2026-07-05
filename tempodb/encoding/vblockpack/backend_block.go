@@ -121,11 +121,10 @@ func ConfigureCacheTiered(filePath string, fileMaxBytes int64, dataMemServers, m
 	blockpackCacheCfg.memServers = dataMemServers
 	blockpackCacheCfg.metadataMemServers = metadataMemServers
 	blockpackCacheCfg.memoryCacheBytes = memoryCacheBytes
-
-	// Cap the process-level decoded-column caches to 512 MiB for query processes.
-	// The default (20% of GOMEMLIMIT) allows up to ~8.8GB on a 44GB pod.
-	// Parquet querier Go heap: 161MB. This brings blockpack closer to parity.
-	blockpack.SetProcessCacheBytes(512 << 20) // 512 MiB
+	// blockpack #466 removed all in-process memory caching (decoded columns, parsed ToC) and
+	// the in-process MemoryCache tier. Only disk + remote memcache remain, shrinking and
+	// stabilizing the querier's memory footprint. memoryCacheBytes is retained in the config
+	// plumbing for compatibility but no longer builds an in-process tier.
 }
 
 // ConfigureFileCache is a deprecated wrapper around ConfigureCache retained for backward compatibility.
@@ -135,7 +134,8 @@ func ConfigureFileCache(path string, maxBytes int64) {
 }
 
 // getCache initializes (once) the process-level TypedTieredCache and returns it.
-// Routing: Footer/TOC/Bloom/Block/Intrinsic → mem+metaRemote; Metadata/TraceIdx → disk+dataRemote.
+// Routing: Footer/TOC/Bloom/Block → metaRemote; Metadata/TraceIdx → disk+dataRemote.
+// blockpack #466 removed the in-process memory tier, so only disk + remote memcache remain.
 // Returns nil if no tiers could be configured.
 func getCache() blockpack.SectionCache {
 	blockpackCacheOnce.Do(func() {
@@ -144,19 +144,7 @@ func getCache() blockpack.SectionCache {
 		cfg := blockpackCacheCfg
 		blockpackCacheMu.Unlock()
 
-		var mem blockpack.Cache
 		var disk blockpack.Cache
-
-		// In-process LRU memory cache.
-		if cfg.memoryCacheBytes > 0 {
-			m, err := blockpack.NewMemoryCache(blockpack.MemoryCacheConfig{
-				MaxBytes:   cfg.memoryCacheBytes,
-				Registerer: prometheus.DefaultRegisterer,
-			})
-			if err == nil && m != nil {
-				mem = m
-			}
-		}
 
 		// Disk-backed file cache — used for large sections (Metadata, TraceIdx).
 		if cfg.filePath != "" && cfg.fileMaxBytes > 0 {
@@ -172,8 +160,8 @@ func getCache() blockpack.SectionCache {
 		}
 
 		// Build TypedTieredCache: routes each section type to the appropriate sub-cache.
-		// When metadata+data memcache servers are both configured, remote caches are added
-		// to the hot (mem) and warm (disk) chains respectively.
+		// When metadata+data memcache servers are both configured, remote caches back the
+		// metadata (small, high-reuse) and page (large block-column) chains respectively.
 		if len(cfg.metadataMemServers) > 0 && len(cfg.memServers) > 0 {
 			metaRemote, err := blockpack.OpenMemCache(blockpack.MemCacheConfig{
 				Servers:    cfg.metadataMemServers,
@@ -186,10 +174,10 @@ func getCache() blockpack.SectionCache {
 				Registerer: prometheus.WrapRegistererWith(prometheus.Labels{"tier": "data"}, prometheus.DefaultRegisterer),
 			})
 			if err == nil && err2 == nil && metaRemote != nil && dataRemote != nil {
-				// Split by entry size: small metadata entries (Footer/TOC/Bloom/Metadata/TraceIdx/Intrinsic)
+				// Split by entry size: small metadata entries (Footer/TOC/Bloom/Metadata/TraceIdx)
 				// go to metaRemote (memcached-01) to keep hit rate high; large column-page blobs (Block)
 				// go to dataRemote (memcached-blockpack-page-01) so page evictions don't displace metadata.
-				metaChain := blockpack.NewChainedCache(nonNil(mem, metaRemote)...)
+				metaChain := blockpack.NewChainedCache(nonNil(metaRemote)...)
 				pageChain := blockpack.NewChainedCache(nonNil(disk, dataRemote)...)
 				cfg2 := blockpack.TwoTierTypedConfig(metaChain, pageChain)
 				cfg2.Registerer = prometheus.DefaultRegisterer
@@ -210,7 +198,11 @@ func getCache() blockpack.SectionCache {
 				remote = r
 			}
 		}
-		hot := blockpack.NewChainedCache(nonNil(mem, remote)...)
+		// #466: with the in-process tier gone, the hot (Footer/TOC/Bloom/Block) chain is
+		// backed by the remote memcache when configured, else by disk so those latency-
+		// critical small sections are still cached rather than falling through to object
+		// storage on every access.
+		hot := blockpack.NewChainedCache(nonNil(remote, disk)...)
 		warm := blockpack.NewChainedCache(nonNil(disk, remote)...)
 		if hot != nil || warm != nil {
 			cfg2 := blockpack.DefaultTypedConfig(hot, warm)
@@ -422,7 +414,18 @@ func (b *blockpackBlock) FindTraceByID(ctx context.Context, id common.ID, _ comm
 
 	traceIDHex := hex.EncodeToString(id)
 
-	matches, err := blockpack.GetTraceByID(r, traceIDHex)
+	// common.SearchOptions carries no time-range field, so the block's own wall-clock range
+	// (tighter than "whole retention") is used as the index discovery window.
+	// TODO(follow-up): pass a real valueindex.LookupStore + indexPrefix here once tempo
+	// wires a querier-side value-index source (see blockpack issue #428 Stage 6 plan) --
+	// this is the one call site where the index would actually activate, since only
+	// compacted backend blocks are index-eligible. Until then this is a nil-lister,
+	// behavior-neutral (always full-scan) call.
+	matches, err := blockpack.GetTraceByID(
+		ctx, r, traceIDHex, nil, b.meta.TenantID, "",
+		uint64(b.meta.StartTime.Unix()), //nolint:gosec // block start times are always positive
+		uint64(b.meta.EndTime.Unix()),   //nolint:gosec // block end times are always positive
+	)
 	if err != nil {
 		return nil, fmt.Errorf("GetTraceByID: %w", err)
 	}

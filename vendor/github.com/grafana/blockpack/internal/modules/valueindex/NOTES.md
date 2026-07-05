@@ -456,6 +456,13 @@ scanning. `ParentSpanID` is zero for the root span.
   group whose every span is dropped is removed entirely. This mirrors the standard
   value-index stale-ref handling (NOTE-VI-037 / #399) — no explicit delete messages needed.
 
+**Addendum (2026-07-04):** `MergeTraceGroups`'s retention-check parameter was widened from the
+bespoke `SourceExists func(sourceRef string) bool` described above to `RefChecker`
+(`IsLive(ctx, sourceRef) (bool, error)`) plus a threaded `context.Context`, matching every
+other compaction code path in this package, as part of wiring this codec into
+`valueindexcompactor` (its first real caller — see NOTE-VI-064). See `SPECS.md` SPEC-VI-6 for
+the full contract.
+
 ### Querier (AssembleTrace) — partial-trace handling
 
 `AssembleTrace` builds the span tree. Spans with a present parent attach as children;
@@ -468,6 +475,19 @@ Back-refs:
 - `internal/modules/valueindex/traceindex.go` (TraceGroup, SpanEntry, EncodeTraceGroups,
   DecodeTraceGroups, MergeTraceGroups, AssembleTrace)
 - `internal/modules/blockio/shared/constants.go:ValueIndexTraceVersion`
+
+**Addendum (2026-07-04):** This codec sat unwired (no producer, no consumer, no query-path
+caller) from its 2026-06-30 introduction until 2026-07-04. A since-superseded investigation
+into `GetTraceByID`'s unconditional full-block-scan OOM incident briefly inferred this file was
+"dead code... superseded by the later v2 BucketGroup format (NOTE-VI-043)" based only on a
+repo-wide grep for callers. That inference does not hold up under a full read of this file and
+its git history and is retracted: no NOTES.md entry anywhere claims or implies supersession,
+`traceindex.go`'s `TraceGroup`/`SpanEntry` payload and NOTE-VI-043's `BucketGroup` payload serve
+genuinely different query shapes (exact trace-ID tree reconstruction vs. generic attribute
+value lookup) and share the same outer file framing / `BlockRef` addressing primitive by
+design, and `traceindex.go` was added the day *after* the old in-file DFS trace index was
+removed (#438) — internally consistent with being the planned replacement, not an abandoned
+experiment. See NOTE-VI-063 for the wiring effort that gives this codec its first real callers.
 
 ---
 
@@ -642,3 +662,391 @@ Back-refs:
 - `internal/modules/blockio/reader/reader.go` (BlockIndexForPage)
 - `internal/modules/executor/metrics_trace.go` (VILookupResult.BlockPage, viSpanKey/viSpanCmp)
 - `internal/modules/executor/search_trace_vi.go` (BlockPage → block-index resolution)
+
+## NOTE-VI-046 — Streaming compaction for the v2 BucketGroup merge path (issue: OOM fix)
+
+Date: 2026-07-02
+
+The v2 BucketGroup merge path's OOM risk was `MergeBucketFiles`'s map-of-maps
+(`groups map[string]*groupAcc` with nested `refAcc`/`spanAcc` accumulators), which
+materializes the *entire* merged output in memory before `SplitIntoBlocks` even starts
+cutting output blocks — **not** "K input files open at once" (K is already small/bounded per
+compaction pass, and a k-way merge inherently needs all K cursors live regardless of
+granularity; K-many decoded files was never the actual cost driver).
+
+### Fix: heap-based k-way merge at file granularity
+
+`StreamCompactBucketFiles` + `BucketFileIterator` (`stream_compaction.go`) perform a
+heap-based k-way merge over per-file iterators, replacing the map-of-maps with: (a) K decoded
+input files (already resident regardless of merge strategy), (b) a tiny transient per-key
+merge buffer (sized to however many of the K files currently share the smallest key, not the
+whole key space), (c) one in-progress output block (at most `groupsPerBlock` groups). See
+SPEC-VI-1 (cross-block ordering, the property that lets `BucketFileIterator` trust a plain
+sequential walk) and SPEC-VI-2 (`StreamCompactBucketFiles`'s merge-semantics-equivalence and
+peak-memory-bound contract) in `SPECS.md`.
+
+`valueindexcompactor.Service.mergeLevel` now decodes/filters one input file at a time
+immediately after each `store.Get`, instead of downloading all input bytes upfront into a
+`fileBytes [][]byte` slice — see `valueindexcompactor/NOTES.md` NOTE-VI-046 for the
+`mergeLevel`-side half of this change.
+
+### Granularity decision: file, not block
+
+File-granularity (decode a whole input file, iterate its blocks/groups in memory) was chosen
+over block-granularity (ranged per-block fetch) because `valueindexcompactor.IndexStore` has
+no ranged-read method today — it is an exported public interface already hand-patched into
+tempo-mrd's local tree pending a real vendor bump, so adding a ranged-read method now would be
+a breaking cross-repo interface change not justified by this fix. It also would not remove
+much: `DecodeBucketFile` still needs the file's tail (footer + block index + string table) via
+at least one more ranged read per file regardless of block-level fetching.
+
+**Follow-up (not built):** block-granularity (ranged per-block fetch via `DecodeBucketFooter`'s
+tail-read plus the block index) would further bound peak memory to `max(single block)` instead
+of `max(single file)`. Worth pursuing if a single compacted file ever grows large enough that
+one fully-decoded file becomes the bottleneck. Blocked on an `IndexStore` ranged-read API
+addition.
+
+Back-refs: `internal/modules/valueindex/stream_compaction.go`,
+`internal/modules/valueindexcompactor/service.go:mergeLevel`.
+
+## NOTE-VI-047 — Cross-block global ordering is an emergent guarantee, not a designed one
+
+Date: 2026-07-02
+
+Blocks within a single `BucketFile` are globally ordered by `(TimeSec ASC, CanonicalValue
+ASC)` end-to-end — not just internally sorted within each block. `SplitIntoBlocks`
+(`bucketmerge.go:145-176`) is the only function that ever partitions groups into multiple
+blocks: it flattens every existing block's `Groups` into one slice, sorts that slice
+**globally** by `(TimeSec, CanonicalValue)`, then cuts it into fixed-size blocks sequentially
+(`all[start:end]`, no reshuffling after the cut). Because the cut points walk monotonically
+through one already-sorted slice, block N's last group is always `<=` block N+1's first group
+by construction. Every multi-block `BucketFile` in this codebase goes through
+`SplitIntoBlocks` — both the write path (`writerImpl.assembleBucket`) and the compaction path
+(`CompactBucketFiles` → `MergeBucketFiles` → `SplitIntoBlocks`) — so the guarantee holds
+universally for self-produced files, not just for compactor output.
+
+This property was discovered by reading `SplitIntoBlocks`'s implementation while
+investigating whether `BucketFileIterator` (the streaming compaction fix, NOTE-VI-046) could
+trust a plain sequential block-by-block walk within one file, or would need to open all of a
+file's blocks up front to find the true next-smallest group across blocks. It was not an
+explicitly documented invariant before this investigation — it is a side effect of how
+`SplitIntoBlocks` happens to be implemented, not a property anyone deliberately designed the
+format around. The formal statement of the invariant lives in `SPECS.md` SPEC-VI-1; this note
+records why it was worth looking for and what would have broken had it not held (a per-file
+iterator would have needed to buffer or re-sort across blocks, defeating the point of
+streaming at file granularity).
+
+**Do not confuse this with the *trace* blockpack format's block ordering, which has no such
+guarantee.** `blockio/writer.sortPending` sorts spans by `(service.name, MinHashSig, TraceID)`
+before cutting trace blocks — that key has **no timestamp component at all** (see
+`blockio/NOTES.md` §2/§32), so trace blocks carry no inherent time or value ordering relative
+to each other; `BlockMeta.MinStart/MaxStart` ranges across trace blocks can and do overlap
+arbitrarily, which is exactly why the trace format needs a separate TS index
+(`blockio/writer/ts_index.go`) to support time-range pruning at all. The BucketGroup VI
+format's `SplitIntoBlocks` sort key directly includes both dimensions the format is queried
+by (`time_sec`, `value`), so no separate cross-block index is needed for a streaming iterator
+to trust block order — this is a structural difference between the two formats, not a
+coincidence, and a future change to either format's block-cutting sort key must not assume
+the other format's ordering behavior.
+
+Back-refs: `internal/modules/valueindex/bucketmerge.go:SplitIntoBlocks`,
+`internal/modules/valueindex/stream_compaction.go:BucketFileIterator`.
+
+---
+
+## NOTE-VI-051 — TimeSec minute-aligned truncation (cardinality reduction)
+
+Date: 2026-07-02
+
+### What changed
+
+`buildSpanStartSecByRef` (`valueindex_extract.go:159-186`) previously floored `span:start`
+(nanoseconds) to the whole second (`v / 1_000_000_000`). It now floors to the whole minute:
+
+```go
+const secondsPerMinute = 60
+m[key] = (v / 1_000_000_000) / secondsPerMinute * secondsPerMinute
+```
+
+This is the value that becomes `ValueIndexEntry.TimeSec` and, from there, the `TimeSec` half
+of the `(TimeSec, CanonicalValue)` merge/sort key that `stream_compaction.go`,
+`bucketfile.go`/`bucketmerge.go`, and `writer.go` all key on (SPEC-VI-1/SPEC-VI-3). See
+SPEC-VI-4 for the formal invariant statement.
+
+### Cardinality rationale
+
+Per-second `TimeSec` produces up to 60x more distinct `(TimeSec, CanonicalValue)` groups per
+minute than necessary for a busy column, driving up postings/group count and the CPU/memory
+cost of decoding and scanning them at query time. Minute-alignment collapses all spans sharing
+a value within the same wall-clock minute into one `BucketGroup`, directly reducing group
+density for high-cardinality-by-time columns without changing the wire format (TimeSec remains
+an opaque uint64 in both the flat VINX and v2 BucketGroup formats — see NOTE-VI-043/NOTE-VI-045
+— so old second-granularity data and new minute-granularity data coexist without a migration;
+they simply won't retroactively coalesce with each other across the transition, which ages out
+naturally via retention).
+
+### Mandatory paired query-side widening requirement (cross-repo)
+
+This truncation is **not safe to ship alone**. tempo-mrd's index-driven TraceQL search path
+(`tempodb/encoding/vblockpack/value_index_query.go:nanoWindowToSec`) converts a query's
+`[startNano, endNano]` window into `[minSec, maxSec]`, and `minSec` is compared against
+`TimeSec` by `bucketquery.go:LookupValue`'s exact-inclusion filter
+(`TimeSec < minTS || TimeSec > maxTS`) with no downstream fallback for a wrongly-excluded
+entry. Before this change, both sides floored to the same (second) granularity, so flooring's
+monotonicity made the comparison always safe (over-inclusion only, never under-inclusion).
+After this change, `nanoWindowToSec`'s `minSec` MUST also floor to the same 60-second alignment
+(`minSec = (startNano/1_000_000_000) / 60 * 60`) or a genuinely in-range span whose
+minute-floored `TimeSec` falls before a non-aligned `minSec` is silently dropped from search
+results — a real false-negative TraceQL search bug with no error surfaced. `maxSec` needs no
+corresponding change (see SPEC-VI-4's algebraic justification). This is a hard, coordinated,
+cross-repo correctness dependency: the blockpack truncation and the tempo-mrd widening must
+ship in the same rollout, or with the tempo-mrd widening deployed first (a wider query bound
+against old, non-minute-floored `TimeSec` data is always safe; the unsafe direction is
+deploying the blockpack truncation ahead of the tempo-mrd widening).
+
+### Permanent 1-minute resolution cap on the dormant CountOverTime/RateOverTime fast path
+
+`internal/modules/valueindex/metrics.go`'s `CountOverTime`/`RateOverTime`/`TimeBuckets`
+compute TraceQL metrics directly from VI `TimeSec` values against an arbitrary `StepNano`
+(exercised at 5-second buckets by `valueindex_e2e_test.go`'s
+`TestValueIndexE2E_CountOverTime`, which constructs `TimeSec` values directly via
+`AddEntryV4` and does not go through `buildSpanStartSecByRef` — so that test is unaffected by
+this change; see `TESTS.md`). This fast path has no live production caller today (not
+re-exported by the root `api.go`, and no caller found in tempo-mrd) — a dormant, tested, but
+unwired feature. Minute-quantizing `TimeSec` permanently caps this feature's usable resolution
+at 1 minute, whatever step size a future caller might request, once it is ever wired up. Not a
+regression today (nothing currently depends on finer resolution), but a real design constraint
+worth knowing before someone wires this up expecting sub-minute granularity.
+
+Back-refs: `valueindex_extract.go:buildSpanStartSecByRef`, `internal/modules/valueindex/metrics.go`
+(`CountOverTime`, `RateOverTime`, `TimeBuckets`), and (external, cross-repo) tempo-mrd's
+`tempodb/encoding/vblockpack/value_index_query.go:nanoWindowToSec`. See `SPECS.md` SPEC-VI-4
+and `TESTS.md` TEST-VI-7.
+
+## NOTE-VI-053 — Disk-backed streaming merge: completing NOTE-VI-046's deferred block-granularity follow-up
+
+Date: 2026-07-03
+
+### Framing: completing NOTE-VI-046, not contradicting it
+
+NOTE-VI-046 (2026-07-02) correctly deferred block-granularity compaction because it required a
+**remote** `IndexStore` ranged-read API addition — an exported, cross-repo interface change
+(`IndexStore` is hand-patched into tempo-mrd's local tree pending a real vendor bump) not
+justified at the time. This entry does **not** reopen or reverse that decision. It achieves
+the same block-granularity goal — bounding peak decoded memory per input file to
+`max(single block)` instead of `max(single file)` — via a fundamentally different mechanism
+NOTE-VI-046's author did not consider: ranging against a **local** temp file, populated by one
+ordinary whole-object `s.store.Get` (the exact same single call `IndexStore` already makes
+today), rather than against the remote object store directly. Local files support trivial
+random-access reads (`os.File.ReadAt`) that a remote object store's `Get`/`Peek`-only
+`IndexStore` interface does not — that is precisely why NOTE-VI-046 rejected *remote* ranged
+reads and precisely why this entry's *local* ranging sidesteps the exact obstacle NOTE-VI-046
+identified. **Zero `IndexStore` interface changes** are made by this redesign.
+
+### The new GroupIterator interface
+
+`StreamCompactBucketFiles`' k-way merge (`bucketIteratorHeap`) was confirmed (by reading its
+`Less`/`Push`/`Pop` implementation directly) to call only `Peek()`/`Advance()` on an iterator
+— nothing about a whole-file in-memory representation is structurally required. `GroupIterator`
+makes this explicit as an exported interface:
+
+```go
+type GroupIterator interface {
+    Peek() (*BucketGroup, bool)
+    Advance(ctx context.Context)
+    StringTable() *StringTable
+    Err() error
+    Close() error
+}
+```
+
+Both `BucketFileIterator` (existing, whole-file in-memory decode — compile-time-asserted via
+`var _ GroupIterator = (*BucketFileIterator)(nil)`) and the new `diskBucketFileIterator`
+(lazy, block-at-a-time decode from a local temp file) satisfy it. See `SPECS.md` SPEC-VI-5 for
+the formal Peek/Advance/Err contract this interface establishes.
+
+**Why `Advance` gained a `ctx context.Context` parameter** (a fallibility gap the original
+Peek/Advance shape didn't need to address, since `BucketFileIterator.Advance` never fails): a
+disk-backed `Advance()` can perform local disk I/O (decoding the next block) and may invoke a
+retention `RefChecker.IsLive` call that itself performs network I/O (e.g.
+`cachingRefChecker`/`SourceExister`, an S3 HEAD). Two options were weighed: storing `ctx` on
+the iterator struct at construction time (rejected — a stored `ctx` on a long-lived object is
+the exact anti-pattern the "don't store contexts in structs" guideline exists to prevent) vs.
+threading `ctx` through `Advance` itself (chosen — mechanical, and every call site inside
+`StreamCompactBucketFiles`'s merge loop already has `ctx` in scope). `Peek()` deliberately
+stays ctx-less and error-free (SPEC-VI-5): the "current" block's groups are always already
+resident by the time `Peek()` is called, since block 0 is decoded synchronously inside the
+constructor and block N+1 is decoded synchronously inside the `Advance()` call that crosses
+into it — never inside `Peek()` itself.
+
+### diskBucketFileIterator: eager metadata, lazy blocks
+
+`NewDiskBucketFileIterator(ctx, path, checker) (GroupIterator, error)` opens `path` and
+eagerly decodes header magic, footer, string table, and block directory — all bounded/cheap
+regardless of file size (footer is fixed-size; the string table scales with distinct interned
+source paths; the block directory scales with block count, never group/span count) — then
+eagerly decodes forward from block 0 until it finds a block with at least one
+(optionally retention-filtered) live group, so `Peek()` never needs to perform I/O (per
+SPEC-VI-5). Each subsequent `Advance(ctx)` that crosses a block boundary decodes exactly the
+next block (`ReadAt` the compressed bytes, `snappy.Decode`, `decodeBucketBlock`,
+`filterDeadRefsBlock`) and discards the previous block's groups (ordinary Go GC — no explicit
+nil-out needed). Peak decoded memory per open disk-backed iterator is therefore one block,
+regardless of the file's total block count or size.
+
+**Per-block retention filtering:** `filterDeadRefsBlock` is a new function
+(`disk_iterator.go`) factored out of `bucketmerge.go`'s existing whole-file `filterDeadRefs`,
+which is now a thin loop calling it once per block with one `live map[uint16]bool` cache
+shared across the whole file — a behavior-preserving refactor (not a behavior change):
+`filterDeadRefs`'s existing tests pass unmodified, and
+`TestFilterDeadRefsBlock_MatchesWholeFileFiltering` proves per-block evaluation with a
+persistent cache produces byte-identical retain/drop decisions and identical
+`checker.IsLive` call counts (at most once per distinct `SourceID` per file, matching the
+prior whole-file cache's behavior) as the original whole-file evaluation, including when a
+`SourceID` repeats across multiple blocks.
+
+**Corruption-handling split (a deliberate behavior change from today, documented prominently
+here since it diverges from the prior silent-skip-on-any-decode-failure behavior):**
+- **Header magic mismatch only** → treated as "legacy pre-v2 file, skip this file, do not
+  abort the merge" — `NewDiskBucketFileIterator` returns `(nil, nil)`, an explicit untyped nil
+  assigned directly to the `GroupIterator` return slot (never a typed-nil `*diskBucketFileIterator`
+  wrapped in the interface — the nil-interface-trap this repo's own past-feedback flags as a
+  recurring bug class). `TestNewDiskBucketFileIterator_LegacyFileReturnsTrueNilInterface`
+  asserts the returned `GroupIterator == nil` compares true, which only holds for a genuine
+  nil interface.
+- **Any other decode failure** (footer/string-table/block-index corruption, discovered eagerly
+  at construction; or an individual block's snappy/decode corruption, discovered lazily at
+  that block's `Advance`) is a real error — returned by the constructor or surfaced via
+  `Err()` — that aborts the whole merge, rather than being silently skipped as a legacy file
+  would be. Before this change, `DecodeFilteredBucketFile`'s eager whole-file decode could not
+  distinguish "which specific check failed," so every non-legacy decode failure was treated
+  identically to a header-magic mismatch (silent skip). See
+  `valueindexcompactor/NOTES.md` NOTE-VI-052 for the caller-side (`mergeLevel`) framing of why
+  this is an intentional, safer change, not a regression.
+
+### Ownership/cleanup contract
+
+Mirrors `runspill.go`'s `runFile.remove()` pattern (single owner, close+remove together):
+
+| Outcome | Who closes the fd | Who removes the local temp file (`path`) |
+|---|---|---|
+| Header magic mismatch (legacy skip) | `NewDiskBucketFileIterator` | caller — ownership never transferred |
+| Any other constructor error | `NewDiskBucketFileIterator` | caller — ownership never transferred |
+| Success (live iterator returned) | the iterator's own `Close()` | the iterator's own `Close()` (idempotent) |
+
+The caller (`valueindexcompactor.mergeLevel`) retains `path` ownership in the first two rows
+because no iterator was ever successfully constructed to hand it to; on success, ownership of
+both the fd and `path` fully transfers to the returned iterator, and the caller only needs
+`defer it.Close()`.
+
+### StatsProvider: an optional, separate interface for retention-filter bookkeeping
+
+`diskBucketFileIterator` additionally implements `StatsProvider` (`Stats() CompactStats`) —
+deliberately **not** part of `GroupIterator` itself, since `Stats()` is never called by the
+merge algorithm (`StreamCompactBucketFiles`/`mergeGroupsAtKey`/`bucketIteratorHeap`), only by
+a caller's own metrics bookkeeping. Before this redesign, `valueindexcompactor.mergeLevel`
+read `CompactStats` directly from `DecodeFilteredBucketFile`'s return value (computed
+up front, whole-file); after this redesign, retention-filter stats accumulate incrementally
+as `Advance` decodes each block, so `mergeLevel` type-asserts a fully-drained iterator to
+`StatsProvider` to read the final per-file total once merging completes. Keeping this a
+separate, optional interface avoids widening `GroupIterator`'s contract (and therefore every
+implementation's required method set, including any future `GroupIterator` that has no
+retention-filter stats to report) for a concern the merge algorithm has no stake in.
+
+### The vi-merge-*.tmp naming convention: deliberately distinct from runspill.go
+
+Both the input side (`valueindexcompactor`, `vi-merge-in-*.tmp`, staged before constructing a
+`diskBucketFileIterator`) and the output side (this package, `stream_compaction.go`'s
+`StreamCompactBucketFiles`, `vi-merge-out-*.tmp`) share the common `vi-merge-` prefix so one
+glob (`SweepOrphanedMergeTempFiles`, below) catches both. This prefix is deliberately distinct
+from `runspill.go`'s existing `vi-run-*.tmp` spill-file convention (NOTE-VI-026), so the new
+startup sweep never touches `runspill.go`'s own in-flight spill files, and vice versa.
+`runspill.go` itself is not modified by this redesign; its own lack of an equivalent startup
+sweep is a latent, low-probability, out-of-scope gap (unchanged by this work).
+
+`SweepOrphanedMergeTempFiles() (removed int, err error)` globs
+`filepath.Join(os.TempDir(), "vi-merge-*.tmp")` and removes every match, best-effort (a
+missing/unreadable directory yields `(0, nil)`, not an error; individual removal failures are
+collected — the first is returned — but every match is still attempted). Intended to be
+called once, at `valueindexcompactor.NewService` construction, to clean up files left behind
+by a prior process that crashed mid-merge (local disk, once a k8s `emptyDir` is added per
+NOTE-VI-052's flagged deployment prerequisite, persists across container restarts of the same
+pod but not across pod reschedules). A sweep failure is logged/metriced but never fails
+service construction.
+
+### filterDeadRefs refactor: behavior-preserving, no invariant change
+
+`bucketmerge.go`'s `filterDeadRefs` (whole-file) is now implemented as a thin loop calling the
+new `filterDeadRefsBlock` once per block, aggregating `CompactStats` — this is a **pure
+composition refactor**, not a behavior change: `filterDeadRefs`'s existing tests pass
+unmodified, and no existing SPECS.md/TESTS.md wording describing whole-file retention
+filtering needed to change as a result (the observable behavior, including the per-file
+`live map[uint16]bool` cache-reuse semantics, is identical before and after).
+
+Back-refs: `internal/modules/valueindex/disk_iterator.go` (`diskBucketFileIterator`,
+`NewDiskBucketFileIterator`, `filterDeadRefsBlock`, `StatsProvider`),
+`internal/modules/valueindex/stream_compaction.go` (`GroupIterator`),
+`internal/modules/valueindex/temp_cleanup.go` (`SweepOrphanedMergeTempFiles`),
+`internal/modules/valueindex/bucketmerge.go` (`filterDeadRefs` refactor), and (cross-package)
+`internal/modules/valueindexcompactor/NOTES.md` NOTE-VI-052 (the `mergeLevel`/input-staging
+half of this same redesign).
+
+## NOTE-VI-063 — `traceindex.go` gets its first real callers: extraction → consumer flush wiring (issue #428 wiring, Stage 1-2)
+
+Date: 2026-07-04
+
+The `TraceGroup`/`SpanEntry` codec documented in NOTE-VI-038 (added 2026-06-30, previously
+unwired — see that entry's 2026-07-04 Addendum) now has real producers: root-package
+`extractBlockColumns` surfaces `ParentSpanID` per row (additive field, see
+`valueindexconsumer/NOTES.md` NOTE-VI-060), and `valueindexconsumer` buffers every span row
+into a per-tenant `TraceGroup` and flushes it via `EncodeTraceGroups` under this package's
+existing, unmodified `hash("trace:id")` colDir/discovery layout (`valueindexconsumer/NOTES.md`
+NOTE-VI-061/062). No change to `traceindex.go`'s own encode/decode/merge/assemble functions was
+needed for this stage — the wiring is entirely upstream (extraction) and downstream
+(consumer), consuming the existing codec as-is.
+
+**Caveat — REAL and LIVE, corrected 2026-07-05 (originally, incorrectly, assessed as
+informational/not-reachable):** the root-package `WriteValueIndexL0` (`valueindex_l0write.go`,
+NOTE-VI-042) is a separate synchronous write path that indexes every column — including
+`trace:id` — via the *generic* `BucketGroup` format (NOTE-VI-043) into the same
+`hash("trace:id")` colDir this wiring now uses for `TraceGroup`-format files. **This was
+originally reported here as "not currently reachable... zero real callers," based on a grep
+that only checked `/home/mdurham/source/tempo-mrd`.** `WriteValueIndexL0` in fact has real,
+live production callers in `/home/mdurham/source/blockpack_collection/tempo`'s
+`tempodb/encoding/vblockpack/compactor.go` and `create.go`, gated behind
+`value_index_enabled`. This is a real, currently-unfixed gap, not a future risk — it must
+exclude `trace:id` (mirroring `valueindexconsumer`'s own sentinel-column design,
+`valueindexconsumer/SPECS.md` SPEC-VI-4) or it writes an incompatible file format into this
+colDir for any tenant with that flag on, today. Full detail in `valueindexconsumer/SPECS.md`
+SPEC-VI-2's corrected "Caveat" paragraph and `valueindexconsumer/NOTES.md` NOTE-VI-042's third
+addendum. Tracked as task #93 (code fix, outside this spec-oracle's own remit).
+
+**Still to come (separate tasks):** the compactor's format-dispatch branch and
+`MergeTraceGroups`'s `RefChecker` signature widening (task #86), and `GetTraceByID`'s read-side
+wiring (task #87) — this entry covers only the write-side (extraction + consumer flush) half
+of the effort.
+
+Back-refs: root `valueindex_extract.go:extractBlockColumns`,
+`internal/modules/valueindexconsumer/traceflush.go`,
+`internal/modules/valueindexconsumer/service.go:ingest`.
+
+## NOTE-VI-064 — `MergeTraceGroups` gets its first real caller: compactor format-dispatch (issue #428 wiring, Stage 3)
+
+Date: 2026-07-04
+
+`valueindexcompactor`'s `mergeTraceLevel` (`internal/modules/valueindexcompactor/
+traceindex_dispatch.go`) is `MergeTraceGroups`'s first production caller since it was added by
+NOTE-VI-038. Because it had zero callers, widening its `SourceExists func(string) bool`
+parameter to the standard `RefChecker` interface (`SPECS.md` SPEC-VI-6) was free — no existing
+call sites needed migration, only the function's own 4 existing tests
+(`TestMergeTraceGroups_MergeSameTrace/DedupSpan/StaleSourceDropped/AllStaleDropsGroup`, updated
+mechanically to pass a `context.Background()` and a `RefChecker`-implementing test fake in
+place of the prior `func(string) bool` literals — no change to the tests' own assertions).
+
+The dispatch decision (which colDir routes to `mergeTraceLevel` vs. the standard `mergeLevel`)
+lives in `valueindexcompactor`, not here — see `valueindexcompactor/NOTES.md` for the
+Finding-2 rationale (why the dispatch must happen before the `vbg2Magic` purge loop, not only
+inside the merge function itself).
+
+Back-refs: `internal/modules/valueindex/traceindex.go:MergeTraceGroups`,
+`internal/modules/valueindexcompactor/traceindex_dispatch.go:mergeTraceLevel`,
+`:isTraceIndexColDir`. See `SPECS.md` SPEC-VI-6.

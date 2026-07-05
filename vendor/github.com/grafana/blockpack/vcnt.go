@@ -37,6 +37,16 @@ func EncodeVCNTRecords(records []VCNTRecord, perChunk int) ([]byte, []VCNTChunkD
 	return valuecounts.EncodeRecords(records, perChunk)
 }
 
+// CompactVCNTRecords merges records via delta accounting: records are grouped
+// by (ColumnName, TimeStart, TimeEnd, Value), Count is summed per group, and
+// groups whose summed Count is <= 0 are dropped. The returned slice is sorted
+// in canonical VCNTRecord order (see SortVCNTRecords). Exposed so callers
+// outside this module (e.g. tempo's block-builder tests) can exercise the
+// real merge semantics end-to-end instead of reimplementing them.
+func CompactVCNTRecords(records []VCNTRecord) []VCNTRecord {
+	return valuecounts.Compact(records)
+}
+
 // VCNTColHash returns the per-column directory hash used in the .vcnt object key.
 func VCNTColHash(colName string) string {
 	return valuecounts.ColHash(colName)

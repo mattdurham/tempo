@@ -1054,3 +1054,30 @@ via per-fetch child spans.
 
 Back-ref: `internal/modules/executor/otel_spans.go:attachCacheStats`,
 `internal/modules/blockio/reader/cache_stats.go`.
+
+---
+
+## SPEC-VIS-1: SliceValueIndexSource concurrency safety
+
+*Added: 2026-07-02*
+
+**Invariant:** `SliceValueIndexSource`'s `Add`, `RecordFileIO`, `Stats`, `LookupResults`, and
+`AllResults` are safe for concurrent callers. All five methods acquire an internal `sync.Mutex`
+for their full body (map/field read or write), so concurrent `Add`/`RecordFileIO` calls from
+multiple goroutines cannot race on the underlying `data` map or `stats` counters, and a
+concurrent `Stats`/`LookupResults`/`AllResults` reader always observes a consistent snapshot
+(never a partially-written map bucket).
+
+This is required by `vibuilder.BuildSource`'s leaf-loop parallelization (tempo issue #465,
+timeout incident): multiple leaf-predicate goroutines call `Add`/`RecordFileIO` on the same
+`SliceValueIndexSource` concurrently once the leaf loop is bounded-concurrency rather than
+serial. See NOTE-VI-048 for the rationale and `vibuilder/NOTES.md`'s corresponding entry for
+the call-site change that makes this concurrency real.
+
+The mutex adds no behavioral change to any method's return semantics — `Stats()`'s
+Hits-derived-at-read-time design (NOTE-VI-039) was already written to tolerate any `Add`
+ordering; the mutex only makes that tolerance safe under the Go memory model when the calls are
+truly concurrent, not just reordered on a single goroutine.
+
+Back-ref: `internal/modules/executor/metrics_trace.go:SliceValueIndexSource`.
+Tests: `internal/modules/executor/metrics_trace_vi_test.go:TestSliceValueIndexSource_ConcurrentAddAndRecordFileIO_NoRace` (EX-VIS-01).

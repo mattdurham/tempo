@@ -3458,3 +3458,45 @@ sole consumer (tempo) can branch on them without importing the internal reader p
 **Back-ref:** `reader/parser.go` (`ErrUnsupportedFormatVersion`,
 `UnsupportedFormatVersionError`, `readFooter`, `tryReadFooterMagic18`), `reader.go` (aliases).
 Tests: `reader/reader_test.go` (`TestFooterVersionDetection`).
+
+## NOTE-479 (#466): Remove all in-process memory caching — disk + memcache only
+
+**Problem:** the querier's memory footprint was dominated by in-process caches layered on top
+of the disk + remote (memcached) tiers that already serve the same data. Under tight,
+sometimes VPA-managed limits this unbounded/heuristically-sized in-process consumer sat on top
+of already-substantial per-query working sets (decode buffers, sort/merge scratch), making OOM
+behavior hard to reason about and contributing to TraceQL timeouts + OOMKills on
+tempo-dev-test-03.
+
+**Change:** removed both in-process mechanisms entirely, leaving only disk (`filecache`) +
+remote (`memcache`):
+
+- Deleted the four process-level parser caches — `parsedV8ColumnCache` (decoded columns),
+  `blockColTypesCache` (parsed per-block ToC), and the already-orphaned `parsedTraceSparseCache`
+  / `parsedTraceChunkCache` — plus `SetProcessCacheBytes` and `ClearCaches`.
+- Removed the whole decoded-column reuse layer that fed off `parsedV8ColumnCache`:
+  `Reader.preDecodedColumns` + `preDecodedLookup`, `stashPreDecodedColumn`,
+  `prunePreDecodedFromFetch`, `getCachedBlockToc`/`cacheBlockColTypes`/
+  `cacheParsedBlockColTypes`, `snapshotDecodedColumn`, `copyDecodedColumnInto`, the
+  `v8ColumnCacheKey*`/`blockColTypesCacheKey` builders, `Column.lazyFileID`/`lazyBlockOffset`,
+  and `Column.SizeBytes`/`columnSnapshotFixedOverhead` (they only existed to satisfy the
+  deleted `objectcache.Sizer`).
+- KEPT `Reader.preCompressedColumns` + `stashPreCompressedColumn` (NOTE-234): that is a
+  PER-QUERY stash of compressed blobs returned by the combined ToC+columns GetMulti, not an
+  in-process cache, and still eliminates the assembled-buffer copy on the warm columnar path.
+- Deleted the `internal/modules/objectcache` and `internal/modules/memorycache` packages.
+- Stripped the public API `MemoryCache`/`NewMemoryCache`/`MemoryCacheConfig`/
+  `SetProcessCacheBytes`; `ClearReaderCaches` is retained as a no-op for tempo test
+  compatibility. `DefaultTypedConfig(mem, disk)` params renamed to `(hot, warm)`.
+
+**Why safe:** every read path already handled a miss gracefully — the block-read path fetches
+every wanted column from the remote/disk tiers, and `decodeNow` always decompresses + decodes
+on first access. No code assumed an in-process cache hit was guaranteed.
+
+**Tradeoff:** previously-in-process-cached decoded columns / parsed ToCs now fall through to
+disk/memcache (compressed bytes) and re-decode per query, trading some added latency and
+disk/memcache load for a smaller, more predictable querier memory footprint.
+
+**Back-ref:** `reader/parser.go`, `reader/columnar_read.go`, `reader/block_parser.go`,
+`reader/column.go`, `reader/block.go`, `reader/reader.go`, top-level `reader.go`/`api.go`,
+`tieredcache/typed.go`. Tempo: `tempodb/encoding/vblockpack/backend_block.go`.

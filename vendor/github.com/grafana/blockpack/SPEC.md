@@ -543,6 +543,21 @@ the query's needed set.
   span:duration in the set; omitting either suppresses span:end synthesis (the synthesis check
   requires both keys present in intrinsicCache).
 
+**Addendum (2026-07-04):** The blanket claim above that "Paths that need all fields
+(GetTraceByID) must pass `wantCols=nil`" no longer describes `GetTraceByID`'s decode strategy
+as a whole — it describes only its *materialization* sub-step. As of the trace-by-ID index
+wiring effort (SPEC-ROOT-018), `GetTraceByID`'s full-scan fallback (`getTraceByIDFullScan`,
+`reader.go`) first runs a cheap `WantOnly({"trace:id"})` match phase over every block
+(`scopeMatchingBlocks`) and only re-decodes blocks that actually contain a matching row with
+`WantAll()` (`parseBlocksWithWant`). The index-hit fast path (`getTraceByIDViaIndex` →
+`materializeTraceGroup`) never enumerates every block at all — it decodes only the exact
+blocks an index hit names, always with `WantAll()` since full-field materialization is
+required at that point regardless of path. **The invariant this rule protects (materialization
+of a matched span must see every field, since `SpanFieldsAdapter` needs an open-ended,
+non-fixed column set — see SPEC-ROOT-018) still holds; only the "every block, every column,
+unconditionally" framing is now stale.** See SPEC-ROOT-018 and
+`internal/modules/blockio/reader/SPECS.md` SPEC-012 for the corrected, complete statement.
+
 **Rationale:**
 
 Decoding intrinsic columns not needed by a query wastes CPU and memory on every matched span.
@@ -564,6 +579,84 @@ Back-ref: `internal/modules/blockio/span_fields.go:loadIntrinsicCache`,
 `query_traceql.go:streamFilterProgram`,
 `api.go:QueryTraceQL`,`
 `reader.go:GetTraceByID`
+
+---
+
+## SPEC-ROOT-018: GetTraceByID — Breaking Signature Change, Index-Is-A-Hint Contract
+*Added: 2026-07-04*
+
+**This is a breaking change to an exported root-package API function**, authorized explicitly
+by the user (not a unilateral agent decision) as part of fixing a production incident: a live
+heap profile on tempo-dev-test-03 showed `GetTraceByID`'s unconditional full-file block scan
+driving a 64Gi-limited querier to 40.5GB/95% heap during a single in-flight `/api/traces/{id}`
+request. Full history in `.bob/state/brainstorm.md` and `.bob/state/plan.md`.
+
+**Old signature (pre-2026-07-04):** `GetTraceByID(r *Reader, traceIDHex string) (results
+[]SpanMatch, err error)`.
+
+**New signature:** `GetTraceByID(ctx context.Context, r *Reader, traceIDHex string, lister
+valueindex.LookupStore, tenant, indexPrefix string, queryMinSec, queryMaxSec uint64) (results
+[]SpanMatch, err error)`.
+
+**Contract:**
+
+1. **Index-first, when given the means.** When `lister != nil && tenant != ""`, `GetTraceByID`
+   first consults the trace-by-ID value index (`internal/modules/valueindex/traceindex.go`,
+   `TraceGroup`/`SpanEntry`) via `getTraceByIDViaIndex`: it discovers candidate index files
+   scoped to `[queryMinSec, queryMaxSec]`, decodes them, and on finding the trace, resolves
+   every `SpanEntry`'s exact `BlockRef`+`RowIdx` directly — touching only the blocks the index
+   names, never enumerating the whole file.
+2. **The index is a hint, never authoritative for absence.** Any of the following
+   unconditionally falls back to `getTraceByIDFullScan` (the exact, complete, pre-existing
+   scan behavior, preserved verbatim in logic — not deleted): `lister == nil`, `tenant == ""`,
+   no candidate index files discovered, every candidate fails to decode, the trace ID is not
+   found in any decoded candidate, an index-named block fails to resolve in `r`
+   (`BlockIndexForPage` returns `!ok` — this is also how a genuinely cross-file span is
+   detected and handled: see v1 scope decision below), or a resolved row's own `trace:id`
+   column value does not actually match the requested trace ID (defensive re-verify;
+   `rowMatchesTraceID`). **No indeterminacy of any kind may produce a wrong or partial
+   result** — every fallback path returns exactly what a full scan would have returned.
+3. **v1 scope decision — no cross-file trace assembly.** `GetTraceByID` operates on exactly
+   one `*Reader` for one file. An index entry naming a block that does not resolve in `r` is
+   what a genuinely cross-file span looks like (a different file's page geometry is unrelated
+   to `r`'s own block layout) — this aborts the index attempt entirely for the whole trace
+   (never a partial result assembled from only the same-file spans) and falls back to a full
+   scan of `r`'s own file, which is exactly what every caller has only ever been able to see
+   regardless of index coverage. Genuine cross-file trace assembly (opening additional readers
+   for other files an index names) is explicitly out of scope for v1.
+4. **`queryMinSec`/`queryMaxSec`** scope the index discovery window. Pass `(0,
+   math.MaxUint64)` when no tighter hint is available — this widens the candidate set, it does
+   not narrow correctness, since the fallback guarantees correctness regardless.
+
+**Known-affected external consumer (breaking-change blast radius):** the `tempo` checkout at
+`/home/mdurham/source/blockpack_collection/tempo`'s `vblockpack` package has two call sites,
+both confirmed and updated as part of this same change (Stage 6). **Correction (2026-07-05):**
+this back-reference originally cited `/home/mdurham/source/tempo-mrd` — a separate checkout of
+the same `mattdurham/tempo` repo that exists alongside the correct one — as the location where
+Stage 6's work landed; that was a checkout-naming mixup discovered after the fact. The actual
+Stage 6 changes are in `/home/mdurham/source/blockpack_collection/tempo`. `tempodb/encoding/
+vblockpack/backend_block.go` (`(*blockpackBlock).FindTraceByID`) passes a real `nil`-safe
+lister for v1 (compile-correct, zero behavior change — real `Lister`/`indexPrefix` wiring into
+the querier is tracked as a required, separate tempo-repo follow-up, not yet done, before this
+fix has any production effect there) using the block's own `BlockMeta.StartTime`/`EndTime` as
+the time hint; `tempodb/encoding/vblockpack/wal_block.go` (`(*walBlock).FindTraceByID`)
+permanently passes `nil`/`""` since WAL data can never have index coverage. Any other external
+caller of `GetTraceByID` not enumerated here will fail to compile against the new signature —
+loudly, at
+build time, not silently at runtime.
+
+**Full-field materialization requirement (relates to SPEC-ROOT-017):** every span actually
+returned by `GetTraceByID` — via either path — is always decoded with `WantAll()` at the point
+of materialization, never `WantOnly()`. `NewSpanFieldsAdapterWithReader` exposes whatever
+columns are present in the decoded block, an open-ended, per-span attribute set that a fixed
+column list would silently truncate (`internal/modules/blockio/reader/SPECS.md` SPEC-012). The
+two-phase `WantOnly`/`WantAll` split in the full-scan fallback narrows which *blocks* get the
+expensive `WantAll()` decode; it never narrows which *columns* a materialized span exposes.
+
+Back-refs: `reader.go:GetTraceByID`, `:getTraceByIDViaIndex`, `:getTraceByIDFullScan`,
+`:materializeTraceGroup`, `:scopeMatchingBlocks`, `internal/modules/valueindex/lookupstore.go:LookupStore`,
+`gettracebyid_index_test.go` (index-path tests), `gettracebyid_test.go`, `api_test.go`
+(fallback-path regression tests, updated call signature).
 
 ---
 

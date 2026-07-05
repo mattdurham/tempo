@@ -31,14 +31,16 @@ import (
 
 // ValueIndexEntry is one extracted (column, span) observation.
 type ValueIndexEntry struct {
-	Value    any    // typed column value (string, int64, uint64, bool, float64, []byte)
-	ColName  string // resolved column name
-	ColType  ColumnType
-	BlockID  uint32              // v1: zero-based block index (NOTE-VI-014)
-	BlockRef valueindex.BlockRef // v2+: page-addressed block reference (NOTE-VI-027)
-	TimeSec  uint64              // span start time in whole seconds (0 if unavailable)
-	SpanID   [8]byte             // span identity for direct lookup (NOTE-VI-029, #428)
-	RowIdx   int                 // row index within block for O(1) access (NOTE-VI-029, #428)
+	Value        any    // typed column value (string, int64, uint64, bool, float64, []byte)
+	ColName      string // resolved column name
+	ColType      ColumnType
+	BlockID      uint32              // v1: zero-based block index (NOTE-VI-014)
+	BlockRef     valueindex.BlockRef // v2+: page-addressed block reference (NOTE-VI-027)
+	TimeSec      uint64              // span start time in whole seconds (0 if unavailable)
+	SpanID       [8]byte             // span identity for direct lookup (NOTE-VI-029, #428)
+	ParentSpanID [8]byte             // parent span identity; zero for a root span or absent column
+	TraceID      [16]byte            // trace identity for the row this entry belongs to
+	RowIdx       int                 // row index within block for O(1) access (NOTE-VI-029, #428)
 }
 
 // ExtractValueIndexEntries reads every indexable (column, span) observation from
@@ -152,8 +154,13 @@ func truncateTimeValueToMillis(name string, val any) any {
 	}
 }
 
-// buildSpanStartSecByRef builds a packed-key (uint32(blockIdx)<<16 | rowIdx) → seconds
-// map from the span:start block column, converting nanoseconds to whole seconds.
+// buildSpanStartSecByRef builds a packed-key (uint32(blockIdx)<<16 | rowIdx) →
+// minute-aligned-seconds map from the span:start block column, converting
+// nanoseconds to whole seconds and flooring to the minute (60s) boundary for
+// cardinality reduction (NOTE-VI-051). The read-side query bound in tempo-mrd's
+// nanoWindowToSec MUST floor to the same 60s alignment or legitimate search
+// matches near the start of a query window are silently dropped — this is a
+// coordinated, cross-repo invariant, not a standalone change (SPEC-VI-4).
 // After #433 (IntrinsicTOC removal), span:start lives in block payload columns.
 // Returns nil when the column is absent so callers fall back to TimeSec == 0.
 func buildSpanStartSecByRef(r *modules_reader.Reader) map[uint32]uint64 {
@@ -176,7 +183,9 @@ func buildSpanStartSecByRef(r *modules_reader.Reader) map[uint32]uint64 {
 				continue
 			}
 			key := uint32(bi)<<16 | uint32(rowIdx) //nolint:gosec // bounded values
-			m[key] = v / 1_000_000_000
+			// SPEC-VI-4, NOTE-VI-051: TimeSec is floored to the minute boundary.
+			const secondsPerMinute = 60
+			m[key] = (v / 1_000_000_000) / secondsPerMinute * secondsPerMinute
 		}
 	}
 	return m
@@ -208,6 +217,17 @@ func extractBlockColumns(
 		}
 		// Look up span:id column for this block once per block (for v4 span identity).
 		spanIDCol := block.Block.GetColumn("span:id")
+		// Look up span:parent_id column once per block (Stage 1, traceindex.go wiring).
+		// The writer only sets this column when ParentSpanId is non-empty (spanmatch.go),
+		// so a root span's row is legitimately absent from this column, not zero-but-present.
+		parentSpanIDCol := block.Block.GetColumn(modules_shared.SpanParentIDColumnName)
+		// Look up trace:id column once per block (Stage 5 fix, traceindex.go wiring plan):
+		// every yielded entry must carry its row's TraceID, not just the entries for the
+		// trace:id column itself -- ColumnEntry.TraceID/ValueIndexEntry.TraceID were
+		// otherwise always zero in production (only hand-built test fixtures set it),
+		// which silently broke any TraceID-keyed consumer of the value index, including
+		// the new trace-group buffer's per-row grouping.
+		traceIDCol := block.Block.GetColumn(modules_shared.TraceIDColumnName)
 		for colKey, col := range block.Block.Columns() {
 			if _, denied := denylist[colKey.Name]; denied {
 				continue
@@ -232,14 +252,28 @@ func extractBlockColumns(
 						copy(spanID[:], v)
 					}
 				}
+				var parentSpanID [8]byte
+				if parentSpanIDCol != nil && parentSpanIDCol.IsPresent(row) {
+					if v, ok2 := parentSpanIDCol.BytesValue(row); ok2 && len(v) == 8 {
+						copy(parentSpanID[:], v)
+					}
+				}
+				var traceID [16]byte
+				if traceIDCol != nil {
+					if v, ok2 := traceIDCol.BytesValue(row); ok2 && len(v) == 16 {
+						copy(traceID[:], v)
+					}
+				}
 				if err := yield(ValueIndexEntry{
-					ColName:  colKey.Name,
-					Value:    val,
-					ColType:  colType,
-					BlockRef: blockRef,
-					TimeSec:  startSecByRef[key],
-					SpanID:   spanID,
-					RowIdx:   row,
+					ColName:      colKey.Name,
+					Value:        val,
+					ColType:      colType,
+					BlockRef:     blockRef,
+					TimeSec:      startSecByRef[key],
+					SpanID:       spanID,
+					ParentSpanID: parentSpanID,
+					TraceID:      traceID,
+					RowIdx:       row,
 				}); err != nil {
 					return err
 				}

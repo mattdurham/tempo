@@ -5,10 +5,14 @@ package blockpack
 // These are the core I/O primitives that storage backends and integrations build on.
 
 import (
+	"bytes"
+	"context"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"runtime"
+	"sort"
+	"sync"
 
 	modules_blockio "github.com/grafana/blockpack/internal/modules/blockio"
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
@@ -16,10 +20,10 @@ import (
 	modules_chaincache "github.com/grafana/blockpack/internal/modules/chaincache"
 	modules_filecache "github.com/grafana/blockpack/internal/modules/filecache"
 	modules_memcache "github.com/grafana/blockpack/internal/modules/memcache"
-	modules_memorycache "github.com/grafana/blockpack/internal/modules/memorycache"
 	modules_rw "github.com/grafana/blockpack/internal/modules/rw"
 	modules_sectioncache "github.com/grafana/blockpack/internal/modules/sectioncache"
 	modules_tieredcache "github.com/grafana/blockpack/internal/modules/tieredcache"
+	"github.com/grafana/blockpack/internal/modules/valueindex"
 	vm "github.com/grafana/blockpack/internal/vm"
 	"golang.org/x/sync/errgroup"
 )
@@ -99,10 +103,10 @@ func NewSharedLRUProvider(underlying ReaderProvider, readerID string, cache *Sha
 }
 
 // Cache is the common interface for all blockpack cache tiers.
-// Implementations: FileCache (disk), MemoryCache (in-process), MemCache (remote),
-// ChainedCache (multi-tier). Use NewChainedCache to compose tiers:
+// Implementations: FileCache (disk), MemCache (remote), ChainedCache (multi-tier).
+// Use NewChainedCache to compose tiers:
 //
-//	chain := NewChainedCache(memCache, diskCache, remoteCache)
+//	chain := NewChainedCache(diskCache, remoteCache)
 type Cache = modules_filecache.Cache
 
 // FileCache is a disk-backed, size-bounded byte cache for blockpack file sections
@@ -132,27 +136,6 @@ func OpenFileCache(cfg FileCacheConfig) (*FileCache, error) {
 		Enabled:    cfg.Enabled,
 		MaxBytes:   cfg.MaxBytes,
 		Path:       cfg.Path,
-		Registerer: cfg.Registerer,
-	})
-}
-
-// MemoryCache is a byte-bounded in-process LRU cache that implements Cache.
-// It is intended as the fastest tier in a multi-tier chain:
-// MemoryCache → FileCache → MemCache.
-type MemoryCache = modules_memorycache.MemoryCache
-
-// MemoryCacheConfig configures an in-process MemoryCache.
-
-// Registerer is an optional Prometheus registerer.
-// When non-nil, cache metrics are registered and incremented on cache operations.
-
-// MaxBytes is the maximum total bytes the cache may hold.
-// Required and must be positive.
-
-// NewMemoryCache creates an in-process LRU cache with the given byte capacity.
-func NewMemoryCache(cfg MemoryCacheConfig) (*MemoryCache, error) {
-	return modules_memorycache.New(modules_memorycache.Config{
-		MaxBytes:   cfg.MaxBytes,
 		Registerer: cfg.Registerer,
 	})
 }
@@ -197,14 +180,13 @@ func OpenMemCache(cfg MemCacheConfig) (*MemCache, error) {
 type ChainedCache = modules_chaincache.ChainedCache
 
 // NewChainedCache creates a ChainedCache from the given tiers ordered fastest-first.
-// Recommended order: MemoryCache → FileCache → MemCache.
+// Recommended order: FileCache (disk) → MemCache (remote).
 //
 // Example:
 //
-//	mem, _ := blockpack.NewMemoryCache(blockpack.MemoryCacheConfig{MaxBytes: 100 << 20})
 //	disk, _ := blockpack.OpenFileCache(blockpack.FileCacheConfig{Path: "/tmp/bpcache", MaxBytes: 1 << 30, Enabled: true})
 //	remote, _ := blockpack.OpenMemCache(blockpack.MemCacheConfig{Servers: []string{"localhost:11211"}, Enabled: true})
-//	chain := blockpack.NewChainedCache(mem, disk, remote)
+//	chain := blockpack.NewChainedCache(disk, remote)
 //	reader, _ := blockpack.NewReaderWithCache(provider, fileID, chain)
 func NewChainedCache(tiers ...Cache) *ChainedCache {
 	return modules_chaincache.New(tiers...)
@@ -221,17 +203,20 @@ type TypedConfig = modules_tieredcache.TypedConfig
 type TypedTieredCache = modules_tieredcache.TypedTieredCache
 
 // DefaultTypedConfig returns a TypedConfig with the recommended tier mapping:
-//   - mem: Footer, TOC, Bloom, Block, Intrinsic (low-latency, high-reuse small blobs)
-//   - disk: Metadata, TraceIdx (large blobs; disk round-trip acceptable)
+//   - hot: Footer, TOC, Bloom, Block (low-latency, high-reuse small blobs)
+//   - warm: Metadata, TraceIdx (large blobs; disk round-trip acceptable)
+//
+// #466 removed the in-process memory tier; both slots are typically a disk FileCache
+// and/or a remote MemCache chain.
 //
 // Example:
 //
-//	mem, _  := blockpack.NewMemoryCache(blockpack.MemoryCacheConfig{MaxBytes: 256 << 20})
 //	disk, _ := blockpack.OpenFileCache(blockpack.FileCacheConfig{Path: "/var/cache/bp", MaxBytes: 10 << 30, Enabled: true})
-//	tiered  := blockpack.NewTypedTieredCache(blockpack.DefaultTypedConfig(mem, disk))
+//	remote, _ := blockpack.OpenMemCache(blockpack.MemCacheConfig{Servers: []string{"localhost:11211"}, Enabled: true})
+//	tiered  := blockpack.NewTypedTieredCache(blockpack.DefaultTypedConfig(disk, blockpack.NewChainedCache(disk, remote)))
 //	reader, _ := blockpack.NewReaderWithCache(provider, fileID, tiered)
-func DefaultTypedConfig(mem, disk Cache) TypedConfig {
-	return modules_tieredcache.DefaultTypedConfig(mem, disk)
+func DefaultTypedConfig(hot, warm Cache) TypedConfig {
+	return modules_tieredcache.DefaultTypedConfig(hot, warm)
 }
 
 // TwoTierTypedConfig returns a TypedConfig that splits caching across two remote caches:
@@ -302,7 +287,7 @@ func NewReaderFromProvider(provider ReaderProvider) (*Reader, error) {
 // reads using the provided Cache. fileID must uniquely identify the file within the
 // cache namespace — typically the file path or object storage key.
 // A nil cache falls back to uncached reads. cache may be any Cache implementation:
-// FileCache, MemoryCache, MemCache, or a ChainedCache.
+// FileCache, MemCache, or a ChainedCache.
 func NewReaderWithCache(provider ReaderProvider, fileID string, cache Cache) (*Reader, error) {
 	var sc modules_sectioncache.SectionCache
 	if cache != nil {
@@ -326,7 +311,7 @@ func NewLeanReaderFromProvider(provider ReaderProvider) (*Reader, error) {
 // NewLeanReaderWithCache creates a lean Reader with caching. Uses the same lean path
 // as NewLeanReaderFromProvider (version-dependent I/O count; see its doc for details)
 // but caches footer and section reads. fileID must uniquely identify the file within the cache namespace.
-// cache may be any Cache implementation: FileCache, MemoryCache, MemCache, or ChainedCache.
+// cache may be any Cache implementation: FileCache, MemCache, or ChainedCache.
 func NewLeanReaderWithCache(provider ReaderProvider, fileID string, cache Cache) (*Reader, error) {
 	var sc modules_sectioncache.SectionCache
 	if cache != nil {
@@ -352,8 +337,30 @@ func NewReaderForProgram(prog *vm.Program, provider ReaderProvider, fileID strin
 // GetTraceByID looks up all spans for the given trace ID and returns them.
 // traceIDHex must be a 32-character hex string (16 bytes); upper or lower case is accepted.
 // Returns an empty slice (not an error) when the trace is not found.
-// Use NewLeanReaderFromProvider for the lowest-I/O path.
-func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error) {
+//
+// When lister is non-nil and tenant is non-empty, GetTraceByID first consults the
+// TraceGroup trace-by-ID index (internal/modules/valueindex/traceindex.go) for exact
+// block+row addressing, avoiding a full-file scan for any trace the index covers.
+// queryMinSec/queryMaxSec scope the index file discovery window; pass (0, math.MaxUint64)
+// when no tighter hint is available (e.g. from a source block's own wall-clock range).
+// A nil lister, an empty tenant, any index miss, any decode failure, or any index/data
+// skew unconditionally falls back to a full, exact block scan — the index is a hint,
+// never authoritative for absence.
+//
+// v1 scope decision (plan Open Question 3): GetTraceByID has exactly one Reader for one
+// file. An index entry naming a block that does not resolve in r — which is what a
+// genuinely cross-file span looks like, since a different file's page geometry is
+// unrelated to r's block layout — aborts the index attempt entirely (never a partial
+// result) and falls back to getTraceByIDFullScan, which has only ever been able to see
+// r's own file. Genuine cross-file trace assembly is out of scope for v1.
+func GetTraceByID(
+	ctx context.Context,
+	r *Reader,
+	traceIDHex string,
+	lister valueindex.LookupStore,
+	tenant, indexPrefix string,
+	queryMinSec, queryMaxSec uint64,
+) (results []SpanMatch, err error) {
 	if r == nil {
 		return nil, fmt.Errorf("GetTraceByID: reader cannot be nil")
 	}
@@ -370,27 +377,255 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 	var traceID [16]byte
 	copy(traceID[:], traceIDBytes)
 
-	// TraceEntries always returns nil (#438: trace DFS index removed).
-	// Build a synthetic entry slice covering all blocks. The block-column scan
-	// filters by trace:id within each block so correctness is preserved.
+	if lister != nil && tenant != "" {
+		if matches, ok := getTraceByIDViaIndex(
+			ctx, r, traceID, lister, tenant, indexPrefix, queryMinSec, queryMaxSec,
+		); ok {
+			return matches, nil
+		}
+	}
+
+	return getTraceByIDFullScan(r, traceID)
+}
+
+// getTraceByIDViaIndex attempts to resolve traceID using the trace-by-ID value index.
+// Returns ok=false for any indeterminacy (no coverage, decode failure, no match, or
+// index/data skew) so the caller falls back to a full scan — the index is a hint, never
+// authoritative for absence.
+func getTraceByIDViaIndex(
+	ctx context.Context,
+	r *Reader,
+	traceID [16]byte,
+	lister valueindex.LookupStore,
+	tenant, indexPrefix string,
+	queryMinSec, queryMaxSec uint64,
+) ([]SpanMatch, bool) {
+	colHash := valueindex.ColHash(modules_shared.TraceIDColumnName)
+	colTypeName := valueindex.ColTypeName(modules_shared.ColumnTypeUUID)
+
+	keys, discoverErr := valueindex.DiscoverIndexFiles(
+		ctx, lister, tenant, indexPrefix, colHash, colTypeName, queryMinSec, queryMaxSec,
+	)
+	if discoverErr != nil || len(keys) == 0 {
+		return nil, false
+	}
+
+	group, found := findTraceGroupInCandidates(ctx, lister, keys, traceID)
+	if !found {
+		return nil, false
+	}
+
+	return materializeTraceGroup(r, group, traceID)
+}
+
+// findTraceGroupInCandidates fetches and decodes every candidate index file — a fetch or
+// decode failure on one file is treated as unreadable, skip and try the next candidate,
+// never as "trace not found." Candidates are NOT short-circuited on the first match:
+// DiscoverIndexFiles can legitimately return multiple valid, not-yet-compacted L0 files
+// for the same TraceID with DISJOINT Spans (e.g. a trace's root span flushed in one
+// consumer window and its child span flushed in another, before the compactor has merged
+// them). Stopping at the first match would silently return a partial trace with no error,
+// violating "the index is a hint, any doubt falls back to full scan." Every matching
+// group across every candidate is merged (spans deduplicated by SpanID, first occurrence
+// wins; TimeSec is the minimum across matches) — the same live-merge semantics as
+// valueindex.MergeTraceGroups, minus its RefChecker/retention-drop machinery, which isn't
+// needed here since materializeTraceGroup's BlockIndexForPage-failure and defensive
+// trace:id re-verify already provide the safety net for any stale reference in the result.
+func findTraceGroupInCandidates(
+	ctx context.Context,
+	lister valueindex.LookupStore,
+	keys []string,
+	traceID [16]byte,
+) (valueindex.TraceGroup, bool) {
+	var merged valueindex.TraceGroup
+	found := false
+	seenSpan := make(map[[8]byte]struct{})
+	for _, key := range keys {
+		data, getErr := lister.Get(ctx, key)
+		if getErr != nil {
+			continue
+		}
+		groups, decErr := valueindex.DecodeTraceGroups(data)
+		if decErr != nil {
+			continue
+		}
+		for _, g := range groups {
+			if g.TraceID != traceID {
+				continue
+			}
+			if !found {
+				merged.TraceID = g.TraceID
+				merged.TimeSec = g.TimeSec
+				found = true
+			} else if g.TimeSec < merged.TimeSec {
+				merged.TimeSec = g.TimeSec
+			}
+			for _, s := range g.Spans {
+				if _, dup := seenSpan[s.SpanID]; dup {
+					continue
+				}
+				seenSpan[s.SpanID] = struct{}{}
+				merged.Spans = append(merged.Spans, s)
+			}
+		}
+	}
+	if !found {
+		return valueindex.TraceGroup{}, false
+	}
+	return merged, true
+}
+
+// materializeTraceGroup resolves every SpanEntry in group to an exact block+row in r and
+// materializes the matching spans. Returns ok=false — never a partial result — the moment
+// any entry fails to resolve to a real block in r (index/data skew, staleness, or a
+// genuinely cross-file span; see GetTraceByID's v1 scope decision) or a resolved row's own
+// trace:id column does not actually match traceID (defensive re-verify: an index hit must
+// never produce a wrong span).
+func materializeTraceGroup(r *Reader, group valueindex.TraceGroup, traceID [16]byte) ([]SpanMatch, bool) {
+	rowsByBlock := make(map[int][]int, len(group.Spans))
+	blockOrder := make([]int, 0, len(group.Spans))
+	seen := make(map[[2]int]struct{}, len(group.Spans))
+	for _, span := range group.Spans {
+		blockIdx, ok := r.BlockIndexForPage(span.BlockRef.PageNum)
+		if !ok {
+			return nil, false
+		}
+		key := [2]int{blockIdx, int(span.RowIdx)}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		if _, exists := rowsByBlock[blockIdx]; !exists {
+			blockOrder = append(blockOrder, blockIdx)
+		}
+		rowsByBlock[blockIdx] = append(rowsByBlock[blockIdx], int(span.RowIdx))
+	}
+	if len(blockOrder) == 0 {
+		return nil, false
+	}
+
+	rawBlocks, readErr := r.ReadBlocks(blockOrder)
+	if readErr != nil {
+		return nil, false
+	}
+
+	traceIDStr := hex.EncodeToString(traceID[:])
+	results := make([]SpanMatch, 0, len(group.Spans))
+	for _, blockIdx := range blockOrder {
+		raw, ok := rawBlocks[blockIdx]
+		if !ok {
+			return nil, false
+		}
+		bwb, parseErr := r.ParseBlockFromBytes(raw, modules_reader.WantAll(), r.BlockMeta(blockIdx))
+		if parseErr != nil {
+			return nil, false
+		}
+		traceIDCol := bwb.Block.GetColumn(modules_shared.TraceIDColumnName)
+		for _, rowIdx := range rowsByBlock[blockIdx] {
+			if !rowMatchesTraceID(traceIDCol, rowIdx, traceID) {
+				return nil, false
+			}
+			results = append(results, buildSpanMatch(bwb.Block, rowIdx, traceIDStr))
+		}
+	}
+	return results, true
+}
+
+// rowMatchesTraceID reports whether col's value at rowIdx equals traceID. Used as the
+// defensive re-verify step after direct index-addressed row access: an index entry is a
+// hint, so the row it names is re-checked against the actual data before being trusted.
+func rowMatchesTraceID(col *modules_reader.Column, rowIdx int, traceID [16]byte) bool {
+	if col == nil {
+		return false
+	}
+	v, ok := col.BytesValue(rowIdx)
+	if !ok {
+		return false
+	}
+	return bytes.Equal(v, traceID[:])
+}
+
+// buildSpanMatch materializes the SpanMatch for the span at (block, rowIdx). block must
+// have been decoded with WantAll() — NewSpanFieldsAdapterWithReader exposes whatever
+// columns are present in the decoded block, an open-ended per-span attribute set, not a
+// fixed identity-column list (blockio/span_fields.go).
+func buildSpanMatch(block *modules_reader.Block, rowIdx int, traceIDStr string) SpanMatch {
+	fields := modules_blockio.NewSpanFieldsAdapterWithReader(block, nil, 0, rowIdx, nil)
+	spanIDStr := ""
+	if col := block.GetColumn(modules_shared.SpanIDColumnName); col != nil {
+		if v, ok := col.BytesValue(rowIdx); ok {
+			spanIDStr = hex.EncodeToString(v)
+		}
+	}
+	match := SpanMatch{
+		Fields:  fields,
+		TraceID: traceIDStr,
+		SpanID:  spanIDStr,
+	}
+	cloned := match.Clone()
+	modules_blockio.ReleaseSpanFieldsAdapter(fields)
+	return cloned
+}
+
+// getTraceByIDFullScan is GetTraceByID's unconditional fallback: an exact scan of every
+// block in r for rows matching traceID. This is the pre-Stage-4 GetTraceByID body, moved
+// here verbatim in logic (Decision 1: the old full-scan path is kept as the internal
+// fallback, not deleted) and split into a two-phase match/materialize decode (Finding 3):
+// a cheap WantOnly({"trace:id"}) pass finds matching rows per block, and only blocks with
+// at least one match are re-decoded with WantAll() for full field materialization —
+// avoiding the WantAll() memory cost (SPEC-ROOT invariant: WantAll() eagerly decodes every
+// column) for blocks that don't contain the trace at all.
+func getTraceByIDFullScan(r *Reader, traceID [16]byte) (results []SpanMatch, err error) {
 	blockCount := r.BlockCount()
 	if blockCount == 0 {
 		return nil, nil
 	}
-	entries := make([]modules_reader.TraceEntry, blockCount)
 	blockIDs := make([]int, blockCount)
 	for i := range blockCount {
-		entries[i] = modules_reader.TraceEntry{BlockID: i}
 		blockIDs[i] = i
 	}
 
 	// NOTE-293 (Lever B): resolve matching rows and span IDs from the block payloads that are
-	// fetched (and decoded with WantAll) anyway. Each block carries per-row trace:id and
-	// span:id columns, so the whole-file intrinsic trace:id and span:id columns — whose size
-	// scales with the file's total span count, not the looked-up trace — no longer need to be
-	// read on this path. The intrinsic columns are loaded only as a lazy fallback for blocks
-	// whose payload lacks these columns (e.g. files written without per-block identity).
-	rawMap := make(map[int][]byte, len(entries))
+	// fetched anyway. Each block carries per-row trace:id and span:id columns, so the
+	// whole-file intrinsic trace:id and span:id columns — whose size scales with the file's
+	// total span count, not the looked-up trace — no longer need to be read on this path.
+	rawMap, fetchErr := fetchAllBlockBytes(r, blockIDs)
+	if fetchErr != nil {
+		return nil, fetchErr
+	}
+
+	rowsByBlock, scopeErr := scopeMatchingBlocks(r, blockIDs, rawMap, traceID)
+	if scopeErr != nil {
+		return nil, scopeErr
+	}
+
+	matchingBlockIDs := make([]int, 0, len(rowsByBlock))
+	for blockID := range rowsByBlock {
+		matchingBlockIDs = append(matchingBlockIDs, blockID)
+	}
+	sort.Ints(matchingBlockIDs)
+
+	// NOTE-291: parse each matching span-block concurrently (see parseBlocksWithWant).
+	parsedBlocks, parseErr := parseBlocksWithWant(r, matchingBlockIDs, rawMap, modules_reader.WantAll())
+	if parseErr != nil {
+		return nil, parseErr
+	}
+
+	traceIDStr := hex.EncodeToString(traceID[:])
+	for _, blockID := range matchingBlockIDs {
+		bwb := parsedBlocks[blockID]
+		for _, rowIdx := range rowsByBlock[blockID] {
+			results = append(results, buildSpanMatch(bwb.Block, rowIdx, traceIDStr))
+		}
+	}
+
+	return results, nil
+}
+
+// fetchAllBlockBytes fetches the raw bytes for every block in blockIDs using aggressive
+// coalescing (a single logical fetch pass regardless of how many blocks end up matching).
+func fetchAllBlockBytes(r *Reader, blockIDs []int) (map[int][]byte, error) {
+	rawMap := make(map[int][]byte, len(blockIDs))
 	for _, group := range r.CoalescedGroups(blockIDs) {
 		groupRaw, fetchErr := r.ReadGroup(group)
 		if fetchErr != nil {
@@ -400,99 +635,75 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 			rawMap[bi] = raw
 		}
 	}
+	return rawMap, nil
+}
 
-	// NOTE-291: parse each matching span-block concurrently (see parseMatchingBlocks).
-	parsedBlocks, parseErr := parseMatchingBlocks(r, entries, rawMap)
-	if parseErr != nil {
-		return nil, parseErr
+// scopeMatchingBlocks is getTraceByIDFullScan's match phase (Finding 3): decode every
+// block with WantOnly({"trace:id"}) — cheap, single-column — and scan for matching rows.
+// Blocks with zero matches are omitted from the result so the materialize phase never
+// re-decodes them with WantAll().
+func scopeMatchingBlocks(
+	r *Reader,
+	blockIDs []int,
+	rawMap map[int][]byte,
+	traceID [16]byte,
+) (map[int][]int, error) {
+	want := modules_reader.WantOnly(map[string]struct{}{modules_shared.TraceIDColumnName: {}})
+	parsedBlocks, err := parseBlocksWithWant(r, blockIDs, rawMap, want)
+	if err != nil {
+		return nil, err
 	}
 
-	// rowsByBlock maps blockID → matching rowIdxs. spanIDByRef holds span IDs keyed by
-	// (blockID<<16 | rowIdx) when resolved from a source that already carries them (the
-	// intrinsic fallback), so the materialization loop need not read a per-block span:id
-	// column for those rows.
-	rowsByBlock := make(map[int][]int, len(entries))
-
-	// NOTE-436: each block carries its own trace:id column. Scan it for matching
-	// rows — there is no intrinsic-section fallback.
-	for i, entry := range entries {
-		traceIDCol := parsedBlocks[i].Block.GetColumn("trace:id")
+	rowsByBlock := make(map[int][]int, len(blockIDs))
+	for _, blockID := range blockIDs {
+		traceIDCol := parsedBlocks[blockID].Block.GetColumn(modules_shared.TraceIDColumnName)
 		if traceIDCol == nil {
 			continue
 		}
 		// NOTE-419: MatchingBytesRows scans the per-block trace:id column for matching rows
 		// while paying the lazy-decode atomic and dense-index expansion ONCE for the whole
-		// block, instead of per row as the prior BytesValue+bytes.Equal loop did.
-		rowsByBlock[entry.BlockID] = traceIDCol.MatchingBytesRows(
-			traceID[:],
-			rowsByBlock[entry.BlockID],
-		)
-	}
-
-	traceIDStr := hex.EncodeToString(traceID[:])
-	for i, entry := range entries {
-		bwb := parsedBlocks[i]
-		for _, rowIdx := range rowsByBlock[entry.BlockID] {
-			fields := modules_blockio.NewSpanFieldsAdapterWithReader(
-				bwb.Block,
-				r,
-				entry.BlockID,
-				rowIdx,
-				nil,
-			)
-			// span:id is a regular per-row block column.
-			spanIDStr := ""
-			if col := bwb.Block.GetColumn("span:id"); col != nil {
-				if v, ok := col.BytesValue(rowIdx); ok {
-					spanIDStr = hex.EncodeToString(v)
-				}
-			}
-			match := SpanMatch{
-				Fields:  fields,
-				TraceID: traceIDStr,
-				SpanID:  spanIDStr,
-			}
-			results = append(results, match.Clone())
-			modules_blockio.ReleaseSpanFieldsAdapter(fields)
+		// block, instead of per row as a BytesValue+bytes.Equal loop would.
+		if rows := traceIDCol.MatchingBytesRows(traceID[:], nil); len(rows) > 0 {
+			rowsByBlock[blockID] = rows
 		}
 	}
-
-	return results, nil
+	return rowsByBlock, nil
 }
 
-// parseMatchingBlocks decodes each matching span-block concurrently (NOTE-291). Each
-// ParseBlockFromBytes call decodes an independent input blob (rawMap[entry.BlockID]) into
-// an independent output Block — there is no shared mutable state between calls
-// (ParseBlockFromBytes allocates a per-call intern map and reads the Reader's
-// pre-decoded/pre-compressed lookups under their own mutexes). A trace that spans N
-// span-blocks within one file previously paid N×decode serially; decoding them in parallel
-// reduces that to ~max.
+// parseBlocksWithWant decodes each of blockIDs concurrently (NOTE-291) using want to
+// control which columns are eagerly decoded. Each ParseBlockFromBytes call decodes an
+// independent input blob (rawMap[blockID]) into an independent output Block — there is no
+// shared mutable state between calls (ParseBlockFromBytes allocates a per-call intern map
+// and reads the Reader's pre-decoded/pre-compressed lookups under their own mutexes).
 //
-// Results are returned in a slice indexed by entry position so the caller's row-emission
-// loop stays sequential and order-preserving. The fan-out is bounded by
-// traceByIDParseConcurrency so a single trace-by-ID call cannot saturate every core and
-// starve concurrent metrics queries on the same querier. Each goroutine writes only its own
-// slot, and all writes happen-before the gParse.Wait() return — no data race.
-func parseMatchingBlocks(
+// The fan-out is bounded by traceByIDParseConcurrency so a single trace-by-ID call cannot
+// saturate every core and starve concurrent metrics queries on the same querier. Each
+// goroutine writes only its own map entry under mu; all writes happen-before the
+// gParse.Wait() return — no data race.
+func parseBlocksWithWant(
 	r *Reader,
-	entries []modules_reader.TraceEntry,
+	blockIDs []int,
 	rawMap map[int][]byte,
-) ([]*modules_reader.BlockWithBytes, error) {
-	parsedBlocks := make([]*modules_reader.BlockWithBytes, len(entries))
+	want modules_reader.WantColumns,
+) (map[int]*modules_reader.BlockWithBytes, error) {
+	parsedBlocks := make(map[int]*modules_reader.BlockWithBytes, len(blockIDs))
+	var mu sync.Mutex
 	var gParse errgroup.Group
 	gParse.SetLimit(traceByIDParseConcurrency())
-	for i, entry := range entries {
-		i, entry := i, entry
-		raw, ok := rawMap[entry.BlockID]
+	for _, blockID := range blockIDs {
+		blockID := blockID
+		raw, ok := rawMap[blockID]
 		if !ok {
-			return nil, fmt.Errorf("GetTraceByID: block %d missing from coalesced read", entry.BlockID)
+			return nil, fmt.Errorf("GetTraceByID: block %d missing from coalesced read", blockID)
 		}
 		gParse.Go(func() error {
-			bwb, blockErr := r.ParseBlockFromBytes(raw, modules_reader.WantAll(), r.BlockMeta(entry.BlockID))
+			bwb, blockErr := r.ParseBlockFromBytes(raw, want, r.BlockMeta(blockID))
 			if blockErr != nil {
-				return fmt.Errorf("GetTraceByID: block %d: %w", entry.BlockID, blockErr)
+				return fmt.Errorf("GetTraceByID: block %d: %w", blockID, blockErr)
 			}
-			parsedBlocks[i] = bwb
+			mu.Lock()
+			parsedBlocks[blockID] = bwb
+			mu.Unlock()
 			return nil
 		})
 	}
@@ -586,11 +797,11 @@ func AnalyzeFileLayout(r *Reader) (report *FileLayoutReport, err error) {
 	return r.FileLayout()
 }
 
-// ClearReaderCaches resets all process-level reader caches (metadata, sketch, intrinsic).
-// Intended for test isolation.
-func ClearReaderCaches() {
-	modules_reader.ClearCaches()
-}
+// ClearReaderCaches is a no-op retained for API compatibility. #466 removed all process-level
+// in-process reader caches (decoded columns, parsed ToC, sparse/chunk trace indexes), leaving
+// only the disk + remote memcache tiers, so there is nothing to clear. Intended for test
+// isolation; callers may remove it.
+func ClearReaderCaches() {}
 
 // ToCSection describes one entry in the file's Table of Contents.
 type ToCSection = modules_reader.ToCSection

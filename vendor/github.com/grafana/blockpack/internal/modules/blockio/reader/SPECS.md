@@ -212,6 +212,59 @@ across the ENTIRE coalesced group, then coalesce those column ranges using the s
 - **SPEC-005e:** The combined TOC read for a group MUST be a single S3 request (not one
   per block) to preserve the latency benefit of coalescing.
 
+### SPEC-012: Two-phase match/materialize decode — a sanctioned exception to "one WantColumns pass per block"
+*Added: 2026-07-04*
+
+**Context:** the blanket guidance elsewhere in this file and in root `SPEC.md` SPEC-ROOT-017
+is "thread the query's needed column set through and decode each block exactly once with the
+narrowest `WantColumns` that satisfies the query." Root package `GetTraceByID`'s full-scan
+fallback (`getTraceByIDFullScan`, `reader.go`) is a **sanctioned exception**: it decodes some
+blocks **twice**, once with `WantOnly({"trace:id"})` and, only for blocks that actually
+matched, again with `WantAll()`.
+
+**Why a single pass cannot work here:** `GetTraceByID` doesn't know its own "needed column
+set" ahead of time in the way a compiled `TraceQL`/SQL query does — the columns it must
+ultimately expose are whatever attributes are present on the matched span, an open-ended,
+per-span set (`NewSpanFieldsAdapterWithReader`'s own doc comment: "the block payload is the
+sole authoritative source for all fields"). A naive single-pass substitution of `WantAll()` →
+`WantOnly(someFixedSet)` would silently drop any span attribute not in that fixed set from the
+materialized result — a correctness regression, not merely a missed optimization. The
+two-phase split resolves this without ever guessing a column list: phase one
+(`scopeMatchingBlocks`) uses the one column that actually IS known ahead of time
+(`trace:id`) to cheaply find which blocks contain a matching row at all; phase two
+(`parseBlocksWithWant(..., WantAll())`, still inside `getTraceByIDFullScan`) re-decodes only
+those blocks with every column, so materialization is always complete.
+
+**Cost model:** for a file where the trace appears in every block (worst case), this is
+strictly more expensive than a single `WantAll()` pass over every block (every block now gets
+both a `WantOnly` and a `WantAll` decode). For the common case motivating this fix — a large
+multi-block file where the target trace lives in a small minority of blocks — this is strictly
+cheaper: the `WantOnly({"trace:id"})` decode is single-column and cheap per block, and the
+expensive `WantAll()` decode only ever runs against blocks known in advance to matter. This is
+the direct fix for the incident that motivated this entry: `GetTraceByID`'s unconditional
+`WantAll()`-decode of every block in a file drove a querier to 40.5GB heap on a file with a
+large internal block count (root `SPEC.md` SPEC-ROOT-018). The worst-case regression is
+measured, not merely reasoned about: `BenchmarkGetTraceByIDWorstCaseEveryBlockMatches`
+(`gettracebyid_test.go`) exercises the every-block-matches case directly, alongside
+`BenchmarkGetTraceByIDBlockCount`'s more representative sparse-match case. The worst-case
+allocation increase was reviewed and accepted deliberately as part of this change, not
+discovered as an unintended regression after the fact — see `NOTES.md` for either module if a
+future contributor documents the specific measured numbers post-benchmark.
+
+**The index-hit fast path (`getTraceByIDViaIndex` → `materializeTraceGroup`) does not need
+this two-phase split at all** — it already knows exactly which blocks matter (from the
+trace-by-ID index's direct addressing) before ever touching the file, so every block it
+touches goes straight to a single `WantAll()` decode, no match-phase needed.
+
+**Scope:** this exception applies specifically to `GetTraceByID`'s full-scan fallback. It is
+not a general license to add ad-hoc double-decoding elsewhere — any other path considering the
+same pattern should first check whether it can determine its column needs statically (the
+normal, single-pass case SPEC-ROOT-017 governs) before reaching for this two-phase shape.
+
+Back-refs: `reader.go:getTraceByIDFullScan`, `:scopeMatchingBlocks`, `:parseBlocksWithWant`,
+`:getTraceByIDViaIndex`, `:materializeTraceGroup`. See root `SPEC.md` SPEC-ROOT-017 (Addendum,
+2026-07-04) and SPEC-ROOT-018.
+
 ### Expected Impact (after column-range coalescing)
 
 | Query type | Current I/O | Target I/O | S3 reqs (current→target) |

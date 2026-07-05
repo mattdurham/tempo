@@ -19,10 +19,24 @@ const (
 	DefaultCompactInterval = 5 * time.Minute
 	// DefaultCompactThresholdFiles is the number of same-level files a column
 	// directory must accumulate before it is compacted.
-	DefaultCompactThresholdFiles = 8
+	DefaultCompactThresholdFiles = 2
+	// DefaultCompactBatchBytes is the maximum total input bytes per merge job.
+	// Files are added to the batch (oldest first) until adding the next one
+	// would exceed this limit. Caps memory usage regardless of individual file
+	// size: a 256 MiB limit keeps peak RSS under ~512 MiB accounting for the
+	// decoded + re-encoded representation. 0 means no cap.
+	DefaultCompactBatchBytes int64 = 1 << 30 // 1 GiB
 	// DefaultMaxOutputBytes is the approximate max serialized size of one output
 	// file before the merge splits into multiple files. 0 disables splitting.
 	DefaultMaxOutputBytes = 256 << 20 // 256 MiB
+	// DefaultCompactConcurrency is the number of concurrent column merges
+	// Run() dispatches per lap. Defaulting to 1 preserves today's fully
+	// sequential dispatch order exactly.
+	DefaultCompactConcurrency = 1
+	// DefaultCompactMaxInputFiles caps the number of files a single merge job
+	// may consume, independent of CompactBatchBytes, to bound fd/local-disk
+	// usage regardless of individual file size.
+	DefaultCompactMaxInputFiles = 150
 )
 
 // Config configures the value-index compactor. It maps to the optional
@@ -33,6 +47,8 @@ const (
 //	  compact_interval: 5m
 //	  compact_threshold_files: 8
 //	  max_output_bytes: 268435456
+//	  compact_concurrency: 1
+//	  compact_max_input_files: 150
 //	  tenants:
 //	    - "11638"     # explicit list, or "*" for all tenants
 type Config struct {
@@ -54,9 +70,15 @@ type Config struct {
 	// CompactThresholdFiles is the min same-level file count that triggers a
 	// column compaction. Defaults to DefaultCompactThresholdFiles when <= 0.
 	CompactThresholdFiles int `yaml:"compact_threshold_files"`
+	// CompactBatchBytes is the maximum total input size (bytes) per merge job.
+	// Files are accumulated oldest-first until the next file would push the
+	// total over this limit. Bounds peak memory usage directly regardless of
+	// individual file size. Defaults to DefaultCompactBatchBytes when <= 0.
+	CompactBatchBytes int64 `yaml:"compact_batch_bytes"`
 	// MaxOutputBytes is the approximate max serialized output-file size before
-	// splitting. Defaults to DefaultMaxOutputBytes when < 0 is not allowed; 0 is
-	// honored as "no split".
+	// splitting, honored only by the legacy flat-VINX compaction path.
+	// StreamCompactBucketFiles (the v2 BucketGroup path) always emits a single
+	// merged output file per level regardless of size — this field has no effect there.
 	MaxOutputBytes int64 `yaml:"max_output_bytes"`
 	// Enabled turns the compactor on. When false the service does nothing.
 	Enabled bool `yaml:"enabled"`
@@ -68,6 +90,14 @@ type Config struct {
 	// Columns are assigned by: int(colHash[0:2], 16) % ShardCount == ShardIndex.
 	// Typically injected via the SHARD_INDEX environment variable.
 	ShardIndex int `yaml:"shard_index"`
+	// CompactConcurrency is the number of concurrent column merges Run()
+	// dispatches per lap. Defaults to DefaultCompactConcurrency (1, exactly
+	// sequential) when <= 0.
+	CompactConcurrency int `yaml:"compact_concurrency"`
+	// CompactMaxInputFiles caps the number of files a single merge job may
+	// consume, applied independently of and before CompactBatchBytes.
+	// Defaults to DefaultCompactMaxInputFiles when <= 0.
+	CompactMaxInputFiles int `yaml:"compact_max_input_files"`
 }
 
 // withDefaults returns a copy of c with empty/zero fields filled in.
@@ -83,6 +113,15 @@ func (c Config) withDefaults() Config {
 	}
 	if c.MaxOutputBytes < 0 {
 		c.MaxOutputBytes = DefaultMaxOutputBytes
+	}
+	if c.CompactBatchBytes <= 0 {
+		c.CompactBatchBytes = DefaultCompactBatchBytes
+	}
+	if c.CompactConcurrency <= 0 {
+		c.CompactConcurrency = DefaultCompactConcurrency
+	}
+	if c.CompactMaxInputFiles <= 0 {
+		c.CompactMaxInputFiles = DefaultCompactMaxInputFiles
 	}
 	return c
 }

@@ -426,54 +426,10 @@ func (c *Column) releaseDecompPooled() {
 // NOTE-CONC-001: no outer rawEncoding check — that read would race with the write inside
 // the closure. decodeOnce.Do is idempotent: the inner guard handles the already-done case.
 func (c *Column) decodeNow() {
-	// NOTE-201: consult the process-level decoded-column cache BEFORE decompressing.
-	// The lazy path defers snappy + readColumnEncoding to first access; without this check the
-	// identical on-disk block column is re-decoded on every warm query that filters/scans it
-	// lazily (e.g. high-cardinality intrinsic group-bys, predicate-filtered block columns that
-	// were not in the eager wantColumns set). On a hit we copy the immutable decoded slices in
-	// and skip decompression entirely. The per-query Column keeps its own fresh denseOnce /
-	// sparseDictIdx so NOTE-PERF-1 dense expansion runs per query and never mutates the snapshot.
-	// NOTE-417: build the cache key here (deferred from lazy registration) so never-accessed
-	// lazy columns never pay the string concatenation. Empty lazyFileID ⇒ no stable key.
-	v8Key := ""
-	if c.lazyFileID != "" {
-		v8Key = v8ColumnCacheKey(c.lazyFileID, c.lazyBlockOffset, c.Name, c.Type)
-	}
-	if v8Key != "" {
-		if cached := parsedV8ColumnCache.Get(v8Key); cached != nil {
-			c.decodeOnce.Do(func() {
-				if c.Present == nil {
-					c.Present = cached.Present
-				}
-				c.StringDict = cached.StringDict
-				c.StringIdx = cached.StringIdx
-				c.Int64Dict = cached.Int64Dict
-				c.Int64Idx = cached.Int64Idx
-				c.Uint64Dict = cached.Uint64Dict
-				c.Uint64Idx = cached.Uint64Idx
-				c.Float64Dict = cached.Float64Dict
-				c.Float64Idx = cached.Float64Idx
-				c.BoolDict = cached.BoolDict
-				c.BoolIdx = cached.BoolIdx
-				c.BytesDict = cached.BytesDict
-				c.BytesIdx = cached.BytesIdx
-				c.BytesInline = cached.BytesInline
-				c.uniformSlab = cached.uniformSlab     // NOTE-351
-				c.uniformStride = cached.uniformStride // NOTE-351
-				c.sparseDictIdx = cached.sparseDictIdx
-				c.denseFlatIdx = cached.denseFlatIdx     // NOTE-358
-				c.packedIdx = cached.packedIdx           // NOTE-369
-				c.packedIdxWidth = cached.packedIdxWidth // NOTE-369
-				c.rawEncoding = nil
-				c.compressedEncoding = nil
-				c.compressedZstd = false
-				c.internMap = nil
-				c.decoded.Store(true)
-			})
-			return
-		}
-	}
-
+	// NOTE-479 (#466): the in-process decoded-column cache (parsedV8ColumnCache) was removed
+	// to shrink and stabilize the querier's memory footprint. The lazy path always
+	// decompresses + decodes on first access; a repeated warm access re-decodes from the
+	// section-cache-resident (disk/memcache) column bytes rather than an in-process snapshot.
 	c.ensureDecompressed()
 	c.decodeOnce.Do(func() {
 		if c.rawEncoding == nil {
@@ -517,17 +473,6 @@ func (c *Column) decodeNow() {
 		c.denseFlatIdx = dec.denseFlatIdx     // NOTE-358
 		c.packedIdx = dec.packedIdx           // NOTE-369
 		c.packedIdxWidth = dec.packedIdxWidth // NOTE-369
-
-		// NOTE-201: store a snapshot of the freshly decoded slices so subsequent warm
-		// queries that lazily access the identical on-disk block column skip the decode.
-		// dec was allocated fresh by readColumnEncoding; the snapshot shares those read-only
-		// slices (dense expansion builds a new Idx on the per-query col, never mutating these).
-		if v8Key != "" {
-			snap := snapshotDecodedColumn(dec, c.Name, c.Type)
-			snap.Present = c.Present
-			snap.SpanCount = c.SpanCount
-			_ = parsedV8ColumnCache.Put(v8Key, snap)
-		}
 
 		// NOTE-209: readColumnEncoding has copied every decoded slice out of rawEncoding,
 		// so the pooled decompression buffer can be recycled now.
@@ -2228,20 +2173,8 @@ func decodeVectorF32(data []byte, spanCount int, ctx *decodeCtx) (*Column, error
 
 // Column is a blockpack data type.
 type Column struct {
-	internMap map[string]string
-	Name      string
-	// NOTE-201/NOTE-417: components of the process-cache key for the lazy (deferred) decode
-	// path, set by the lazy-registration loop in parseBlockColumnsReuse when a stable fileID is
-	// available. decodeNow builds the parsedV8ColumnCache key from (lazyFileID, lazyBlockOffset,
-	// Name, Type) ONLY when the column is actually decoded — it consults parsedV8ColumnCache on
-	// that key before snappy+readColumnEncoding and stores a snapshot on miss, extending
-	// NOTE-200's eager-loop reuse to first-access decode. lazyFileID == "" ⇒ no stable key (no
-	// fileID) — decode proceeds without cache. NOTE-417: storing the (fileID, offset) components
-	// instead of the pre-built string defers the 5-part concatenation + strconv allocs to first
-	// access. A narrow WantOnly query registers hundreds of never-accessed lazy columns per
-	// block; eagerly building each one's key was pure per-block CPU/allocation for keys that were
-	// never used (the column's decodeNow never ran). The components are cheap value copies.
-	lazyFileID  string
+	internMap   map[string]string
+	Name        string
 	StringDict  []string
 	StringIdx   []uint32
 	Int64Dict   []int64
@@ -2284,15 +2217,11 @@ type Column struct {
 	// columns, a 2x blowup). When packedIdxWidth != 0 the type-specific *Idx slice is left
 	// nil and the dict index for row i is read at native width from packedIdx via
 	// dictIdxAt — packedIdx[i] (width 1) or LE-uint16 at packedIdx[2i:] (width 2). The
-	// snapshot stored in parsedV8ColumnCache (NOTE-200) shares this compact slice, so the
 	// retained footprint is the on-disk width, not 4 bytes/row. Width-4 columns keep the
 	// []uint32 path (no blowup to remove). Only the all-present dense dict path uses this;
 	// sparse / denseFlatIdx (NOTE-358) are unchanged.
-	packedIdx []byte
-	SpanCount int
-	// NOTE-417: block byte offset within the file, paired with lazyFileID to build the
-	// parsedV8ColumnCache key lazily in decodeNow (deferred from eager registration).
-	lazyBlockOffset uint64
+	packedIdx       []byte
+	SpanCount       int
 	decodeOnce      sync.Once
 	denseOnce       sync.Once
 	decompressOnce  sync.Once
@@ -2307,7 +2236,7 @@ type Column struct {
 	// index for every row is the row index itself (Dict has one entry per present row, in
 	// row order; all-present ⇒ present-rank(i) == i). For these columns the *Idx slice is a
 	// pure identity permutation [0,1,2,…,SpanCount-1] — 4 bytes/row of redundant retained
-	// memory (both per-query AND in the parsedV8ColumnCache snapshot). The bit-packed delta
+	// memory. The bit-packed delta
 	// (decodeDeltaUint64BitPacked) and Gorilla-float64 (decodeGorillaFloat64) decoders set
 	// this flag instead of materializing the identity slice; readers resolve the dict index
 	// arithmetically via dictIdxAt. Mirrors NOTE-354's flat-dense refIndex drop. Only the

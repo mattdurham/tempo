@@ -238,43 +238,24 @@ func CompactBucketFiles(
 // deleted removed. Groups and blocks that become empty are dropped. It counts retained vs
 // dropped refs. The string table is rebuilt implicitly by MergeBucketFiles downstream, so
 // here we only prune; SourceIDs remain valid against f.StringTable for the returned file.
+//
+// Implemented in terms of filterDeadRefsBlock, called once per block with one live-cache
+// shared across the whole file — a behavior-preserving refactor (disk_iterator.go reuses
+// filterDeadRefsBlock at per-block decode granularity for the disk-backed iterator; this
+// function is unchanged in observable behavior, only in how it is composed).
 func filterDeadRefs(ctx context.Context, f *BucketFile, checker RefChecker) (*BucketFile, CompactStats, error) {
 	var stats CompactStats
 	live := make(map[uint16]bool)
 	out := &BucketFile{StringTable: f.StringTable}
 	for bi := range f.Blocks {
-		b := &f.Blocks[bi]
-		nb := BucketBlock{}
-		for gi := range b.Groups {
-			g := &b.Groups[gi]
-			ng := BucketGroup{TimeSec: g.TimeSec, CanonicalValue: g.CanonicalValue}
-			for ri := range g.Refs {
-				r := &g.Refs[ri]
-				isLive, ok := live[r.SourceID]
-				if !ok {
-					l, err := checker.IsLive(ctx, f.StringTable.Lookup(r.SourceID))
-					if err != nil {
-						return nil, CompactStats{}, fmt.Errorf(
-							"valueindex: RefChecker.IsLive(%q): %w", f.StringTable.Lookup(r.SourceID), err,
-						)
-					}
-					isLive = l
-					live[r.SourceID] = l
-				}
-				if !isLive {
-					stats.Dropped++
-					continue
-				}
-				stats.Retained++
-				ng.Refs = append(ng.Refs, *r)
-			}
-			if len(ng.Refs) > 0 {
-				nb.Groups = append(nb.Groups, ng)
-			}
+		nb, bstats, err := filterDeadRefsBlock(ctx, &f.Blocks[bi], f.StringTable, checker, live)
+		if err != nil {
+			return nil, CompactStats{}, err
 		}
-		if len(nb.Groups) > 0 {
-			nb.ComputeBlockMeta()
-			out.Blocks = append(out.Blocks, nb)
+		stats.Retained += bstats.Retained
+		stats.Dropped += bstats.Dropped
+		if nb != nil {
+			out.Blocks = append(out.Blocks, *nb)
 		}
 	}
 	if len(out.Blocks) > 0 {
@@ -290,6 +271,55 @@ func filterDeadRefs(ctx context.Context, f *BucketFile, checker RefChecker) (*Bu
 		}
 	}
 	return out, stats, nil
+}
+
+// filterDeadRefsBlock returns a copy of b with every BucketBlockRef whose SourceRef is
+// confirmed deleted removed, or nil if every group in b becomes empty. live is a
+// SourceID->isLive cache the caller shares across every block of one file, so a SourceID
+// repeated across blocks is probed via checker.IsLive at most once per file — the same
+// cache-reuse behavior filterDeadRefs (whole-file) already had, now evaluated incrementally
+// per block instead of over the whole file's blocks in one pass (Decision 2, plan.md).
+func filterDeadRefsBlock(
+	ctx context.Context,
+	b *BucketBlock,
+	table *StringTable,
+	checker RefChecker,
+	live map[uint16]bool,
+) (*BucketBlock, CompactStats, error) {
+	var stats CompactStats
+	nb := BucketBlock{}
+	for gi := range b.Groups {
+		g := &b.Groups[gi]
+		ng := BucketGroup{TimeSec: g.TimeSec, CanonicalValue: g.CanonicalValue}
+		for ri := range g.Refs {
+			r := &g.Refs[ri]
+			isLive, ok := live[r.SourceID]
+			if !ok {
+				l, err := checker.IsLive(ctx, table.Lookup(r.SourceID))
+				if err != nil {
+					return nil, CompactStats{}, fmt.Errorf(
+						"valueindex: RefChecker.IsLive(%q): %w", table.Lookup(r.SourceID), err,
+					)
+				}
+				isLive = l
+				live[r.SourceID] = l
+			}
+			if !isLive {
+				stats.Dropped++
+				continue
+			}
+			stats.Retained++
+			ng.Refs = append(ng.Refs, *r)
+		}
+		if len(ng.Refs) > 0 {
+			nb.Groups = append(nb.Groups, ng)
+		}
+	}
+	if len(nb.Groups) == 0 {
+		return nil, stats, nil
+	}
+	nb.ComputeBlockMeta()
+	return &nb, stats, nil
 }
 
 // countBucketRefs counts total BucketBlockRefs across all groups (retained-count proxy when

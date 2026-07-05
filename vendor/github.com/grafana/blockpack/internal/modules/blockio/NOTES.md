@@ -1760,6 +1760,13 @@ making `loadIntrinsicCache` column filtering active on that path. Only
 `reader.go:GetTraceByID` and the structural result path with empty SelectColumns continue
 to pass `wantCols=nil`.
 
+**Addendum (2026-07-04):** `reader.go:GetTraceByID` no longer passes `wantCols=nil`
+unconditionally end-to-end — its full-scan fallback now has a first-pass `WantOnly({"trace:id"})`
+match phase ahead of the `wantCols=nil`/`WantAll()` materialize phase this statement describes
+(root `SPEC.md` SPEC-ROOT-018, `internal/modules/blockio/reader/SPECS.md` SPEC-012). The
+*materialize* step's behavior is unchanged and still matches this entry; only the "GetTraceByID
+passes wantCols=nil" framing as a description of its one and only decode pass is now stale.
+
 Back-ref: `internal/modules/blockio/span_fields.go:modulesSpanFieldsAdapter`,
 `internal/modules/blockio/span_fields.go:ComputeIsDualStorage`,
 `internal/modules/blockio/span_fields.go:getSpanFieldsAdapterWithReader`,

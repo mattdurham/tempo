@@ -1207,11 +1207,16 @@ type ValueIndexBuildStats struct {
 // SliceValueIndexSource implements ValueIndexSource from pre-downloaded value-index
 // results, grouped by column name and type. Callers populate it from
 // valueindex.QueryFiles output (one leaf predicate already applied per column).
+//
+// mu guards data and stats: vibuilder's leaf-loop parallelization (tempo timeout
+// incident, issue #465) calls Add/RecordFileIO concurrently from multiple leaf
+// goroutines, so every method must be safe for concurrent callers.
 type SliceValueIndexSource struct {
 	// data maps colName → colType → matched results for that column.
 	data map[string]map[modules_shared.ColumnType][]VILookupResult
 	// stats records the build-time I/O so the querier can report it (issue #465).
 	stats ValueIndexBuildStats
+	mu    sync.Mutex
 }
 
 // NewSliceValueIndexSource builds an empty source. Use Add to populate per-column
@@ -1226,6 +1231,8 @@ func NewSliceValueIndexSource() *SliceValueIndexSource {
 // stats (issue #465). filesRead is the file count for the column, bytesRead their
 // total size. Safe to call repeatedly; counters accumulate.
 func (s *SliceValueIndexSource) RecordFileIO(filesRead int, bytesRead int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.stats.FilesRead += filesRead
 	s.stats.BytesRead += bytesRead
 }
@@ -1233,6 +1240,8 @@ func (s *SliceValueIndexSource) RecordFileIO(filesRead int, bytesRead int64) {
 // Stats returns the build-time I/O counters. Hits is derived from the stored
 // results so it stays correct regardless of Add ordering.
 func (s *SliceValueIndexSource) Stats() ValueIndexBuildStats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	out := s.stats
 	for _, byType := range s.data {
 		for _, results := range byType {
@@ -1245,6 +1254,8 @@ func (s *SliceValueIndexSource) Stats() ValueIndexBuildStats {
 // Add records the matched results for one (colName, colType). Repeated calls for the
 // same key append.
 func (s *SliceValueIndexSource) Add(colName string, colType modules_shared.ColumnType, results []VILookupResult) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	byType, ok := s.data[colName]
 	if !ok {
 		byType = make(map[modules_shared.ColumnType][]VILookupResult)
@@ -1258,6 +1269,8 @@ func (s *SliceValueIndexSource) Add(colName string, colType modules_shared.Colum
 // leaf predicate that produced them already constrained the type), so an unindexed
 // column yields (nil, false) and an indexed one yields (results, true).
 func (s *SliceValueIndexSource) LookupResults(colName string, _ modules_shared.ColumnType) ([]VILookupResult, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	byType, ok := s.data[colName]
 	if !ok {
 		return nil, false
@@ -1273,6 +1286,8 @@ func (s *SliceValueIndexSource) LookupResults(colName string, _ modules_shared.C
 // (TraceID, SpanID). It returns (nil, false) when the source holds no data, so a
 // match-all query falls back to a block scan rather than reporting an empty result.
 func (s *SliceValueIndexSource) AllResults() ([]VILookupResult, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if len(s.data) == 0 {
 		return nil, false
 	}

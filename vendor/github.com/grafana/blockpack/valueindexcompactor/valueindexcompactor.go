@@ -48,3 +48,6 @@ const (
 func NewService(cfg Config, store IndexStore, exister SourceExister) (*Service, error) {
 	return valueindexcompactor.NewService(cfg, store, exister)
 }
+
+// IndexObject is a key+size pair returned by IndexStore.List.
+type IndexObject = valueindexcompactor.IndexObject

@@ -1001,6 +1001,14 @@ set is 8 columns: `trace:id`, `span:id`, `span:start`, `span:end`, `span:duratio
 `FindTraceByID` (`GetTraceByID` in api.go) uses `GetBlockWithBytes` directly and always
 reads all columns — unaffected by this change. Only `QueryTraceQL` filter queries benefit.
 
+**Addendum (2026-07-04):** "always reads all columns" no longer describes `GetTraceByID` as a
+whole. Its full-scan fallback now runs a cheap `WantOnly({"trace:id"})` match phase before
+`WantAll()`-decoding only the blocks that matched (root `SPEC.md` SPEC-ROOT-018,
+`internal/modules/blockio/reader/SPECS.md` SPEC-012); its index-hit fast path decodes only the
+exact blocks an index names. Every span actually *returned* is still decoded with `WantAll()`
+at materialization time — the "unaffected" claim about output completeness still holds, only
+the "every block, unconditionally" framing about how it gets there is now stale.
+
 **Back-ref:** `internal/modules/executor/stream.go:Collect`,
 `internal/modules/executor/predicates.go:searchMetaColumns`
 
@@ -3145,6 +3153,13 @@ wantCols=ComputeSecondPassCols(nil, opts.SelectColumns)`. Nil program is correct
   columns ∪ searchMetaCols ∪ traceIntrinsicColumns.
 + `reader.go:GetTraceByID` — passes `isDualStorage=computeIsDualStorage(bwb.Block, r), wantCols=nil`.
   GetTraceByID requires all fields; nil wantCols is correct.
+
+**Addendum (2026-07-04):** this call-site decision describes `GetTraceByID`'s materialization
+step specifically (both its full-scan fallback's second pass and its index-hit fast path
+always decode with `wantCols=nil`/`WantAll()` at the point a span is actually built into a
+`SpanMatch`) — it no longer describes `GetTraceByID`'s decode strategy end-to-end, since a new
+first-pass match phase (`WantOnly({"trace:id"})`) was added ahead of it for the full-scan
+fallback. See root `SPEC.md` SPEC-ROOT-017's own 2026-07-04 Addendum and SPEC-ROOT-018.
 
 **SPEC-ROOT-017** codifies this as a codebase-wide invariant.
 
@@ -7151,3 +7166,58 @@ to `false`/`nil`):**
 `span:end` synthesis (`ProgramWantColumns`) and string-typed query handling
 (`column_provider.go`) — they no longer drive any storage or fetch-path decision.
 `IntrinsicColumnName` (`spanmatch.go`) remains a pure `"span:" + name` string helper.
+
+## NOTE-VI-048 — SliceValueIndexSource made concurrency-safe for vibuilder's parallel leaf loop (tempo issue #465)
+
+*Added: 2026-07-02*
+
+`SliceValueIndexSource` (`metrics_trace.go`) previously used a plain, unsynchronized
+`data map[string]map[modules_shared.ColumnType][]VILookupResult` plus a `stats
+ValueIndexBuildStats` field, with no protection against concurrent access. This was safe as
+long as the only caller — `vibuilder.BuildSource` (NOTE-VI-036) — populated it from a fully
+serial leaf loop, one `Add`/`RecordFileIO` call at a time.
+
+That assumption stopped holding once vibuilder's leaf-predicate loop was parallelized to fix
+a production timeout: `vibuilder.downloadAll` and related loops were issuing up to ~930
+sequential S3 round trips per TraceQL query, causing 33s-2m38s query timeouts on
+tempo-dev-test-03. The fix bounds concurrency in vibuilder's download and leaf-evaluation
+loops (see `vibuilder/NOTES.md`'s corresponding entry for the full root-cause and
+concurrency-bound rationale), which means multiple leaf-predicate goroutines now call
+`Add`/`RecordFileIO` on the *same* `SliceValueIndexSource` instance concurrently — a
+genuinely new access pattern this type was never built for.
+
+**Fix:** added a `sync.Mutex` field (`mu`) to `SliceValueIndexSource`, guarding the full body
+of `Add`, `RecordFileIO`, `Stats`, `LookupResults`, and `AllResults`. `betteralign` placed `mu`
+last in the struct (`data`, `stats`, `mu`) for pointer-byte layout — not first, which an
+earlier draft assumed.
+
+**Why this was a small, additive change, not a redesign:** `Stats()` was already written
+(NOTE-VI-039) to derive `Hits` from the stored result slices at read time specifically so it
+would "stay correct regardless of `Add` ordering" — that design already anticipated
+non-deterministic ordering, just not true concurrent access. Adding a mutex makes the existing
+ordering-tolerance safe under the Go memory model without changing any method's return
+semantics or callers' call sites.
+
+**Why a plain mutex, not finer-grained locking (e.g. per-column locks) or a `sync.Map`:** the
+critical sections are short (a map lookup/insert and a slice append or scan), the number of
+concurrent callers is small and bounded (vibuilder's `leafConcurrency` cap, not per-span), and
+`Stats()`/`AllResults()` need a consistent view across the *entire* `data` map (a per-column
+lock would not help them and would add complexity for no benefit at this call volume). Mutex
+overhead is negligible relative to the S3 I/O it guards.
+
+**Confirmed unaffected:** the vibuilder invariants this type participates in — NOTE-VI-036
+(coverage contract: empty-slice-Add vs never-Add), NOTE-VI-039 (stats accumulation), and
+NOTE-VI-041 (404-skip-vs-abort) — are all about *what* gets Added and *when a file download is
+skipped*, not about the ordering or concurrency of the `Add` calls themselves; none of them are
+affected by this change.
+
+Regression guard: `TestSliceValueIndexSource_ConcurrentAddAndRecordFileIO_NoRace` (EX-VIS-01)
+runs 50 goroutines × 3 results each (mixed across 5 column names to force map-write
+contention) and asserts `Stats()`/`AllResults()` totals after `wg.Wait()`; it requires `-race`
+to catch a regression (a plain `go test` run without `-race` would not reliably fail even
+without the mutex).
+
+Back-ref: `internal/modules/executor/metrics_trace.go:SliceValueIndexSource`,
+`internal/modules/executor/metrics_trace_vi_test.go:TestSliceValueIndexSource_ConcurrentAddAndRecordFileIO_NoRace`.
+See also: SPEC-VIS-1 (`SPECS.md`), `vibuilder/NOTES.md` (call-site rewrite this note is the
+prerequisite for).

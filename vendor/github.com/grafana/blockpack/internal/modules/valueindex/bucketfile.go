@@ -44,6 +44,7 @@ package valueindex
 // Block payloads are snappy-compressed; the directory stores the compressed offset/len.
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"fmt"
@@ -269,6 +270,24 @@ func EncodeBucketFile(f *BucketFile) ([]byte, error) {
 	}
 	f.MinTimeSec, f.MaxTimeSec = fileMin, fileMax
 
+	return assembleBucketFileBytes(body, dir, f.StringTable, fileMin, fileMax), nil
+}
+
+// assembleBucketFileBytes appends the string table, block index, and footer to a body of
+// already-compressed block bytes, returning the complete file. Shared by EncodeBucketFile
+// (single-shot, given a *BucketFile) and StreamCompactBucketFiles (incremental, body/dir
+// built block-by-block) so both produce byte-identical framing. dir's CompOff values must
+// be body-relative (0-based within body); they are shifted to file-absolute offsets here.
+// fileMin/fileMax are the footer's file-level min/max time, computed by the caller from only
+// its non-empty blocks (a BlockDirEntry alone can't distinguish "empty block" from
+// "MinTimeSec/MaxTimeSec legitimately 0", since ComputeBlockMeta zeroes both for a block with
+// no groups — recomputing unconditionally from dir here would corrupt the footer whenever any
+// block in dir is empty).
+func assembleBucketFileBytes(body []byte, dir []BlockDirEntry, table *StringTable, fileMin, fileMax uint64) []byte {
+	if table == nil {
+		table = NewStringTable()
+	}
+
 	// File header: magic[4] + version[1].
 	out := make([]byte, 0, len(body)+256)
 	out = binary.LittleEndian.AppendUint32(out, BucketFileMagic)
@@ -284,7 +303,7 @@ func EncodeBucketFile(f *BucketFile) ([]byte, error) {
 
 	// String table.
 	strOff := uint64(len(out))
-	strBytes := EncodeStringTable(f.StringTable)
+	strBytes := EncodeStringTable(table)
 	out = append(out, strBytes...)
 	strLen := uint64(len(strBytes))
 
@@ -303,7 +322,57 @@ func EncodeBucketFile(f *BucketFile) ([]byte, error) {
 	out = binary.LittleEndian.AppendUint64(out, fileMax)
 	out = append(out, BucketFileVersion)
 
-	return out, nil
+	return out
+}
+
+// writeBucketFileTail writes the string table, block index, and footer directly to bw,
+// completing a file whose header and block body were already written by the caller
+// (StreamCompactBucketFiles' disk-backed output path, plan.md Decision 3). Unlike
+// assembleBucketFileBytes (which builds these same sections into a body-relative []byte and
+// shifts dir's offsets to file-absolute afterward), dir's CompOff values here are already
+// file-absolute — the caller wrote the 5-byte header first and sized every block write
+// against a running byte counter, so no post-hoc shift is needed. bodyEnd is the
+// file-absolute offset immediately after the last block byte (i.e. where the string table
+// begins). assembleBucketFileBytes itself is not modified — this is a new sibling function,
+// since assembleBucketFileBytes has an existing, unrelated caller (EncodeBucketFile) outside
+// this task's scope.
+func writeBucketFileTail(
+	bw *bufio.Writer,
+	dir []BlockDirEntry,
+	table *StringTable,
+	fileMin, fileMax, bodyEnd uint64,
+) error {
+	if table == nil {
+		table = NewStringTable()
+	}
+
+	strOff := bodyEnd
+	strBytes := EncodeStringTable(table)
+	if _, err := bw.Write(strBytes); err != nil {
+		return fmt.Errorf("valueindex: writeBucketFileTail: write string table: %w", err)
+	}
+	strLen := uint64(len(strBytes))
+
+	blockIdxOff := strOff + strLen
+	blockIdxBytes := appendBlockIndex(nil, dir)
+	if _, err := bw.Write(blockIdxBytes); err != nil {
+		return fmt.Errorf("valueindex: writeBucketFileTail: write block index: %w", err)
+	}
+	blockIdxLen := uint64(len(blockIdxBytes))
+
+	footer := make([]byte, 0, bucketFooterSize)
+	footer = binary.LittleEndian.AppendUint32(footer, BucketFileMagic)
+	footer = binary.LittleEndian.AppendUint64(footer, blockIdxOff)
+	footer = binary.LittleEndian.AppendUint64(footer, blockIdxLen)
+	footer = binary.LittleEndian.AppendUint64(footer, strOff)
+	footer = binary.LittleEndian.AppendUint64(footer, strLen)
+	footer = binary.LittleEndian.AppendUint64(footer, fileMin)
+	footer = binary.LittleEndian.AppendUint64(footer, fileMax)
+	footer = append(footer, BucketFileVersion)
+	if _, err := bw.Write(footer); err != nil {
+		return fmt.Errorf("valueindex: writeBucketFileTail: write footer: %w", err)
+	}
+	return nil
 }
 
 func appendBlockIndex(out []byte, dir []BlockDirEntry) []byte {
