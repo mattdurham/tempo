@@ -14,6 +14,7 @@ import (
 	"container/heap"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -122,17 +123,20 @@ func (it *BucketFileIterator) skipEmptyBlocks() {
 }
 
 // DecodeFilteredBucketFile decodes data and applies retention filtering (mirrors the
-// per-input step inside CompactBucketFiles), returning (nil, stats, nil) — not an error —
-// for files that fail to decode (legacy pre-v2 files), matching CompactBucketFiles' skip-
-// not-abort semantics.
-//
-// SPEC-ROOT-010 exception: intentional, same as CompactBucketFiles in bucketmerge.go — a
-// decode failure here means a legacy-format input, not a real error, and the caller (a
-// compaction pass merging many files) should keep going rather than abort the whole job.
+// per-input step inside CompactBucketFiles). It returns (nil, stats, nil) — not an error —
+// ONLY for a bad-magic file (ErrNotBucketFile), a legacy pre-v2 input that holds no v2
+// postings and so can be skipped without dropping any live posting. Every other decode
+// failure is a genuine corrupt v2 file and is returned as an error: silently skipping it
+// would permanently drop its postings from a compacted output, silently under-counting the
+// index — the same silent-partial-result bug class the trace-by-id review caught
+// (NOTE-VI-046). Mirrors NewDiskBucketFileIterator's discipline.
 func DecodeFilteredBucketFile(ctx context.Context, data []byte, checker RefChecker) (*BucketFile, CompactStats, error) {
 	f, err := DecodeBucketFile(data)
 	if err != nil {
-		return nil, CompactStats{}, nil //nolint:nilerr // intentional: legacy pre-v2 files are skipped, not aborted
+		if errors.Is(err, ErrNotBucketFile) {
+			return nil, CompactStats{}, nil //nolint:nilerr // intentional: legacy bad-magic pre-v2 files are skipped, not aborted
+		}
+		return nil, CompactStats{}, fmt.Errorf("valueindex: DecodeFilteredBucketFile: decode: %w", err)
 	}
 	if checker != nil {
 		filtered, stats, ferr := filterDeadRefs(ctx, f, checker)

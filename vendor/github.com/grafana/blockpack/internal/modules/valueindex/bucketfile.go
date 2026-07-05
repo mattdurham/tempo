@@ -47,6 +47,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"sort"
 
@@ -427,18 +428,35 @@ func encodeBucketBlock(b *BucketBlock) []byte {
 	return buf
 }
 
+// ErrNotBucketFile signals that data is not a v2 BucketGroup file at all — its
+// header or footer magic does not match BucketFileMagic. This is distinct from a
+// decode error on a genuine v2 file (corruption past the magic): a caller iterating
+// a discovered file set may safely SKIP an ErrNotBucketFile (e.g. a stray
+// old-format or non-value-index object sharing the prefix, which holds no v2
+// postings and so cannot under-count results), but must NOT silently skip any other
+// decode error — a corrupt v2 file dropped from an otherwise-authoritative index
+// query silently under-counts, the exact silent-partial-result bug class the
+// trace-by-id review caught in findTraceGroupInCandidates (NOTE-VI-046).
+// Recognize with errors.Is(err, ErrNotBucketFile).
+var ErrNotBucketFile = errors.New("valueindex: not a bucket file (bad magic)")
+
 // DecodeBucketFile parses the full v2 wire format produced by EncodeBucketFile.
+// A bad header or footer magic is reported as ErrNotBucketFile (the data is not a
+// v2 file at all); every other failure is a genuine decode error on a v2 file.
 func DecodeBucketFile(data []byte) (*BucketFile, error) {
 	if len(data) < 5+bucketFooterSize {
-		return nil, fmt.Errorf("valueindex: bucket file too short (%d bytes)", len(data))
+		// Too short to even hold a header magic + footer: it cannot be a v2 file, so
+		// classify as ErrNotBucketFile — a caller iterating a discovered file set may
+		// skip it (a stray/empty object holds no v2 postings). NOTE-VI-046.
+		return nil, fmt.Errorf("valueindex: bucket file too short (%d bytes): %w", len(data), ErrNotBucketFile)
 	}
 	if binary.LittleEndian.Uint32(data[:4]) != BucketFileMagic {
-		return nil, fmt.Errorf("valueindex: bad header magic")
+		return nil, fmt.Errorf("valueindex: bad header magic: %w", ErrNotBucketFile)
 	}
 
 	footer := data[len(data)-bucketFooterSize:]
 	if binary.LittleEndian.Uint32(footer[:4]) != BucketFileMagic {
-		return nil, fmt.Errorf("valueindex: bad footer magic")
+		return nil, fmt.Errorf("valueindex: bad footer magic: %w", ErrNotBucketFile)
 	}
 	blockIdxOff := binary.LittleEndian.Uint64(footer[4:12])
 	blockIdxLen := binary.LittleEndian.Uint64(footer[12:20])
@@ -447,7 +465,14 @@ func DecodeBucketFile(data []byte) (*BucketFile, error) {
 	fileMin := binary.LittleEndian.Uint64(footer[36:44])
 	fileMax := binary.LittleEndian.Uint64(footer[44:52])
 
-	if strOff+strLen > uint64(len(data)) || blockIdxOff+blockIdxLen > uint64(len(data)) {
+	// Overflow-safe bounds validation: a corrupt footer can carry huge offsets/lengths
+	// whose sum wraps uint64 and slips past a naive `off+len > len(data)` check, then
+	// panics the decode goroutine on the slice below. Checking each term against
+	// len(data) first (offsets/lengths individually cannot legitimately exceed the file
+	// size) makes the subsequent sum overflow-free (NOTE-VI-046).
+	dataLen := uint64(len(data))
+	if strOff > dataLen || strLen > dataLen || strOff+strLen > dataLen ||
+		blockIdxOff > dataLen || blockIdxLen > dataLen || blockIdxOff+blockIdxLen > dataLen {
 		return nil, fmt.Errorf("valueindex: footer offsets out of bounds")
 	}
 

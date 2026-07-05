@@ -1050,3 +1050,47 @@ inside the merge function itself).
 Back-refs: `internal/modules/valueindex/traceindex.go:MergeTraceGroups`,
 `internal/modules/valueindexcompactor/traceindex_dispatch.go:mergeTraceLevel`,
 `:isTraceIndexColDir`. See `SPECS.md` SPEC-VI-6.
+
+## NOTE-VI-046 — corrupt v2 file must ERROR, not silently skip (issue #469 audit, step 1)
+
+Date: 2026-07-05
+
+The trace-by-id review (2026-07-05, `reader.go:findTraceGroupInCandidates`) identified a
+general silent-partial-result bug class: a value-index consumer that treats its result as
+authoritative coverage but silently skips a file it fails to decode will under-count without
+error. Issue #469 step 1 audited the search/metrics path for the same gap.
+
+**Finding.** `DecodeBucketFile` returned an undifferentiated error for two very different cases:
+(a) bad header/footer magic — the input is not a v2 BucketGroup file at all (a legacy pre-v2 or
+stray object sharing the prefix; holds no v2 postings, so skipping it cannot drop any live
+posting), and (b) a decode failure *past* the magic — a genuinely corrupt v2 file (bad footer
+offsets, truncated block index, snappy failure, block-body overrun; skipping it silently drops
+real postings). Three consumers conflated the two by skipping on *any* decode error:
+`QueryBucketFiles` (the live search/metrics query path — a covered-but-empty column is treated
+as authoritative coverage per NOTE-VI-033, so a silent skip produced an authoritative
+under-count with no fallback), `CompactBucketFiles`, and `DecodeFilteredBucketFile`. Only the
+disk-backed `NewDiskBucketFileIterator` (the live compactor path via `StreamCompactBucketFiles`)
+already had the correct discipline: skip only on the header-magic check, error on everything
+else.
+
+**Fix.** `DecodeBucketFile` now wraps `ErrNotBucketFile` on bad-magic *and* too-short inputs
+(neither can be a v2 file), and returns every other failure as a bare decode error. Callers
+iterating a discovered file set skip only `errors.Is(err, ErrNotBucketFile)` and surface any
+other decode error so the caller falls back to a full scan (query) or aborts the merge
+(compaction) rather than silently under-counting — matching `NewDiskBucketFileIterator` and
+the trace-by-id "any doubt ⇒ full scan" contract.
+
+**Secondary fix (found by the corruption test).** `DecodeBucketFile`'s footer bounds check
+`off+len > len(data)` was uint64-overflow-unsafe: a corrupt offset of ~2^64 wrapped past the
+guard and *panicked* the decode goroutine on the slice. Now each offset/length is checked
+against `len(data)` individually before the (now overflow-free) sum, so a corrupt file yields
+a clean error instead of a panic in the querier.
+
+This audit did NOT remove the search/metrics full-scan fallback (issue #469 step 3) — that
+remains gated on completing the correctness confirmation (step 2). It closes the analogous
+silent-partial-result gap the fallback would otherwise mask.
+
+Back-refs: `internal/modules/valueindex/bucketfile.go:DecodeBucketFile` (ErrNotBucketFile,
+overflow-safe bounds), `:bucketquery.go:QueryBucketFiles`, `:bucketmerge.go:CompactBucketFiles`,
+`:stream_compaction.go:DecodeFilteredBucketFile`. Regression tests:
+`bucketquery_corruption_test.go`, `bucketfile_test.go:TestDecodeBucketFileBadMagic/CorruptionNotBadMagic`.

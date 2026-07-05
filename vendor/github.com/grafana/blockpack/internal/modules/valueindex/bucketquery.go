@@ -12,6 +12,7 @@ package valueindex
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 )
 
@@ -114,11 +115,21 @@ func QueryBucketFiles(pred Predicate, timeRange *[2]uint64, files ...[]byte) ([]
 	for _, data := range files {
 		f, err := DecodeBucketFile(data)
 		if err != nil {
-			// Skip files that fail to decode — they may be old VINX-format files
-			// written before the v2 BucketGroup format was introduced. Returning an
-			// error here would abort the whole query; skipping is safe because the
-			// full block scan falls back as the source of truth.
-			continue
+			if errors.Is(err, ErrNotBucketFile) {
+				// Not a v2 BucketGroup file at all (bad magic) — e.g. a stray
+				// old-format or non-value-index object sharing the prefix. It holds
+				// no v2 postings, so skipping it cannot under-count results. Safe to
+				// skip and continue.
+				continue
+			}
+			// A genuine decode failure on a real v2 file (corruption past the magic:
+			// bad offsets, truncated block index, snappy failure, block-body
+			// overrun). Silently skipping it would drop this file's postings from a
+			// result the querier treats as authoritative coverage (NOTE-VI-033),
+			// silently under-counting — the exact silent-partial-result bug the
+			// trace-by-id review caught (NOTE-VI-046). Surface the error so the
+			// caller falls back to a full scan rather than return a wrong result.
+			return nil, fmt.Errorf("valueindex: query bucket file: %w", err)
 		}
 		for bi := range f.Blocks {
 			b := &f.Blocks[bi]

@@ -13,6 +13,7 @@ package valueindex
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"sort"
 
@@ -200,9 +201,19 @@ func CompactBucketFiles(
 	for _, data := range files {
 		f, err := DecodeBucketFile(data)
 		if err != nil {
-			// Skip files that fail to decode (old VINX-format files from before
-			// the v2 BucketGroup migration). Do not abort the whole compaction.
-			continue
+			if errors.Is(err, ErrNotBucketFile) {
+				// Not a v2 BucketGroup file at all (bad magic) — a legacy pre-v2
+				// file. It holds no v2 postings, so skipping it cannot drop any live
+				// posting from the merged output. Skip, do not abort.
+				continue
+			}
+			// A genuine decode failure on a real v2 file. Silently skipping it would
+			// permanently drop this file's postings from the compacted output (a
+			// merge is a rewrite, not a hint), silently under-counting the index —
+			// the same silent-partial-result bug class the trace-by-id review caught
+			// (NOTE-VI-046). Abort so the compaction is retried rather than emitting
+			// a lossy merged file. Mirrors NewDiskBucketFileIterator's discipline.
+			return CompactStats{}, fmt.Errorf("valueindex: CompactBucketFiles: decode: %w", err)
 		}
 		if cfg.Checker != nil {
 			filtered, fstats, ferr := filterDeadRefs(ctx, f, cfg.Checker)
