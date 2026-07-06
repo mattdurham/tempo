@@ -7115,11 +7115,12 @@ has O(1) direct row access. The metrics path ignores both.
 
 + `source` nil (caller did no discovery) or query is not a filter expression.
 + Any leaf column with no index coverage (`viMatchSpans` returns `ok=false`).
-+ Result set above `maxIndexHits` (default `DefaultMaxIndexHits` = 100k): a full scan
-  amortizes better than many small per-block fetch+materialize round-trips.
-+ Any matched span's `BlockID` is out of range, or its block is missing from the
-  fetch — both mean the index and data file are out of sync, so fall back rather
-  than return a partial result.
+
+> **UPDATED by NOTE-VI-047 (issue #474):** the `maxIndexHits` size-based fallback and
+> its parameter were removed — the value index is now authoritative for covered
+> columns, so a large-but-correct result set is returned in full. The index/data
+> out-of-sync case (`BlockIndexForPage` `!ok`, or a missing block) is now an **error**
+> `(nil, false, err)`, not a silent fallback. See NOTE-VI-047 below.
 
 **Empty-but-covered vs fallback:** a covered query whose spans all belong to other
 SourceRefs (or whose file simply has no matches) returns `(nil, true, nil)` — a
@@ -7221,3 +7222,55 @@ Back-ref: `internal/modules/executor/metrics_trace.go:SliceValueIndexSource`,
 `internal/modules/executor/metrics_trace_vi_test.go:TestSliceValueIndexSource_ConcurrentAddAndRecordFileIO_NoRace`.
 See also: SPEC-VIS-1 (`SPECS.md`), `vibuilder/NOTES.md` (call-site rewrite this note is the
 prerequisite for).
+
+## NOTE-VI-047 — Search/metrics value index is authoritative; removed the maxIndexHits hint (issue #474)
+
+*Added: 2026-07-06*
+
+Issue #474 confirmed the direction (2026-07-06): the value index is **authoritative** for the
+search and metrics query paths, not a hint-with-speculative-fallback. Codified as SPEC-ROOT-019.
+
+**What was removed.** `QueryTraceQLFromIndex` (both the executor function and the exported
+`api.go` wrapper) previously took a `maxIndexHits int` parameter and returned `ok=false` when a
+*correctly-answered* query produced more than `DefaultMaxIndexHits` (100k) results, "because a
+full scan amortizes better than many small per-block fetches". That was the last true
+"index is a hint" behavior on this path: the index had produced the complete, correct answer and
+we discarded it to run a slower scan that could only reproduce the identical result. The
+parameter, the `DefaultMaxIndexHits` constant, and the size check are all gone. Result-set size
+no longer influences correctness or path selection.
+
+**What was kept (documented exceptions, SPEC-ROOT-019).** Genuine "the index cannot answer this"
+cases still return `(nil, false, nil)` and fall back: (1) a leaf column with no index coverage —
+a negation/unindexable predicate the querier never `Add`ed, so `viMatchSpans` returns
+`ok=false`; (2) a non-filter (structural/pipeline) query; (3) for metrics, an unsupported shape
+(group-by, non-count/rate function) or a file predating per-span timestamps (`TimeSec == 0`).
+
+**What changed from silent-fallback to error.** An index/data inconsistency — a matched span
+naming a `BlockPage` with no block start (`BlockIndexForPage` `!ok`) or a block the reader
+returns no bytes for — used to silently return `(nil, false, nil)` and scan. Because the index
+is now authoritative, this is index corruption and is surfaced as `(nil, false, err)`. The tempo
+caller (`tryIndexFetch`) logs it and still falls back to a correct scan, so a corrupt index never
+produces a wrong result, but the inconsistency is now observable instead of masked. This is the
+deliberate inverse of SPEC-ROOT-018's trace-by-ID contract, where the same skew stays a routine
+silent fallback because that (much newer, NOTE-VI-070) index is still only a hint.
+
+**Why this path could go authoritative but trace-by-ID (#473) cannot yet.** The search/metrics
+span-attribute index has been written and matured over a long window — the block writer already
+documents it as *"the authoritative source for pruning"* and in-file pruning was removed in
+NOTE-477. The trace-by-ID `TraceGroup` index only started building coverage on 2026-07-06
+(NOTE-VI-070), so removing *its* fallback would return "not found" for the vast majority of real
+traces. Different maturity, different contract — do not conflate them.
+
+**Breaking signature change (authorized by #474).** Exported `blockpack.QueryTraceQLFromIndex`
+dropped its trailing `maxIndexHits int` arg; the internal executor function did too. Tempo's
+`vblockpack/value_index_query.go:tryIndexFetch` is updated in the same commit cycle: it drops the
+argument and now branches on a non-nil error (log + fall back) separately from a routine
+`!indexOK` miss.
+
+Back-ref: `internal/modules/executor/search_trace_vi.go:QueryTraceQLFromIndex`,
+`api.go:QueryTraceQLFromIndex`, `api.go:ExecuteMetricsTraceQL`, `tracemetricoptions.go`,
+`valueindex_query.go`. SPEC: SPEC-ROOT-019 (root `SPEC.md`). Tests:
+`search_trace_vi_test.go` (`_ANDMatchesFullScan`, `_ORMatchesFullScan`,
+`_ANDPartialCoverageFallsBack`, `_LargeResultSetIsAuthoritative`, `_InconsistentIndexIsError`),
+`api_test.go:TestQueryTraceQLFromIndex_Public*`. External: tempo
+`tempodb/encoding/vblockpack/value_index_query.go`, `backend_block.go`.

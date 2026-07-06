@@ -1094,3 +1094,35 @@ Back-refs: `internal/modules/valueindex/bucketfile.go:DecodeBucketFile` (ErrNotB
 overflow-safe bounds), `:bucketquery.go:QueryBucketFiles`, `:bucketmerge.go:CompactBucketFiles`,
 `:stream_compaction.go:DecodeFilteredBucketFile`. Regression tests:
 `bucketquery_corruption_test.go`, `bucketfile_test.go:TestDecodeBucketFileBadMagic/CorruptionNotBadMagic`.
+
+## NOTE-VI-070 — `WriteValueIndexL0` (root package) builds the TraceGroup index too (issue #468 data-production gap)
+
+Date: 2026-07-06
+
+Issue #468 wired `GetTraceByID` to consult a real `LookupStore` when `value_index_query.enabled`
+(tempo `backend_block.go`), but that wiring was inert: the only code that ever *built* a
+`TraceGroup` entry was `valueindexconsumer`'s `bufferTraceRow`/`flushTraceGroups`
+(NOTE-VI-063/traceflush.go) — an async, Redis-Streams-consumer path. `value-index-consumer`
+(the Kubernetes deployment running that consumer) was confirmed at 0 replicas on
+tempo-dev-test-03, "replaced by inline `ValueIndexSink`" per `setup.sh`'s own comment. The
+inline sink is `WriteValueIndexL0` (root `valueindex_l0write.go`, NOTE-VI-042) — the only
+value-index write path that has actually run against live production data. Before this note,
+it only knew enough about the TraceGroup format to *exclude* `trace:id` from the standard
+per-column path (NOTE-VI-068); it never built a TraceGroup itself. Net effect: #468's lookup
+had no data to ever find — every trace-by-id query would silently fall through to the full-scan
+fallback forever, correctly (per SPEC-ROOT-018's "index is a hint" contract) but uselessly.
+
+**Fix.** `WriteValueIndexL0` now accumulates `valueindex.SpanEntry` rows keyed by `TraceID`
+during its single `ExtractValueIndexEntries` pass, triggered on the `span:id` sentinel column
+exactly like `valueindexconsumer.ingest()` does (accumulate for the trace index AND continue to
+standard per-column indexing — `span:id` is not excluded like `trace:id` is). Unlike the
+consumer's `traceGroupBuffer` (which spills to disk across many async messages within a flush
+window), this is a single synchronous pass over one reader, so an in-memory map
+(`l0TraceAccum`) is sufficient — no cross-call buffering needed. The accumulated groups are
+encoded via `valueindex.EncodeTraceGroups` and PUT under the same
+`colHash("trace:id")/uuid/L0-...` key layout `flushTraceGroups` uses, so the querier's
+`DiscoverIndexFiles`/compactor's format-dispatch need no changes to find them.
+
+Back-refs: `valueindex_l0write.go:WriteValueIndexL0`, `:flushAndPutTraceGroups`,
+`:l0TraceAccum`. Regression test: `valueindex_l0write_test.go:TestWriteValueIndexL0_BuildsTraceGroupIndex`
+(confirmed red before the fix — 0 trace-group files produced — green after).

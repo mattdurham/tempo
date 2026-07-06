@@ -146,10 +146,21 @@ func (b *blockpackBlock) tryIndexFetch(
 	stats.Hits = bs.Hits
 
 	sourceRef := blockObjectKey(b.meta.TenantID, b.meta.BlockID.String())
+	// The value index is authoritative for the columns it covers (blockpack
+	// NOTE-VI-047, issue #474): QueryTraceQLFromIndex no longer speculatively
+	// declines a large-but-correct result set. A non-nil err now signals an
+	// index/data inconsistency (the index named a block/page absent from the
+	// file) rather than a routine miss; log it and fall back to a correct full
+	// scan, but surface it so the inconsistency is observable.
 	matches, indexOK, err := blockpack.QueryTraceQLFromIndex(
-		ctx, r, src, query, sourceRef, opts, 0, /* maxIndexHits: 0 = default */
+		ctx, r, src, query, sourceRef, opts,
 	)
-	if err != nil || !indexOK {
+	if err != nil {
+		level.Warn(util_log.Logger).Log("msg", "vblockpack: index fetch: index/data inconsistency, falling back to scan",
+			"block", b.meta.BlockID, "tenant", b.meta.TenantID, "err", err)
+		return nil, false, stats
+	}
+	if !indexOK {
 		return nil, false, stats
 	}
 	stats.Used = true

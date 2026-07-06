@@ -14,15 +14,21 @@ package blockpack
 //   - ValueIndexFileStore: the download contract (Size + ReadAt by object key).
 //   - BuildValueIndexSource: the orchestration that ties them together.
 //
+// The value index is authoritative for the columns it covers (NOTE-VI-047, issue
+// #474): the querier falls back to a full scan only when the index genuinely cannot
+// answer (no coverage for a leaf, or a non-filter query), never speculatively when
+// it already produced a correct answer.
+//
 // The querier flow is then:
 //
 //	prog, _ := blockpack.CompileTraceQL(query, opts)
 //	src, ok, err := blockpack.BuildValueIndexSource(ctx, cache, store, prog, minSec, maxSec)
 //	if ok && err == nil {
-//	    matches, indexOK, _ := blockpack.QueryTraceQLFromIndex(ctx, r, src, query, sourceRef, opts, max)
-//	    if indexOK { return matches }
+//	    matches, indexOK, err := blockpack.QueryTraceQLFromIndex(ctx, r, src, query, sourceRef, opts)
+//	    if err != nil { return err }        // index/data inconsistency — surfaced, not masked
+//	    if indexOK { return matches }        // authoritative answer
 //	}
-//	// fall back to QueryTraceQL full scan
+//	// no coverage: fall back to QueryTraceQL full scan
 
 import (
 	"context"

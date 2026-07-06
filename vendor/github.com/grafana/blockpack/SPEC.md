@@ -665,6 +665,61 @@ Back-refs: `reader.go:GetTraceByID`, `:getTraceByIDViaIndex`, `:getTraceByIDFull
 
 ---
 
+## SPEC-ROOT-019: Search/Metrics Value Index — Authoritative for Covered Columns
+*Added: 2026-07-06 (issue #474, NOTE-VI-047)*
+
+The value index is **authoritative** for the search (`QueryTraceQLFromIndex`) and metrics
+(`ExecuteMetricsTraceQL` with `TraceMetricOptions.ValueIndex`) query paths — **not** a
+hint-with-speculative-fallback. When every leaf predicate the query needs resolves against the
+index, the index-produced result is the complete, correct answer for that file. This is
+deliberately the **opposite** posture to SPEC-ROOT-018's trace-by-ID "index is a hint" contract:
+the search/metrics span-attribute index has been written and matured over a long window (the
+block writer treats it as *"the authoritative source for pruning"*), whereas the trace-by-ID
+`TraceGroup` index only began building coverage on 2026-07-06 (NOTE-VI-070) and therefore keeps
+its fallback until coverage is proven (issue #473). The two indexes are at different maturity
+points; do not conflate their contracts.
+
+**What "authoritative" removed:** the `maxIndexHits` speculative fallback in
+`executor.QueryTraceQLFromIndex`. Previously a *correctly-answered* query whose result set
+exceeded `DefaultMaxIndexHits` (100k) was discarded and re-run as a full scan "because a scan is
+cheaper" — a scan that could only reproduce the identical result at higher cost. That heuristic,
+and the `maxIndexHits` parameter on both the executor and the exported root
+`QueryTraceQLFromIndex`, are gone. Size no longer influences correctness or path selection.
+
+**Fallback is now reserved for genuine "the index cannot answer this":**
+
+1. **No coverage for a leaf.** A negation (`!=`, `!~`) or otherwise unindexable predicate has no
+   fast VI path; the querier does not `Add` that column, `viMatchSpans` returns `ok=false`, and
+   the caller falls back to a full scan. This is a **documented, accepted exception**, not a
+   regression — negation-heavy queries scan as before. `(nil, false, nil)`.
+2. **Wrong query type.** Structural/pipeline queries are not filter expressions and use their own
+   execution paths. `(nil, false, nil)`.
+3. **Metrics shape unsupported by the VI path.** Group-by, or a non-`count`/`rate` function, or a
+   file predating per-span timestamps (`TimeSec == 0`), falls back. `(nil, false, nil)`.
+
+**Index/data inconsistency is now an error, not a silent scan.** When a matched span names a
+block/page absent from the data file (`BlockIndexForPage` `!ok`, or a block the reader returns no
+bytes for), the index and the file are out of sync. Because the index is authoritative, this is
+surfaced as an error `(nil, false, err)` — the querier logs it and falls back to a correct full
+scan, but the inconsistency is observable rather than masked. Contrast SPEC-ROOT-018, where the
+same skew is a routine, silent fallback because that index is only a hint.
+
+**Breaking signature change (authorized by issue #474):** the exported
+`blockpack.QueryTraceQLFromIndex` lost its trailing `maxIndexHits int` parameter, as did the
+internal `executor.QueryTraceQLFromIndex`. The single external consumer — tempo's
+`vblockpack` package (`tempodb/encoding/vblockpack/value_index_query.go:tryIndexFetch`) — is
+updated in the same commit cycle: it drops the argument and now logs+falls-back on a non-nil
+error (index/data inconsistency) rather than treating error identically to a routine miss.
+
+Back-refs: `internal/modules/executor/search_trace_vi.go:QueryTraceQLFromIndex`,
+`api.go:QueryTraceQLFromIndex`, `api.go:ExecuteMetricsTraceQL`,
+`internal/modules/executor/metrics_trace.go:ExecuteTraceMetricsFromVI`,
+`search_trace_vi_test.go` (AND/OR/authoritative-large-result/inconsistency-is-error tests),
+`valueindex_query.go` (querier-flow doc). External: tempo
+`tempodb/encoding/vblockpack/value_index_query.go`, `backend_block.go`.
+
+---
+
 ## SPEC-FORMAT-001: All Metadata Sections Must Be ToC-Driven for Selective Decoding
 
 **Invariant:** Every metadata section that contains per-column data MUST be stored as an

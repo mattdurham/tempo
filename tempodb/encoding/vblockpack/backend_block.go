@@ -717,9 +717,13 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 	// Index-driven path (blockpack issue #461): when the querier has a value-index
 	// reader configured and the query compiled to a filter program, try to answer
 	// it from the value index (discover + download + per-leaf predicate, then
-	// block-pruned fetch). On no coverage / unsupported predicate / error we fall
-	// through to the full-scan paths below — the index path is a strict
-	// optimisation, never the only source of truth.
+	// block-pruned fetch). The value index is AUTHORITATIVE for the columns it
+	// covers (blockpack NOTE-VI-047, issue #474): when it answers, that answer is
+	// the complete, correct result and we do not scan — there is no speculative
+	// "the index answered but a scan is cheaper" fallback. We fall through to the
+	// full-scan paths below ONLY when the index genuinely cannot answer: no
+	// coverage for a leaf (negation/unindexable predicate), a non-filter query, or
+	// an index/data inconsistency (logged in tryIndexFetch, then a correct scan).
 	if compiledProgram != nil {
 		im, ok, istats := b.tryIndexFetch(ctx, r, compiledProgram, query, queryOpts)
 		// Record index-path I/O on the span whenever the index was consulted (any

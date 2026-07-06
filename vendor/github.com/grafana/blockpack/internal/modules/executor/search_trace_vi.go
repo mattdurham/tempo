@@ -21,11 +21,6 @@ import (
 	"github.com/grafana/blockpack/internal/vm"
 )
 
-// DefaultMaxIndexHits is the fallback threshold for the index search path. When the
-// value index produces more matching spans than this, a full block scan is cheaper
-// than per-block fetch-and-materialize, so QueryTraceQLFromIndex returns ok=false.
-const DefaultMaxIndexHits = 100_000
-
 // QueryTraceQLFromIndex executes a TraceQL filter query using the value index for
 // block pruning. It returns the matching spans as executor SpanMatch values
 // (Block + BlockIdx + RowIdx populated for field materialization by the caller).
@@ -37,13 +32,28 @@ const DefaultMaxIndexHits = 100_000
 //   - sourceRef: the SourceRef whose results in source belong to r; results for any
 //     other SourceRef are skipped (a single Reader serves one data file)
 //   - wantCols: columns to decode when parsing matched blocks (result materialization)
-//   - maxIndexHits: fallback threshold; <= 0 uses DefaultMaxIndexHits
 //
-// Returns (matches, true, nil) when the query is fully answerable from the index.
-// Returns (nil, false, nil) when the caller must fall back to a full block scan:
-//   - any leaf column has no index coverage (source.LookupResults ok=false)
-//   - the index produced more than maxIndexHits results (scan is cheaper)
-//   - a matched span carries no row address (RowIdx unusable for direct access)
+// The value index is AUTHORITATIVE for the columns it covers (NOTE-VI-047, issue
+// #474): when every leaf predicate resolves against the index, the returned spans
+// are the complete, correct answer for this file — there is no speculative
+// "the index answered but a full scan is cheaper" fallback, because a scan would
+// only reproduce the identical result at higher cost.
+//
+// Returns (matches, true, nil) when the query is fully answerable from the index —
+// including an empty match set (coverage with no matching span is a definitive
+// empty answer, not a fallback).
+//
+// Returns (nil, false, nil) ONLY when the index genuinely cannot answer the query
+// and the caller must fall back to a full block scan:
+//   - any leaf column has no index coverage (source.LookupResults ok=false) — e.g.
+//     a negation or otherwise unindexable predicate has no fast VI path (documented
+//     exception, SPEC-ROOT-019).
+//
+// Returns (nil, false, err) when the index and the data file are inconsistent — a
+// matched span names a block/page that does not exist in the file. This is index
+// corruption, not a routine "no coverage" miss: surfacing it as an error (rather
+// than silently reproducing the answer via a scan) upholds the authoritative
+// contract and makes the inconsistency observable (NOTE-VI-047, issue #474).
 func QueryTraceQLFromIndex(
 	ctx context.Context,
 	source ValueIndexSource,
@@ -51,7 +61,6 @@ func QueryTraceQLFromIndex(
 	prog *vm.Program,
 	sourceRef string,
 	wantCols map[string]struct{},
-	maxIndexHits int,
 ) ([]SpanMatch, bool, error) {
 	if source == nil || prog == nil || r == nil {
 		return nil, false, nil
@@ -60,9 +69,6 @@ func QueryTraceQLFromIndex(
 		if err := ctx.Err(); err != nil {
 			return nil, false, err
 		}
-	}
-	if maxIndexHits <= 0 {
-		maxIndexHits = DefaultMaxIndexHits
 	}
 
 	// Resolve the matching spans from the value index using the same boolean
@@ -85,11 +91,6 @@ func QueryTraceQLFromIndex(
 		filtered = append(filtered, m)
 	}
 
-	// Fallback when the result set is too broad: a full scan amortizes better than
-	// many small per-block fetches + materializations.
-	if len(filtered) > maxIndexHits {
-		return nil, false, nil
-	}
 	if len(filtered) == 0 {
 		// Coverage existed but no span in this file matched — a definitive empty
 		// result for this file, not a fallback. Return an empty match set.
@@ -101,8 +102,9 @@ func QueryTraceQLFromIndex(
 	// direct row access and would have to scan the block anyway.
 	// NOTE-VI-045 (#429): the v2 BucketGroup index carries a page-addressed BlockRef
 	// (BlockPage), not a block index. Resolve each page to a block index via the reader;
-	// a page that names no block start means the index and data file are out of sync ⇒
-	// fall back to a scan rather than returning a partial result.
+	// a page that names no block start means the index and data file are out of sync.
+	// The value index is authoritative (NOTE-VI-047, #474): an out-of-sync page is index
+	// corruption, so surface it as an error rather than silently masking it with a scan.
 	rowsByBlock := make(map[int][]uint16)
 	blockOrder := make([]int, 0, len(filtered))
 	type spanKey struct {
@@ -113,7 +115,12 @@ func QueryTraceQLFromIndex(
 	for _, m := range filtered {
 		blockIdx, ok := r.BlockIndexForPage(m.BlockPage)
 		if !ok {
-			return nil, false, nil // page names no block ⇒ index/data skew ⇒ fall back
+			// Page names no block start ⇒ the index and data file are out of sync.
+			return nil, false, fmt.Errorf(
+				"QueryTraceQLFromIndex: value index names page %d with no block start in %s (index/data inconsistency)",
+				m.BlockPage,
+				sourceRef,
+			)
 		}
 		key := spanKey{blockIdx: blockIdx, rowIdx: m.RowIdx}
 		if _, seen := identity[key]; seen {
@@ -145,7 +152,13 @@ func QueryTraceQLFromIndex(
 		}
 		raw, ok := rawBlocks[blockIdx]
 		if !ok {
-			return nil, false, nil // missing block ⇒ inconsistent index ⇒ fall back
+			// Reader returned no bytes for a block the index named ⇒ index/data
+			// inconsistency; surface it (NOTE-VI-047, #474) rather than masking it.
+			return nil, false, fmt.Errorf(
+				"QueryTraceQLFromIndex: value index names block %d absent from %s (index/data inconsistency)",
+				blockIdx,
+				sourceRef,
+			)
 		}
 		meta := r.BlockMeta(blockIdx)
 		bwb, parseErr := r.ParseBlockFromBytes(raw, want, meta)

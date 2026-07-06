@@ -50,6 +50,17 @@ type l0Group struct {
 	colType ColumnType
 }
 
+// l0TraceAccum accumulates one trace's SpanEntry rows during a single
+// WriteValueIndexL0 pass. Unlike valueindexconsumer's traceGroupBuffer (which
+// spills to disk across many async messages within a flush window),
+// WriteValueIndexL0 processes exactly one reader synchronously, so an
+// in-memory map is sufficient -- no cross-call buffering is needed.
+type l0TraceAccum struct {
+	spans   []valueindex.SpanEntry
+	timeSec uint64
+	seen    bool
+}
+
 // WriteValueIndexL0 extracts every indexable (column, span) observation from r,
 // groups the observations by (column name, column type), and writes one L0 value
 // index file per group to store under:
@@ -83,9 +94,45 @@ func WriteValueIndexL0(r *Reader, store ObjectPutter, sourceRef, tenant, indexPr
 		}
 	}()
 
+	// Trace-by-ID index accumulation (issue #468 data-production gap): this is the
+	// only write path that runs against live production data today
+	// (valueindexconsumer, which builds the same TraceGroup index asynchronously
+	// via traceflush.go, is not currently deployed) -- without this, GetTraceByID's
+	// index-hit path (wired per #468) would have no data to ever find, silently
+	// falling back to a full scan on every lookup regardless of the wiring being
+	// correct. Mirrors valueindexconsumer's bufferTraceRow/flushTraceGroups exactly,
+	// collapsed into a single in-memory pass since WriteValueIndexL0 processes
+	// exactly one block synchronously -- no cross-call buffering is needed.
+	traceGroups := make(map[[16]byte]*l0TraceAccum)
+
 	// nil denylist indexes every column (NOTE-VI-027, issue #414): the value index
 	// is policy-free; the querier decides which columns are useful at read time.
 	err := ExtractValueIndexEntries(r, nil, func(e ValueIndexEntry) error {
+		// Trace-by-ID index: triggered on the span:id sentinel column, independent of
+		// the configured column allowlist -- trace-by-id coverage must not depend on
+		// which attribute columns an operator chose to index. Mirrors
+		// valueindexconsumer's ingest() exactly: accumulate for the trace index AND
+		// continue to standard per-column indexing below (span:id is not excluded
+		// like trace:id is).
+		if e.ColName == modules_shared.SpanIDColumnName {
+			ta := traceGroups[e.TraceID]
+			if ta == nil {
+				ta = &l0TraceAccum{}
+				traceGroups[e.TraceID] = ta
+			}
+			if !ta.seen || e.TimeSec < ta.timeSec {
+				ta.timeSec = e.TimeSec
+			}
+			ta.seen = true
+			rowIdx := uint16(e.RowIdx) //nolint:gosec // RowIdx bounded by MaxBlockSpans <= 65534
+			ta.spans = append(ta.spans, valueindex.SpanEntry{
+				SourceRef:    sourceRef,
+				SpanID:       e.SpanID,
+				ParentSpanID: e.ParentSpanID,
+				BlockRef:     e.BlockRef,
+				RowIdx:       rowIdx,
+			})
+		}
 		// trace:id is excluded from the standard per-column value-index path
 		// (SPEC-VI-4/NOTE-VI-068, mirrors the same exclusion in
 		// valueindexconsumer's ingest()): both this path and the dedicated
@@ -125,7 +172,15 @@ func WriteValueIndexL0(r *Reader, store ObjectPutter, sourceRef, tenant, indexPr
 		case e.BlockRef.PageNum > 0 || e.BlockRef.LenPages > 0:
 			if e.SpanID != ([8]byte{}) {
 				rowIdx := uint16(e.RowIdx) //nolint:gosec // RowIdx bounded by MaxBlockSpans ≤ 65534
-				return g.writer.AddEntryV4(e.Value, e.TraceID, sourceRef, e.BlockRef, e.TimeSec, e.SpanID, rowIdx)
+				return g.writer.AddEntryV4(
+					e.Value,
+					e.TraceID,
+					sourceRef,
+					e.BlockRef,
+					e.TimeSec,
+					e.SpanID,
+					rowIdx,
+				)
 			}
 			return g.writer.AddEntryV2(e.Value, e.TraceID, sourceRef, e.BlockRef, e.TimeSec)
 		default:
@@ -140,6 +195,60 @@ func WriteValueIndexL0(r *Reader, store ObjectPutter, sourceRef, tenant, indexPr
 		if err := flushAndPutL0(store, g, tenant, indexPrefix); err != nil {
 			return err
 		}
+	}
+
+	return flushAndPutTraceGroups(store, traceGroups, tenant, indexPrefix)
+}
+
+// flushAndPutTraceGroups encodes the trace groups accumulated during one
+// WriteValueIndexL0 pass and PUTs them as a single TraceGroup-format L0 file
+// under the trace:id column directory, mirroring valueindexconsumer's
+// flushTraceGroups. A no-op when accum is empty (no span:id-sentinel rows
+// observed -- e.g. a reader with no spans).
+func flushAndPutTraceGroups(
+	store ObjectPutter,
+	accum map[[16]byte]*l0TraceAccum,
+	tenant, indexPrefix string,
+) error {
+	if len(accum) == 0 {
+		return nil
+	}
+
+	groups := make([]valueindex.TraceGroup, 0, len(accum))
+	var wallMinSec, wallMaxSec uint64
+	first := true
+	for tid, ta := range accum {
+		groups = append(groups, valueindex.TraceGroup{
+			TraceID: tid,
+			TimeSec: ta.timeSec,
+			Spans:   ta.spans,
+		})
+		if first || ta.timeSec < wallMinSec {
+			wallMinSec = ta.timeSec
+		}
+		if first || ta.timeSec > wallMaxSec {
+			wallMaxSec = ta.timeSec
+		}
+		first = false
+	}
+
+	data, err := valueindex.EncodeTraceGroups(groups)
+	if err != nil {
+		// Mirrors flushTraceGroups: string-table overflow within one block is an
+		// accepted, documented low-probability edge case for v1, surfaced as a hard
+		// error rather than silently dropping trace-by-ID coverage for this block.
+		return fmt.Errorf("blockpack: WriteValueIndexL0: encode trace groups: %w", err)
+	}
+
+	key := path.Join(
+		tenant,
+		indexPrefix,
+		valueindex.ColHash(modules_shared.TraceIDColumnName),
+		valueindex.ColTypeName(modules_shared.ColumnTypeUUID),
+		valueindex.FormatFilenameV2(0, wallMinSec, wallMaxSec, valueindex.NewID()),
+	)
+	if err := store.Put(key, data); err != nil {
+		return fmt.Errorf("blockpack: WriteValueIndexL0: put %q: %w", key, err)
 	}
 	return nil
 }

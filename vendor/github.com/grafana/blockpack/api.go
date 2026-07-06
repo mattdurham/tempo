@@ -195,12 +195,23 @@ func QueryTraceQLWithProgram(
 // as it does for the metrics path (NOTE-VI-033). sourceRef identifies which data file
 // r was opened against so results for other files are ignored.
 //
-// Returns (matches, true, nil) when the query is fully answerable from the index.
-// Returns (nil, false, nil) when the caller must fall back to QueryTraceQL (full scan):
+// The value index is AUTHORITATIVE for the columns it covers (NOTE-VI-047, issue
+// #474): when the query resolves against the index there is no speculative
+// "index answered but a scan is cheaper" fallback — a scan would only reproduce
+// the identical result at higher cost.
+//
+// Returns (matches, true, nil) when the query is fully answerable from the index
+// (an empty match set is a definitive empty answer, not a fallback).
+// Returns (nil, false, nil) when the index genuinely cannot answer and the caller
+// must fall back to QueryTraceQL (full scan):
 //   - source is nil (caller did no discovery)
-//   - any leaf column has no index coverage
-//   - the index produced more than maxIndexHits results (<= 0 uses the default)
+//   - any leaf column has no index coverage (e.g. a negation/unindexable predicate
+//     with no fast VI path — documented exception, SPEC-ROOT-019)
 //   - the query is not a filter expression (structural/metrics use their own paths)
+//
+// Returns (nil, false, err) when the index and data file are inconsistent (a
+// matched span names a block/page absent from the file) — index corruption is
+// surfaced, not silently masked by a scan.
 //
 // Each returned SpanMatch.Fields is materialized and safe to retain after return.
 func QueryTraceQLFromIndex(
@@ -210,7 +221,6 @@ func QueryTraceQLFromIndex(
 	traceqlQuery string,
 	sourceRef string,
 	opts QueryOptions,
-	maxIndexHits int,
 ) (results []SpanMatch, ok bool, err error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -253,7 +263,6 @@ func QueryTraceQLFromIndex(
 	matches, indexOK, execErr := modules_executor.QueryTraceQLFromIndex(
 		ctx, source, r, program, sourceRef,
 		modules_executor.ComputeSecondPassCols(program, opts.SelectColumns),
-		maxIndexHits,
 	)
 	if execErr != nil {
 		return nil, false, execErr
@@ -516,8 +525,11 @@ func ExecuteMetricsTraceQL(
 
 	// NOTE-VI-033 (issue #460): try the zero-block-read value-index path first.
 	// count_over_time()/rate() without group-by are answerable from index TimeSec
-	// alone. ExecuteTraceMetricsFromVI returns ok=false for unsupported queries or
-	// missing index coverage, in which case we fall back to the full block scan.
+	// alone, and the index is authoritative for those shapes (NOTE-VI-047, #474):
+	// when it answers, that answer is complete. ExecuteTraceMetricsFromVI returns
+	// ok=false ONLY when the index genuinely cannot answer — an unsupported metric
+	// shape or a leaf column with no coverage — in which case we fall back to the
+	// full block scan.
 	if opts.ValueIndex != nil {
 		viResult, ok, viErr := modules_executor.ExecuteTraceMetricsFromVI(ctx, opts.ValueIndex, prog, *spec)
 		if viErr != nil {
