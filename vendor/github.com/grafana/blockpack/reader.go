@@ -382,6 +382,23 @@ func NewReaderForProgram(
 // cross-file span looks like, since a different file's page geometry is unrelated to r's
 // block layout — is index/data skew and surfaces as an error. Genuine cross-file trace
 // assembly is out of scope for v1.
+//
+// sourceRef (NOTE-VI-076, issue #479): the object key of the data file r was opened
+// against — exactly what the write path stamps on each SpanEntry.SourceRef
+// (blockObjectKey(tenant, blockID) in tempo). A compacted trace-by-ID index file commonly
+// spans many source blocks, so DiscoverIndexFiles returns the SAME wide file as a
+// candidate for EVERY block whose time window overlaps it. Without sourceRef, every one of
+// those parallel per-block GetTraceByID calls resolves the same TraceGroup, then tries to
+// materialize sibling-block spans against r — whose page geometry is unrelated — producing
+// a spurious "index/data skew" error for every block except the one that actually owns the
+// spans. Because tempo's querier fails the whole trace-by-id query on ANY single block
+// error, that turned the normal (shared-file) case into a guaranteed 500. When sourceRef
+// is non-empty, materializeTraceGroup keeps only SpanEntries whose SourceRef matches it;
+// spans belonging to sibling blocks are dropped before resolution (that sibling's own
+// GetTraceByID call resolves them against its own reader). If zero spans remain after the
+// filter, that is an authoritative "not found in this block" (nil, nil), NOT skew. A span
+// that DOES claim this sourceRef but still fails to resolve remains genuine skew (error).
+// An empty sourceRef disables the filter (v1 back-compat / callers with no per-block key).
 func GetTraceByID(
 	ctx context.Context,
 	r *Reader,
@@ -389,6 +406,7 @@ func GetTraceByID(
 	lister LookupStore,
 	tenant, indexPrefix string,
 	queryMinSec, queryMaxSec uint64,
+	sourceRef string,
 ) (results []SpanMatch, err error) {
 	if r == nil {
 		return nil, fmt.Errorf("GetTraceByID: reader cannot be nil")
@@ -426,7 +444,7 @@ func GetTraceByID(
 	copy(traceID[:], traceIDBytes)
 
 	return getTraceByIDViaIndex(
-		ctx, r, traceID, lister, tenant, indexPrefix, queryMinSec, queryMaxSec,
+		ctx, r, traceID, lister, tenant, indexPrefix, queryMinSec, queryMaxSec, sourceRef,
 	)
 }
 
@@ -449,6 +467,7 @@ func getTraceByIDViaIndex(
 	lister LookupStore,
 	tenant, indexPrefix string,
 	queryMinSec, queryMaxSec uint64,
+	sourceRef string,
 ) ([]SpanMatch, error) {
 	colHash := valueindex.ColHash(modules_shared.TraceIDColumnName)
 	colTypeName := valueindex.ColTypeName(modules_shared.ColumnTypeUUID)
@@ -483,7 +502,7 @@ func getTraceByIDViaIndex(
 		return nil, nil
 	}
 
-	return materializeTraceGroup(r, group, traceID)
+	return materializeTraceGroup(r, group, traceID, sourceRef)
 }
 
 // findTraceGroupInCandidates fetches and decodes every candidate index file. Because the
@@ -620,21 +639,38 @@ func probeTraceV2(store LookupStore, key string) (bool, error) {
 // materializes the matching spans. Because the index is AUTHORITATIVE (NOTE-VI-071), any
 // inconsistency between the index and the data file is returned as an ERROR — never a
 // partial result and never a silent degrade to a scan: an entry that fails to resolve to a
-// real block in r (index/data skew, staleness, or a genuinely cross-file span — see
-// GetTraceByID's v1 scope decision), a block the reader returns no bytes for, a block that
-// fails to parse, or a resolved row whose own trace:id column does not actually match
-// traceID (defensive re-verify: an index hit must never produce a wrong span). The error
-// tells the caller the index and the data file are out of sync so the inconsistency is
-// observable rather than masked (cf. SPEC-ROOT-019 for the search/metrics path).
+// real block in r (index/data skew or staleness), a block the reader returns no bytes for,
+// a block that fails to parse, or a resolved row whose own trace:id column does not
+// actually match traceID (defensive re-verify: an index hit must never produce a wrong
+// span). The error tells the caller the index and the data file are out of sync so the
+// inconsistency is observable rather than masked (cf. SPEC-ROOT-019 for the search/metrics
+// path).
+//
+// sourceRef filter (NOTE-VI-076, issue #479): a compacted TraceGroup index file spans many
+// source blocks, so the group commonly carries SpanEntries belonging to sibling blocks, not
+// to r. When sourceRef is non-empty, only entries whose SpanEntry.SourceRef equals it are
+// resolved against r; sibling-block entries are dropped up front (their own block's parallel
+// GetTraceByID call resolves them against its own reader). This distinguishes "this entry is
+// for a sibling block, ignore it" from "this entry claims to be for me but doesn't resolve"
+// — only the latter is genuine skew. If no span survives the filter, that is an
+// authoritative "not found in THIS block" ((nil, nil)), not an error: some sibling block owns
+// the trace and will resolve it. An empty sourceRef disables the filter (v1 back-compat).
 func materializeTraceGroup(
 	r *Reader,
 	group valueindex.TraceGroup,
 	traceID [16]byte,
+	sourceRef string,
 ) ([]SpanMatch, error) {
 	rowsByBlock := make(map[int][]int, len(group.Spans))
 	blockOrder := make([]int, 0, len(group.Spans))
 	seen := make(map[[2]int]struct{}, len(group.Spans))
 	for _, span := range group.Spans {
+		// Drop spans owned by a sibling block: they are addressed against a
+		// different file's page geometry, so resolving them against r would be a
+		// spurious skew error. The sibling's own GetTraceByID call handles them.
+		if sourceRef != "" && span.SourceRef != sourceRef {
+			continue
+		}
 		blockIdx, ok := r.BlockIndexForPage(span.BlockRef.PageNum)
 		if !ok {
 			return nil, fmt.Errorf(
@@ -653,6 +689,14 @@ func materializeTraceGroup(
 		rowsByBlock[blockIdx] = append(rowsByBlock[blockIdx], int(span.RowIdx))
 	}
 	if len(blockOrder) == 0 {
+		if sourceRef != "" {
+			// Every span in the group belonged to a sibling block (filtered out
+			// above). This block simply does not hold the trace -- an authoritative
+			// "not found in THIS block," not skew. The sibling block whose SourceRef
+			// matches resolves the trace in its own parallel GetTraceByID call
+			// (NOTE-VI-076, issue #479).
+			return nil, nil
+		}
 		return nil, fmt.Errorf("GetTraceByID: index/data skew: trace group resolved to zero blocks")
 	}
 

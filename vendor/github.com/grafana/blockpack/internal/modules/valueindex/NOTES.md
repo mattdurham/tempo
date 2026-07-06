@@ -1338,3 +1338,59 @@ TraceRandomReader), `internal/modules/valueindex/lookupstore.go` (widened Lookup
 `reader.go` (findTraceGroupInCandidates + probeTraceV2),
 `internal/modules/blockio/shared/constants.go` (ValueIndexTraceGroupsPerBlock, TraceFileVersion
 context). Tests: `traceindexquery_test.go`, `traceindex_test.go`.
+
+## NOTE-VI-076 — `GetTraceByID` sourceRef filter: sibling-block index entries are not skew (issue #479)
+
+Date: 2026-07-06
+
+Discovered immediately after deploying #475/#476/#477/#478: trace-by-id queries against
+already-flushed backend blocks returned HTTP 500 with `index/data skew: index-named page N
+does not resolve in file`, and the *same page number recurred across unrelated block IDs* —
+systematic, not corruption.
+
+**Root cause.** `GetTraceByID` runs once per candidate block (tempo's `tempodb.Find` fans out
+over every block whose window overlaps the query). `DiscoverIndexFiles` selection is
+window-based, not block-specific, so when `valueindexcompactor` merges many source blocks'
+trace-by-id entries into one wide compacted index file (the normal case: files span dozens of
+blocks' data), *every* block whose window overlaps that file is a discovery candidate, resolves
+the target `TraceGroup`, and tries to materialize it. `materializeTraceGroup` never checked
+whether a matched `SpanEntry.SourceRef` actually corresponded to the reader `r` it was given —
+it called `r.BlockIndexForPage(span.BlockRef.PageNum)` on every span. For every block except
+the one that owns that page, this fails: the page is real and valid, just not in *this* block's
+file — surfacing as the spurious skew error. And because tempo's querier
+(`modules/querier/querier.go`) fails the ENTIRE trace-by-id query on ANY single block error
+(`multierr.Combine(blockErrs...)`), one spurious sibling error killed the whole response even
+when the correct block resolved it. #476 made this newly load-bearing: correct cross-block
+discovery (fixing the minute-floor bug that had masked most sharing via false "zero candidates"
+misses) meant the wide compacted files were now actually consulted.
+
+**Fix.** Widen `GetTraceByID` (and `getTraceByIDViaIndex`, `materializeTraceGroup`) with a
+`sourceRef string` param — the exact object key of the block being queried, matching what
+`WriteValueIndexL0`/compaction stamp on each `SpanEntry.SourceRef` (tempo's
+`blockObjectKey(tenant, blockID)` = `<tenant>/<block-id>/data.blockpack`). When `sourceRef` is
+non-empty, `materializeTraceGroup` drops any `SpanEntry` whose `SourceRef != sourceRef` BEFORE
+attempting `BlockIndexForPage` — sibling entries never touch this reader. Three outcomes:
+
+  - Some entries match this sourceRef and resolve ⇒ materialize them (correct spans for THIS
+    block); sibling entries silently ignored.
+  - After filtering, zero spans remain ⇒ authoritative "not found in THIS block" `(nil, nil)`,
+    NOT skew. The sibling block whose sourceRef matches resolves the trace in its own parallel
+    `GetTraceByID` call.
+  - An entry that DOES match this sourceRef but still doesn't resolve ⇒ genuine index/data skew,
+    still an error (unchanged).
+
+An empty `sourceRef` disables the filter (v1 back-compat: callers/tests with no per-block key
+keep the original "every entry must resolve or it's skew" behavior).
+
+Mirrors the search/metrics path (`QueryTraceQLFromIndex`, `search_trace_vi.go`), which already
+takes a `sourceRef` and skips `m.SourceRef != sourceRef` — this closes the same gap on the
+trace-by-id path.
+
+Back-refs: root `reader.go` (`GetTraceByID`, `getTraceByIDViaIndex`, `materializeTraceGroup`);
+tempo `tempodb/encoding/vblockpack/backend_block.go` (`FindTraceByID` passes
+`blockObjectKey(...)`). Tests: `gettracebyid_index_test.go`
+(`TestGetTraceByID_SiblingSourceRefFilteredNotSkew`,
+`TestGetTraceByID_AllSiblingSourceRefsIsNotFound`,
+`TestGetTraceByID_MatchingSourceRefButUnresolvableIsStillSkew`). Follow-up worth considering
+(not in scope): should tempo's querier tolerate per-block errors when at least one block
+succeeded, so a genuinely corrupt block cannot poison an otherwise-successful query?

@@ -636,12 +636,21 @@ mutually exclusive, selected by whether the caller supplies a lister:
    which permanently passes `nil`; or a backend block when the value-index query feature is
    disabled). `scanTraceByID` performs an exact, complete scan of `r`. This is the sole correct
    path when no index exists — it is **not** a fallback from a failed index attempt.
-3. **v1 scope decision — no cross-file trace assembly.** `GetTraceByID` operates on exactly
-   one `*Reader` for one file. On the index path an entry naming a block that does not resolve
-   in `r` is what a genuinely cross-file span looks like (a different file's page geometry is
-   unrelated to `r`'s own block layout) — this is now index/data skew and returns an error
-   (item 1), not a silent same-file scan. Genuine cross-file trace assembly (opening additional
-   readers for other files an index names) is explicitly out of scope for v1.
+3. **v1 scope decision — no cross-file trace assembly; sourceRef scoping (NOTE-VI-076, issue
+   #479).** `GetTraceByID` operates on exactly one `*Reader` for one file. A compacted
+   `TraceGroup` index file commonly spans many source blocks, so `DiscoverIndexFiles` returns
+   the SAME wide file as a candidate for EVERY block whose window overlaps it; the resolved
+   group therefore carries `SpanEntry`s belonging to sibling blocks, not to `r`. `GetTraceByID`
+   takes a `sourceRef` — the object key of the block `r` was opened against, matching what the
+   write path stamps on each `SpanEntry.SourceRef` (tempo `blockObjectKey`). When non-empty,
+   `materializeTraceGroup` drops any span whose `SourceRef != sourceRef` BEFORE resolving it
+   against `r`, so a sibling entry is never mistaken for skew (that sibling block resolves it in
+   its own parallel call). If no span survives the filter, that is an authoritative "not found
+   in THIS block" `(nil, nil)`, not an error. Only an entry that matches this `sourceRef` yet
+   still fails to resolve (`BlockIndexForPage` `!ok`, or a `trace:id` re-verify mismatch)
+   remains genuine index/data skew (item 1). An empty `sourceRef` disables the filter (v1
+   back-compat). Genuine cross-file trace assembly (opening additional readers for other files
+   an index names) is explicitly out of scope for v1.
 4. **`queryMinSec`/`queryMaxSec`** scope the index discovery window. Pass `(0,
    math.MaxUint64)` when no tighter hint is available — this widens the candidate set. Under
    the authoritative contract a too-narrow window that excludes the covering file reads as a

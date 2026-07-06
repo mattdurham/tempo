@@ -444,10 +444,21 @@ func (b *blockpackBlock) FindTraceByID(ctx context.Context, id common.ID, _ comm
 	// index file's floored TimeSec ever falls inside, and DiscoverIndexFiles reports zero
 	// covering files -- now a hard error (NOTE-VI-072), not a silently-corrected scan.
 	queryMinSec := floorToMinuteSec(uint64(b.meta.StartTime.Unix())) //nolint:gosec // block start times are always positive
+	// sourceRef (blockpack NOTE-VI-076, issue #479): a compacted trace-by-ID index file
+	// commonly spans many source blocks, so DiscoverIndexFiles returns the SAME file as a
+	// candidate for every block whose window overlaps it. Passing this block's own object
+	// key lets GetTraceByID drop SpanEntries belonging to sibling blocks (whose page
+	// geometry is unrelated to this reader) instead of failing them as spurious index/data
+	// skew -- which, because the querier fails the whole trace-by-id query on any single
+	// block error, previously turned the normal shared-file case into a guaranteed 500.
+	// This must match exactly what the write path stamps on each SpanEntry.SourceRef
+	// (blockObjectKey in create.go/compactor.go).
+	sourceRef := blockObjectKey(b.meta.TenantID, b.meta.BlockID.String())
 	matches, err := blockpack.GetTraceByID(
 		ctx, r, traceIDHex, lister, b.meta.TenantID, indexPrefix,
 		queryMinSec,
 		uint64(b.meta.EndTime.Unix()), //nolint:gosec // block end times are always positive
+		sourceRef,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("GetTraceByID: %w", err)
