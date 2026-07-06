@@ -310,9 +310,11 @@ func (w *walBlock) FindTraceByID(ctx context.Context, id common.ID, _ common.Sea
 	traceIDHex := hex.EncodeToString(id)
 	// A WAL block is freshly-ingested data that has not been flushed to the backend, let
 	// alone consumed by valueindexconsumer or compacted by valueindexcompactor — it can
-	// never have trace-index coverage. Permanently pass a nil lister so GetTraceByID skips
-	// straight to its full-scan fallback; do not "fix" this by wiring in a lister later, it
-	// would only ever miss and cost a wasted DiscoverIndexFiles List call.
+	// never have trace-index coverage. Permanently pass a nil lister so GetTraceByID takes
+	// its no-index scan path (blockpack SPEC-ROOT-018 rev. NOTE-VI-071); do not "fix" this by
+	// wiring in a lister later. Under the now-authoritative index contract a lister here would
+	// not merely waste a DiscoverIndexFiles List call — it would return an authoritative "not
+	// found" for every WAL trace (no coverage exists), so the scan is mandatory, not optional.
 	matches, err := blockpack.GetTraceByID(ctx, r, traceIDHex, nil, "", "", 0, math.MaxUint64)
 	if err != nil {
 		return nil, fmt.Errorf("walBlock FindTraceByID: GetTraceByID: %w", err)

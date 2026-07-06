@@ -417,15 +417,18 @@ func (b *blockpackBlock) FindTraceByID(ctx context.Context, id common.ID, _ comm
 	// common.SearchOptions carries no time-range field, so the block's own wall-clock range
 	// (tighter than "whole retention") is used as the index discovery window.
 	//
-	// Index-first trace-by-ID (blockpack issue #468): when the value-index query path is
-	// configured (value_index_query.enabled), pass the configured LookupStore + index prefix
-	// so GetTraceByID consults the trace-by-ID value index for exact block+row addressing
-	// before falling back to a full block scan. The index is a hint, never authoritative for
-	// absence -- any miss/decode-error/skew falls back to the identical full-scan result
-	// (SPEC-ROOT-018). When the path is disabled the lister is nil and this is byte-identical
-	// to the prior full-scan-only behaviour. Only compacted backend blocks are index-eligible;
-	// WAL blocks (wal_block.go) permanently pass nil since freshly-ingested data is not yet
-	// consumed by the async indexer.
+	// Authoritative trace-by-ID index (blockpack issue #473, SPEC-ROOT-018 rev. NOTE-VI-071):
+	// when the value-index query path is configured (value_index_query.enabled), pass the
+	// configured LookupStore + index prefix so GetTraceByID resolves the trace via the
+	// trace-by-ID value index. The index is now AUTHORITATIVE, not a hint with a scan fallback:
+	// a hit returns the covered spans, an index miss returns an empty result (authoritative
+	// "not found" -- it does NOT scan the file), and any index/data inconsistency (corrupt
+	// candidate, unresolvable/stale entry) surfaces as an error, which we propagate below.
+	// The accepted, known coverage gap: traces written before the index began building
+	// (blockpack NOTE-VI-070) read as "not found." When the path is disabled the lister is nil
+	// and GetTraceByID falls to its no-index scan (byte-identical to the prior behaviour). Only
+	// compacted backend blocks are index-eligible; WAL blocks (wal_block.go) permanently pass
+	// nil since freshly-ingested data is not yet consumed by the async indexer.
 	var lister blockpack.LookupStore
 	indexPrefix := ""
 	if vr := getValueIndexQueryReader(); vr != nil {

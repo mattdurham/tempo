@@ -1126,3 +1126,57 @@ encoded via `valueindex.EncodeTraceGroups` and PUT under the same
 Back-refs: `valueindex_l0write.go:WriteValueIndexL0`, `:flushAndPutTraceGroups`,
 `:l0TraceAccum`. Regression test: `valueindex_l0write_test.go:TestWriteValueIndexL0_BuildsTraceGroupIndex`
 (confirmed red before the fix — 0 trace-group files produced — green after).
+
+## NOTE-VI-071 — trace-by-ID index is authoritative; `getTraceByIDFullScan` removed (issue #473)
+
+Date: 2026-07-06
+
+Issue #473 (closing direction, maintainer comment): make the trace-by-ID `TraceGroup` index
+authoritative and remove `getTraceByIDFullScan` (root `reader.go`) — the pre-existing
+unconditional index fallback — gated on the standard build/test/race/precommit discipline, not
+on observed live coverage. This mirrors SPEC-ROOT-019 (issue #474), which had just done the same
+for the search/metrics index.
+
+**The fallbacks split into three categories** (the reusable classification from NOTE-VI-047),
+and the fix treats each differently:
+
+1. **No index provided (`lister == nil || tenant == ""`)** — genuine "there is no index to
+   consult," not indeterminacy. This is the WAL block (tempo `wal_block.go` permanently passes
+   `nil` — freshly-ingested data is never indexed) and a backend block when the value-index
+   query feature is disabled. The scan is the *only* correct path here, so it is KEPT — but
+   renamed `getTraceByIDFullScan` → `scanTraceByID` and re-documented as the no-index path, NOT
+   "the index fallback." The issue's "remove `getTraceByIDFullScan`" is satisfied: the function
+   with that fallback contract is gone; a scan for the no-index case remains because a WAL block
+   would otherwise return nothing.
+2. **Authoritative miss** — the index was consulted and holds no covering entry: either
+   `DiscoverIndexFiles` found zero candidate files for the window, or readable candidates simply
+   lack the trace. Now returns `(nil, nil)` — an empty result, NO scan. The accepted, known
+   consequence (issue #473, and the sibling NOTE-VI-070 coverage gap): any trace written before
+   `fd2726f0` has no entry and reads as "not found." No backfill; retention ages it out.
+3. **Index/data inconsistency** — a discovery-time `List` error, a fetch/decode failure on a
+   candidate (corrupt index), an index-named page that does not resolve in `r`
+   (`BlockIndexForPage !ok`; also how a cross-file span manifests), a block with no bytes / a
+   parse failure, or a defensive re-verify mismatch (`rowMatchesTraceID`). All previously silent
+   fallbacks; now `(nil, err)` — the index and the data file are out of sync and the caller
+   observes it, exactly as SPEC-ROOT-019 does for the search/metrics path.
+
+**Why `findTraceGroupInCandidates`/`materializeTraceGroup` changed their return shape.** Both
+returned a bare `ok bool` (any doubt ⇒ fall back). They now return an explicit `error` for
+category (3) and reserve `false`/empty for category (2), so the caller can distinguish "not
+found" from "corrupt/skewed." A decode failure on one L0 candidate is no longer skipped ("try
+the next") — under the authoritative contract a silent skip would let the index under-report a
+trace's spans with no observable signal.
+
+**A latent test bug surfaced.** `TestGetTraceByID_MultiBlockTraceViaIndex` hardcoded "target
+span i lives at physical block 2*i," an unsound guess (the writer does not guarantee block order
+matches submission order). Under the old hint contract the wrong index entries silently fell back
+to a full scan, so the test passed for the wrong reason. Under the authoritative contract the
+mismatch now (correctly) errors, exposing the guess. Fixed by building the fixture's TraceGroup
+from real `ExtractValueIndexEntries` output (`realTraceGroupFor`), addressing each span by its
+ACTUAL `BlockRef`+`RowIdx` — the same discipline `traceindex_pipeline_test.go` already used.
+
+Back-refs: root `reader.go:GetTraceByID`, `:getTraceByIDViaIndex`, `:findTraceGroupInCandidates`,
+`:materializeTraceGroup`, `:scanTraceByID`; root `SPEC.md` SPEC-ROOT-018 (revised) and
+SPEC-ROOT-019 (the sibling authoritative contract). Tests: `gettracebyid_index_test.go`
+(authoritative outcomes), `traceindex_pipeline_test.go` (end-to-end multi-L0 merge on the
+authoritative path).

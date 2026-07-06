@@ -546,10 +546,10 @@ the query's needed set.
 **Addendum (2026-07-04):** The blanket claim above that "Paths that need all fields
 (GetTraceByID) must pass `wantCols=nil`" no longer describes `GetTraceByID`'s decode strategy
 as a whole — it describes only its *materialization* sub-step. As of the trace-by-ID index
-wiring effort (SPEC-ROOT-018), `GetTraceByID`'s full-scan fallback (`getTraceByIDFullScan`,
+wiring effort (SPEC-ROOT-018), `GetTraceByID`'s no-index scan path (`scanTraceByID`,
 `reader.go`) first runs a cheap `WantOnly({"trace:id"})` match phase over every block
 (`scopeMatchingBlocks`) and only re-decodes blocks that actually contain a matching row with
-`WantAll()` (`parseBlocksWithWant`). The index-hit fast path (`getTraceByIDViaIndex` →
+`WantAll()` (`parseBlocksWithWant`). The index path (`getTraceByIDViaIndex` →
 `materializeTraceGroup`) never enumerates every block at all — it decodes only the exact
 blocks an index hit names, always with `WantAll()` since full-field materialization is
 required at that point regardless of path. **The invariant this rule protects (materialization
@@ -582,8 +582,13 @@ Back-ref: `internal/modules/blockio/span_fields.go:loadIntrinsicCache`,
 
 ---
 
-## SPEC-ROOT-018: GetTraceByID — Breaking Signature Change, Index-Is-A-Hint Contract
+## SPEC-ROOT-018: GetTraceByID — Breaking Signature Change, Index-Is-Authoritative Contract
 *Added: 2026-07-04*
+*Revised: 2026-07-06 (issue #473, NOTE-VI-071): the trace-by-ID index is now AUTHORITATIVE,
+not a hint-with-fallback. `getTraceByIDFullScan` (the unconditional index fallback) is gone;
+the scan survives ONLY as the no-index path (`scanTraceByID`) for callers that pass no lister.
+The original "index is a hint" contract is preserved below in strikethrough form for history;
+the authoritative contract that supersedes it follows.*
 
 **This is a breaking change to an exported root-package API function**, authorized explicitly
 by the user (not a unilateral agent decision) as part of fixing a production incident: a live
@@ -598,35 +603,57 @@ request. Full history in `.bob/state/brainstorm.md` and `.bob/state/plan.md`.
 valueindex.LookupStore, tenant, indexPrefix string, queryMinSec, queryMaxSec uint64) (results
 []SpanMatch, err error)`.
 
-**Contract:**
+**Original contract (2026-07-04, ~~superseded 2026-07-06~~):** ~~the index was a hint, never
+authoritative for absence; any index miss / decode failure / index-data skew fell back to
+`getTraceByIDFullScan` and returned exactly what a full scan would have. That fallback is now
+gone (issue #473); the authoritative contract below replaces it.~~
 
-1. **Index-first, when given the means.** When `lister != nil && tenant != ""`, `GetTraceByID`
-   first consults the trace-by-ID value index (`internal/modules/valueindex/traceindex.go`,
-   `TraceGroup`/`SpanEntry`) via `getTraceByIDViaIndex`: it discovers candidate index files
-   scoped to `[queryMinSec, queryMaxSec]`, decodes them, and on finding the trace, resolves
-   every `SpanEntry`'s exact `BlockRef`+`RowIdx` directly — touching only the blocks the index
-   names, never enumerating the whole file.
-2. **The index is a hint, never authoritative for absence.** Any of the following
-   unconditionally falls back to `getTraceByIDFullScan` (the exact, complete, pre-existing
-   scan behavior, preserved verbatim in logic — not deleted): `lister == nil`, `tenant == ""`,
-   no candidate index files discovered, every candidate fails to decode, the trace ID is not
-   found in any decoded candidate, an index-named block fails to resolve in `r`
-   (`BlockIndexForPage` returns `!ok` — this is also how a genuinely cross-file span is
-   detected and handled: see v1 scope decision below), or a resolved row's own `trace:id`
-   column value does not actually match the requested trace ID (defensive re-verify;
-   `rowMatchesTraceID`). **No indeterminacy of any kind may produce a wrong or partial
-   result** — every fallback path returns exactly what a full scan would have returned.
+**Authoritative contract (2026-07-06, NOTE-VI-071):** the trace-by-ID index is authoritative
+when consulted, exactly like the search/metrics index (SPEC-ROOT-019). The two paths are now
+mutually exclusive, selected by whether the caller supplies a lister:
+
+1. **Index path — `lister != nil && tenant != ""`.** `GetTraceByID` consults the trace-by-ID
+   value index (`internal/modules/valueindex/traceindex.go`, `TraceGroup`/`SpanEntry`) via
+   `getTraceByIDViaIndex`: it discovers candidate index files scoped to `[queryMinSec,
+   queryMaxSec]`, decodes them, and on finding the trace, resolves every `SpanEntry`'s exact
+   `BlockRef`+`RowIdx` directly — touching only the blocks the index names, never enumerating
+   the whole file. Three outcomes, and **no fallback to a scan**:
+   - **Hit** → the covered spans (complete for this file).
+   - **Miss** → an empty result, no error. This includes "no candidate index file covers the
+     window" (`DiscoverIndexFiles` returns zero keys) and "a readable candidate holds no entry
+     for the trace." The index is authoritative for absence: absence means not found.
+   - **Error** → any of: a discovery-time failure (e.g. object-store `List` error), a
+     fetch/decode failure on a candidate file (corrupt index), an index-named block that does
+     not resolve in `r` (`BlockIndexForPage` `!ok` — also how a cross-file span manifests, see
+     item 3), a block the reader returns no bytes for, a block that fails to parse, or a
+     resolved row whose own `trace:id` column does not match (`rowMatchesTraceID`; defensive
+     re-verify). These are index/data inconsistency: the index and the data file are out of
+     sync, surfaced so it is observable rather than masked by a silent scan. Contrast the old
+     contract, where every one of these was a routine silent fallback. **No indeterminacy of
+     any kind may produce a wrong or partial result** — it produces an error instead.
+2. **No-index path — `lister == nil || tenant == ""`.** There is no index to consult (WAL
+   blocks, which are freshly-ingested and never indexed — see tempo `vblockpack/wal_block.go`
+   which permanently passes `nil`; or a backend block when the value-index query feature is
+   disabled). `scanTraceByID` performs an exact, complete scan of `r`. This is the sole correct
+   path when no index exists — it is **not** a fallback from a failed index attempt.
 3. **v1 scope decision — no cross-file trace assembly.** `GetTraceByID` operates on exactly
-   one `*Reader` for one file. An index entry naming a block that does not resolve in `r` is
-   what a genuinely cross-file span looks like (a different file's page geometry is unrelated
-   to `r`'s own block layout) — this aborts the index attempt entirely for the whole trace
-   (never a partial result assembled from only the same-file spans) and falls back to a full
-   scan of `r`'s own file, which is exactly what every caller has only ever been able to see
-   regardless of index coverage. Genuine cross-file trace assembly (opening additional readers
-   for other files an index names) is explicitly out of scope for v1.
+   one `*Reader` for one file. On the index path an entry naming a block that does not resolve
+   in `r` is what a genuinely cross-file span looks like (a different file's page geometry is
+   unrelated to `r`'s own block layout) — this is now index/data skew and returns an error
+   (item 1), not a silent same-file scan. Genuine cross-file trace assembly (opening additional
+   readers for other files an index names) is explicitly out of scope for v1.
 4. **`queryMinSec`/`queryMaxSec`** scope the index discovery window. Pass `(0,
-   math.MaxUint64)` when no tighter hint is available — this widens the candidate set, it does
-   not narrow correctness, since the fallback guarantees correctness regardless.
+   math.MaxUint64)` when no tighter hint is available — this widens the candidate set. Under
+   the authoritative contract a too-narrow window that excludes the covering file reads as a
+   miss (not found), so callers must pass a window that actually contains the trace (backend
+   blocks use their own wall-clock range).
+
+**Accepted, known coverage gap (issue #473):** any trace written before the trace-by-ID index
+began building coverage (NOTE-VI-070, commit `fd2726f0`) has no index entry and, on the index
+path, reads as "not found." There is no backfill and none is planned; retention ages out the
+uncovered window. This is a deliberate, accepted consequence of making the index authoritative,
+per the issue's maintainer direction ("the data-coverage gap ... is an accepted, known
+consequence for this environment, not a blocker to shipping the removal").
 
 **Known-affected external consumer (breaking-change blast radius):** the `tempo` checkout at
 `/home/mdurham/source/blockpack_collection/tempo`'s `vblockpack` package has two call sites,
@@ -655,13 +682,16 @@ returned by `GetTraceByID` — via either path — is always decoded with `WantA
 of materialization, never `WantOnly()`. `NewSpanFieldsAdapterWithReader` exposes whatever
 columns are present in the decoded block, an open-ended, per-span attribute set that a fixed
 column list would silently truncate (`internal/modules/blockio/reader/SPECS.md` SPEC-012). The
-two-phase `WantOnly`/`WantAll` split in the full-scan fallback narrows which *blocks* get the
+two-phase `WantOnly`/`WantAll` split in the no-index scan narrows which *blocks* get the
 expensive `WantAll()` decode; it never narrows which *columns* a materialized span exposes.
 
-Back-refs: `reader.go:GetTraceByID`, `:getTraceByIDViaIndex`, `:getTraceByIDFullScan`,
-`:materializeTraceGroup`, `:scopeMatchingBlocks`, `internal/modules/valueindex/lookupstore.go:LookupStore`,
-`gettracebyid_index_test.go` (index-path tests), `gettracebyid_test.go`, `api_test.go`
-(fallback-path regression tests, updated call signature).
+Back-refs: `reader.go:GetTraceByID`, `:getTraceByIDViaIndex`, `:scanTraceByID`,
+`:materializeTraceGroup`, `:findTraceGroupInCandidates`, `:scopeMatchingBlocks`,
+`internal/modules/valueindex/lookupstore.go:LookupStore`,
+`gettracebyid_index_test.go` (authoritative index-path tests: hit / authoritative-miss /
+discovery-error / corrupt-candidate-error / cross-file-skew-error / stale-entry-error),
+`gettracebyid_test.go` (no-index scan path), `traceindex_pipeline_test.go`
+(end-to-end multi-L0-candidate merge on the authoritative path), `api_test.go`.
 
 ---
 

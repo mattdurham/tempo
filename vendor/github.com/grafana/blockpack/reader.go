@@ -339,22 +339,37 @@ func NewReaderForProgram(prog *vm.Program, provider ReaderProvider, fileID strin
 // Returns an empty slice (not an error) when the trace is not found.
 //
 // lister is a LookupStore (re-exported at the root as blockpack.LookupStore for
-// external consumers — NOTE-ROOT-021). When it is non-nil and tenant is non-empty,
-// GetTraceByID first consults the
-// TraceGroup trace-by-ID index (internal/modules/valueindex/traceindex.go) for exact
-// block+row addressing, avoiding a full-file scan for any trace the index covers.
-// queryMinSec/queryMaxSec scope the index file discovery window; pass (0, math.MaxUint64)
-// when no tighter hint is available (e.g. from a source block's own wall-clock range).
-// A nil lister, an empty tenant, any index miss, any decode failure, or any index/data
-// skew unconditionally falls back to a full, exact block scan — the index is a hint,
-// never authoritative for absence.
+// external consumers — NOTE-ROOT-021). It selects between two mutually-exclusive paths:
+//
+//   - Index path (lister != nil && tenant != ""): the trace-by-ID value index
+//     (internal/modules/valueindex/traceindex.go, TraceGroup/SpanEntry) is
+//     AUTHORITATIVE — it is not a hint with a speculative scan fallback (NOTE-VI-071,
+//     SPEC-ROOT-018 rev. 2026-07-06, issue #473). When the index is consulted and
+//     resolves the trace, its answer is complete; when it finds no covering entry, that
+//     is an authoritative "not found" and GetTraceByID returns an empty slice — it does
+//     NOT then scan the file. queryMinSec/queryMaxSec scope the index file discovery
+//     window; pass (0, math.MaxUint64) when no tighter hint is available (e.g. a source
+//     block's own wall-clock range). A discovery-time or decode-time failure, or any
+//     index/data skew (an index-named block that does not resolve in r, or a resolved
+//     row whose own trace:id column does not match), is surfaced as an ERROR rather than
+//     silently masked — the index and the data file are out of sync and the caller
+//     should observe it. The accepted, known consequence (issue #473) is that any trace
+//     written before the trace-by-ID index began building coverage (NOTE-VI-070) has no
+//     entry and reads as "not found"; there is no backfill and none is planned —
+//     retention ages out the uncovered window.
+//
+//   - No-index path (lister == nil || tenant == ""): there is no index to consult (WAL
+//     blocks, which are freshly-ingested and never indexed; or a backend block when the
+//     value-index query feature is disabled). The only correct answer comes from an
+//     exact, complete scan of r via scanTraceByID. This is NOT a fallback from a failed
+//     index attempt — it is the sole path when no index exists.
 //
 // v1 scope decision (plan Open Question 3): GetTraceByID has exactly one Reader for one
-// file. An index entry naming a block that does not resolve in r — which is what a
-// genuinely cross-file span looks like, since a different file's page geometry is
-// unrelated to r's block layout — aborts the index attempt entirely (never a partial
-// result) and falls back to getTraceByIDFullScan, which has only ever been able to see
-// r's own file. Genuine cross-file trace assembly is out of scope for v1.
+// file. On the index path an entry naming a block that does not resolve in r — which is
+// what a genuinely cross-file span looks like, since a different file's page geometry is
+// unrelated to r's block layout — is index/data skew and now surfaces as an error (it no
+// longer silently degrades to a same-file scan). Genuine cross-file trace assembly is out
+// of scope for v1.
 func GetTraceByID(
 	ctx context.Context,
 	r *Reader,
@@ -380,20 +395,25 @@ func GetTraceByID(
 	copy(traceID[:], traceIDBytes)
 
 	if lister != nil && tenant != "" {
-		if matches, ok := getTraceByIDViaIndex(
+		return getTraceByIDViaIndex(
 			ctx, r, traceID, lister, tenant, indexPrefix, queryMinSec, queryMaxSec,
-		); ok {
-			return matches, nil
-		}
+		)
 	}
 
-	return getTraceByIDFullScan(r, traceID)
+	return scanTraceByID(r, traceID)
 }
 
-// getTraceByIDViaIndex attempts to resolve traceID using the trace-by-ID value index.
-// Returns ok=false for any indeterminacy (no coverage, decode failure, no match, or
-// index/data skew) so the caller falls back to a full scan — the index is a hint, never
-// authoritative for absence.
+// getTraceByIDViaIndex resolves traceID using the AUTHORITATIVE trace-by-ID value index
+// (NOTE-VI-071). It never falls back to a scan. The three possible outcomes:
+//
+//   - (spans, nil): the index covers the trace and every entry resolves in r.
+//   - (nil, nil): the index was consulted and holds no covering entry — an authoritative
+//     "not found." This includes the "no candidate index files for this window" case: if
+//     no index file covers the discovery window, the index says the trace is not present.
+//   - (nil, err): the index could not be trusted — a discovery-time failure (e.g. an
+//     object-store List error), a decode failure on a candidate file (corrupt index), or
+//     index/data skew (see materializeTraceGroup). The index and the data file are out of
+//     sync; the caller should observe the error rather than a wrong/partial result.
 func getTraceByIDViaIndex(
 	ctx context.Context,
 	r *Reader,
@@ -401,55 +421,75 @@ func getTraceByIDViaIndex(
 	lister LookupStore,
 	tenant, indexPrefix string,
 	queryMinSec, queryMaxSec uint64,
-) ([]SpanMatch, bool) {
+) ([]SpanMatch, error) {
 	colHash := valueindex.ColHash(modules_shared.TraceIDColumnName)
 	colTypeName := valueindex.ColTypeName(modules_shared.ColumnTypeUUID)
 
 	keys, discoverErr := valueindex.DiscoverIndexFiles(
 		ctx, lister, tenant, indexPrefix, colHash, colTypeName, queryMinSec, queryMaxSec,
 	)
-	if discoverErr != nil || len(keys) == 0 {
-		return nil, false
+	if discoverErr != nil {
+		return nil, fmt.Errorf("GetTraceByID: discover index files: %w", discoverErr)
+	}
+	if len(keys) == 0 {
+		// No index file covers the window: the authoritative index has no entry ⇒ not found.
+		return nil, nil
 	}
 
-	group, found := findTraceGroupInCandidates(ctx, lister, keys, traceID)
+	group, found, findErr := findTraceGroupInCandidates(ctx, lister, keys, traceID)
+	if findErr != nil {
+		return nil, findErr
+	}
 	if !found {
-		return nil, false
+		// The index was readable and covers the window but holds no entry for this trace.
+		return nil, nil
 	}
 
 	return materializeTraceGroup(r, group, traceID)
 }
 
-// findTraceGroupInCandidates fetches and decodes every candidate index file — a fetch or
-// decode failure on one file is treated as unreadable, skip and try the next candidate,
-// never as "trace not found." Candidates are NOT short-circuited on the first match:
-// DiscoverIndexFiles can legitimately return multiple valid, not-yet-compacted L0 files
-// for the same TraceID with DISJOINT Spans (e.g. a trace's root span flushed in one
-// consumer window and its child span flushed in another, before the compactor has merged
-// them). Stopping at the first match would silently return a partial trace with no error,
-// violating "the index is a hint, any doubt falls back to full scan." Every matching
-// group across every candidate is merged (spans deduplicated by SpanID, first occurrence
-// wins; TimeSec is the minimum across matches) — the same live-merge semantics as
-// valueindex.MergeTraceGroups, minus its RefChecker/retention-drop machinery, which isn't
-// needed here since materializeTraceGroup's BlockIndexForPage-failure and defensive
-// trace:id re-verify already provide the safety net for any stale reference in the result.
+// findTraceGroupInCandidates fetches and decodes every candidate index file. Because the
+// index is now AUTHORITATIVE (NOTE-VI-071), a fetch or decode failure on any candidate is
+// index/data inconsistency and is returned as an ERROR — it is NOT skipped as "unreadable,
+// try the next" (the pre-NOTE-VI-071 behavior, safe only while a full scan could still
+// produce the correct answer). Silently skipping a corrupt candidate would let the index
+// under-report a trace's spans with no observable signal, which the authoritative contract
+// forbids.
+//
+// Candidates are NOT short-circuited on the first match: DiscoverIndexFiles can
+// legitimately return multiple valid, not-yet-compacted L0 files for the same TraceID with
+// DISJOINT Spans (e.g. a trace's root span flushed in one consumer window and its child
+// span flushed in another, before the compactor has merged them). Stopping at the first
+// match would silently return a partial trace. Every matching group across every candidate
+// is merged (spans deduplicated by SpanID, first occurrence wins; TimeSec is the minimum
+// across matches) — the same live-merge semantics as valueindex.MergeTraceGroups, minus
+// its RefChecker/retention-drop machinery, which isn't needed here since
+// materializeTraceGroup's BlockIndexForPage-failure and defensive trace:id re-verify
+// surface any stale reference in the result as an error.
+//
+// Returns (group, true, nil) on a hit, (zero, false, nil) when no candidate holds the
+// trace (an authoritative miss), or (zero, false, err) on any fetch/decode failure.
 func findTraceGroupInCandidates(
 	ctx context.Context,
 	lister LookupStore,
 	keys []string,
 	traceID [16]byte,
-) (valueindex.TraceGroup, bool) {
+) (valueindex.TraceGroup, bool, error) {
 	var merged valueindex.TraceGroup
 	found := false
 	seenSpan := make(map[[8]byte]struct{})
 	for _, key := range keys {
 		data, getErr := lister.Get(ctx, key)
 		if getErr != nil {
-			continue
+			return valueindex.TraceGroup{}, false, fmt.Errorf(
+				"GetTraceByID: fetch index candidate %q: %w", key, getErr,
+			)
 		}
 		groups, decErr := valueindex.DecodeTraceGroups(data)
 		if decErr != nil {
-			continue
+			return valueindex.TraceGroup{}, false, fmt.Errorf(
+				"GetTraceByID: decode index candidate %q: %w", key, decErr,
+			)
 		}
 		for _, g := range groups {
 			if g.TraceID != traceID {
@@ -472,25 +512,32 @@ func findTraceGroupInCandidates(
 		}
 	}
 	if !found {
-		return valueindex.TraceGroup{}, false
+		return valueindex.TraceGroup{}, false, nil
 	}
-	return merged, true
+	return merged, true, nil
 }
 
 // materializeTraceGroup resolves every SpanEntry in group to an exact block+row in r and
-// materializes the matching spans. Returns ok=false — never a partial result — the moment
-// any entry fails to resolve to a real block in r (index/data skew, staleness, or a
-// genuinely cross-file span; see GetTraceByID's v1 scope decision) or a resolved row's own
-// trace:id column does not actually match traceID (defensive re-verify: an index hit must
-// never produce a wrong span).
-func materializeTraceGroup(r *Reader, group valueindex.TraceGroup, traceID [16]byte) ([]SpanMatch, bool) {
+// materializes the matching spans. Because the index is AUTHORITATIVE (NOTE-VI-071), any
+// inconsistency between the index and the data file is returned as an ERROR — never a
+// partial result and never a silent degrade to a scan: an entry that fails to resolve to a
+// real block in r (index/data skew, staleness, or a genuinely cross-file span — see
+// GetTraceByID's v1 scope decision), a block the reader returns no bytes for, a block that
+// fails to parse, or a resolved row whose own trace:id column does not actually match
+// traceID (defensive re-verify: an index hit must never produce a wrong span). The error
+// tells the caller the index and the data file are out of sync so the inconsistency is
+// observable rather than masked (cf. SPEC-ROOT-019 for the search/metrics path).
+func materializeTraceGroup(r *Reader, group valueindex.TraceGroup, traceID [16]byte) ([]SpanMatch, error) {
 	rowsByBlock := make(map[int][]int, len(group.Spans))
 	blockOrder := make([]int, 0, len(group.Spans))
 	seen := make(map[[2]int]struct{}, len(group.Spans))
 	for _, span := range group.Spans {
 		blockIdx, ok := r.BlockIndexForPage(span.BlockRef.PageNum)
 		if !ok {
-			return nil, false
+			return nil, fmt.Errorf(
+				"GetTraceByID: index/data skew: index-named page %d does not resolve in file",
+				span.BlockRef.PageNum,
+			)
 		}
 		key := [2]int{blockIdx, int(span.RowIdx)}
 		if _, dup := seen[key]; dup {
@@ -503,12 +550,12 @@ func materializeTraceGroup(r *Reader, group valueindex.TraceGroup, traceID [16]b
 		rowsByBlock[blockIdx] = append(rowsByBlock[blockIdx], int(span.RowIdx))
 	}
 	if len(blockOrder) == 0 {
-		return nil, false
+		return nil, fmt.Errorf("GetTraceByID: index/data skew: trace group resolved to zero blocks")
 	}
 
 	rawBlocks, readErr := r.ReadBlocks(blockOrder)
 	if readErr != nil {
-		return nil, false
+		return nil, fmt.Errorf("GetTraceByID: read index-named blocks: %w", readErr)
 	}
 
 	traceIDStr := hex.EncodeToString(traceID[:])
@@ -516,21 +563,26 @@ func materializeTraceGroup(r *Reader, group valueindex.TraceGroup, traceID [16]b
 	for _, blockIdx := range blockOrder {
 		raw, ok := rawBlocks[blockIdx]
 		if !ok {
-			return nil, false
+			return nil, fmt.Errorf(
+				"GetTraceByID: index/data skew: block %d missing from read result", blockIdx,
+			)
 		}
 		bwb, parseErr := r.ParseBlockFromBytes(raw, modules_reader.WantAll(), r.BlockMeta(blockIdx))
 		if parseErr != nil {
-			return nil, false
+			return nil, fmt.Errorf("GetTraceByID: parse block %d: %w", blockIdx, parseErr)
 		}
 		traceIDCol := bwb.Block.GetColumn(modules_shared.TraceIDColumnName)
 		for _, rowIdx := range rowsByBlock[blockIdx] {
 			if !rowMatchesTraceID(traceIDCol, rowIdx, traceID) {
-				return nil, false
+				return nil, fmt.Errorf(
+					"GetTraceByID: index/data skew: block %d row %d trace:id does not match index entry",
+					blockIdx, rowIdx,
+				)
 			}
 			results = append(results, buildSpanMatch(bwb.Block, rowIdx, traceIDStr))
 		}
 	}
-	return results, true
+	return results, nil
 }
 
 // rowMatchesTraceID reports whether col's value at rowIdx equals traceID. Used as the
@@ -569,15 +621,20 @@ func buildSpanMatch(block *modules_reader.Block, rowIdx int, traceIDStr string) 
 	return cloned
 }
 
-// getTraceByIDFullScan is GetTraceByID's unconditional fallback: an exact scan of every
-// block in r for rows matching traceID. This is the pre-Stage-4 GetTraceByID body, moved
-// here verbatim in logic (Decision 1: the old full-scan path is kept as the internal
-// fallback, not deleted) and split into a two-phase match/materialize decode (Finding 3):
-// a cheap WantOnly({"trace:id"}) pass finds matching rows per block, and only blocks with
-// at least one match are re-decoded with WantAll() for full field materialization —
-// avoiding the WantAll() memory cost (SPEC-ROOT invariant: WantAll() eagerly decodes every
-// column) for blocks that don't contain the trace at all.
-func getTraceByIDFullScan(r *Reader, traceID [16]byte) (results []SpanMatch, err error) {
+// scanTraceByID is GetTraceByID's NO-INDEX path (NOTE-VI-071): an exact scan of every
+// block in r for rows matching traceID. It is reached ONLY when no index is available
+// (lister == nil || tenant == "") — WAL blocks (freshly-ingested, never indexed) and
+// backend blocks when the value-index query feature is disabled. It is NOT a fallback from
+// a failed index attempt: once the index is consulted it is authoritative, so an index
+// miss returns "not found" and index/data skew returns an error — neither degrades to this
+// scan (that was the pre-NOTE-VI-071 getTraceByIDFullScan behavior).
+//
+// The scan is split into a two-phase match/materialize decode: a cheap
+// WantOnly({"trace:id"}) pass finds matching rows per block, and only blocks with at least
+// one match are re-decoded with WantAll() for full field materialization — avoiding the
+// WantAll() memory cost (SPEC-ROOT invariant: WantAll() eagerly decodes every column) for
+// blocks that don't contain the trace at all.
+func scanTraceByID(r *Reader, traceID [16]byte) (results []SpanMatch, err error) {
 	blockCount := r.BlockCount()
 	if blockCount == 0 {
 		return nil, nil
@@ -640,7 +697,7 @@ func fetchAllBlockBytes(r *Reader, blockIDs []int) (map[int][]byte, error) {
 	return rawMap, nil
 }
 
-// scopeMatchingBlocks is getTraceByIDFullScan's match phase (Finding 3): decode every
+// scopeMatchingBlocks is scanTraceByID's match phase (Finding 3): decode every
 // block with WantOnly({"trace:id"}) — cheap, single-column — and scan for matching rows.
 // Blocks with zero matches are omitted from the result so the materialize phase never
 // re-decodes them with WantAll().
