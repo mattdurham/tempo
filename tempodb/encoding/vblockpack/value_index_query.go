@@ -68,7 +68,9 @@ var (
 // Call once at querier startup. A nil client or disabled config leaves the reader unset.
 // Search/metrics (tryIndexFetch) still fall back to a full block scan when unset; trace-by-id
 // (FindTraceByID) does not — it requires the index unconditionally (NOTE-VI-073).
-func ConfigureValueIndexQuery(client *minio.Client, bucket, indexPrefix string, ttl time.Duration) {
+// contentCacheBytes bounds the trace-by-ID index-file content cache (blockpack
+// issue #475); zero disables it, leaving the raw store (byte-identical to before).
+func ConfigureValueIndexQuery(client *minio.Client, bucket, indexPrefix string, ttl time.Duration, contentCacheBytes int64) {
 	viQueryReaderMu.Lock()
 	defer viQueryReaderMu.Unlock()
 
@@ -79,8 +81,22 @@ func ConfigureValueIndexQuery(client *minio.Client, bucket, indexPrefix string, 
 	if indexPrefix == "" {
 		indexPrefix = "indexes"
 	}
+	// blockpack issue #475: the content cache is the direct mitigation for the
+	// N-way redundant fetch that caused the production timeout, so it is on by
+	// default. A negative value explicitly disables it (raw store, byte-identical
+	// to before); zero takes the default budget.
+	switch {
+	case contentCacheBytes < 0:
+		contentCacheBytes = 0
+	case contentCacheBytes == 0:
+		contentCacheBytes = defaultContentCacheBytes
+	}
+	// Wrap the raw store with the content cache + singleflight dedup for the
+	// trace-by-ID Get path (blockpack issue #475). newCachingStore returns the raw
+	// store unwrapped when contentCacheBytes <= 0.
+	store := newCachingStore(&minioVIStore{client: client, bucket: bucket}, contentCacheBytes)
 	viQueryReaderPtr = &viQueryReader{
-		store:       &minioVIStore{client: client, bucket: bucket},
+		store:       store,
 		caches:      make(map[string]*blockpack.IndexFileCache),
 		indexPrefix: indexPrefix,
 		ttl:         ttl,

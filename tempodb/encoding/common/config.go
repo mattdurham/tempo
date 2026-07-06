@@ -171,6 +171,14 @@ type ValueIndexQueryConfig struct {
 	// CacheTTL is the refresh interval for the in-process index-file listing cache
 	// (blockpack issue #462). Zero uses the blockpack default (30s).
 	CacheTTL time.Duration `yaml:"cache_ttl"`
+	// ContentCacheBytes bounds the process-level content cache for trace-by-ID index
+	// file bytes (blockpack issue #475). Trace-by-ID index files are immutable once
+	// written, so the cache is keyed by object key with no TTL — a size-bounded LRU
+	// plus singleflight dedup that eliminates the N-way redundant full-object fetch of
+	// the SAME large index file when many overlapping blocks fan out to it in one
+	// query. Zero disables the cache (raw store, byte-identical to before). See
+	// newCachingStore.
+	ContentCacheBytes int64 `yaml:"content_cache_bytes"`
 }
 
 func (cfg *BlockConfig) RegisterFlagsAndApplyDefaults(prefix string, f *flag.FlagSet) {
