@@ -83,3 +83,34 @@ keeping the file's dictionary self-contained (NOTE-CUBE-002, per-file scope).
 object store without a temp file; `Flush(path)` now calls `Encode` then writes atomically.
 
 **Back-ref:** `internal/modules/cube/accumulator.go:Add,Encode,FlushTo,Reset`
+
+## NOTE-CUBE-010: Filter is part of the cube identity — root exports for external routing
+
+_Added: 2026-07-06 (issue #480)_
+
+`ComputeCubeID` has always hashed `tenant + sorted(dims) + sorted(filters)`, so the routing
+key already differentiates two cubes that share group-by dims but differ in their originating
+query filter (`{span.kind = server}` vs `{status = error}` vs `{}`). `RegistryEntry.Filters`
+is persisted in `index.json`, and both `QueryRouter.Route` and `CreationTrigger.TryCreate`
+match on the filter-aware `CubeID`. The correctness gap in #480 was **entirely on the tempo
+side**: tempo passed `nil` filters to both `Route` and `TryCreate` because it only parsed the
+`by(...)` group-by clause and never the `{...}` predicate — so a filtered query could silently
+route to (or overwrite) an unfiltered cube.
+
+The blockpack change is purely additive API surface so an external consumer (tempo) can
+construct the filter half of the routing key:
+
+- `CubeDefFilterOp` (alias of `cube.DefFilterOp`) + the `CubeDefFilterOp{GT,GTE,LT,LTE,EQ}`
+  constants — needed to set `CubeColumnFilter.Op`, which was otherwise an unconstructible
+  internal string type from outside the module.
+- `CubeComputeID(tenant, dims, filters)` — exposes the routing-key computation so callers can
+  precompute/verify a cube identity directly.
+
+**Decision (issue #480, point 2):** "no filter" and "some filter" are intentionally *distinct*
+cube identities. An unfiltered `{}` query produces an empty filter set (its own identity),
+never a filter-independent base cube that queries post-filter against (that would be a much
+larger design and is explicitly out of scope). Tempo's `extractFilters` therefore treats an
+empty predicate as a valid zero-filter identity, and refuses (falls back to full scan) for any
+predicate a cube cannot faithfully bake in (`!=`, regex, OR) rather than risk a filter mismatch.
+
+**Back-ref:** `cube_ingest.go:CubeDefFilterOp,CubeComputeID`; `internal/modules/cube/definition.go:ComputeCubeID`.

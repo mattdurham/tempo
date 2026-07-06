@@ -25,6 +25,7 @@ import (
 	blockpack "github.com/grafana/blockpack"
 	"github.com/grafana/tempo/pkg/tempopb"
 	commonpbv1 "github.com/grafana/tempo/pkg/tempopb/common/v1"
+	"github.com/grafana/tempo/pkg/traceql"
 	util_log "github.com/grafana/tempo/pkg/util/log"
 	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
 	minio "github.com/minio/minio-go/v7"
@@ -134,7 +135,16 @@ func (cqp *cubeQueryPath) tryQueryFromCube(
 		level.Debug(util_log.Logger).Log("msg", "vblockpack: cube: no group-by dims in query", "query", req.Query)
 		return nil, false // no group-by → cube not applicable
 	}
-	level.Debug(util_log.Logger).Log("msg", "vblockpack: cube: found dims", "dims", strings.Join(dims, ","), "tenant", tenant)
+
+	// The query's {...} predicate is part of the cube identity (#480): a cube built for
+	// one filter must not answer a query with a different filter. If the predicate cannot
+	// be faithfully canonicalized into cube filters, the cube path is unsafe — fall back.
+	filters, filtersOK := extractFilters(req.Query)
+	if !filtersOK {
+		level.Debug(util_log.Logger).Log("msg", "vblockpack: cube: filter not cube-representable; falling back", "query", req.Query)
+		return nil, false
+	}
+	level.Debug(util_log.Logger).Log("msg", "vblockpack: cube: found dims", "dims", strings.Join(dims, ","), "filters", filterDedupKey(filters), "tenant", tenant)
 
 	entries, err := cqp.loadEntries(ctx, tenant)
 	if err != nil {
@@ -144,11 +154,11 @@ func (cqp *cubeQueryPath) tryQueryFromCube(
 	router := blockpack.NewCubeQueryRouter(entries)
 	minMinute := uint32(req.Start / 60_000_000_000)
 	maxMinute := uint32(req.End / 60_000_000_000)
-	result, routeErr := router.Route(tenant, dims, nil, 1, minMinute, maxMinute)
+	result, routeErr := router.Route(tenant, dims, filters, 1, minMinute, maxMinute)
 	if routeErr != nil || !result.Found {
 		// Cube not found — attempt to create it on first query.
 		// Fire cube creation in a background goroutine so QueryRange is not blocked.
-		go cqp.maybeCreateCube(context.Background(), tenant, dims, req)
+		go cqp.maybeCreateCube(context.Background(), tenant, dims, filters)
 		return nil, false
 	}
 
@@ -184,16 +194,18 @@ func (cqp *cubeQueryPath) tryQueryFromCube(
 	return buildCubeQueryResponse(cells, result.Entry.Dimensions, req), true
 }
 
-// maybeCreateCube fires TryCreate for a (tenant, dims) pattern that had no cube.
-// It is rate-limited to at most once per minute per (tenant+dims) key to prevent
-// the per-block fan-out from creating a storm of concurrent S3 ConditionalPuts.
+// maybeCreateCube fires TryCreate for a (tenant, dims, filters) pattern that had no
+// cube. It is rate-limited to at most once per minute per (tenant+dims+filters) key to
+// prevent the per-block fan-out from creating a storm of concurrent S3 ConditionalPuts.
+// The filters are part of the cube identity (#480): two queries with the same group-by
+// dims but different filters must create (and route to) distinct cubes.
 func (cqp *cubeQueryPath) maybeCreateCube(
 	ctx context.Context,
 	tenant string,
 	dims []string,
-	req *tempopb.QueryRangeRequest,
+	filters []blockpack.CubeColumnFilter,
 ) {
-	key := tenant + "|" + strings.Join(dims, ",")
+	key := tenant + "|" + strings.Join(dims, ",") + "|" + filterDedupKey(filters)
 
 	cqp.mu.Lock()
 	if last, ok := cqp.createSeen[key]; ok && time.Since(last) < time.Minute {
@@ -207,8 +219,8 @@ func (cqp *cubeQueryPath) maybeCreateCube(
 	reg := blockpack.NewCubeRegistry(os, tenant)
 	trigger := blockpack.NewCubeCreationTrigger(reg, blockpack.CubeTriggerConfig{})
 	// Pass empty VCNT data — cardinality gate is best-effort; if no VCNT data
-	// is available yet the gate passes by default.
-	result, err := trigger.TryCreate(ctx, tenant, dims, nil, nil, nil, 0, 0)
+	// is available yet the gate passes by default. (Wiring real VCNT data is #483.)
+	result, err := trigger.TryCreate(ctx, tenant, dims, filters, nil, nil, 0, 0)
 	if err != nil {
 		level.Warn(util_log.Logger).Log("msg", "vblockpack: cube TryCreate failed", "tenant", tenant, "dims", dims, "err", err)
 		return
@@ -271,6 +283,114 @@ func extractGroupByDims(query string) []string {
 	}
 	sort.Strings(dims)
 	return dims
+}
+
+// filterOpFromTraceQL maps a TraceQL comparison operator to its cube-definition
+// equivalent. Only operators a cube can bake in as an equality/range predicate are
+// supported. Unsupported operators (!=, regex, etc.) return ok=false, which forces
+// the caller to skip the cube path entirely rather than risk routing to a cube whose
+// baked-in filter does not match the query — the silent-wrong-answer gap from #480.
+func filterOpFromTraceQL(op traceql.Operator) (blockpack.CubeDefFilterOp, bool) {
+	switch op {
+	case traceql.OpEqual:
+		return blockpack.CubeDefFilterOpEQ, true
+	case traceql.OpGreater:
+		return blockpack.CubeDefFilterOpGT, true
+	case traceql.OpGreaterEqual:
+		return blockpack.CubeDefFilterOpGTE, true
+	case traceql.OpLess:
+		return blockpack.CubeDefFilterOpLT, true
+	case traceql.OpLessEqual:
+		return blockpack.CubeDefFilterOpLTE, true
+	default:
+		return "", false
+	}
+}
+
+// extractFilters canonicalizes the query's {...} predicate into the cube-definition
+// filter set used as part of the cube routing/creation key (#480). It returns
+// (filters, true) when every predicate in the query maps cleanly to a cube filter,
+// and (nil, false) when the query contains any predicate that a cube cannot faithfully
+// represent — in which case the caller must NOT use the cube path (fall back to a full
+// scan) rather than route to a cube whose filter differs from the query's.
+//
+// A query with an empty {} predicate yields (nil-length-slice, true): an unfiltered
+// cube is a distinct, valid identity (issue #480, decision (2)).
+//
+// The returned slice is deterministic (sorted by column, then op, then value) so the
+// same query always produces the same routing key regardless of predicate ordering.
+func extractFilters(query string) ([]blockpack.CubeColumnFilter, bool) {
+	req, err := traceql.ExtractFetchSpansRequest(query)
+	if err != nil {
+		// Unparseable / unsupported metrics shape — cannot canonicalize the filter,
+		// so the cube path is unsafe. Fall back.
+		return nil, false
+	}
+	// AllConditions is false when the predicate uses OR semantics (or is otherwise not a
+	// pure conjunction). A cube bakes in a conjunction of filters; anything else cannot be
+	// represented and must fall back.
+	if !req.AllConditions {
+		return nil, false
+	}
+
+	filters := make([]blockpack.CubeColumnFilter, 0, len(req.Conditions))
+	for _, c := range req.Conditions {
+		// OpNone conditions carry no predicate (e.g. the synthetic spanStartTime
+		// condition emitted for an empty {} query, or bare attribute-existence probes).
+		if c.Op == traceql.OpNone {
+			continue
+		}
+		op, ok := filterOpFromTraceQL(c.Op)
+		if !ok {
+			return nil, false // unsupported operator → unsafe to use a cube.
+		}
+		if len(c.Operands) != 1 {
+			return nil, false // multi/zero-operand predicate → not a simple filter.
+		}
+		// Canonical value: the operand's stable encoded string form. Using the encoded
+		// string uniformly (string, number, duration, status, kind) keeps the routing key
+		// deterministic and JSON-serializable in the RegistryEntry.
+		col := strings.TrimPrefix(c.Attribute.String(), ".")
+		filters = append(filters, blockpack.CubeColumnFilter{
+			Column: col,
+			Op:     op,
+			Value:  c.Operands[0].EncodeToString(false),
+		})
+	}
+
+	sort.Slice(filters, func(i, j int) bool {
+		if filters[i].Column != filters[j].Column {
+			return filters[i].Column < filters[j].Column
+		}
+		if filters[i].Op != filters[j].Op {
+			return filters[i].Op < filters[j].Op
+		}
+		vi, _ := filters[i].Value.(string)
+		vj, _ := filters[j].Value.(string)
+		return vi < vj
+	})
+	return filters, true
+}
+
+// filterDedupKey renders a canonical filter set into a stable string for use in the
+// per-(tenant+dims+filters) creation-cooldown dedup key.
+func filterDedupKey(filters []blockpack.CubeColumnFilter) string {
+	if len(filters) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for i, f := range filters {
+		if i > 0 {
+			b.WriteByte(';')
+		}
+		v, _ := f.Value.(string)
+		b.WriteString(f.Column)
+		b.WriteByte(':')
+		b.WriteString(string(f.Op))
+		b.WriteByte(':')
+		b.WriteString(v)
+	}
+	return b.String()
 }
 
 // buildCubeQueryResponse builds a QueryRangeResponse from rolled-up cube cells.

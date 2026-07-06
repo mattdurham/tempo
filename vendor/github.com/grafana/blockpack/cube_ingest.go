@@ -38,6 +38,26 @@ type CubeFilterOp = cube.FilterOp
 // CubeColumnFilter is a serialized filter baked into a RegistryEntry.
 type CubeColumnFilter = cube.ColumnFilter
 
+// CubeDefFilterOp is the serialized comparison operator stored in a
+// CubeColumnFilter (the stable wire/JSON form persisted in index.json).
+// External callers (tempo) construct CubeColumnFilter values to differentiate
+// cubes by their originating query filter; they need this type and its
+// constants to set CubeColumnFilter.Op. See issue #480.
+type CubeDefFilterOp = cube.DefFilterOp
+
+const (
+	// CubeDefFilterOpGT is the ">" operator in a cube definition filter.
+	CubeDefFilterOpGT = cube.DefFilterOpGT
+	// CubeDefFilterOpGTE is the ">=" operator in a cube definition filter.
+	CubeDefFilterOpGTE = cube.DefFilterOpGTE
+	// CubeDefFilterOpLT is the "<" operator in a cube definition filter.
+	CubeDefFilterOpLT = cube.DefFilterOpLT
+	// CubeDefFilterOpLTE is the "<=" operator in a cube definition filter.
+	CubeDefFilterOpLTE = cube.DefFilterOpLTE
+	// CubeDefFilterOpEQ is the "=" operator in a cube definition filter.
+	CubeDefFilterOpEQ = cube.DefFilterOpEQ
+)
+
 // CubeObjectStore is the minimal S3-compatible interface the CubeRegistry needs.
 type CubeObjectStore = cube.ObjectStore
 
@@ -58,6 +78,14 @@ func CubeReadHeader(buf []byte) (minMinute, maxMinute, resolution uint32, err er
 		return 0, 0, 0, err
 	}
 	return h.MinMinute, h.MaxMinute, h.Resolution, nil
+}
+
+// CubeComputeID returns the deterministic hex cube ID for a
+// (tenant, dimensions, filters) combination. It is the routing key: two queries
+// sharing the same tenant+dims but differing in filters produce different IDs, so a
+// filtered cube is never reused for a query with a different filter (issue #480).
+func CubeComputeID(tenant string, dimensions []string, filters []CubeColumnFilter) string {
+	return cube.ComputeCubeID(tenant, dimensions, filters)
 }
 
 // CubeIDFromHex parses a hex cube ID string into its [16]byte representation.
