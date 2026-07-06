@@ -4,11 +4,40 @@ import (
 	"errors"
 	"io"
 	"testing"
+	"time"
 
 	blockpack "github.com/grafana/blockpack"
 	minio "github.com/minio/minio-go/v7"
 	"github.com/stretchr/testify/assert"
 )
+
+// withVIQueryReader installs store as the process-level index-driven query reader for the
+// duration of the test and restores the prior state on cleanup, mirroring withVISink
+// (valueindex_test.go) on the write side. FindTraceByID now requires the index
+// unconditionally (NOTE-VI-073) — any test exercising it against a non-empty block must
+// wire this up (typically together with withVISink using the same *fakeVISink instance, so
+// CreateBlock's real WriteValueIndexL0 write path populates the same store this reads from).
+func withVIQueryReader(t *testing.T, store valueIndexStore, indexPrefix string) {
+	t.Helper()
+	viQueryReaderMu.Lock()
+	prev := viQueryReaderPtr
+	if store == nil {
+		viQueryReaderPtr = nil
+	} else {
+		viQueryReaderPtr = &viQueryReader{
+			store:       store,
+			caches:      make(map[string]*blockpack.IndexFileCache),
+			indexPrefix: indexPrefix,
+			ttl:         time.Minute,
+		}
+	}
+	viQueryReaderMu.Unlock()
+	t.Cleanup(func() {
+		viQueryReaderMu.Lock()
+		viQueryReaderPtr = prev
+		viQueryReaderMu.Unlock()
+	})
+}
 
 // minioVIStore must satisfy all three blockpack read-side interfaces: Lister and
 // ValueIndexFileStore drive the search/metrics index path; LookupStore (List + Get)

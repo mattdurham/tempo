@@ -6,7 +6,6 @@ import (
 	"encoding/hex" //nolint:depguard
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -253,78 +252,19 @@ func (w *walBlock) Clear() error {
 
 // FindTraceByID finds a trace by ID in the WAL block.
 // It snapshots the current writer state and queries blockpack for the given trace.
-func (w *walBlock) FindTraceByID(ctx context.Context, id common.ID, _ common.SearchOptions) (*tempopb.TraceByIDResponse, error) {
+// FindTraceByID never finds a trace: vblockpack WAL blocks are not queried by trace ID in
+// any live path. Live-store's WAL.Version now tracks storage.trace.block.version, which is
+// vParquet4 (2026-07-06) — vblockpack WAL blocks are no longer created there. Block-builder
+// still writes vblockpack WAL blocks (its own block.version is unchanged), but block-builder
+// never calls FindTraceByID against its own WAL — it only builds and completes blocks — and
+// tempo-cli's block-query tools read backend blocks, not local WAL directories. blockpack's
+// GetTraceByID also no longer has a scan fallback to call into (lister and tenant are
+// required unconditionally, NOTE-VI-073), so there is nothing left to correctly do here.
+func (w *walBlock) FindTraceByID(_ context.Context, id common.ID, _ common.SearchOptions) (*tempopb.TraceByIDResponse, error) {
 	if len(id) != 16 {
 		return nil, fmt.Errorf("trace ID must be 16 bytes, got %d", len(id))
 	}
-
-	w.mu.Lock()
-	var data []byte
-
-	if w.writer != nil && w.buf != nil {
-		// Writer still active — flush to snapshot the buffer without destroying state.
-		if _, err := w.writer.Flush(); err != nil {
-			w.mu.Unlock()
-			return nil, fmt.Errorf("walBlock FindTraceByID: flush: %w", err)
-		}
-		if w.buf.Len() > 0 {
-			data = make([]byte, w.buf.Len())
-			copy(data, w.buf.Bytes())
-		}
-		// Re-initialize writer so future appends continue to work.
-		w.buf.Reset()
-		cfg := blockpack.WriterConfig{
-			OutputStream:  w.buf,
-			MaxBlockSpans: 2000,
-		}
-		if w.meta != nil && len(w.meta.DedicatedColumns) > 0 {
-			cfg.DedicatedColumns = dedicatedColumnsToBlockpack(w.meta.DedicatedColumns)
-		}
-		newWriter, err := blockpack.NewWriterWithConfig(cfg)
-		if err != nil {
-			w.mu.Unlock()
-			return nil, fmt.Errorf("walBlock FindTraceByID: re-init writer: %w", err)
-		}
-		w.writer = newWriter
-	} else {
-		// Writer already flushed to disk — read from file.
-		filePath := w.path + "/" + DataFileName
-		var err error
-		data, err = os.ReadFile(filePath)
-		if err != nil || len(data) == 0 {
-			w.mu.Unlock()
-			return nil, nil
-		}
-	}
-	w.mu.Unlock()
-
-	if len(data) == 0 {
-		return nil, nil
-	}
-
-	r, err := blockpack.NewReaderFromProvider(&bytesReaderProvider{data: data})
-	if err != nil {
-		return nil, fmt.Errorf("walBlock FindTraceByID: create reader: %w", err)
-	}
-
-	traceIDHex := hex.EncodeToString(id)
-	// A WAL block is freshly-ingested data that has not been flushed to the backend, let
-	// alone consumed by valueindexconsumer or compacted by valueindexcompactor — it can
-	// never have trace-index coverage. Permanently pass a nil lister so GetTraceByID takes
-	// its no-index scan path (blockpack SPEC-ROOT-018 rev. NOTE-VI-071); do not "fix" this by
-	// wiring in a lister later. Under the now-authoritative index contract a lister here would
-	// not merely waste a DiscoverIndexFiles List call — it would return an authoritative "not
-	// found" for every WAL trace (no coverage exists), so the scan is mandatory, not optional.
-	matches, err := blockpack.GetTraceByID(ctx, r, traceIDHex, nil, "", "", 0, math.MaxUint64)
-	if err != nil {
-		return nil, fmt.Errorf("walBlock FindTraceByID: GetTraceByID: %w", err)
-	}
-	if len(matches) == 0 {
-		return nil, nil
-	}
-
-	trace := reconstructTrace(id, matches)
-	return &tempopb.TraceByIDResponse{Trace: trace}, nil
+	return nil, nil
 }
 
 // Search performs a search (not implemented for WAL - WAL is write-only during ingestion)

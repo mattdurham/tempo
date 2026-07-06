@@ -22,13 +22,23 @@ import (
 	minio "github.com/minio/minio-go/v7"
 )
 
+// valueIndexStore is the read surface viQueryReader needs from its backing object store:
+// List+Get (blockpack.LookupStore, trace-by-id) and Size+ReadAt (blockpack.ValueIndexFileStore,
+// search/metrics). minioVIStore is the only production implementation; tests substitute an
+// in-memory fake (see enableValueIndexForTest) to exercise the now-mandatory index path
+// (NOTE-VI-073 removed GetTraceByID's no-lister scan fallback) without a live object store.
+type valueIndexStore interface {
+	blockpack.LookupStore
+	blockpack.ValueIndexFileStore
+}
+
 // viQueryReader holds the process-level state needed to answer queries from the
 // value index. The querier serves many tenants, so the file-listing cache is
 // per-tenant (issue #462's IndexFileCache bakes in the tenant); reader lazily
 // builds and memoises one cache per tenant. The object store is shared — it
 // addresses objects by full key, which already embeds the tenant.
 type viQueryReader struct {
-	store       *minioVIStore
+	store       valueIndexStore
 	caches      map[string]*blockpack.IndexFileCache
 	indexPrefix string
 	ttl         time.Duration
@@ -55,8 +65,9 @@ var (
 )
 
 // ConfigureValueIndexQuery installs the process-level index-driven query reader.
-// Call once at querier startup. A nil client or disabled config leaves the reader
-// unset, so the query path falls back to a full block scan (the prior behaviour).
+// Call once at querier startup. A nil client or disabled config leaves the reader unset.
+// Search/metrics (tryIndexFetch) still fall back to a full block scan when unset; trace-by-id
+// (FindTraceByID) does not — it requires the index unconditionally (NOTE-VI-073).
 func ConfigureValueIndexQuery(client *minio.Client, bucket, indexPrefix string, ttl time.Duration) {
 	viQueryReaderMu.Lock()
 	defer viQueryReaderMu.Unlock()
@@ -167,25 +178,32 @@ func (b *blockpackBlock) tryIndexFetch(
 	return matches, true, stats
 }
 
+// floorToMinuteSec floors sec down to the same 60-second (minute) alignment as
+// blockpack's write-side TimeSec truncation. This is a mandatory, coordinated
+// invariant, not an independent optimization: if the query side disagrees with the
+// write side's granularity, a span whose minute-floored TimeSec falls before a
+// non-aligned query minSec is silently dropped by LookupValue's exact inclusion
+// filter (the search/metrics path), or DiscoverIndexFiles reports zero covering
+// files entirely (the trace-by-id path, where a coverage gap is now a hard error —
+// NOTE-VI-072/NOTE-VI-073 removed the scan fallback that used to mask this).
+// TestNanoWindowToSec_MinuteFloorAlignsWithWriteSide and
+// TestFindTraceByID_QueryWindowIsMinuteFloored are the regression tests for the two
+// call sites (search/metrics and trace-by-id respectively).
+func floorToMinuteSec(sec uint64) uint64 {
+	return sec / secondsPerMinute * secondsPerMinute
+}
+
 // nanoWindowToSec converts a [startNano, endNano] window to whole seconds for
 // value-index file discovery. A zero bound is treated as unbounded.
 //
-// minSec is floored to the same 60-second (minute) alignment as blockpack's
-// write-side TimeSec truncation (valueindex_extract.go:buildSpanStartSecByRef,
-// (v/1e9)/60*60) — this is a mandatory, coordinated invariant, not an
-// independent optimization: if the two sides disagree on granularity, a span
-// whose minute-floored TimeSec falls before a non-aligned minSec is silently
-// dropped by LookupValue's exact inclusion filter, with no fallback
-// (TestNanoWindowToSec_MinuteFloorAlignsWithWriteSide is the regression test).
-// maxSec needs no equivalent widening: flooring only ever reduces TimeSec
-// relative to the true span second, so TimeSec <= true_span_sec <= maxSec
-// holds regardless of alignment (proven algebraically, not just asserted).
+// maxSec needs no equivalent widening to minSec's floor: flooring only ever
+// reduces TimeSec relative to the true span second, so TimeSec <= true_span_sec <=
+// maxSec holds regardless of alignment (proven algebraically, not just asserted).
 func nanoWindowToSec(startNano, endNano uint64) (uint64, uint64) {
 	const nanosPerSec = 1_000_000_000
-	const secondsPerMinute = 60
 	minSec := uint64(0)
 	if startNano > 0 {
-		minSec = (startNano / nanosPerSec) / secondsPerMinute * secondsPerMinute
+		minSec = floorToMinuteSec(startNano / nanosPerSec)
 	}
 	maxSec := ^uint64(0)
 	if endNano > 0 {

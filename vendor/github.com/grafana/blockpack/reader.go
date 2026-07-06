@@ -10,9 +10,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"runtime"
-	"sort"
-	"sync"
 
 	modules_blockio "github.com/grafana/blockpack/internal/modules/blockio"
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
@@ -25,7 +22,6 @@ import (
 	modules_tieredcache "github.com/grafana/blockpack/internal/modules/tieredcache"
 	"github.com/grafana/blockpack/internal/modules/valueindex"
 	vm "github.com/grafana/blockpack/internal/vm"
-	"golang.org/x/sync/errgroup"
 )
 
 // AGENT: Reader types - these provide access to blockpack data.
@@ -98,7 +94,11 @@ func NewSharedLRUCache(maxBytes int64) *SharedLRUCache {
 // NewSharedLRUProvider wraps underlying with a caching layer backed by a shared LRU cache.
 // readerID uniquely identifies this reader within the cache (e.g. file path or object key).
 // The returned provider satisfies ReaderProvider and is safe for concurrent use.
-func NewSharedLRUProvider(underlying ReaderProvider, readerID string, cache *SharedLRUCache) ReaderProvider {
+func NewSharedLRUProvider(
+	underlying ReaderProvider,
+	readerID string,
+	cache *SharedLRUCache,
+) ReaderProvider {
 	return modules_rw.NewSharedLRUProvider(underlying, readerID, cache)
 }
 
@@ -248,7 +248,11 @@ type SectionCache = modules_sectioncache.SectionCache
 
 // NewReaderWithSectionCache creates a Reader using a SectionCache directly.
 // Use this when passing a *TypedTieredCache to avoid the FilecacheAdapter wrapper.
-func NewReaderWithSectionCache(provider ReaderProvider, fileID string, sc SectionCache) (*Reader, error) {
+func NewReaderWithSectionCache(
+	provider ReaderProvider,
+	fileID string,
+	sc SectionCache,
+) (*Reader, error) {
 	return modules_reader.NewReaderFromProviderWithOptions(provider, modules_reader.Options{
 		Cache:  sc,
 		FileID: fileID,
@@ -257,7 +261,11 @@ func NewReaderWithSectionCache(provider ReaderProvider, fileID string, sc Sectio
 
 // NewLeanReaderWithSectionCache creates a lean Reader using a SectionCache directly.
 // Use this when passing a *TypedTieredCache to avoid the FilecacheAdapter wrapper.
-func NewLeanReaderWithSectionCache(provider ReaderProvider, fileID string, sc SectionCache) (*Reader, error) {
+func NewLeanReaderWithSectionCache(
+	provider ReaderProvider,
+	fileID string,
+	sc SectionCache,
+) (*Reader, error) {
 	return modules_reader.NewLeanReaderFromProviderWithOptions(provider, modules_reader.Options{
 		Cache:  sc,
 		FileID: fileID,
@@ -327,49 +335,53 @@ func NewLeanReaderWithCache(provider ReaderProvider, fileID string, cache Cache)
 // Programs that require column data (column predicates, streaming, vector scoring)
 // get a full reader. All other programs — including nil — get a lean reader
 // that reads only the compact trace index on bloom hit.
-func NewReaderForProgram(prog *vm.Program, provider ReaderProvider, fileID string, cache Cache) (*Reader, error) {
+func NewReaderForProgram(
+	prog *vm.Program,
+	provider ReaderProvider,
+	fileID string,
+	cache Cache,
+) (*Reader, error) {
 	if prog.NeedsColumnData() {
 		return NewReaderWithCache(provider, fileID, cache)
 	}
 	return NewLeanReaderWithCache(provider, fileID, cache)
 }
 
-// GetTraceByID looks up all spans for the given trace ID and returns them.
-// traceIDHex must be a 32-character hex string (16 bytes); upper or lower case is accepted.
-// Returns an empty slice (not an error) when the trace is not found.
+// GetTraceByID looks up all spans for the given trace ID via the trace-by-ID value index
+// and returns them. traceIDHex must be a 32-character hex string (16 bytes); upper or
+// lower case is accepted. Returns an empty slice (not an error) when the index is
+// consulted and finds no covering entry — an authoritative "not found".
 //
-// lister is a LookupStore (re-exported at the root as blockpack.LookupStore for
-// external consumers — NOTE-ROOT-021). It selects between two mutually-exclusive paths:
+// lister (a LookupStore, re-exported at the root as blockpack.LookupStore for external
+// consumers — NOTE-ROOT-021) and tenant are now REQUIRED (NOTE-VI-073, issue #473
+// follow-up): the value index is the only supported path — there is no scan fallback for
+// callers that omit them. Passing a nil lister or empty tenant is a caller error, not a
+// signal to fall back; it returns an error immediately. This is safe because the only
+// caller that used to omit them (WAL blocks, which structurally cannot be indexed) no
+// longer routes through this function at all: live-store — the sole reader of vblockpack
+// WAL blocks — was moved to vParquet4 (2026-07-06), so blockpack's WAL/no-index path has
+// no remaining caller.
 //
-//   - Index path (lister != nil && tenant != ""): the trace-by-ID value index
-//     (internal/modules/valueindex/traceindex.go, TraceGroup/SpanEntry) is
-//     AUTHORITATIVE — it is not a hint with a speculative scan fallback (NOTE-VI-071,
-//     SPEC-ROOT-018 rev. 2026-07-06, issue #473). When the index is consulted and
-//     resolves the trace, its answer is complete; when it finds no covering entry, that
-//     is an authoritative "not found" and GetTraceByID returns an empty slice — it does
-//     NOT then scan the file. queryMinSec/queryMaxSec scope the index file discovery
-//     window; pass (0, math.MaxUint64) when no tighter hint is available (e.g. a source
-//     block's own wall-clock range). A discovery-time or decode-time failure, or any
-//     index/data skew (an index-named block that does not resolve in r, or a resolved
-//     row whose own trace:id column does not match), is surfaced as an ERROR rather than
-//     silently masked — the index and the data file are out of sync and the caller
-//     should observe it. The accepted, known consequence (issue #473) is that any trace
-//     written before the trace-by-ID index began building coverage (NOTE-VI-070) has no
-//     entry and reads as "not found"; there is no backfill and none is planned —
-//     retention ages out the uncovered window.
-//
-//   - No-index path (lister == nil || tenant == ""): there is no index to consult (WAL
-//     blocks, which are freshly-ingested and never indexed; or a backend block when the
-//     value-index query feature is disabled). The only correct answer comes from an
-//     exact, complete scan of r via scanTraceByID. This is NOT a fallback from a failed
-//     index attempt — it is the sole path when no index exists.
+// The trace-by-ID value index (internal/modules/valueindex/traceindex.go,
+// TraceGroup/SpanEntry) is AUTHORITATIVE (NOTE-VI-071, SPEC-ROOT-018 rev. 2026-07-06,
+// issue #473) — not a hint with a speculative scan fallback. When the index is consulted
+// and resolves the trace, its answer is complete. queryMinSec/queryMaxSec scope the index
+// file discovery window; pass (0, math.MaxUint64) when no tighter hint is available (e.g.
+// a source block's own wall-clock range). Zero candidate index files for that window is an
+// indexing coverage gap (NOTE-VI-072) and surfaces as an error, not "not found" — the
+// window comes from a block known to hold real data. A discovery-time or decode-time
+// failure, or any index/data skew (an index-named block that does not resolve in r, or a
+// resolved row whose own trace:id column does not match), is likewise surfaced as an
+// ERROR rather than silently masked. The accepted, known consequence (issue #473) is that
+// any trace written before the trace-by-ID index began building coverage (NOTE-VI-070) has
+// no entry and reads as "not found"; there is no backfill and none is planned — retention
+// ages out the uncovered window.
 //
 // v1 scope decision (plan Open Question 3): GetTraceByID has exactly one Reader for one
-// file. On the index path an entry naming a block that does not resolve in r — which is
-// what a genuinely cross-file span looks like, since a different file's page geometry is
-// unrelated to r's block layout — is index/data skew and now surfaces as an error (it no
-// longer silently degrades to a same-file scan). Genuine cross-file trace assembly is out
-// of scope for v1.
+// file. An index entry naming a block that does not resolve in r — what a genuinely
+// cross-file span looks like, since a different file's page geometry is unrelated to r's
+// block layout — is index/data skew and surfaces as an error. Genuine cross-file trace
+// assembly is out of scope for v1.
 func GetTraceByID(
 	ctx context.Context,
 	r *Reader,
@@ -383,7 +395,26 @@ func GetTraceByID(
 	}
 
 	if len(traceIDHex) != 32 {
-		return nil, fmt.Errorf("GetTraceByID: traceIDHex must be 32 hex chars, got %d", len(traceIDHex))
+		return nil, fmt.Errorf(
+			"GetTraceByID: traceIDHex must be 32 hex chars, got %d",
+			len(traceIDHex),
+		)
+	}
+
+	// A genuinely empty file has no spans and therefore nothing the trace-by-ID index
+	// could ever have covered -- zero index files for its window is expected, not a
+	// coverage gap (NOTE-VI-072's "caller only asks about known-non-empty blocks"
+	// premise does not hold here). This is checked ahead of the lister requirement below:
+	// an empty file has nothing to look up regardless of whether the index is configured
+	// (NOTE-VI-074).
+	if r.BlockCount() == 0 {
+		return nil, nil
+	}
+
+	if lister == nil || tenant == "" {
+		return nil, fmt.Errorf(
+			"GetTraceByID: lister and tenant are required (NOTE-VI-073) -- there is no scan fallback",
+		)
 	}
 
 	traceIDBytes, decErr := hex.DecodeString(traceIDHex)
@@ -394,26 +425,23 @@ func GetTraceByID(
 	var traceID [16]byte
 	copy(traceID[:], traceIDBytes)
 
-	if lister != nil && tenant != "" {
-		return getTraceByIDViaIndex(
-			ctx, r, traceID, lister, tenant, indexPrefix, queryMinSec, queryMaxSec,
-		)
-	}
-
-	return scanTraceByID(r, traceID)
+	return getTraceByIDViaIndex(
+		ctx, r, traceID, lister, tenant, indexPrefix, queryMinSec, queryMaxSec,
+	)
 }
 
 // getTraceByIDViaIndex resolves traceID using the AUTHORITATIVE trace-by-ID value index
 // (NOTE-VI-071). It never falls back to a scan. The three possible outcomes:
 //
 //   - (spans, nil): the index covers the trace and every entry resolves in r.
-//   - (nil, nil): the index was consulted and holds no covering entry — an authoritative
-//     "not found." This includes the "no candidate index files for this window" case: if
-//     no index file covers the discovery window, the index says the trace is not present.
+//   - (nil, nil): the index was consulted and holds no covering entry for this specific
+//     trace — an authoritative "not found."
 //   - (nil, err): the index could not be trusted — a discovery-time failure (e.g. an
-//     object-store List error), a decode failure on a candidate file (corrupt index), or
-//     index/data skew (see materializeTraceGroup). The index and the data file are out of
-//     sync; the caller should observe the error rather than a wrong/partial result.
+//     object-store List error), zero candidate index files covering the window (NOTE-VI-072:
+//     an indexing coverage gap for a block GetTraceByID's caller knows is non-empty), a decode
+//     failure on a candidate file (corrupt index), or index/data skew (see
+//     materializeTraceGroup). The index and the data file are out of sync, or were never built
+//     for this window; the caller should observe the error rather than a wrong/partial result.
 func getTraceByIDViaIndex(
 	ctx context.Context,
 	r *Reader,
@@ -432,8 +460,18 @@ func getTraceByIDViaIndex(
 		return nil, fmt.Errorf("GetTraceByID: discover index files: %w", discoverErr)
 	}
 	if len(keys) == 0 {
-		// No index file covers the window: the authoritative index has no entry ⇒ not found.
-		return nil, nil
+		// queryMinSec/queryMaxSec come from the caller's own block metadata (a block
+		// known to hold real data -- that's why GetTraceByID was called against it), so
+		// zero candidate index files for that exact window is not "no traces exist
+		// here": it means the trace-by-ID index never covered a block we know is
+		// non-empty. That's an indexing coverage gap, not an authoritative absence --
+		// surface it as an error so it doesn't get silently misread as "not found."
+		return nil, fmt.Errorf(
+			"GetTraceByID: no trace-by-ID index files cover window [%d,%d] for tenant %q -- index coverage gap, not an authoritative not-found",
+			queryMinSec,
+			queryMaxSec,
+			tenant,
+		)
 	}
 
 	group, found, findErr := findTraceGroupInCandidates(ctx, lister, keys, traceID)
@@ -527,7 +565,11 @@ func findTraceGroupInCandidates(
 // traceID (defensive re-verify: an index hit must never produce a wrong span). The error
 // tells the caller the index and the data file are out of sync so the inconsistency is
 // observable rather than masked (cf. SPEC-ROOT-019 for the search/metrics path).
-func materializeTraceGroup(r *Reader, group valueindex.TraceGroup, traceID [16]byte) ([]SpanMatch, error) {
+func materializeTraceGroup(
+	r *Reader,
+	group valueindex.TraceGroup,
+	traceID [16]byte,
+) ([]SpanMatch, error) {
 	rowsByBlock := make(map[int][]int, len(group.Spans))
 	blockOrder := make([]int, 0, len(group.Spans))
 	seen := make(map[[2]int]struct{}, len(group.Spans))
@@ -576,7 +618,8 @@ func materializeTraceGroup(r *Reader, group valueindex.TraceGroup, traceID [16]b
 			if !rowMatchesTraceID(traceIDCol, rowIdx, traceID) {
 				return nil, fmt.Errorf(
 					"GetTraceByID: index/data skew: block %d row %d trace:id does not match index entry",
-					blockIdx, rowIdx,
+					blockIdx,
+					rowIdx,
 				)
 			}
 			results = append(results, buildSpanMatch(bwb.Block, rowIdx, traceIDStr))
@@ -619,179 +662,6 @@ func buildSpanMatch(block *modules_reader.Block, rowIdx int, traceIDStr string) 
 	cloned := match.Clone()
 	modules_blockio.ReleaseSpanFieldsAdapter(fields)
 	return cloned
-}
-
-// scanTraceByID is GetTraceByID's NO-INDEX path (NOTE-VI-071): an exact scan of every
-// block in r for rows matching traceID. It is reached ONLY when no index is available
-// (lister == nil || tenant == "") — WAL blocks (freshly-ingested, never indexed) and
-// backend blocks when the value-index query feature is disabled. It is NOT a fallback from
-// a failed index attempt: once the index is consulted it is authoritative, so an index
-// miss returns "not found" and index/data skew returns an error — neither degrades to this
-// scan (that was the pre-NOTE-VI-071 getTraceByIDFullScan behavior).
-//
-// The scan is split into a two-phase match/materialize decode: a cheap
-// WantOnly({"trace:id"}) pass finds matching rows per block, and only blocks with at least
-// one match are re-decoded with WantAll() for full field materialization — avoiding the
-// WantAll() memory cost (SPEC-ROOT invariant: WantAll() eagerly decodes every column) for
-// blocks that don't contain the trace at all.
-func scanTraceByID(r *Reader, traceID [16]byte) (results []SpanMatch, err error) {
-	blockCount := r.BlockCount()
-	if blockCount == 0 {
-		return nil, nil
-	}
-	blockIDs := make([]int, blockCount)
-	for i := range blockCount {
-		blockIDs[i] = i
-	}
-
-	// NOTE-293 (Lever B): resolve matching rows and span IDs from the block payloads that are
-	// fetched anyway. Each block carries per-row trace:id and span:id columns, so the
-	// whole-file intrinsic trace:id and span:id columns — whose size scales with the file's
-	// total span count, not the looked-up trace — no longer need to be read on this path.
-	rawMap, fetchErr := fetchAllBlockBytes(r, blockIDs)
-	if fetchErr != nil {
-		return nil, fetchErr
-	}
-
-	rowsByBlock, scopeErr := scopeMatchingBlocks(r, blockIDs, rawMap, traceID)
-	if scopeErr != nil {
-		return nil, scopeErr
-	}
-
-	matchingBlockIDs := make([]int, 0, len(rowsByBlock))
-	for blockID := range rowsByBlock {
-		matchingBlockIDs = append(matchingBlockIDs, blockID)
-	}
-	sort.Ints(matchingBlockIDs)
-
-	// NOTE-291: parse each matching span-block concurrently (see parseBlocksWithWant).
-	parsedBlocks, parseErr := parseBlocksWithWant(r, matchingBlockIDs, rawMap, modules_reader.WantAll())
-	if parseErr != nil {
-		return nil, parseErr
-	}
-
-	traceIDStr := hex.EncodeToString(traceID[:])
-	for _, blockID := range matchingBlockIDs {
-		bwb := parsedBlocks[blockID]
-		for _, rowIdx := range rowsByBlock[blockID] {
-			results = append(results, buildSpanMatch(bwb.Block, rowIdx, traceIDStr))
-		}
-	}
-
-	return results, nil
-}
-
-// fetchAllBlockBytes fetches the raw bytes for every block in blockIDs using aggressive
-// coalescing (a single logical fetch pass regardless of how many blocks end up matching).
-func fetchAllBlockBytes(r *Reader, blockIDs []int) (map[int][]byte, error) {
-	rawMap := make(map[int][]byte, len(blockIDs))
-	for _, group := range r.CoalescedGroups(blockIDs) {
-		groupRaw, fetchErr := r.ReadGroup(group)
-		if fetchErr != nil {
-			return nil, fmt.Errorf("GetTraceByID: read group: %w", fetchErr)
-		}
-		for bi, raw := range groupRaw {
-			rawMap[bi] = raw
-		}
-	}
-	return rawMap, nil
-}
-
-// scopeMatchingBlocks is scanTraceByID's match phase (Finding 3): decode every
-// block with WantOnly({"trace:id"}) — cheap, single-column — and scan for matching rows.
-// Blocks with zero matches are omitted from the result so the materialize phase never
-// re-decodes them with WantAll().
-func scopeMatchingBlocks(
-	r *Reader,
-	blockIDs []int,
-	rawMap map[int][]byte,
-	traceID [16]byte,
-) (map[int][]int, error) {
-	want := modules_reader.WantOnly(map[string]struct{}{modules_shared.TraceIDColumnName: {}})
-	parsedBlocks, err := parseBlocksWithWant(r, blockIDs, rawMap, want)
-	if err != nil {
-		return nil, err
-	}
-
-	rowsByBlock := make(map[int][]int, len(blockIDs))
-	for _, blockID := range blockIDs {
-		traceIDCol := parsedBlocks[blockID].Block.GetColumn(modules_shared.TraceIDColumnName)
-		if traceIDCol == nil {
-			continue
-		}
-		// NOTE-419: MatchingBytesRows scans the per-block trace:id column for matching rows
-		// while paying the lazy-decode atomic and dense-index expansion ONCE for the whole
-		// block, instead of per row as a BytesValue+bytes.Equal loop would.
-		if rows := traceIDCol.MatchingBytesRows(traceID[:], nil); len(rows) > 0 {
-			rowsByBlock[blockID] = rows
-		}
-	}
-	return rowsByBlock, nil
-}
-
-// parseBlocksWithWant decodes each of blockIDs concurrently (NOTE-291) using want to
-// control which columns are eagerly decoded. Each ParseBlockFromBytes call decodes an
-// independent input blob (rawMap[blockID]) into an independent output Block — there is no
-// shared mutable state between calls (ParseBlockFromBytes allocates a per-call intern map
-// and reads the Reader's pre-decoded/pre-compressed lookups under their own mutexes).
-//
-// The fan-out is bounded by traceByIDParseConcurrency so a single trace-by-ID call cannot
-// saturate every core and starve concurrent metrics queries on the same querier. Each
-// goroutine writes only its own map entry under mu; all writes happen-before the
-// gParse.Wait() return — no data race.
-func parseBlocksWithWant(
-	r *Reader,
-	blockIDs []int,
-	rawMap map[int][]byte,
-	want modules_reader.WantColumns,
-) (map[int]*modules_reader.BlockWithBytes, error) {
-	parsedBlocks := make(map[int]*modules_reader.BlockWithBytes, len(blockIDs))
-	var mu sync.Mutex
-	var gParse errgroup.Group
-	gParse.SetLimit(traceByIDParseConcurrency())
-	for _, blockID := range blockIDs {
-		blockID := blockID
-		raw, ok := rawMap[blockID]
-		if !ok {
-			return nil, fmt.Errorf("GetTraceByID: block %d missing from coalesced read", blockID)
-		}
-		gParse.Go(func() error {
-			bwb, blockErr := r.ParseBlockFromBytes(raw, want, r.BlockMeta(blockID))
-			if blockErr != nil {
-				return fmt.Errorf("GetTraceByID: block %d: %w", blockID, blockErr)
-			}
-			mu.Lock()
-			parsedBlocks[blockID] = bwb
-			mu.Unlock()
-			return nil
-		})
-	}
-	if waitErr := gParse.Wait(); waitErr != nil {
-		return nil, waitErr
-	}
-	return parsedBlocks, nil
-}
-
-// traceByIDParseConcurrency bounds the number of span-blocks GetTraceByID decodes
-// concurrently (NOTE-291). Trace-by-ID is an interactive, relatively rare lookup that
-// shares the querier with background metrics scans, so the per-trace decode fan-out is
-// capped to a small fraction of available cores. The cap scales with GOMAXPROCS but is
-// clamped to [2, 4]: 2 guarantees within-file parallelism even on small queriers, and 4
-// caps the CPU a single trace-by-ID call can claim so it cannot starve concurrent
-// metrics queries. A trace spanning fewer blocks than the cap simply uses fewer workers.
-func traceByIDParseConcurrency() int {
-	const (
-		minLimit = 2
-		maxLimit = 4
-	)
-	n := runtime.GOMAXPROCS(0) / 2
-	if n < minLimit {
-		n = minLimit
-	}
-	if n > maxLimit {
-		n = maxLimit
-	}
-	return n
 }
 
 // AGENT: Writer constructors - minimal set needed for creating writers.

@@ -62,7 +62,14 @@ func TestWALToBackend_Iterator(t *testing.T) {
 	require.ErrorIs(t, err, io.EOF)
 	require.Nil(t, eof)
 
-	// Also verify the full promotion path: CreateBlock → FindTraceByID.
+	// Also verify the full promotion path: CreateBlock → FindTraceByID. FindTraceByID
+	// requires the trace-by-ID index unconditionally (NOTE-VI-073) — wire the same fake
+	// store as both the write-time sink (so CreateBlock's WriteValueIndexL0 call actually
+	// produces index files) and the read-time query reader.
+	viStore := &fakeVISink{}
+	withVISink(t, viStore, "indexes")
+	withVIQueryReader(t, viStore, "indexes")
+
 	rawR, rawW, _, err := local.New(&local.Config{Path: t.TempDir()})
 	require.NoError(t, err)
 	r := backend.NewReader(rawR)
@@ -87,14 +94,13 @@ func TestWALToBackend_Iterator(t *testing.T) {
 	require.NotNil(t, resp, "FindTraceByID must find the trace promoted from WAL")
 }
 
-// TestWalBlock_FindTraceByID_PermanentlySkipsIndex pins the Stage 6 v1 behavior for
-// walBlock: a WAL block is freshly-ingested data that has never been consumed by
-// valueindexconsumer or compacted by valueindexcompactor, so it can never have
-// trace-index coverage. FindTraceByID's lister/tenant/indexPrefix parameters are
-// PERMANENTLY nil/""/"" here (not an interim v1 shortcut — see the code comment at the
-// call site). This test confirms an active, unflushed WAL block still finds a trace
-// correctly via GetTraceByID's full-scan fallback.
-func TestWalBlock_FindTraceByID_PermanentlySkipsIndex(t *testing.T) {
+// TestWalBlock_FindTraceByID_NeverFinds pins the current behavior for walBlock:
+// vblockpack WAL blocks are no longer queried by trace ID in any live path (live-store's
+// WAL now uses vParquet4; block-builder never calls FindTraceByID against its own WAL),
+// and blockpack.GetTraceByID no longer has a scan fallback to fall back to (NOTE-VI-073).
+// FindTraceByID on a walBlock always returns a nil, non-error result, even for a trace
+// that was genuinely appended.
+func TestWalBlock_FindTraceByID_NeverFinds(t *testing.T) {
 	ctx := context.Background()
 	tmpDir := t.TempDir()
 
@@ -121,13 +127,19 @@ func TestWalBlock_FindTraceByID_PermanentlySkipsIndex(t *testing.T) {
 
 	resp, err := wal.FindTraceByID(ctx, traceID, common.SearchOptions{})
 	require.NoError(t, err)
-	require.NotNil(t, resp, "FindTraceByID must find a trace in an active WAL block via the full-scan fallback")
-	require.NotNil(t, resp.Trace)
-	require.NotEmpty(t, resp.Trace.ResourceSpans)
+	require.Nil(t, resp, "walBlock.FindTraceByID no longer scans -- it always returns not-found")
 }
 
 func TestRoundTrip_WriteAndReadBlock(t *testing.T) {
 	t.Log("Testing write then read roundtrip")
+
+	// FindTraceByID requires the trace-by-ID index unconditionally (NOTE-VI-073) --
+	// wire the same fake store as both the write-time sink and the read-time query
+	// reader so CreateBlock's real WriteValueIndexL0 call populates what FindTraceByID
+	// consults.
+	viStore := &fakeVISink{}
+	withVISink(t, viStore, "indexes")
+	withVIQueryReader(t, viStore, "indexes")
 
 	// Setup
 	ctx := context.Background()
@@ -136,6 +148,7 @@ func TestRoundTrip_WriteAndReadBlock(t *testing.T) {
 	}
 
 	// Create test trace with known data
+	now := time.Now()
 	traceID := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 	trace := &tempopb.Trace{
 		ResourceSpans: []*tempotrace.ResourceSpans{
@@ -147,8 +160,8 @@ func TestRoundTrip_WriteAndReadBlock(t *testing.T) {
 								TraceId:           traceID,
 								SpanId:            []byte{1, 0, 0, 0, 0, 0, 0, 1},
 								Name:              "test-span",
-								StartTimeUnixNano: uint64(time.Now().UnixNano()),
-								EndTimeUnixNano:   uint64(time.Now().Add(time.Millisecond * 100).UnixNano()),
+								StartTimeUnixNano: uint64(now.UnixNano()),                             //nolint:gosec // test data
+								EndTimeUnixNano:   uint64(now.Add(time.Millisecond * 100).UnixNano()), //nolint:gosec // test data
 							},
 						},
 					},
@@ -172,7 +185,12 @@ func TestRoundTrip_WriteAndReadBlock(t *testing.T) {
 	r := backend.NewReader(rawR)
 	w := backend.NewWriter(rawW)
 
+	// CreateBlock does not itself populate meta.StartTime/EndTime (create.go) -- set
+	// it from the same span timestamps written into the block, as a realistic caller
+	// would.
 	meta := backend.NewBlockMeta("test-tenant", uuid.New(), VersionString)
+	meta.StartTime = now
+	meta.EndTime = now.Add(time.Millisecond * 100)
 
 	t.Log("Writing block...")
 

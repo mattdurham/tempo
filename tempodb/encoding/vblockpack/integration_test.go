@@ -249,6 +249,14 @@ func (i *testIterator) Close() {}
 
 // TestBackendBlockFindTraceByID tests FindTraceByID with end-to-end trace reconstruction
 func TestBackendBlockFindTraceByID(t *testing.T) {
+	// FindTraceByID requires the trace-by-ID index unconditionally (NOTE-VI-073) --
+	// wire the same fake store as both the write-time sink and the read-time query
+	// reader so CreateBlock's real WriteValueIndexL0 call populates what FindTraceByID
+	// consults.
+	viStore := &fakeVISink{}
+	withVISink(t, viStore, "indexes")
+	withVIQueryReader(t, viStore, "indexes")
+
 	tmpDir := t.TempDir()
 
 	// Set up backend storage
@@ -261,6 +269,7 @@ func TestBackendBlockFindTraceByID(t *testing.T) {
 	writer := backend.NewWriter(rawWriter)
 
 	// Create test trace with known ID
+	now := time.Now()
 	traceIDBytes := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 	trace := &tempopb.Trace{
 		ResourceSpans: []*tempotrace.ResourceSpans{
@@ -272,8 +281,8 @@ func TestBackendBlockFindTraceByID(t *testing.T) {
 								TraceId:           traceIDBytes,
 								SpanId:            []byte{1, 2, 3, 4, 5, 6, 7, 8},
 								Name:              "test-span",
-								StartTimeUnixNano: uint64(time.Now().UnixNano()),
-								EndTimeUnixNano:   uint64(time.Now().Add(time.Second).UnixNano()),
+								StartTimeUnixNano: uint64(now.UnixNano()),                  //nolint:gosec // test data
+								EndTimeUnixNano:   uint64(now.Add(time.Second).UnixNano()), //nolint:gosec // test data
 							},
 						},
 					},
@@ -295,8 +304,12 @@ func TestBackendBlockFindTraceByID(t *testing.T) {
 		},
 	}
 
-	// Create block metadata
+	// Create block metadata. CreateBlock does not itself populate
+	// meta.StartTime/EndTime (create.go) -- a realistic caller (WAL bookkeeping in
+	// production) sets it from the same span timestamps written into the block.
 	meta := backend.NewBlockMeta("test-tenant", uuid.New(), VersionString)
+	meta.StartTime = now
+	meta.EndTime = now.Add(time.Second)
 
 	// Configure block
 	cfg := &common.BlockConfig{
@@ -355,14 +368,17 @@ func TestBackendBlockFindTraceByID(t *testing.T) {
 	}
 }
 
-// TestBlockpackBlock_FindTraceByID_StillFullScansWithoutIndexWiring pins the Stage 6
-// v1 behavior: blockpack.GetTraceByID's new signature adds a lister/tenant/indexPrefix
-// for its trace-by-ID index fast path, but backend_block.go's FindTraceByID currently
-// passes nil/""/"" for those (real Lister wiring is a separate, un-started follow-up —
-// see blockpack issue #428 Stage 6 plan). This must remain a correctness-neutral,
-// always-full-scan call: FindTraceByID must still find a trace end-to-end with no index
-// coverage at all, exactly as it did before the signature change.
-func TestBlockpackBlock_FindTraceByID_StillFullScansWithoutIndexWiring(t *testing.T) {
+// TestBlockpackBlock_FindTraceByID_ErrorsWithoutIndexWiring supersedes the old Stage 6
+// v1 pin (formerly TestBlockpackBlock_FindTraceByID_StillFullScansWithoutIndexWiring):
+// GetTraceByID no longer has a scan fallback at all (NOTE-VI-073). With no value-index
+// query reader configured, backend_block.go's FindTraceByID passes a nil lister, and a
+// non-empty block must now return an ERROR, not silently degrade to a full scan.
+// Deploying with value_index_query disabled means trace-by-id is unavailable for
+// backend blocks, by design -- this test pins that as the expected behavior.
+func TestBlockpackBlock_FindTraceByID_ErrorsWithoutIndexWiring(t *testing.T) {
+	withVISink(t, nil, "")
+	withVIQueryReader(t, nil, "")
+
 	tmpDir := t.TempDir()
 
 	rawReader, rawWriter, _, err := local.New(&local.Config{Path: tmpDir})
@@ -372,6 +388,7 @@ func TestBlockpackBlock_FindTraceByID_StillFullScansWithoutIndexWiring(t *testin
 	reader := backend.NewReader(rawReader)
 	writer := backend.NewWriter(rawWriter)
 
+	now := time.Now()
 	traceIDBytes := []byte{9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9}
 	trace := &tempopb.Trace{
 		ResourceSpans: []*tempotrace.ResourceSpans{{
@@ -380,8 +397,8 @@ func TestBlockpackBlock_FindTraceByID_StillFullScansWithoutIndexWiring(t *testin
 					TraceId:           traceIDBytes,
 					SpanId:            []byte{1, 1, 1, 1, 1, 1, 1, 1},
 					Name:              "no-index-span",
-					StartTimeUnixNano: uint64(time.Now().UnixNano()),
-					EndTimeUnixNano:   uint64(time.Now().Add(time.Second).UnixNano()),
+					StartTimeUnixNano: uint64(now.UnixNano()),                  //nolint:gosec // test data
+					EndTimeUnixNano:   uint64(now.Add(time.Second).UnixNano()), //nolint:gosec // test data
 				}},
 			}},
 		}},
@@ -395,6 +412,8 @@ func TestBlockpackBlock_FindTraceByID_StillFullScansWithoutIndexWiring(t *testin
 	}
 
 	meta := backend.NewBlockMeta("test-tenant", uuid.New(), VersionString)
+	meta.StartTime = now
+	meta.EndTime = now.Add(time.Second)
 	cfg := &common.BlockConfig{RowGroupSizeBytes: 10000}
 
 	ctx := context.Background()
@@ -406,19 +425,11 @@ func TestBlockpackBlock_FindTraceByID_StillFullScansWithoutIndexWiring(t *testin
 	backendBlock := newBackendBlock(resultMeta, reader)
 
 	response, err := backendBlock.FindTraceByID(ctx, common.ID(traceIDBytes), common.SearchOptions{})
-	if err != nil {
-		t.Fatalf("FindTraceByID failed: %v", err)
+	if err == nil {
+		t.Fatalf("expected an error with no value-index reader configured, got response=%v", response)
 	}
-	if response == nil || response.Trace == nil {
-		t.Fatalf("expected trace to be found via full scan (no index coverage exists)")
-	}
-	if len(response.Trace.ResourceSpans) == 0 ||
-		len(response.Trace.ResourceSpans[0].ScopeSpans) == 0 ||
-		len(response.Trace.ResourceSpans[0].ScopeSpans[0].Spans) == 0 {
-		t.Fatalf("expected the found trace to contain the span")
-	}
-	if got := response.Trace.ResourceSpans[0].ScopeSpans[0].Spans[0].Name; got != "no-index-span" {
-		t.Errorf("expected span name 'no-index-span', got %q", got)
+	if response != nil {
+		t.Fatalf("expected a nil response alongside the error, got %v", response)
 	}
 }
 
@@ -578,6 +589,14 @@ func TestSearchTagValues(t *testing.T) {
 // TestEndToEndTraceFlow tests the complete flow from trace creation to backend block read
 // This tests: trace creation -> iterator -> block creation -> block read
 func TestEndToEndTraceFlow(t *testing.T) {
+	// FindTraceByID requires the trace-by-ID index unconditionally (NOTE-VI-073) --
+	// wire the same fake store as both the write-time sink and the read-time query
+	// reader so CreateBlock's real WriteValueIndexL0 call populates what FindTraceByID
+	// consults.
+	viStore := &fakeVISink{}
+	withVISink(t, viStore, "indexes")
+	withVIQueryReader(t, viStore, "indexes")
+
 	tmpDir := t.TempDir()
 
 	// Set up backend storage
@@ -590,6 +609,7 @@ func TestEndToEndTraceFlow(t *testing.T) {
 	writer := backend.NewWriter(rawWriter)
 
 	// Create multiple test traces
+	now := time.Now()
 	traceData := []struct {
 		id   []byte
 		name string
@@ -615,8 +635,8 @@ func TestEndToEndTraceFlow(t *testing.T) {
 									TraceId:           tc.id,
 									SpanId:            []byte{byte(i + 1), 2, 3, 4, 5, 6, 7, 8},
 									Name:              tc.name,
-									StartTimeUnixNano: uint64(time.Now().UnixNano()),
-									EndTimeUnixNano:   uint64(time.Now().Add(time.Second).UnixNano()),
+									StartTimeUnixNano: uint64(now.UnixNano()),                  //nolint:gosec // test data
+									EndTimeUnixNano:   uint64(now.Add(time.Second).UnixNano()), //nolint:gosec // test data
 								},
 							},
 						},
@@ -633,8 +653,12 @@ func TestEndToEndTraceFlow(t *testing.T) {
 	// Step 1: Create iterator with traces
 	iter := &testIterator{traces: traces}
 
-	// Step 2: Create backend block from iterator
+	// Step 2: Create backend block from iterator. CreateBlock does not itself
+	// populate meta.StartTime/EndTime (create.go) -- set it from the same span
+	// timestamps written into the block, as a realistic caller would.
 	blockMeta := backend.NewBlockMeta("test-tenant", uuid.New(), VersionString)
+	blockMeta.StartTime = now
+	blockMeta.EndTime = now.Add(time.Second)
 	cfg := &common.BlockConfig{RowGroupSizeBytes: 10000}
 	ctx := context.Background()
 
@@ -839,6 +863,14 @@ func TestMultipleBlocksSearch(t *testing.T) {
 
 // TestLargeTraceReconstruction tests reconstruction of traces with many spans
 func TestLargeTraceReconstruction(t *testing.T) {
+	// FindTraceByID requires the trace-by-ID index unconditionally (NOTE-VI-073) --
+	// wire the same fake store as both the write-time sink and the read-time query
+	// reader so CreateBlock's real WriteValueIndexL0 call populates what FindTraceByID
+	// consults.
+	viStore := &fakeVISink{}
+	withVISink(t, viStore, "indexes")
+	withVIQueryReader(t, viStore, "indexes")
+
 	tmpDir := t.TempDir()
 
 	rawReader, rawWriter, _, err := local.New(&local.Config{Path: tmpDir})
@@ -850,6 +882,7 @@ func TestLargeTraceReconstruction(t *testing.T) {
 	writer := backend.NewWriter(rawWriter)
 
 	// Create a trace with many spans
+	now := time.Now()
 	traceID := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 	spanCount := 50
 
@@ -859,8 +892,8 @@ func TestLargeTraceReconstruction(t *testing.T) {
 			TraceId:           traceID,
 			SpanId:            []byte{byte(i), 2, 3, 4, 5, 6, 7, 8},
 			Name:              "span-" + string(rune('a'+i%26)),
-			StartTimeUnixNano: uint64(time.Now().Add(time.Duration(i) * time.Millisecond).UnixNano()),
-			EndTimeUnixNano:   uint64(time.Now().Add(time.Duration(i+1) * time.Millisecond).UnixNano()),
+			StartTimeUnixNano: uint64(now.Add(time.Duration(i) * time.Millisecond).UnixNano()),   //nolint:gosec // test data
+			EndTimeUnixNano:   uint64(now.Add(time.Duration(i+1) * time.Millisecond).UnixNano()), //nolint:gosec // test data
 		}
 	}
 
@@ -885,7 +918,12 @@ func TestLargeTraceReconstruction(t *testing.T) {
 		},
 	}
 
+	// CreateBlock does not itself populate meta.StartTime/EndTime (create.go) -- set
+	// it from the same span timestamps written into the block, as a realistic caller
+	// would.
 	meta := backend.NewBlockMeta("test-tenant", uuid.New(), VersionString)
+	meta.StartTime = now
+	meta.EndTime = now.Add(time.Duration(spanCount+1) * time.Millisecond)
 	cfg := &common.BlockConfig{RowGroupSizeBytes: 10000}
 	ctx := context.Background()
 
@@ -920,6 +958,14 @@ func TestLargeTraceReconstruction(t *testing.T) {
 
 // TestConcurrentBlockAccess tests concurrent reads from the same block
 func TestConcurrentBlockAccess(t *testing.T) {
+	// FindTraceByID requires the trace-by-ID index unconditionally (NOTE-VI-073) --
+	// wire the same fake store as both the write-time sink and the read-time query
+	// reader so CreateBlock's real WriteValueIndexL0 call populates what FindTraceByID
+	// consults.
+	viStore := &fakeVISink{}
+	withVISink(t, viStore, "indexes")
+	withVIQueryReader(t, viStore, "indexes")
+
 	tmpDir := t.TempDir()
 
 	rawReader, rawWriter, _, err := local.New(&local.Config{Path: tmpDir})
@@ -931,6 +977,7 @@ func TestConcurrentBlockAccess(t *testing.T) {
 	writer := backend.NewWriter(rawWriter)
 
 	// Create test block
+	now := time.Now()
 	traceID := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 	trace := &tempopb.Trace{
 		ResourceSpans: []*tempotrace.ResourceSpans{
@@ -942,8 +989,8 @@ func TestConcurrentBlockAccess(t *testing.T) {
 								TraceId:           traceID,
 								SpanId:            []byte{1, 2, 3, 4, 5, 6, 7, 8},
 								Name:              "test-span",
-								StartTimeUnixNano: uint64(time.Now().UnixNano()),
-								EndTimeUnixNano:   uint64(time.Now().Add(time.Second).UnixNano()),
+								StartTimeUnixNano: uint64(now.UnixNano()),                  //nolint:gosec // test data
+								EndTimeUnixNano:   uint64(now.Add(time.Second).UnixNano()), //nolint:gosec // test data
 							},
 						},
 					},
@@ -961,7 +1008,12 @@ func TestConcurrentBlockAccess(t *testing.T) {
 		},
 	}
 
+	// CreateBlock does not itself populate meta.StartTime/EndTime (create.go) -- set
+	// it from the same span timestamps written into the block, as a realistic caller
+	// would.
 	meta := backend.NewBlockMeta("test-tenant", uuid.New(), VersionString)
+	meta.StartTime = now
+	meta.EndTime = now.Add(time.Second)
 	cfg := &common.BlockConfig{RowGroupSizeBytes: 10000}
 	ctx := context.Background()
 

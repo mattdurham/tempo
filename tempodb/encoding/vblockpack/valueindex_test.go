@@ -7,6 +7,7 @@ package vblockpack
 
 import (
 	"context"
+	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -26,11 +27,21 @@ import (
 	"github.com/grafana/tempo/tempodb/encoding/common"
 )
 
-// fakeVISink captures Put calls so a test can assert index files were written.
+// fakeVISink captures Put calls so a test can assert index files were written. It also
+// implements the read side (List/Get/Size/ReadAt, blockpack.LookupStore +
+// blockpack.ValueIndexFileStore) so the same instance can drive withVIQueryReader
+// (value_index_query_test.go) and let a test exercise a real write-then-read round trip
+// through the authoritative value index without a live object store.
 type fakeVISink struct {
 	objs map[string][]byte
 	mu   sync.Mutex
 }
+
+var (
+	_ blockpack.ObjectPutter        = (*fakeVISink)(nil)
+	_ blockpack.LookupStore         = (*fakeVISink)(nil)
+	_ blockpack.ValueIndexFileStore = (*fakeVISink)(nil)
+)
 
 func (f *fakeVISink) Put(key string, data []byte) error {
 	f.mu.Lock()
@@ -42,6 +53,55 @@ func (f *fakeVISink) Put(key string, data []byte) error {
 	copy(cp, data)
 	f.objs[key] = cp
 	return nil
+}
+
+func (f *fakeVISink) List(_ context.Context, prefix string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var keys []string
+	for k := range f.objs {
+		if strings.HasPrefix(k, prefix) {
+			keys = append(keys, k)
+		}
+	}
+	return keys, nil
+}
+
+func (f *fakeVISink) Get(_ context.Context, key string) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	data, ok := f.objs[key]
+	if !ok {
+		return nil, blockpack.ErrValueIndexFileNotFound
+	}
+	return data, nil
+}
+
+func (f *fakeVISink) Size(key string) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	data, ok := f.objs[key]
+	if !ok {
+		return 0, blockpack.ErrValueIndexFileNotFound
+	}
+	return int64(len(data)), nil
+}
+
+func (f *fakeVISink) ReadAt(key string, p []byte, off int64) (int, error) {
+	f.mu.Lock()
+	data, ok := f.objs[key]
+	f.mu.Unlock()
+	if !ok {
+		return 0, blockpack.ErrValueIndexFileNotFound
+	}
+	if off >= int64(len(data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, data[off:])
+	if n < len(p) {
+		return n, io.ErrUnexpectedEOF
+	}
+	return n, nil
 }
 
 // withVISink installs sink as the process-level value-index sink for the duration
@@ -110,6 +170,67 @@ func TestCreateBlock_WritesValueIndexL0(t *testing.T) {
 			"index key %q must be under <tenant>/<prefix>/", k)
 		assert.True(t, strings.HasSuffix(k, ".blockpack"), "index key %q must end .blockpack", k)
 	}
+}
+
+// TestFindTraceByID_QueryWindowIsMinuteFloored is the regression test for
+// backend_block.go's queryMinSec flooring (floorToMinuteSec, value_index_query.go).
+// The block's own StartTime is real wall-clock time and essentially never falls
+// exactly on a minute boundary, while the write-side TimeSec is always floored to
+// the minute (blockpack valueindex_extract.go:buildSpanStartSecByRef). Without the
+// floor on the query side, DiscoverIndexFiles reports zero covering files for a
+// block whose only span landed just after a minute boundary, which NOTE-VI-072
+// treats as a hard coverage-gap error, not a scan-fallback-masked non-issue.
+func TestFindTraceByID_QueryWindowIsMinuteFloored(t *testing.T) {
+	store := &fakeVISink{}
+	withVISink(t, store, "indexes")
+	withVIQueryReader(t, store, "indexes")
+
+	ctx := context.Background()
+	cfg := &common.BlockConfig{RowGroupSizeBytes: 100 * 1024 * 1024}
+
+	// CreateBlock does not itself populate meta.StartTime/EndTime (create.go: that's
+	// left to the caller -- WAL bookkeeping in production, setBlockTimeRange for
+	// compaction output). A realistic caller sets it from the same real wall-clock
+	// span timestamps written into the block, which essentially never land exactly on
+	// a minute boundary -- that misalignment is exactly what this test exercises.
+	now := time.Now()
+	traceID := []byte{7, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	trace := &tempopb.Trace{
+		ResourceSpans: []*tempotrace.ResourceSpans{{
+			Resource: &temporesource.Resource{Attributes: []*tempocommon.KeyValue{{
+				Key:   "service.name",
+				Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_StringValue{StringValue: "svc-floor"}},
+			}}},
+			ScopeSpans: []*tempotrace.ScopeSpans{{
+				Spans: []*tempotrace.Span{{
+					TraceId:           traceID,
+					SpanId:            []byte{1, 0, 0, 0, 0, 0, 0, 1},
+					Name:              "test-span",
+					StartTimeUnixNano: uint64(now.UnixNano()),             //nolint:gosec // test data
+					EndTimeUnixNano:   uint64(now.UnixNano()) + 1_000_000, //nolint:gosec // test data
+				}},
+			}},
+		}},
+	}
+	iter := &mockIterator{traces: []*tempopb.Trace{trace}, ids: [][]byte{traceID}}
+
+	tempDir := t.TempDir()
+	rawR, rawW, _, err := local.New(&local.Config{Path: tempDir})
+	require.NoError(t, err)
+	r := backend.NewReader(rawR)
+	w := backend.NewWriter(rawW)
+	meta := backend.NewBlockMeta("test-tenant", uuid.New(), VersionString)
+	meta.StartTime = now
+	meta.EndTime = now.Add(time.Second)
+
+	blockMeta, err := CreateBlock(ctx, cfg, meta, iter, r, w)
+	require.NoError(t, err)
+
+	block := newBackendBlock(blockMeta, r)
+	resp, err := block.FindTraceByID(ctx, traceID, common.SearchOptions{})
+	require.NoError(t, err, "a block whose StartTime isn't minute-aligned must still find its own trace")
+	require.NotNil(t, resp)
+	require.NotNil(t, resp.Trace)
 }
 
 func TestCreateBlock_NoSinkWritesNoIndex(t *testing.T) {

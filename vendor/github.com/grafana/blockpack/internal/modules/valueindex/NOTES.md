@@ -1180,3 +1180,82 @@ Back-refs: root `reader.go:GetTraceByID`, `:getTraceByIDViaIndex`, `:findTraceGr
 SPEC-ROOT-019 (the sibling authoritative contract). Tests: `gettracebyid_index_test.go`
 (authoritative outcomes), `traceindex_pipeline_test.go` (end-to-end multi-L0 merge on the
 authoritative path).
+
+## NOTE-VI-072 — zero index files for a known-non-empty window is a coverage gap, not "not found"
+
+Date: 2026-07-06
+
+NOTE-VI-071 made `getTraceByIDViaIndex` authoritative, but `DiscoverIndexFiles` returning zero
+candidate files was still treated the same as "a covering file exists but lacks this trace":
+both returned `(nil, nil)`. That conflates two different situations. `queryMinSec`/`queryMaxSec`
+come from the caller's own block metadata — a block `GetTraceByID` is being asked about
+specifically because it holds real data — so zero index files covering that exact window means
+the trace-by-ID index never ran against a block known to be non-empty. That is an indexing
+coverage gap (a pipeline problem worth surfacing), not "the index consulted its records and
+found nothing" (a legitimate per-trace miss).
+
+**Fix.** `getTraceByIDViaIndex` now returns an error, not `(nil, nil)`, when `len(keys) == 0`.
+The other miss case is unchanged: at least one index file covers the window but holds no entry
+for this specific trace (e.g. async pipeline lag between block flush and index build for that
+one trace, per `TestGetTraceByID_FreshTraceNotYetIndexedIsNotFound`) is still an authoritative,
+error-free "not found" — only the total-absence-of-coverage case changed.
+
+Back-refs: root `reader.go:getTraceByIDViaIndex`. Test:
+`gettracebyid_index_test.go:TestGetTraceByID_NoIndexFileForKnownNonEmptyBlockErrors` (renamed
+from `TestGetTraceByID_NoIndexFileIsAuthoritativeNotFound`, which locked in the now-incorrect
+behavior).
+
+## NOTE-VI-073 — `scanTraceByID` (the no-index path) removed entirely; `GetTraceByID` requires a lister
+
+Date: 2026-07-06
+
+NOTE-VI-071 kept `scanTraceByID` (renamed from `getTraceByIDFullScan`) for category 1 — the
+"no index to consult" case (`lister == nil || tenant == ""`) — because tempo's WAL block
+(`wal_block.go`) permanently called `GetTraceByID` with a nil lister, and a WAL block can never
+have trace-index coverage. That justification no longer holds: tempo's live-store switched its
+`storage.trace.block.version` from `vblockpack` to `vParquet4` (this also governs
+`LiveStore.WAL.Version`, per `cmd/tempo/app/modules.go`), so live-store no longer creates
+vblockpack WAL blocks at all. Block-builder still writes vblockpack WAL blocks (its own
+`block.version` is unchanged), but nothing calls `FindTraceByID` against a block-builder WAL
+block — block-builder only builds/completes blocks, and `tempo-cli` block-query tools read
+backend blocks, not local WAL directories. With no live caller left for the no-index case,
+`scanTraceByID` became genuine dead code.
+
+**Fix.** `GetTraceByID` now requires `lister != nil && tenant != ""` unconditionally, returning
+an error immediately otherwise (`"lister and tenant are required (NOTE-VI-073) -- there is no
+scan fallback"`). `scanTraceByID` and its exclusive dependencies (`fetchAllBlockBytes`,
+`scopeMatchingBlocks`, `parseBlocksWithWant`, `traceByIDParseConcurrency`) were deleted from
+root `reader.go`. Shared helpers used by both the old scan path and the index path
+(`rowMatchesTraceID`, `buildSpanMatch`) were kept — the index path still needs them.
+
+**Tempo-side companion change.** `wal_block.go`'s `FindTraceByID` no longer calls into
+`blockpack.GetTraceByID` at all (it would now hard-error on every call, breaking the interface
+contract). It returns `(nil, nil)` immediately — an unreachable-but-still-correct "not found" —
+without reading or decoding any WAL data.
+
+Back-refs: root `reader.go:GetTraceByID`. Tests: every test file that previously called
+`GetTraceByID` with a nil lister to get "scan ground truth" was rewritten to assert against the
+fixture's own known values instead (`gettracebyid_test.go`, `gettracebyid_index_test.go`,
+`gettracebyid_lookupstore_alias_test.go`, `api_test.go`, `traceindex_pipeline_test.go`); the
+scan-specific regression tests and benchmarks in `gettracebyid_test.go` were deleted outright
+since they had no path left to test. Tempo: `tempodb/encoding/vblockpack/roundtrip_test.go`
+(`TestWalBlock_FindTraceByID_NeverFinds`, renamed from `TestWalBlock_FindTraceByID_PermanentlySkipsIndex`).
+
+## NOTE-VI-074 — a genuinely empty file short-circuits `GetTraceByID`, ahead of the lister requirement
+
+Date: 2026-07-06
+
+NOTE-VI-073 removing `scanTraceByID` exposed a real gap in NOTE-VI-072's reasoning: "zero
+index files for the caller's window is a coverage gap, not a legitimate miss" explicitly relies
+on the caller only ever asking about a block it knows holds data. Tempo's `backend_block.go`
+also falls back to a nil lister when `value_index_query` is disabled (mirroring the WAL case
+NOTE-VI-073 addressed) — and for a genuinely empty block (zero traces, `r.BlockCount() == 0`,
+e.g. tempo's `TestEmptyBlock`), that premise is false: there is trivially nothing to index, so
+zero covering index files is expected, not a gap.
+
+**Fix.** `GetTraceByID` checks `r.BlockCount() == 0` right after basic trace-ID format
+validation and returns `(nil, nil)` immediately — before the lister/tenant requirement
+(NOTE-VI-073) is even checked. An empty file has nothing to look up regardless of whether the
+index is configured, so it must not demand one.
+
+Back-refs: root `reader.go:GetTraceByID`. Test: `gettracebyid_index_test.go:TestGetTraceByID_EmptyFileIsNotFoundNotError`.

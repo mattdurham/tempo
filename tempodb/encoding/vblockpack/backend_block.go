@@ -425,20 +425,29 @@ func (b *blockpackBlock) FindTraceByID(ctx context.Context, id common.ID, _ comm
 	// "not found" -- it does NOT scan the file), and any index/data inconsistency (corrupt
 	// candidate, unresolvable/stale entry) surfaces as an error, which we propagate below.
 	// The accepted, known coverage gap: traces written before the index began building
-	// (blockpack NOTE-VI-070) read as "not found." When the path is disabled the lister is nil
-	// and GetTraceByID falls to its no-index scan (byte-identical to the prior behaviour). Only
-	// compacted backend blocks are index-eligible; WAL blocks (wal_block.go) permanently pass
-	// nil since freshly-ingested data is not yet consumed by the async indexer.
+	// (blockpack NOTE-VI-070) read as "not found." GetTraceByID no longer has a scan fallback
+	// at all (NOTE-VI-073): when value_index_query is disabled, lister is nil and every
+	// non-empty-block lookup below returns an error, not a scan. Deploying with the value
+	// index disabled therefore breaks trace-by-id for backend blocks -- value_index_query must
+	// be enabled for this path to work. WAL blocks (wal_block.go) never reach here; their own
+	// FindTraceByID always returns not-found without calling GetTraceByID.
 	var lister blockpack.LookupStore
 	indexPrefix := ""
 	if vr := getValueIndexQueryReader(); vr != nil {
 		lister = vr.store
 		indexPrefix = vr.indexPrefix
 	}
+	// The lower bound must be floored to the same minute alignment as the write-side
+	// TimeSec truncation (floorToMinuteSec) -- the same coordinated invariant the
+	// search/metrics path (nanoWindowToSec) already applies. Without it, a block whose
+	// StartTime isn't itself minute-aligned (virtually always) asks for a window no L0
+	// index file's floored TimeSec ever falls inside, and DiscoverIndexFiles reports zero
+	// covering files -- now a hard error (NOTE-VI-072), not a silently-corrected scan.
+	queryMinSec := floorToMinuteSec(uint64(b.meta.StartTime.Unix())) //nolint:gosec // block start times are always positive
 	matches, err := blockpack.GetTraceByID(
 		ctx, r, traceIDHex, lister, b.meta.TenantID, indexPrefix,
-		uint64(b.meta.StartTime.Unix()), //nolint:gosec // block start times are always positive
-		uint64(b.meta.EndTime.Unix()),   //nolint:gosec // block end times are always positive
+		queryMinSec,
+		uint64(b.meta.EndTime.Unix()), //nolint:gosec // block end times are always positive
 	)
 	if err != nil {
 		return nil, fmt.Errorf("GetTraceByID: %w", err)
@@ -765,7 +774,8 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 		spanAttrs = append(spanAttrs, attribute.String("scan.execution_path", qs.ExecutionPath))
 		for _, step := range qs.Steps {
 			args = append(args, step.Name+"_dur", step.Duration, step.Name+"_io", step.IOOps, step.Name+"_bytes", step.BytesRead)
-			spanAttrs = append(spanAttrs,
+			spanAttrs = append(
+				spanAttrs,
 				attribute.Int64("scan."+step.Name+".io_ops", int64(step.IOOps)),
 				attribute.Int64("scan."+step.Name+".bytes_read", int64(step.BytesRead)),
 				attribute.Int64("scan."+step.Name+".duration_ns", int64(step.Duration)),
