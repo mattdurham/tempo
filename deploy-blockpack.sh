@@ -75,8 +75,22 @@ echo "--- Updating querier ---"
 kubectl set image deployment/querier -n "$NAMESPACE" "querier=${IMAGE}"
 # GOMEMLIMIT is required to bound parsedIntrinsicCache (objectcache.Cache budget = 20% of GOMEMLIMIT).
 # Without it, the cache is unbounded and querier pods OOMKill after a few M8 histogram queries.
-# Format must be GiB (not Gi) — Go runtime panics on malformed GOMEMLIMIT.
-kubectl set env deployment/querier -n "$NAMESPACE" "GOMEMLIMIT=13GiB"
+# MUST stay below the container's actual memory limit -- Go's GC needs headroom to react to
+# GOMEMLIMIT before the kernel enforces the hard cgroup limit. Derived as 80% of the
+# deployment's own memory limit rather than hardcoded, so it can't silently drift out of sync
+# with it (2026-07-06 incident: a stale GOMEMLIMIT=13GiB sat ABOVE the actual 8Gi limit, so
+# GOMEMLIMIT never triggered and a broad search query OOMKilled the querier outright instead
+# of the GC backing off gracefully).
+MEM_LIMIT=$(kubectl get deployment/querier -n "$NAMESPACE" \
+    -o jsonpath='{.spec.template.spec.containers[0].resources.limits.memory}')
+case "$MEM_LIMIT" in
+    *Gi) MEM_MIB=$(( ${MEM_LIMIT%Gi} * 1024 )) ;;
+    *Mi) MEM_MIB=${MEM_LIMIT%Mi} ;;
+    *) echo "ERROR: unrecognized querier memory limit format: ${MEM_LIMIT}" >&2; exit 1 ;;
+esac
+GOMEMLIMIT_MIB=$(( MEM_MIB * 80 / 100 ))
+echo "    querier memory limit: ${MEM_LIMIT} -> GOMEMLIMIT=${GOMEMLIMIT_MIB}MiB (80%)"
+kubectl set env deployment/querier -n "$NAMESPACE" "GOMEMLIMIT=${GOMEMLIMIT_MIB}MiB"
 # Add 10 Gi emptyDir for blockpack disk cache (file_cache_path: /var/tempo/blockpack-cache).
 # Strategic merge patch is idempotent — safe to re-apply on every deploy.
 kubectl patch deployment/querier -n "$NAMESPACE" --type=strategic -p \
