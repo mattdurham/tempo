@@ -158,7 +158,11 @@ func (cqp *cubeQueryPath) tryQueryFromCube(
 	if routeErr != nil || !result.Found {
 		// Cube not found — attempt to create it on first query.
 		// Fire cube creation in a background goroutine so QueryRange is not blocked.
-		go cqp.maybeCreateCube(context.Background(), tenant, dims, filters)
+		// req.Start/req.End are nanoseconds; VCNT records are keyed in unix seconds
+		// (minute-floored), so pass the query window in seconds for the cardinality gate.
+		minTS := req.Start / 1_000_000_000
+		maxTS := req.End / 1_000_000_000
+		go cqp.maybeCreateCube(context.Background(), tenant, dims, filters, minTS, maxTS)
 		return nil, false
 	}
 
@@ -199,11 +203,15 @@ func (cqp *cubeQueryPath) tryQueryFromCube(
 // prevent the per-block fan-out from creating a storm of concurrent S3 ConditionalPuts.
 // The filters are part of the cube identity (#480): two queries with the same group-by
 // dims but different filters must create (and route to) distinct cubes.
+//
+// minTS/maxTS are the query window in unix seconds; they scope the VCNT read used by
+// the cardinality gate to the same window the query asked for.
 func (cqp *cubeQueryPath) maybeCreateCube(
 	ctx context.Context,
 	tenant string,
 	dims []string,
 	filters []blockpack.CubeColumnFilter,
+	minTS, maxTS uint64,
 ) {
 	key := tenant + "|" + strings.Join(dims, ",") + "|" + filterDedupKey(filters)
 
@@ -218,9 +226,14 @@ func (cqp *cubeQueryPath) maybeCreateCube(
 	os := &minioObjectStore{client: cqp.client, bucket: cqp.bucket}
 	reg := blockpack.NewCubeRegistry(os, tenant)
 	trigger := blockpack.NewCubeCreationTrigger(reg, blockpack.CubeTriggerConfig{})
-	// Pass empty VCNT data — cardinality gate is best-effort; if no VCNT data
-	// is available yet the gate passes by default. (Wiring real VCNT data is #483.)
-	result, err := trigger.TryCreate(ctx, tenant, dims, filters, nil, nil, 0, 0)
+	// Fetch real VCNT data for the proposed dimensions over the query window so the
+	// cardinality gate runs against actual per-dimension distinct-value counts
+	// instead of nil (#483). Reads go through the same shared cachingStore-wrapped
+	// minioVIStore the backfill/query paths use. If no VCNT coverage exists for the
+	// dims/window, the section is empty and the gate passes by default — matching
+	// the prior best-effort behaviour rather than blocking cube creation.
+	vcntData, vcntDir := cqp.fetchVCNTSection(ctx, tenant, dims, minTS, maxTS)
+	result, err := trigger.TryCreate(ctx, tenant, dims, filters, vcntData, vcntDir, minTS, maxTS)
 	if err != nil {
 		level.Warn(util_log.Logger).Log("msg", "vblockpack: cube TryCreate failed", "tenant", tenant, "dims", dims, "err", err)
 		return

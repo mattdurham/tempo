@@ -69,6 +69,66 @@ func newBackfillVIStore(client *minio.Client, bucket string) valueIndexStore {
 	)
 }
 
+// fetchVCNTSection lists and downloads the .vcnt files covering each proposed cube
+// dimension, then merges them into one consolidated VCNT section (data + dir) via
+// blockpack.VCNTBuildSectionFromObjects — the shape the cardinality gate consumes
+// (#483). Reads go through the same shared cachingStore-wrapped minioVIStore the
+// backfill/query paths use (issue #478), so repeated gate attempts for the same dims
+// collapse to cached LISTs/GETs rather than re-hitting S3.
+//
+// VCNT filenames (L<N>-<id>.vcnt) carry no embedded time range — unlike VI files —
+// so all of a column's .vcnt files are fetched and the query window is applied at the
+// record level by the gate's ValuesInRange decode. minTS/maxTS are accepted here only
+// to document that scoping contract; they are not used to prune the file list.
+//
+// On any error (or absent coverage) it returns a nil/empty section, which the gate
+// treats as "no coverage" and passes by default — a VCNT read failure must never block
+// cube creation, only inform it when data is present.
+func (cqp *cubeQueryPath) fetchVCNTSection(
+	ctx context.Context,
+	tenant string,
+	dims []string,
+	minTS, maxTS uint64,
+) ([]byte, []blockpack.VCNTChunkDirEntry) {
+	return buildVCNTSection(ctx, newBackfillVIStore(cqp.client, cqp.bucket), tenant, dims, minTS, maxTS)
+}
+
+// buildVCNTSection is the store-agnostic core of fetchVCNTSection: given any
+// valueIndexStore, list+download the .vcnt files for each dim and merge them into a
+// single consolidated section. Split out from fetchVCNTSection so the list/filter/build
+// glue is unit-testable against an in-memory store without a live object store (#483).
+func buildVCNTSection(
+	ctx context.Context,
+	store valueIndexStore,
+	tenant string,
+	dims []string,
+	_, _ uint64,
+) ([]byte, []blockpack.VCNTChunkDirEntry) {
+	var objects [][]byte
+	for _, dim := range dims {
+		colHash := blockpack.VCNTColHash(dim)
+		prefix := path.Join(tenant, defaultValueIndexPref, "unique_values", colHash) + "/"
+		keys, err := store.List(ctx, prefix)
+		if err != nil || len(keys) == 0 {
+			continue
+		}
+		for _, k := range keys {
+			if path.Ext(k) != ".vcnt" {
+				continue
+			}
+			data, getErr := store.Get(ctx, k)
+			if getErr != nil || len(data) == 0 {
+				continue
+			}
+			objects = append(objects, data)
+		}
+	}
+	if len(objects) == 0 {
+		return nil, nil
+	}
+	return blockpack.VCNTBuildSectionFromObjects(objects)
+}
+
 func (s *viBackfillSource) LookupColumn(
 	ctx context.Context,
 	tenant, column string,

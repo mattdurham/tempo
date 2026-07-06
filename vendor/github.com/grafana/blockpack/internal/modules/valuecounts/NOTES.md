@@ -274,3 +274,51 @@ touched.
 
 Back-refs: `vcnt.go:CompactVCNTRecords`, `internal/modules/valuecounts/compaction.go:Compact`.
 `SPECS.md` SPEC-VC-3.
+
+---
+
+## NOTE-VC-012 — VCNTBuildSectionFromObjects: consolidate fetched .vcnt objects into one gate-ready section
+
+Date: 2026-07-06
+
+### Why
+
+The cube cardinality gate (`cube.CheckCardinality`, driven by `CubeCreationTrigger.TryCreate`)
+consumes a *single* VCNT section `(data []byte, dir []ChunkDirEntry)` and answers per-dimension
+distinct-value queries against it via `ValuesInRange`. But real VCNT data for a proposed cube's
+dimensions is spread across *many* `.vcnt` objects in S3 — one per column-hash directory, one per
+block-builder flush / compaction pass. tempo's `maybeCreateCube` had no way to turn "N fetched
+`.vcnt` objects across M dimensions" into the one section the gate wants, so it passed `nil` and the
+gate was a permanent no-op in production (issue #483).
+
+### What was added
+
+`blockpack.VCNTBuildSectionFromObjects(objects [][]byte) ([]byte, []VCNTChunkDirEntry)` (`vcnt.go`):
+decode each object via `DecodeVCNTObject` (handles both the self-describing and legacy single-chunk
+formats transparently), concatenate all records, run `Compact` (delta accounting — so a later
+retention/compaction delta correctly nets a value out of the merged live set), and re-encode via
+`EncodeRecords`. The output is byte-for-byte the same section shape the gate already consumes.
+
+### Design decisions
+
+- **Skip-on-error, never fail the build.** A single corrupt/truncated `.vcnt` object is skipped, not
+  propagated — a bad file for one dimension must not defeat the gate for every other dimension. An
+  all-empty/all-corrupt input yields an empty-but-valid section, which the gate reads as "no
+  coverage" and passes by default. This preserves the prior `nil`-data best-effort contract exactly:
+  wiring real data can only *tighten* the gate where coverage exists, never newly *block* creation
+  where coverage is missing.
+- **Compact, not raw concat.** Feeding un-compacted records to `ValuesInRange` would still net
+  correctly (it sums per value and drops `<= 0`), but compacting once here keeps the section small and
+  makes the delta-accounting semantics explicit at build time rather than deferring them to every
+  per-dimension read.
+
+### Consumer
+
+tempo `cube_backfill.go:buildVCNTSection` lists+downloads the `.vcnt` files under each dim's
+`unique_values/<colHash>/` prefix (through the shared `cachingStore`-wrapped `minioVIStore`, issue
+#478) and calls this to build the section `maybeCreateCube` hands to `TryCreate`. VCNT filenames carry
+no embedded time range (unlike VI files), so all of a column's files are fetched and the query window
+is applied at the record level by the gate's `ValuesInRange` decode.
+
+Back-refs: `vcnt.go:VCNTBuildSectionFromObjects`, `internal/modules/cube/cardinality.go:CheckCardinality`,
+`internal/modules/valuecounts/selfdescribing.go:DecodeVCNTObject`. Issue #483.

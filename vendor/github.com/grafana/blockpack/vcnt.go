@@ -71,6 +71,36 @@ func VCNTObjectKey(tenant, indexPrefix, colName, id string) string {
 	return path.Join(tenant, indexPrefix, "unique_values", colHash, filename)
 }
 
+// VCNTBuildSectionFromObjects decodes each raw .vcnt object (self-describing or
+// legacy — via DecodeVCNTObject), merges all records via delta-accounting Compact,
+// and re-encodes them into a single consolidated VCNT section (data + dir). The
+// result is the exact (data, dir) shape CubeCreationTrigger.TryCreate /
+// CheckCardinality consume, so a caller that has fetched the .vcnt objects covering
+// a set of dimensions can produce one section spanning all of them in a single call
+// — instead of feeding the cardinality gate nil data (issue #483).
+//
+// Objects that fail to decode are skipped rather than failing the whole build: a
+// single corrupt or truncated .vcnt file must not defeat the cardinality gate for
+// every other dimension. An empty or all-unreadable input yields an empty-but-valid
+// section (dir may be empty), which CheckCardinality treats as "no VCNT coverage" —
+// the gate then passes by default for the affected dimension, matching prior
+// best-effort behavior. See NOTE-VC-012.
+func VCNTBuildSectionFromObjects(objects [][]byte) ([]byte, []VCNTChunkDirEntry) {
+	var all []VCNTRecord
+	for _, obj := range objects {
+		if len(obj) == 0 {
+			continue
+		}
+		recs, err := valuecounts.DecodeVCNTObject(obj)
+		if err != nil {
+			continue // skip undecodable object; other dims still gate correctly
+		}
+		all = append(all, recs...)
+	}
+	merged := valuecounts.Compact(all)
+	return valuecounts.EncodeRecords(merged, 0)
+}
+
 // VIFileMeta holds the parsed metadata from a v2 value-index filename.
 type VIFileMeta = valueindex.FileMeta
 
