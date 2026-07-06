@@ -215,7 +215,9 @@ the same change — there were no existing call sites to migrate.
 `(TraceID, SpanID)` pairs (first occurrence wins across the flattened input order), drops a
 span whose `checker.IsLive` reports false, drops a group entirely if every span was dropped,
 takes the minimum `TimeSec` across all contributing groups for a given `TraceID`. Output is
-sorted `(TimeSec ASC, TraceID ASC)`.
+sorted `(TraceID ASC, TimeSec ASC)` — TraceID leads because it is the trace-by-id point-lookup
+key, making each v2 block's `[minTraceID, maxTraceID]` a tight, seekable pruning bound (issue
+#476, NOTE-VI-075; changed from the original `(TimeSec, TraceID)` flat-blob ordering).
 
 **v1 scope boundary — in-memory only, not disk-streaming:** unlike `StreamCompactBucketFiles`
 (SPEC-VI-2), `MergeTraceGroups` requires every input file's `TraceGroup`s fully decoded into
@@ -229,6 +231,14 @@ streaming precedent SPEC-VI-2/NOTE-VI-052 already established for `BucketGroup` 
 revisit only if post-deployment telemetry shows trace-index file sizes or merge batch sizes
 growing large enough to make whole-batch in-memory decoding a real memory-pressure risk — do
 not build a streaming variant preemptively.
+
+**Update (issue #476, NOTE-VI-075):** the v2 batched TraceGroup on-disk format now bounds the
+READ path cost independently of output-file size — the querier ranged-reads only the footer +
+block directory + the surviving block(s), never the whole file — so a single large compacted
+output file is no longer a read-path liability (this was the concern behind the original
+"revisit if files grow large" clause). The compactor merge remains in-memory-only per the v1
+scope boundary above; that decision is about compactor MEMORY, which v2 batching does not
+change (the merge still decodes every input into memory before re-encoding into blocks).
 
 Back-refs: `internal/modules/valueindex/traceindex.go:MergeTraceGroups`,
 `internal/modules/valueindexcompactor/traceindex_dispatch.go:mergeTraceLevel` (the sole

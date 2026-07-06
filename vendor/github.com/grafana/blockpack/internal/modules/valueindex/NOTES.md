@@ -1259,3 +1259,82 @@ validation and returns `(nil, nil)` immediately — before the lister/tenant req
 index is configured, so it must not demand one.
 
 Back-refs: root `reader.go:GetTraceByID`. Test: `gettracebyid_index_test.go:TestGetTraceByID_EmptyFileIsNotFoundNotError`.
+
+## NOTE-VI-075 — v2 batched TraceGroup index format: partial-read trace-by-id (issue #476)
+
+Date: 2026-07-06
+
+Production incident 2026-07-06 (issue #475 handled the immediate cache/dedup mitigation)
+traced back to the trace-by-id **TraceGroup** index format being structurally unable to
+support partial reads. The old flat-blob format (`ValueIndexTraceVersion = 0x01`) wrote
+`version + string_table + group_count + [groups...]` as a single snappy stream — no offset
+table, no per-block metadata, no bloom — so every trace-by-id lookup required a whole-object
+download + full decode just to check for one trace ID. Well-compacted files ran 19MB-205MB in
+production; `findTraceGroupInCandidates` fully decoded every candidate with no early exit.
+
+### The redesign
+
+Rebuild TraceGroup to match blockpack's own working design for exactly this problem — the v2
+**BucketGroup** search/metrics format (NOTE-VI-043/045). New format, magic `"VTG2"`,
+`TraceFileVersion = 0x02`:
+
+```
+magic[4] version[1]                          -- header
+[ block 0 ] ... [ block N ]                  -- snappy-compressed block bodies
+string_table
+block_index (TOC: one traceBlockDirEntry per block)
+footer[traceFooterSize]                      -- fixed 53 bytes, tail-addressable
+```
+
+Block body: `min_trace_id[16] max_trace_id[16] min_time[8] max_time[8] bloom_len[4] bloom[N]
+group_count[4] [groups...]`.
+
+**Key ordering decision.** Groups sort by `(TraceID ASC, TimeSec ASC)` — TraceID FIRST,
+unlike BucketGroup's `(TimeSec, value)` and unlike the old flat format's `(TimeSec, TraceID)`.
+TraceID leads because it is the trace-by-id **point-lookup key**: ordering by TraceID makes
+each block's `[minTraceID, maxTraceID]` a tight, seekable bound, so the block directory prunes
+whole blocks by TraceID range with no body fetch. The per-block bloom is over the block's
+16-byte trace IDs (reusing `bucketbloom.go`'s value bloom, which is defined over arbitrary
+bytes — trace IDs are just fixed-length values). Blocks are count-triggered at
+`shared.ValueIndexTraceGroupsPerBlock` (default 4096), mirroring
+`ValueIndexBucketGroupsPerBlock`. This also subsumes the compactor's unbounded
+`mergeTraceLevel` output concern (issue #476 point 4): the read path never loads the whole
+file, only surviving blocks, so a large single output file no longer costs a large read.
+
+### Read path (`traceindexquery.go`)
+
+`LookupTraceGroupPartial(store, key, traceID, minSec, maxSec)`:
+1. Ranged tail read of `TraceFooterSize` bytes → file min/max time (prune whole file by time).
+2. One ranged read of the contiguous `string table + block directory` tail region.
+3. Prune blocks by `[minTraceID,maxTraceID]` range then time overlap.
+4. For each surviving block, ranged-read + snappy-decode ONLY that block, test the trace-ID
+   bloom (definite-no skip), then scan for the target TraceID.
+
+A miss anywhere resolves with zero body fetches; a hit fetches only the covering block(s).
+Groups for the same trace can straddle adjacent blocks (disjoint L0 spans), so matches are
+merged with the same live-merge semantics as `MergeTraceGroups` (dedup by SpanID, min TimeSec).
+
+### Interface change (breaking)
+
+`LookupStore` now embeds `TraceRandomReader` (Size + ReadAt) in addition to Lister +
+TraceIndexGetter. Get is retained only for the legacy flat-blob format (no footer/TOC to seek
+within). **Non-breaking for tempo in practice:** its `minioVIStore` and `cachingStore` already
+implement Size + ReadAt for the search/metrics path, so they satisfy the widened interface
+with no new methods.
+
+### Migration
+
+`DecodeTraceGroups` dispatches on format: `isTraceV2` (both header + footer magic == `"VTG2"`)
+→ block-by-block decode; otherwise → `decodeLegacyTraceGroups` (the old 0x01 flat blob). Old
+files written before rollover still read; new writes use v2. `findTraceGroupInCandidates`
+probes each candidate's format with a single ranged footer read (`probeTraceV2`) and uses the
+partial path for v2, whole-file Get + decode for legacy. No backfill — retention ages out the
+mixed window.
+
+Back-refs: `internal/modules/valueindex/traceindex.go` (EncodeTraceGroups/DecodeTraceGroups,
+encodeTraceBlock, traceBlockDirEntry, decodeLegacyTraceGroups),
+`internal/modules/valueindex/traceindexquery.go` (DecodeTraceFooter, LookupTraceGroupPartial,
+TraceRandomReader), `internal/modules/valueindex/lookupstore.go` (widened LookupStore),
+`reader.go` (findTraceGroupInCandidates + probeTraceV2),
+`internal/modules/blockio/shared/constants.go` (ValueIndexTraceGroupsPerBlock, TraceFileVersion
+context). Tests: `traceindexquery_test.go`, `traceindex_test.go`.

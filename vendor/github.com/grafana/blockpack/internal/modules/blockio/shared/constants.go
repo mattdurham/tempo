@@ -422,9 +422,24 @@ const (
 	ValueIndexEntriesVersionV4 uint8 = 0x04 // V3 + SpanID[8] + RowIdx[2] per entry (issue #428, default)
 	ValueIndexKLLVersion       uint8 = 0x01
 
-	// ValueIndexTraceVersion is the encode version for the TraceID index payload
-	// (TraceGroup/SpanEntry parent-child structure, issue #428, NOTE-VI-038).
+	// ValueIndexTraceVersion is the encode version for the legacy flat-blob TraceID
+	// index payload (TraceGroup/SpanEntry parent-child structure, issue #428,
+	// NOTE-VI-038). This is the v1 whole-object format: a single snappy stream with
+	// no offset table, no per-block metadata, and no bloom, so every trace-by-id
+	// lookup required a full download + full decode. Retained only for reading old
+	// files during the rollover window (NOTE-VI-047); new files use the v2 batched
+	// TraceBlockGroup format (magic "VTG2", ValueIndexTraceGroupsPerBlock).
 	ValueIndexTraceVersion uint8 = 0x01
+
+	// ValueIndexTraceGroupsPerBlock is the maximum number of TraceGroups packed into
+	// a single block of a v2 batched TraceGroup index file (issue #476). Each block
+	// carries its own min/max TraceID, min/max TimeSec, and a bloom over its trace
+	// IDs, so a trace-by-id lookup prunes at block granularity: a single ranged tail
+	// read of the footer + block directory prunes whole files/blocks by TraceID range,
+	// and only the surviving block(s) are fetched. Groups are ordered by TraceID (the
+	// point-lookup key) so the per-block min/max range is a tight, seekable bound.
+	// Mirrors ValueIndexBucketGroupsPerBlock's role for the search/metrics index.
+	ValueIndexTraceGroupsPerBlock = 4_096
 
 	// ValueIndexKLLK is the k parameter for the vi:value KLL sketch (~0.01% quantile error).
 	// Value index files carry exactly one KLL column so there is no per-column memory pressure.

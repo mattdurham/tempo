@@ -27,8 +27,18 @@ package vblockpack
 //
 // This mirrors the SectionCache/TypedTieredCache pattern getCache() already uses
 // for data-block reads. It is scoped narrowly per issue #475: tempo-side only, no
-// blockpack API or wire-format change. It does NOT shrink the oversized index
-// files — that is follow-up issue #476.
+// blockpack API or wire-format change.
+//
+// Update (blockpack issue #476 / NOTE-VI-075): the trace-by-id index wire format
+// has since been rebuilt into a batched min/max+bloom+footer format that resolves
+// a lookup with targeted partial reads (Size + ranged ReadAt of only the footer +
+// block directory + surviving block), never a whole-object Get. So for v2 index
+// files this Get cache is no longer on the hot path — those go through the ReadAt
+// passthrough below. Get is still exercised for legacy pre-#476 flat-blob files
+// during the rollover window (blockpack's findTraceGroupInCandidates falls back to
+// Get + full decode for a non-v2 file), so the cache is retained: it keeps the
+// oversized legacy files from being re-downloaded whole per candidate until
+// retention ages them out.
 
 import (
 	"context"
