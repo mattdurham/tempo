@@ -8,10 +8,9 @@ package vblockpack
 // the value index, newest-first, writing L0 cube files per minute.
 
 import (
-	"bytes"
 	"context"
-	"io"
 	"path"
+	"time"
 
 	"github.com/go-kit/log/level"
 	blockpack "github.com/grafana/blockpack"
@@ -25,10 +24,49 @@ import (
 // LookupColumn lists + downloads VI files for (tenant, column) in [minSec, maxSec],
 // returning one VIQueryResult per span with SourceRef set to the decoded string
 // column value (the convention expected by the cube Backfiller).
+//
+// blockpack issue #478: reads go through a shared valueIndexStore (a cachingStore
+// wrapping the same minioVIStore the query path uses), NOT a bespoke minio-client
+// list/get. This unifies what had been a THIRD parallel object-store implementation
+// with the value-index/trace-by-id store and reuses its caching: List hits a TTL'd
+// listing cache (repeated re-lists of the same tenant/column/type prefix during a
+// backfill pass or repeated cardinality-gate TryCreate collapse to one LIST) and
+// Get hits the immutable content cache with singleflight dedup (re-scanning
+// overlapping windows no longer re-downloads the same VI/VCNT file).
 type viBackfillSource struct {
-	client      *minio.Client
-	bucket      string
+	store       valueIndexStore
 	indexPrefix string
+}
+
+// backfillListTTL bounds how long a viBackfillSource List(prefix) result is
+// reused (blockpack issue #478). It must be short enough that a backfill/query
+// still observes VI/VCNT files written after it starts within a bounded delay,
+// but long enough to collapse the repeated re-lists of the same
+// (tenant, column, type) prefix that a single backfill pass — or a burst of
+// cardinality-gate TryCreate attempts before a cube is actually created — issues.
+// 30s comfortably covers a single pass's re-list burst while keeping any
+// staleness window small relative to the 7-day backfill window.
+const backfillListTTL = 30 * time.Second
+
+// backfillContentCacheBytes bounds the immutable VI/VCNT content cache shared by
+// the cube-backfill/cardinality-gate reads (blockpack issue #478). VI/VCNT files
+// are immutable once written, so a keyed cache needs no TTL; this budget caps how
+// many are retained so re-scanning overlapping windows reuses the same file rather
+// than re-downloading it. Sized well below the query-path default (defaultContentCacheBytes,
+// 2 GiB) because this is a write/backfill-adjacent path, not the user-facing query hot path.
+const backfillContentCacheBytes = 512 << 20 // 512 MiB
+
+// newBackfillVIStore builds the shared value-index store the cube backfill /
+// cardinality-gate path reads through (blockpack issue #478): a cachingStore
+// wrapping the same minioVIStore the query path uses, with the immutable content
+// cache (Get/Size/ReadAt) plus a short-TTL listing cache. Unifying on minioVIStore
+// removes the third parallel object-store implementation this path used to carry.
+func newBackfillVIStore(client *minio.Client, bucket string) valueIndexStore {
+	return newCachingStoreWithListTTL(
+		&minioVIStore{client: client, bucket: bucket},
+		backfillContentCacheBytes,
+		backfillListTTL,
+	)
 }
 
 func (s *viBackfillSource) LookupColumn(
@@ -41,7 +79,7 @@ func (s *viBackfillSource) LookupColumn(
 	var results []blockpack.VIQueryResult
 	for _, typeName := range []string{"string", "int64", "uint64", "bool", "float64"} {
 		prefix := path.Join(tenant, s.indexPrefix, colHash, typeName) + "/"
-		keys, err := s.listObjects(ctx, prefix)
+		keys, err := s.store.List(ctx, prefix)
 		if err != nil || len(keys) == 0 {
 			continue
 		}
@@ -54,7 +92,7 @@ func (s *viBackfillSource) LookupColumn(
 			if !meta.IsInTimeRange(minSec, maxSec) {
 				continue
 			}
-			data, getErr := s.getObject(ctx, k)
+			data, getErr := s.store.Get(ctx, k)
 			if getErr != nil {
 				continue
 			}
@@ -83,29 +121,6 @@ func (s *viBackfillSource) LookupColumn(
 		}
 	}
 	return results, nil
-}
-
-func (s *viBackfillSource) listObjects(ctx context.Context, prefix string) ([]string, error) {
-	var keys []string
-	for obj := range s.client.ListObjects(ctx, s.bucket,
-		minio.ListObjectsOptions{Prefix: prefix, Recursive: true}) {
-		if obj.Err != nil {
-			return nil, obj.Err
-		}
-		keys = append(keys, obj.Key)
-	}
-	return keys, nil
-}
-
-func (s *viBackfillSource) getObject(ctx context.Context, key string) ([]byte, error) {
-	obj, err := s.client.GetObject(ctx, s.bucket, key, minio.GetObjectOptions{})
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = obj.Close() }()
-	var buf bytes.Buffer
-	_, err = io.Copy(&buf, obj)
-	return buf.Bytes(), err
 }
 
 // decodeCanonicalVI converts canonical VI value bytes to a string.
@@ -138,8 +153,7 @@ func launchBackfill(entry blockpack.CubeRegistryEntry) {
 		return
 	}
 	src := &viBackfillSource{
-		client:      cqp.client,
-		bucket:      cqp.bucket,
+		store:       newBackfillVIStore(cqp.client, cqp.bucket),
 		indexPrefix: defaultValueIndexPref,
 	}
 	store := &s3ObjectPutter{client: cqp.client, bucket: cqp.bucket}
@@ -198,8 +212,7 @@ func RunCubeBackfill(ctx context.Context, entry blockpack.CubeRegistryEntry, s3c
 		return
 	}
 	src := &viBackfillSource{
-		client:      client,
-		bucket:      s3cfg.Bucket,
+		store:       newBackfillVIStore(client, s3cfg.Bucket),
 		indexPrefix: defaultValueIndexPref,
 	}
 	store := &s3ObjectPutter{client: client, bucket: s3cfg.Bucket}

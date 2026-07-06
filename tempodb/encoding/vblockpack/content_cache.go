@@ -55,6 +55,7 @@ import (
 	"context"
 	"strconv"
 	"sync"
+	"time"
 
 	blockpack "github.com/grafana/blockpack"
 	"github.com/hashicorp/golang-lru/v2/simplelru"
@@ -225,6 +226,61 @@ func (c *sizeCache) add(key string, sz int64) {
 	c.sizes[key] = sz
 }
 
+// listCache memoises List(prefix) results for a bounded time (blockpack issue
+// #478, the cube-backfill/cardinality-gate VCNT read path). Unlike object bytes,
+// sizes, and ranges — all immutable per key — a directory LISTING is NOT
+// immutable: a new VI/VCNT file written under the prefix changes the correct
+// result. So a listing entry is only valid for ttl, after which it is refetched.
+// The backfill/cardinality-gate path re-lists the SAME (tenant, column, type)
+// prefix repeatedly within a single pass (per span, per repeated TryCreate); a
+// short TTL collapses those bursts to one LIST while still observing newly-written
+// files within ttl. The entry count is bounded by the live prefix set (one per
+// tenant/column/type), so no byte budget is needed — each value is a slice of
+// keys, far smaller than a cached object.
+type listCache struct {
+	mu      sync.Mutex
+	entries map[string]listCacheEntry
+	ttl     time.Duration
+	now     func() time.Time // injectable for tests; defaults to time.Now
+}
+
+type listCacheEntry struct {
+	keys    []string
+	fetched time.Time
+}
+
+func newListCache(ttl time.Duration) *listCache {
+	return &listCache{
+		entries: make(map[string]listCacheEntry),
+		ttl:     ttl,
+		now:     time.Now,
+	}
+}
+
+// get returns the cached keys for prefix if a fresh (within ttl) entry exists.
+// It returns a copy so a caller mutating (e.g. sorting/appending to) the returned
+// slice cannot corrupt the cached entry.
+func (c *listCache) get(prefix string) ([]string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.entries[prefix]
+	if !ok || c.now().Sub(e.fetched) >= c.ttl {
+		return nil, false
+	}
+	out := make([]string, len(e.keys))
+	copy(out, e.keys)
+	return out, true
+}
+
+// add stores a copy of keys under prefix with the current fetch time.
+func (c *listCache) add(prefix string, keys []string) {
+	stored := make([]string, len(keys))
+	copy(stored, keys)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries[prefix] = listCacheEntry{keys: stored, fetched: c.now()}
+}
+
 // cachingStore decorates a valueIndexStore so value-index / trace-by-ID index
 // file reads hit process-level caches with singleflight dedup: whole-object Get
 // (blockpack issue #475), object Size, and ranged ReadAt (blockpack issue #477).
@@ -237,27 +293,51 @@ type cachingStore struct {
 	cache  *contentCache
 	ranges *rangeCache
 	sizes  *sizeCache
+	// lists, when non-nil, memoises List(prefix) results for a bounded TTL
+	// (blockpack issue #478). It is nil on the query path (List passes straight
+	// through, already covered by blockpack's IndexFileCache) and set only for the
+	// cube-backfill/cardinality-gate path, which has no IndexFileCache in front and
+	// re-lists the same prefix repeatedly.
+	lists *listCache
 	// group dedups whole-object Get flights (keyed by object key); rangeGroup dedups
-	// ranged ReadAt flights (keyed by "key|off|len"). Separate groups so a Get and a
-	// ReadAt of the same key never collide on one flight key.
+	// ranged ReadAt flights (keyed by "key|off|len"); listGroup dedups List flights
+	// (keyed by prefix). Separate groups so a Get, a ReadAt, and a List of the same
+	// key/prefix never collide on one flight key.
 	group      singleflight.Group
 	rangeGroup singleflight.Group
+	listGroup  singleflight.Group
 }
 
 // newCachingStore wraps inner with byte-bounded caches for Get and ReadAt (sharing
-// maxBytes) plus a Size memo. A maxBytes <= 0 disables all caching and returns
-// inner unwrapped, so every read path is byte-identical to before (raw store, no
-// dedup).
+// maxBytes) plus a Size memo. List passes straight through (already covered by
+// blockpack's IndexFileCache on the query path). A maxBytes <= 0 disables all
+// caching and returns inner unwrapped, so every read path is byte-identical to
+// before (raw store, no dedup).
 func newCachingStore(inner valueIndexStore, maxBytes int64) valueIndexStore {
-	if maxBytes <= 0 {
+	return newCachingStoreWithListTTL(inner, maxBytes, 0)
+}
+
+// newCachingStoreWithListTTL is newCachingStore plus an optional listing cache
+// (blockpack issue #478). A listTTL > 0 memoises List(prefix) results for that
+// duration; listTTL <= 0 leaves List a straight pass-through (the query-path
+// default, where IndexFileCache already covers listings). Used by the
+// cube-backfill/cardinality-gate VCNT path, which has no IndexFileCache and
+// re-lists the same (tenant, column, type) prefix repeatedly. When both maxBytes
+// <= 0 and listTTL <= 0 there is nothing to cache, so inner is returned unwrapped
+// (byte-identical to before, no dedup).
+func newCachingStoreWithListTTL(inner valueIndexStore, maxBytes int64, listTTL time.Duration) valueIndexStore {
+	if maxBytes <= 0 && listTTL <= 0 {
 		return inner
 	}
-	return &cachingStore{
-		inner:  inner,
-		cache:  newContentCache(maxBytes),
-		ranges: newRangeCache(maxBytes),
-		sizes:  newSizeCache(),
+	cs := &cachingStore{inner: inner, sizes: newSizeCache()}
+	if maxBytes > 0 {
+		cs.cache = newContentCache(maxBytes)
+		cs.ranges = newRangeCache(maxBytes)
 	}
+	if listTTL > 0 {
+		cs.lists = newListCache(listTTL)
+	}
+	return cs
 }
 
 // Get serves index file bytes from the content cache, deduplicating concurrent
@@ -267,6 +347,10 @@ func newCachingStore(inner valueIndexStore, maxBytes int64) valueIndexStore {
 // the caller still sees a correct failure (blockpack's GetTraceByID treats a
 // fetch error as a hard error, not a silent miss).
 func (s *cachingStore) Get(ctx context.Context, key string) ([]byte, error) {
+	if s.cache == nil {
+		// No content cache configured (list-only wrapping): pass straight through.
+		return s.inner.Get(ctx, key)
+	}
 	if data, ok := s.cache.get(key); ok {
 		return data, nil
 	}
@@ -289,10 +373,44 @@ func (s *cachingStore) Get(ctx context.Context, key string) ([]byte, error) {
 	return v.([]byte), nil
 }
 
-// List passes through — DiscoverIndexFiles listing is cheap and already covered
-// by blockpack's IndexFileCache; there is nothing large to dedup here.
+// List serves object listings from the TTL'd listing cache when one is
+// configured (blockpack issue #478, the cube-backfill/cardinality-gate VCNT
+// path), deduplicating concurrent misses on the same prefix via singleflight so
+// repeated re-lists of the same (tenant, column, type) collapse to one LIST. When
+// no listing cache is configured (the query path, where blockpack's
+// IndexFileCache already covers listings) List passes straight through. Listings
+// are NOT immutable — a newly-written file changes the correct result — so an
+// entry is only valid within its TTL, unlike the immutable Get/Size/ReadAt caches.
+// On any inner error nothing is cached and the error propagates.
 func (s *cachingStore) List(ctx context.Context, prefix string) ([]string, error) {
-	return s.inner.List(ctx, prefix)
+	if s.lists == nil {
+		return s.inner.List(ctx, prefix)
+	}
+	if keys, ok := s.lists.get(prefix); ok {
+		return keys, nil
+	}
+	v, err, _ := s.listGroup.Do(prefix, func() (interface{}, error) {
+		// Re-check under the flight: an earlier flight for the same prefix may have
+		// populated the cache while we waited to become the leader.
+		if keys, ok := s.lists.get(prefix); ok {
+			return keys, nil
+		}
+		keys, lerr := s.inner.List(ctx, prefix)
+		if lerr != nil {
+			return nil, lerr
+		}
+		s.lists.add(prefix, keys)
+		return keys, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	// Copy: the singleflight result is shared across all waiters, and get() already
+	// returns copies, so callers must never observe a shared slice they might mutate.
+	keys := v.([]string)
+	out := make([]string, len(keys))
+	copy(out, keys)
+	return out, nil
 }
 
 // Size serves the object length from the size memo. Object lengths are immutable
@@ -319,6 +437,10 @@ func (s *cachingStore) Size(key string) (int64, error) {
 // nil) is cached — a short read is an error condition (io.ReaderAt contract) that
 // must not be memoised as if it were the whole range.
 func (s *cachingStore) ReadAt(key string, p []byte, off int64) (int, error) {
+	if s.ranges == nil {
+		// No range cache configured (list-only wrapping): pass straight through.
+		return s.inner.ReadAt(key, p, off)
+	}
 	rk := rangeKey{key: key, off: off, len: len(p)}
 	if data, ok := s.ranges.get(rk); ok {
 		return copy(p, data), nil
