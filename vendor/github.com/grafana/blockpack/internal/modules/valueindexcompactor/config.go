@@ -76,9 +76,10 @@ type Config struct {
 	// individual file size. Defaults to DefaultCompactBatchBytes when <= 0.
 	CompactBatchBytes int64 `yaml:"compact_batch_bytes"`
 	// MaxOutputBytes is the approximate max serialized output-file size before
-	// splitting, honored only by the legacy flat-VINX compaction path.
-	// StreamCompactBucketFiles (the v2 BucketGroup path) always emits a single
-	// merged output file per level regardless of size — this field has no effect there.
+	// splitting. Honored by both the legacy flat-VINX compaction path and, since
+	// NOTE-VI-077 (#482), the v2 BucketGroup path (StreamCompactBucketFiles), which
+	// rotates to a fresh output file at a block boundary once the running body size
+	// exceeds this cap. <= 0 means no cap (a single output file per merged input set).
 	MaxOutputBytes int64 `yaml:"max_output_bytes"`
 	// Enabled turns the compactor on. When false the service does nothing.
 	Enabled bool `yaml:"enabled"`

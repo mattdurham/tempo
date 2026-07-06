@@ -1394,3 +1394,64 @@ tempo `tempodb/encoding/vblockpack/backend_block.go` (`FindTraceByID` passes
 `TestGetTraceByID_MatchingSourceRefButUnresolvableIsStillSkew`). Follow-up worth considering
 (not in scope): should tempo's querier tolerate per-block errors when at least one block
 succeeded, so a genuinely corrupt block cannot poison an otherwise-successful query?
+
+## NOTE-VI-077 — `StreamCompactBucketFiles` honors `MaxOutputBytes` by splitting at block boundaries (issue #482)
+
+Date: 2026-07-06
+
+Before this change the v2 BucketGroup compaction path (`StreamCompactBucketFiles`) always
+emitted exactly one output file per merged input set, regardless of size — the config's
+`MaxOutputBytes` was threaded only through the legacy flat-VINX `CompactFiles` path. In
+production this let common indexed columns (e.g. `span:kind`) grow to 75–223 MB per file
+across L0→L1→L3 compaction levels, so every query touching such a file paid a larger minimum
+I/O and decode cost than necessary. This is the BucketGroup sibling of the size-bounding gap
+the trace-by-id TraceGroup work addressed; it was never ported to the search/metrics path.
+
+`StreamCompactBucketFiles` now takes a `maxOutputBytes int64` argument. When `> 0`, after each
+output block is cut it evaluates a **projected finalized file size** (`projectedFileSize`) and,
+if that meets or exceeds the cap, finalizes the current output file (writes its string table +
+block index + footer, hands its path to the `output` callback) and starts a fresh one. Key
+decisions:
+
+- **Rotation only at a block boundary, never mid-block.** A block's groups reference the
+  current file's string table by interned index; splitting mid-block would strand references
+  to SourceRefs the new file's fresh table does not carry. The size check therefore runs only
+  right after `streamOutputWriter.add` reports it cut a block (`blockCut`). Consequence: the
+  effective rotation granularity is one block (`ValueIndexBucketGroupsPerBlock` = 4096 groups),
+  so a file can overshoot the cap by at most one block's serialized size. This matches the cap
+  being "approximate" (same posture as the flat-VINX path's byte heuristic).
+
+- **Project the *finalized* size, not just the body.** For a many-block file the tail (string
+  table + block index + fixed footer) dominates the compressed body — a `bodyEnd`-only check
+  would essentially never fire. `projectedFileSize` adds the exact string-table encoded size
+  (`StringTable.EncodedSize`, no allocation) plus the exact block-index size derived from the
+  flushed `dir` entries plus the fixed footer.
+
+- **Advance contributors before the split check.** `collectContributionsAtKey` pops every
+  contributing iterator off the merge heap, so `h.Len()` is 0 mid-merge for a single-input
+  compaction even when that input still has groups. The "more input remaining" guard
+  (`h.Len() > 0`, which prevents ever finalizing a rotation that would leave a trailing empty
+  file) is therefore evaluated only *after* `advanceContributors` restores the heap.
+
+- **Per-file state is bundled.** Each output file gets its own `bucketOutputFile` (temp file +
+  buffered writer + fresh `StringTable` + `streamOutputWriter`); rotation replaces the live
+  one with a new instance. `finalizeBucketOutputFile` clears the handed-off file handle so the
+  function's single deferred `cleanup` only ever removes the in-progress (un-finalized) file,
+  not one the `output` callback now owns.
+
+- **Caller wiring.** `valueindexcompactor`'s `mergeLevel` passes `s.cfg.MaxOutputBytes`; its
+  existing `output` callback (which reads the temp file, embeds the file's min/max time in a
+  fresh V2 filename, and Puts it) already runs once per emitted file, so multi-file output
+  drops straight in — each split file gets its own `NewID()` filename and independent
+  time-range for `DiscoverIndexFiles` pruning. `MaxOutputBytes <= 0` disables splitting (a
+  single output file, as before).
+
+Back-refs: `internal/modules/valueindex/stream_compaction.go`
+(`StreamCompactBucketFiles`, `projectedFileSize`, `bucketOutputFile`,
+`finalizeBucketOutputFile`), `internal/modules/valueindex/stringtable.go`
+(`StringTable.EncodedSize`), `internal/modules/valueindexcompactor/service.go` (`mergeLevel`).
+Tests: `stream_compaction_test.go`
+(`TestStreamCompactBucketFiles_MaxOutputBytesSplits`,
+`TestStreamCompactBucketFiles_MaxOutputBytesNoSplitWhenUnderCap`);
+`service_test.go` (`TestMergeLevel_MaxOutputBytesSplitsIntoMultipleFiles`). See `SPECS.md`
+SPEC-VI-2 (Addendum 2026-07-06).

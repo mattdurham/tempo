@@ -84,6 +84,23 @@ is `func(path string) error`, not `func(data []byte) error`; this is a caller-vi
 mechanical signature change, not a semantic one (`output`'s at-most-once, exhaustive-empty-set
 semantics above are unchanged).
 
+**Addendum (2026-07-06, NOTE-VI-077, issue #482):** `StreamCompactBucketFiles` now takes a
+`maxOutputBytes int64` argument and MAY emit **more than one** output file. When
+`maxOutputBytes > 0`, once the projected finalized size of the in-progress output file
+(compressed body + string table + block index + footer) meets or exceeds the cap *at a block
+boundary*, the current file is finalized and handed to `output`, and a fresh output file is
+started. `output` is therefore now called **once per emitted file**, in emission order, rather
+than at most once — but its per-file contract is unchanged (each invocation receives the path
+to one fully assembled, self-contained BucketGroup file). The at-most-once guarantee now
+applies per emitted file, and the "not at all if there is nothing to emit" guarantee still
+holds for the whole call (an empty merge produces zero files).
+
+The split lands only at block boundaries — never mid-block — because a block's groups reference
+the current file's string table by interned index, so the effective rotation granularity is
+one block (`ValueIndexBucketGroupsPerBlock`) and a file may overshoot the cap by at most one
+block's serialized size (the cap is approximate, matching the flat-VINX path). `maxOutputBytes
+<= 0` preserves the original single-file behavior.
+
 Back-ref: `internal/modules/valueindex/stream_compaction.go:StreamCompactBucketFiles`.
 
 ---

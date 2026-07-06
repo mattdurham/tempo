@@ -480,9 +480,11 @@ func (s *Service) mergeLevel(ctx context.Context, colDir string, files []levelFi
 
 	outputLevel := files[0].level + 1
 
-	// MaxOutputBytes is not honored by the v2 BucketGroup path (StreamCompactBucketFiles
-	// always emits a single file); it only applies to the older flat-VINX CompactFiles
-	// path, so it is not threaded through here.
+	// NOTE-VI-077 (#482): MaxOutputBytes is threaded into StreamCompactBucketFiles below so
+	// the v2 BucketGroup path splits its output into multiple size-bounded files at block
+	// boundaries once the cap is exceeded, instead of emitting one unbounded file per input
+	// set. Each emitted file gets its own V2 filename (time range embedded) so discovery
+	// pruning (DiscoverIndexFiles) treats them independently.
 	var checker valueindex.RefChecker
 	if s.exister != nil {
 		checker = newCachingRefChecker(s.exister)
@@ -527,7 +529,7 @@ func (s *Service) mergeLevel(ctx context.Context, colDir string, files []levelFi
 	}
 
 	var written int
-	err := valueindex.StreamCompactBucketFiles(ctx, iterators, 0, func(outPath string) error {
+	err := valueindex.StreamCompactBucketFiles(ctx, iterators, 0, s.cfg.MaxOutputBytes, func(outPath string) error {
 		//nolint:gosec // G304: outPath is StreamCompactBucketFiles' own local temp output file, not user input
 		data, err := os.ReadFile(outPath)
 		if err != nil {

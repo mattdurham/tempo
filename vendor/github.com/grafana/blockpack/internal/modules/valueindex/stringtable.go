@@ -75,6 +75,21 @@ func (t *StringTable) Lookup(idx uint16) string {
 // Len returns the number of strings in the table.
 func (t *StringTable) Len() int { return len(t.strs) }
 
+// EncodedSize returns the exact number of bytes EncodeStringTable would produce for t,
+// without allocating the encoded buffer. Used by StreamCompactBucketFiles' output-size split
+// heuristic (NOTE-VI-077) to project the eventual on-disk file size at a block boundary
+// without serializing the tail on every check.
+func (t *StringTable) EncodedSize() int {
+	if t == nil || len(t.strs) == 0 {
+		return 2 // empty table: str_count[2]
+	}
+	size := 2 // str_count[2]
+	for _, s := range t.strs {
+		size += 2 + len(s) // str_len[2] + str_bytes[N]
+	}
+	return size
+}
+
 // EncodeStringTable serializes the string table into the wire format.
 // Returns nil if the table is empty.
 func EncodeStringTable(t *StringTable) []byte {

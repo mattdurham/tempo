@@ -342,13 +342,19 @@ func newStreamOutputWriter(bw *bufio.Writer, groupsPerBlock int, headerLen uint6
 	}
 }
 
-// add appends g to the pending block, flushing automatically once groupsPerBlock is reached.
-func (w *streamOutputWriter) add(g BucketGroup) error {
+// add appends g to the pending block, flushing automatically once groupsPerBlock is
+// reached. It reports whether a block was just cut (flushed) by this call, so the caller
+// can safely evaluate an output-file-size split boundary only at a block boundary — never
+// mid-block, since a block's groups reference the current file's string table (NOTE-VI-077).
+func (w *streamOutputWriter) add(g BucketGroup) (blockCut bool, err error) {
 	w.pending = append(w.pending, g)
 	if len(w.pending) >= w.groupsPerBlock {
-		return w.flush()
+		if err := w.flush(); err != nil {
+			return false, err
+		}
+		return true, nil
 	}
-	return nil
+	return false, nil
 }
 
 // flush writes the pending block (if non-empty) to bw and records its directory entry.
@@ -384,6 +390,26 @@ func (w *streamOutputWriter) flush() error {
 	w.haveFileTime = true
 	w.pending = make([]BucketGroup, 0, w.groupsPerBlock)
 	return nil
+}
+
+// projectedFileSize returns an estimate of the eventual on-disk size of the output file if it
+// were finalized right now, given the writer's flushed body (bodyEnd) plus the tail it will
+// grow: the string table (sized from table) + block index (one entry per flushed block) +
+// fixed footer. Used only by the output-size split heuristic (NOTE-VI-077) — it is an
+// estimate, not a guarantee, because the not-yet-flushed pending block and any future blocks
+// still add to the body, and the string table may still gain SourceRefs; but evaluated only
+// at a block boundary (pending empty) it is exact for everything already committed, which is
+// enough to bound each rotated file within a small multiple of the cap.
+func projectedFileSize(w *streamOutputWriter, table *StringTable) uint64 {
+	// Block index: 4-byte count prefix + per-entry fixed fields (4×uint64) + two
+	// length-prefixed values, mirroring appendBlockIndex's layout exactly.
+	blockIdxSize := uint64(4)
+	for i := range w.dir {
+		d := &w.dir[i]
+		blockIdxSize += 8 + 8 + 8 + 8 + 2 + uint64(len(d.MinValue)) + 2 + uint64(len(d.MaxValue))
+	}
+	//nolint:gosec // G115: EncodedSize is a byte length, always >= 0, never overflows uint64.
+	return w.bodyEnd + uint64(table.EncodedSize()) + blockIdxSize + bucketFooterSize
 }
 
 // populateMergeHeap pushes every non-exhausted iterator onto a fresh heap, propagating any
@@ -482,6 +508,7 @@ func StreamCompactBucketFiles(
 	ctx context.Context,
 	iterators []GroupIterator,
 	groupsPerBlock int,
+	maxOutputBytes int64,
 	output func(path string) error,
 ) error {
 	if err := ctx.Err(); err != nil {
@@ -496,25 +523,14 @@ func StreamCompactBucketFiles(
 		return err
 	}
 
-	outFile, err := os.CreateTemp("", "vi-merge-out-*.tmp")
+	of, err := newBucketOutputFile(groupsPerBlock)
 	if err != nil {
-		return fmt.Errorf("valueindex: StreamCompactBucketFiles: create temp output: %w", err)
+		return err
 	}
-	outPath := outFile.Name()
-	defer func() {
-		_ = outFile.Close()
-		_ = os.Remove(outPath)
-	}()
-
-	bw := bufio.NewWriterSize(outFile, 256<<10)
-	header := binary.LittleEndian.AppendUint32(make([]byte, 0, 5), BucketFileMagic)
-	header = append(header, BucketFileVersion)
-	if _, err := bw.Write(header); err != nil {
-		return fmt.Errorf("valueindex: StreamCompactBucketFiles: write header: %w", err)
-	}
-
-	outTable := NewStringTable()
-	out := newStreamOutputWriter(bw, groupsPerBlock, uint64(len(header)))
+	// Only the current (in-progress) output file needs cleanup on error: a file that has
+	// been finalized+handed to `output` is the caller's responsibility per the callback
+	// contract, and finalizeBucketOutputFile clears of.file after a successful handoff.
+	defer func() { of.cleanup() }()
 
 	contribGroups := make([]*BucketGroup, 0, len(iterators))
 	contribTables := make([]*StringTable, 0, len(iterators))
@@ -548,35 +564,130 @@ func StreamCompactBucketFiles(
 			return cerr
 		}
 
-		merged, err := mergeGroupsAtKey(keyTS, keyValue, contribGroups, contribTables, outTable)
+		merged, err := mergeGroupsAtKey(keyTS, keyValue, contribGroups, contribTables, of.table)
 		if err != nil {
 			return fmt.Errorf("valueindex: StreamCompactBucketFiles: %w", err)
 		}
-		if err := out.add(merged); err != nil {
-			return err
+		blockCut, addErr := of.out.add(merged)
+		if addErr != nil {
+			return addErr
 		}
 
-		if err := advanceContributors(ctx, h, contribIters); err != nil {
-			return err
+		// Advance the contributing iterators back onto the heap BEFORE evaluating the split
+		// boundary: collectContributionsAtKey popped every contributor out of the heap, so
+		// h.Len() would be 0 here for a single-input merge even when that input still has more
+		// groups. Advancing first restores the heap to reflect the true remaining work, so the
+		// "more input remaining" guard below is accurate.
+		if advErr := advanceContributors(ctx, h, contribIters); advErr != nil {
+			return advErr
+		}
+
+		// NOTE-VI-077 (#482): honor maxOutputBytes by rotating to a fresh output file at a
+		// block boundary once the projected finalized file size has grown past the cap.
+		// projectedFileSize (not just bodyEnd) accounts for the tail — string table + block
+		// index + footer — which for a many-block file dominates the compressed body, so a
+		// bodyEnd-only check would never trigger. Rotation is only ever evaluated right after
+		// a block was cut (blockCut) so the split lands on a block boundary — never mid-block,
+		// since a block's groups reference the current file's string table (a mid-block split
+		// would strand references to interned SourceRefs the new file's table does not carry).
+		// The h.Len() > 0 guard (evaluated after advanceContributors above) guarantees
+		// rotation never produces a trailing empty file.
+		//nolint:gosec // G115: maxOutputBytes > 0 is guarded here, so the uint64 conversion is safe.
+		if blockCut && maxOutputBytes > 0 && h.Len() > 0 &&
+			projectedFileSize(of.out, of.table) >= uint64(maxOutputBytes) {
+			if finErr := finalizeBucketOutputFile(of, output); finErr != nil {
+				return finErr
+			}
+			var newErr error
+			if of, newErr = newBucketOutputFile(groupsPerBlock); newErr != nil {
+				return newErr
+			}
 		}
 	}
 
-	if err := out.flush(); err != nil {
+	if err := of.out.flush(); err != nil {
 		return err
 	}
 
-	if len(out.dir) == 0 {
+	if len(of.out.dir) == 0 {
+		// Nothing left to emit in the trailing file (all remaining groups, if any, were
+		// already flushed into a prior rotated file). cleanup (deferred) removes the empty
+		// temp file.
 		return nil
 	}
 
-	if err := writeBucketFileTail(bw, out.dir, outTable, out.fileMin, out.fileMax, out.bodyEnd); err != nil {
+	return finalizeBucketOutputFile(of, output)
+}
+
+// bucketOutputFile bundles the per-output-file state StreamCompactBucketFiles cuts blocks
+// into: the temp file + buffered writer, this file's own string table (SourceRefs are
+// interned per file — a rotated file starts with a fresh table, NOTE-VI-077), and the
+// block-cutting streamOutputWriter. One instance is live at a time; multi-file output
+// (maxOutputBytes splitting) replaces it with a fresh instance after each finalize.
+type bucketOutputFile struct {
+	file  *os.File
+	bw    *bufio.Writer
+	table *StringTable
+	out   *streamOutputWriter
+}
+
+// newBucketOutputFile creates a fresh temp output file, writes its header, and returns the
+// bundled per-file writer state.
+func newBucketOutputFile(groupsPerBlock int) (*bucketOutputFile, error) {
+	f, err := os.CreateTemp("", "vi-merge-out-*.tmp")
+	if err != nil {
+		return nil, fmt.Errorf("valueindex: StreamCompactBucketFiles: create temp output: %w", err)
+	}
+	bw := bufio.NewWriterSize(f, 256<<10)
+	header := binary.LittleEndian.AppendUint32(make([]byte, 0, 5), BucketFileMagic)
+	header = append(header, BucketFileVersion)
+	if _, err := bw.Write(header); err != nil {
+		_ = f.Close()
+		_ = os.Remove(f.Name()) //nolint:gosec // G703: f is our own os.CreateTemp file, not user-supplied.
+		return nil, fmt.Errorf("valueindex: StreamCompactBucketFiles: write header: %w", err)
+	}
+	return &bucketOutputFile{
+		file:  f,
+		bw:    bw,
+		table: NewStringTable(),
+		out:   newStreamOutputWriter(bw, groupsPerBlock, uint64(len(header))),
+	}, nil
+}
+
+// cleanup closes and removes the current (not-yet-finalized) temp file. It is a no-op once
+// the file has been handed off to `output` (finalizeBucketOutputFile clears of.file), so a
+// deferred cleanup only ever removes an in-progress file, never one the caller now owns.
+func (of *bucketOutputFile) cleanup() {
+	if of == nil || of.file == nil {
+		return
+	}
+	name := of.file.Name()
+	_ = of.file.Close()
+	//nolint:gosec // G703: name is our own os.CreateTemp file, not user-supplied.
+	_ = os.Remove(name)
+	of.file = nil
+}
+
+// finalizeBucketOutputFile flushes any pending block, writes the string table / block index /
+// footer, flushes+closes the file, and hands its path to `output`. On success it clears
+// of.file so the deferred cleanup will not remove the file the caller now owns. `output` must
+// be called at most once per finalized file; multiple finalized files (from maxOutputBytes
+// splitting) invoke it once each, in emission order.
+func finalizeBucketOutputFile(of *bucketOutputFile, output func(path string) error) error {
+	if err := of.out.flush(); err != nil {
 		return err
 	}
-	if err := bw.Flush(); err != nil {
+	if err := writeBucketFileTail(of.bw, of.out.dir, of.table, of.out.fileMin, of.out.fileMax, of.out.bodyEnd); err != nil {
+		return err
+	}
+	if err := of.bw.Flush(); err != nil {
 		return fmt.Errorf("valueindex: StreamCompactBucketFiles: flush output: %w", err)
 	}
-	if err := outFile.Close(); err != nil {
+	name := of.file.Name()
+	if err := of.file.Close(); err != nil {
 		return fmt.Errorf("valueindex: StreamCompactBucketFiles: close output: %w", err)
 	}
-	return output(outPath)
+	of.file = nil // handed off; deferred cleanup must not remove it now
+	defer func() { _ = os.Remove(name) }()
+	return output(name)
 }
