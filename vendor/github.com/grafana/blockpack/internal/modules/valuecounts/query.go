@@ -89,6 +89,72 @@ func TopNInRange(data []byte, dir []ChunkDirEntry, column string, minTS, maxTS u
 	return out, nil
 }
 
+// SelectivityEstimate is the result of a per-(column, value) selectivity lookup against a VCNT
+// section (issue #484, Phase 1). It approximates how many spans a leaf predicate
+// `column = value` would match over the query window, for cost-based leaf-resolution ordering.
+//
+// Covered distinguishes "the value index has no data for this (column, value, window) — treat
+// as unknown selectivity" from "the value index knows this value matches zero live spans".
+// The two are directionally opposite for ordering: a Covered zero-count leaf is maximally
+// selective (resolve it first, it can short-circuit an AND), whereas an uncovered leaf carries
+// no signal (resolve it last / by the caller's fallback policy). Callers must not collapse them.
+type SelectivityEstimate struct {
+	// Count is the net live span count for the value over the window. Only meaningful when
+	// Covered is true. It is clamped to >= 0: a net-negative sum (more deletions than
+	// introductions seen so far, an async/retention artifact) reads as zero live spans.
+	Count int64
+	// Covered reports whether any VCNT record was found for the (column, value, window). When
+	// false, Count is zero and carries no selectivity signal — the caller should apply its
+	// no-coverage fallback (e.g. "resolve last / unknown").
+	Covered bool
+}
+
+// SelectivityInRange approximates the span count of the leaf predicate `column = value` over
+// [minTS, maxTS] against a single VCNT section (data + dir). It is the selectivity oracle
+// behind cost-based AND-leaf resolution ordering (issue #484, Phase 1, NOTE-VC-013): a cheaper,
+// value-scoped counterpart to ValuesInRange that sums Count for exactly one value rather than
+// enumerating every distinct value of the column.
+//
+// value is the canonical-encoded column value, matched byte-for-byte against Record.Value (the
+// same encoding ValuesInRange returns in ValueCount.Value). Records outside the column, the
+// value, or the time window are ignored; records that overlap the window are summed following
+// the same signed delta-accounting liveness rule as the rest of this package (NOTE-VC-001).
+//
+// Estimation accuracy only needs to be directionally correct for ordering purposes — VCNT's
+// async/approximate nature (batch writes, retention deltas) is acceptable (issue #484). Like
+// the other read primitives it opens no blockpack data files.
+func SelectivityInRange(
+	data []byte,
+	dir []ChunkDirEntry,
+	column string,
+	value []byte,
+	minTS, maxTS uint64,
+) (SelectivityEstimate, error) {
+	recs, err := DecodeTimeRange(data, dir, minTS, maxTS)
+	if err != nil {
+		return SelectivityEstimate{}, err
+	}
+	var (
+		sum     int64
+		covered bool
+	)
+	for i := range recs {
+		r := &recs[i]
+		if r.ColumnName != column {
+			continue
+		}
+		if !bytes.Equal(r.Value, value) {
+			continue
+		}
+		covered = true
+		sum += r.Count
+	}
+	if sum < 0 {
+		sum = 0
+	}
+	return SelectivityEstimate{Count: sum, Covered: covered}, nil
+}
+
 // CardinalityInRange answers "how many distinct values does column have in [minTS, maxTS]?" —
 // the cardinality gate primitive for cube creation (issue #400, reopened requirement; #445).
 // It counts the distinct values whose net live count is > 0, opening no blockpack data files.

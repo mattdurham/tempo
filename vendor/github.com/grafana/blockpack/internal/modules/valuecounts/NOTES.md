@@ -322,3 +322,51 @@ is applied at the record level by the gate's `ValuesInRange` decode.
 
 Back-refs: `vcnt.go:VCNTBuildSectionFromObjects`, `internal/modules/cube/cardinality.go:CheckCardinality`,
 `internal/modules/valuecounts/selfdescribing.go:DecodeVCNTObject`. Issue #483.
+
+---
+
+## NOTE-VC-013 — SelectivityInRange: a value-scoped selectivity oracle for AND-leaf ordering
+
+Date: 2026-07-06
+
+`SelectivityInRange(data, dir, column, value, minTS, maxTS)` is the Phase 1 primitive of the
+cost-based leaf-resolution ordering work (issue #484). Given a single canonical-encoded value,
+it sums the net live `Count` for that one value over the window and returns a
+`SelectivityEstimate{Count, Covered}` — an approximate span count for the leaf predicate
+`column = value`, cheap enough to consult before deciding which columns' value-index files to
+fetch from object storage.
+
+### Why a separate primitive, not `ValuesInRange` + a lookup
+
+`ValuesInRange` enumerates *every* distinct value of the column and their counts, then a caller
+would scan for the one it wants. For a selectivity oracle over a specific value that is wasted
+work (build the full per-value map, sort, allocate a slice, discard all but one entry).
+`SelectivityInRange` sums only records matching the requested value in a single pass, no
+per-value map, no sort, no `[]ValueCount` allocation. Both share `DecodeTimeRange` and the same
+signed delta-accounting liveness rule (NOTE-VC-001), so results are consistent between them.
+
+### `Covered` is load-bearing — do not collapse it into `Count == 0`
+
+The estimate distinguishes two cases the caller must treat oppositely for ordering:
+
+  - **Covered, Count == 0** — the value index affirmatively knows this value matches zero live
+    spans in the window. This leaf is *maximally selective*: resolve it first, an empty result
+    short-circuits the whole AND group (mirrors NOTE-019's `len(result)==0` early exit, applied
+    one level up at index-fetch-decision time — Phase 2).
+  - **Not Covered** — no VCNT record exists for the (column, value, window). This carries *no*
+    selectivity signal; the caller must fall back to its no-coverage policy (resolve last /
+    unknown), never treat the leaf as if it matched zero spans.
+
+Collapsing these into a single "zero" would make an uncovered leaf masquerade as maximally
+selective and wrongly short-circuit an AND that actually has matches — a correctness bug, not
+just a bad estimate. Hence the explicit `Covered` flag.
+
+### Clamp to >= 0
+
+Net-negative sums are possible transiently (a retention/compaction delta subtracted before its
+matching introduction is seen, given VCNT's async batch writes). A negative live count is
+meaningless as a span estimate, so `Count` is clamped to zero — reading as "zero live spans"
+while `Covered` stays true. Accuracy only needs to be directionally correct for ordering (issue
+#484), so this clamp is safe.
+
+Back-refs: `SelectivityInRange`, `SelectivityEstimate` in query.go. Issue #484.

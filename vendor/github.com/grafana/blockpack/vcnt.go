@@ -47,6 +47,28 @@ func CompactVCNTRecords(records []VCNTRecord) []VCNTRecord {
 	return valuecounts.Compact(records)
 }
 
+// VCNTSelectivityEstimate is an approximate span count for a leaf predicate
+// `column = value`, produced by VCNTSelectivityInRange. Covered distinguishes
+// "the index affirmatively knows this value matches zero live spans" (Covered,
+// Count 0 — maximally selective) from "no VCNT coverage — unknown selectivity"
+// (not Covered). See NOTE-VC-013.
+type VCNTSelectivityEstimate = valuecounts.SelectivityEstimate
+
+// VCNTSelectivityInRange approximates how many spans the leaf predicate
+// `column = value` matches over [minTS, maxTS] against a single VCNT section,
+// summing the net live Count for exactly that one canonical-encoded value. It is
+// the cost oracle behind cost-based AND-leaf resolution ordering (issue #484,
+// Phase 1); it opens no blockpack data files. See NOTE-VC-013.
+func VCNTSelectivityInRange(
+	data []byte,
+	dir []VCNTChunkDirEntry,
+	column string,
+	value []byte,
+	minTS, maxTS uint64,
+) (VCNTSelectivityEstimate, error) {
+	return valuecounts.SelectivityInRange(data, dir, column, value, minTS, maxTS)
+}
+
 // VCNTColHash returns the per-column directory hash used in the .vcnt object key.
 func VCNTColHash(colName string) string {
 	return valuecounts.ColHash(colName)
