@@ -18,6 +18,7 @@ import (
 	"github.com/go-kit/log"
 	"github.com/gogo/protobuf/jsonpb"
 	"github.com/google/uuid"
+	"github.com/grafana/blockpack"
 	"github.com/grafana/dskit/user"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
@@ -474,7 +475,7 @@ func TestBackendRequests(t *testing.T) {
 			pipelineRequest := pipeline.NewHTTPRequest(r)
 
 			searchJobResponse := &combiner.SearchJobResponse{}
-			s.backendRequests(ctx, "test", pipelineRequest, searchReq, searchJobResponse, reqCh, cancelCause)
+			s.backendRequests(ctx, "test", pipelineRequest, searchReq, searchJobResponse, nil, reqCh, cancelCause)
 			require.Equal(t, tc.expectedJobs, searchJobResponse.TotalJobs)
 			require.Equal(t, tc.expectedBlocks, searchJobResponse.TotalBlocks)
 			require.Equal(t, tc.expectedBlockBytes, searchJobResponse.TotalBytes)
@@ -489,6 +490,469 @@ func TestBackendRequests(t *testing.T) {
 			urisEqual(t, tc.expectedReqsURIs, actualReqURIs)
 		})
 	}
+}
+
+// TestSearchSharder_TimeSlicedDispatch_UsesQueryPlanSlicesNotBlockPaging pins #487's
+// time-sliced dispatch: given a QueryPlan with Strategy: DispatchTimeSliced and a non-empty
+// Slices, backendRequests must emit one job per (block, slice) pair with IndexOnly=true and
+// SearchReq.Start/End overridden to the slice's bounds — NOT the pagesPerRequest-computed
+// page range backendJobsFunc would otherwise use.
+func TestSearchSharder_TimeSlicedDispatch_UsesQueryPlanSlicesNotBlockPaging(t *testing.T) {
+	bm := backend.NewBlockMeta("test", uuid.New(), "wdwad")
+	bm.StartTime = time.Unix(100, 0)
+	bm.EndTime = time.Unix(200, 0)
+	bm.Size_ = defaultTargetBytesPerRequest * 2
+	bm.TotalRecords = 2
+
+	s := &asyncSearchSharder{
+		cfg:    SearchSharderConfig{MostRecentShards: defaultMostRecentShards},
+		reader: &mockReader{metas: []*backend.BlockMeta{bm}},
+	}
+
+	r := httptest.NewRequest("GET", "/?tags=foo%3Dbar&limit=50&start=100&end=200", nil)
+	searchReq, err := api.ParseSearchRequest(r)
+	require.NoError(t, err)
+
+	plan := &blockpack.QueryPlan{
+		Strategy: blockpack.DispatchTimeSliced,
+		Slices: []blockpack.TimeSlice{
+			{Start: 150, End: 200},
+			{Start: 100, End: 150},
+		},
+	}
+
+	reqCh := make(chan pipeline.Request)
+	ctx, cancelCause := context.WithCancelCause(context.Background())
+	pipelineRequest := pipeline.NewHTTPRequest(r)
+	searchJobResponse := &combiner.SearchJobResponse{}
+
+	go s.backendRequests(ctx, "test", pipelineRequest, searchReq, searchJobResponse, plan, reqCh, cancelCause)
+
+	var gotReqs []*tempopb.SearchBlockRequest
+	for pr := range reqCh {
+		parsed, err := api.ParseSearchBlockRequest(pr.HTTPRequest())
+		require.NoError(t, err)
+		gotReqs = append(gotReqs, parsed)
+	}
+	require.NoError(t, ctx.Err())
+
+	require.Equal(t, 2, searchJobResponse.TotalJobs, "one job per (block, slice) pair for the single block")
+	require.Len(t, gotReqs, 2)
+
+	sort.Slice(gotReqs, func(i, j int) bool { return gotReqs[i].SearchReq.Start < gotReqs[j].SearchReq.Start })
+
+	require.Equal(t, uint32(100), gotReqs[0].SearchReq.Start)
+	require.Equal(t, uint32(150), gotReqs[0].SearchReq.End)
+	require.True(t, gotReqs[0].IndexOnly, "a time-sliced job must set IndexOnly=true")
+
+	require.Equal(t, uint32(150), gotReqs[1].SearchReq.Start)
+	require.Equal(t, uint32(200), gotReqs[1].SearchReq.End)
+	require.True(t, gotReqs[1].IndexOnly, "a time-sliced job must set IndexOnly=true")
+}
+
+// TestSearchSharder_BlockShardedDispatch_UnchangedWhenStrategyIsBlockSharded pins the
+// parity-and-fallback-first discipline: a nil plan, and a plan whose Strategy is the
+// zero-value DispatchBlockSharded, must both produce byte-identical output to today's
+// block-sharded backendJobsFunc-only path — including IndexOnly=false (the zero value) on
+// every job.
+func TestSearchSharder_BlockShardedDispatch_UnchangedWhenStrategyIsBlockSharded(t *testing.T) {
+	bm := backend.NewBlockMeta("test", uuid.New(), "wdwad")
+	bm.StartTime = time.Unix(100, 0)
+	bm.EndTime = time.Unix(200, 0)
+	bm.Size_ = defaultTargetBytesPerRequest * 2
+	bm.TotalRecords = 2
+
+	newSharder := func() *asyncSearchSharder {
+		return &asyncSearchSharder{
+			cfg:    SearchSharderConfig{MostRecentShards: defaultMostRecentShards},
+			reader: &mockReader{metas: []*backend.BlockMeta{bm}},
+		}
+	}
+
+	runWithPlan := func(t *testing.T, plan *blockpack.QueryPlan) (int, []string) {
+		t.Helper()
+		r := httptest.NewRequest("GET", "/?tags=foo%3Dbar&minDuration=10ms&maxDuration=30ms&limit=50&start=100&end=200", nil)
+		searchReq, err := api.ParseSearchRequest(r)
+		require.NoError(t, err)
+
+		reqCh := make(chan pipeline.Request)
+		ctx, cancelCause := context.WithCancelCause(context.Background())
+		pipelineRequest := pipeline.NewHTTPRequest(r)
+		searchJobResponse := &combiner.SearchJobResponse{}
+
+		go newSharder().backendRequests(ctx, "test", pipelineRequest, searchReq, searchJobResponse, plan, reqCh, cancelCause)
+
+		var uris []string
+		for pr := range reqCh {
+			uris = append(uris, pr.HTTPRequest().RequestURI)
+			parsed, err := api.ParseSearchBlockRequest(pr.HTTPRequest())
+			require.NoError(t, err)
+			require.False(t, parsed.IndexOnly, "block-sharded jobs must have IndexOnly=false")
+		}
+		require.NoError(t, ctx.Err())
+		return searchJobResponse.TotalJobs, uris
+	}
+
+	nilJobs, nilURIs := runWithPlan(t, nil)
+	blockShardedJobs, blockShardedURIs := runWithPlan(t, &blockpack.QueryPlan{Strategy: blockpack.DispatchBlockSharded})
+
+	require.Equal(t, 2, nilJobs)
+	require.Equal(t, nilJobs, blockShardedJobs)
+	require.Equal(t, nilURIs, blockShardedURIs)
+}
+
+// twoBlockGroupsForTimeSlicedShardTest returns two blocks (a recent one and an older
+// one) plus a sharder configured so timeSlicedJobsFunc rolls them into two separate
+// shards (MostRecentShards=2 -> blocksPerShard=1) — the fixture the T4 (#487 brainstorm
+// risk 1) tests below share, so all three exercise the exact same shard-array shape T2's
+// production code produces.
+func twoBlockGroupsForTimeSlicedShardTest() (*asyncSearchSharder, *http.Request, *tempopb.SearchRequest) {
+	bmRecent := backend.NewBlockMeta("test", uuid.New(), "wdwad")
+	bmRecent.StartTime = time.Unix(200, 0)
+	bmRecent.EndTime = time.Unix(300, 0)
+	bmRecent.Size_ = 100
+	bmRecent.TotalRecords = 1
+
+	bmOlder := backend.NewBlockMeta("test", uuid.New(), "wdwad")
+	bmOlder.StartTime = time.Unix(100, 0)
+	bmOlder.EndTime = time.Unix(200, 0)
+	bmOlder.Size_ = 100
+	bmOlder.TotalRecords = 1
+
+	s := &asyncSearchSharder{
+		cfg:    SearchSharderConfig{MostRecentShards: 2},
+		reader: &mockReader{metas: []*backend.BlockMeta{bmRecent, bmOlder}},
+	}
+
+	r := httptest.NewRequest("GET", "/?tags=foo%3Dbar&limit=50&start=100&end=300", nil)
+	searchReq, err := api.ParseSearchRequest(r)
+	if err != nil {
+		panic(err) // fixture construction only; a parse failure here is a test-writing bug
+	}
+
+	return s, r, searchReq
+}
+
+// runTimeSlicedBackendRequests drives backendRequests to completion for the given plan
+// and returns the resulting shard array plus each dispatched job's (Start, End) pair in
+// the exact order jobs were sent to reqCh (buildTimeSlicedBackendRequests iterates
+// blocks/slices on a single goroutine, so channel receive order == send order).
+func runTimeSlicedBackendRequests(t *testing.T, s *asyncSearchSharder, r *http.Request, searchReq *tempopb.SearchRequest, plan *blockpack.QueryPlan) ([]shardtracker.Shard, [][2]uint32) {
+	t.Helper()
+	reqCh := make(chan pipeline.Request)
+	ctx, cancelCause := context.WithCancelCause(context.Background())
+	resp := &combiner.SearchJobResponse{}
+
+	go s.backendRequests(ctx, "test", pipeline.NewHTTPRequest(r), searchReq, resp, plan, reqCh, cancelCause)
+
+	var order [][2]uint32
+	for pr := range reqCh {
+		parsed, err := api.ParseSearchBlockRequest(pr.HTTPRequest())
+		require.NoError(t, err)
+		order = append(order, [2]uint32{parsed.SearchReq.Start, parsed.SearchReq.End})
+	}
+	require.NoError(t, ctx.Err())
+
+	return resp.Shards, order
+}
+
+// TestTimeSlicedDispatch_ShardArrayOrderIsChronologicalNotPriority pins the #487
+// brainstorm's headline risk (plan-c.md T4): the []shardtracker.Shard array
+// timeSlicedJobsFunc/backendRequests builds must depend only on block chronology
+// (blockMetasForSearch's most-recent-first order), never on TimeSlice.EstMatches or the
+// order Slices happen to be given in. A recent, low-EstMatches slice and an older,
+// high-EstMatches slice (non-monotonic with time, exactly the brainstorm's scenario) must
+// not perturb the shard array — feeding Slices in chronological order versus a
+// hypothetical (incorrect) EstMatches-DESC dispatch-priority order must produce a
+// byte-identical shard array, since shard construction never inspects EstMatches at all.
+func TestTimeSlicedDispatch_ShardArrayOrderIsChronologicalNotPriority(t *testing.T) {
+	s, r, searchReq := twoBlockGroupsForTimeSlicedShardTest()
+
+	// chronological is exactly BuildTimeSlices' guaranteed output shape: most-recent-first,
+	// with EstMatches deliberately NOT monotonic with time (recent=low, older=high).
+	chronological := []blockpack.TimeSlice{
+		{Start: 200, End: 300, EstMatches: 5, EstKnown: true},   // most recent, low priority
+		{Start: 100, End: 200, EstMatches: 500, EstKnown: true}, // older, high priority
+	}
+	// priorityOrdered is what a hypothetical (incorrect) EstMatches-DESC caller might feed
+	// into shard construction instead — the exact "helpful refactor" this test guards
+	// against ever reaching shard-array construction.
+	priorityOrdered := []blockpack.TimeSlice{chronological[1], chronological[0]}
+
+	chronoShards, _ := runTimeSlicedBackendRequests(t, s, r, searchReq,
+		&blockpack.QueryPlan{Strategy: blockpack.DispatchTimeSliced, Slices: chronological})
+	priorityShards, _ := runTimeSlicedBackendRequests(t, s, r, searchReq,
+		&blockpack.QueryPlan{Strategy: blockpack.DispatchTimeSliced, Slices: priorityOrdered})
+
+	// The known-correct shape: two blocks (MostRecentShards=2 -> blocksPerShard=1) roll into
+	// two BLOCK-driven shards. Shard 0's boundary is the most-recent block group's EndTime
+	// (300); shard 1 is the final/older block group's sentinel boundary (1). Asserting this
+	// exact shape (not just self-consistency between the two Slices orderings) is what
+	// actually catches a "helpful" refactor that shards by slice-priority-group instead of
+	// block-group — such a refactor would still be internally self-consistent (both
+	// orderings would normalize to the same, but WRONG, shard values) without this explicit
+	// expected-value check.
+	//
+	// TotalJobs is 1 and 2, not 2 and 2 (team-lead's layer-(a) overlap filter,
+	// blockOverlapsSlice): bmRecent is [200,300] (closed) and the older slice is [100,200)
+	// (half-open) — they share no second at all (the slice's exclusive end, 200, is exactly
+	// where bmRecent's inclusive start begins), so bmRecent gets only the recent slice's job.
+	// bmOlder is [100,200] (closed) and the recent slice is [200,300) (half-open) — these DO
+	// share second 200 (the slice's inclusive start falls inside bmOlder's inclusive end), so
+	// bmOlder still gets both slices' jobs. This asymmetric touching-boundary behavior is the
+	// expected, principled consequence of TimeSlice's own half-open [Start, End) contract
+	// against a block's closed [StartTime, EndTime] convention — not an inconsistency.
+	wantShards := []shardtracker.Shard{
+		{TotalJobs: 1, CompletedThroughSeconds: 300},
+		{TotalJobs: 2, CompletedThroughSeconds: 1},
+	}
+	require.Equal(t, wantShards, chronoShards,
+		"the shard array must be block-chronology-driven (matching backendJobsFunc's own "+
+			"block-group shard shape), never slice-priority-driven")
+	require.Equal(t, chronoShards, priorityShards,
+		"the shard array must depend only on block chronology, never on Slices' order/EstMatches — "+
+			"a dispatch-priority reordering of Slices must not change shard-array construction")
+}
+
+// TestTimeSlicedDispatch_CompletedThroughSecondsAdvancesEvenWhenHighPrioritySliceIsSlow is
+// the regression guard directly modeling the brainstorm risk: the highest-EstMatches
+// slice's job (bundled into the OLDER block group's shard, per T2's per-block-group
+// sharding) never completes, while the chronologically-earlier (array index 0, most
+// recent block group) shard's jobs all complete promptly. CompletedThroughSeconds must
+// still advance past that completed prefix — CompletionTracker itself is untouched; this
+// only exercises it against a shard array built by the real production shard-array
+// construction (twoBlockGroupsForTimeSlicedShardTest / runTimeSlicedBackendRequests).
+func TestTimeSlicedDispatch_CompletedThroughSecondsAdvancesEvenWhenHighPrioritySliceIsSlow(t *testing.T) {
+	s, r, searchReq := twoBlockGroupsForTimeSlicedShardTest()
+	slices := []blockpack.TimeSlice{
+		{Start: 200, End: 300, EstMatches: 5, EstKnown: true},   // most recent, low priority
+		{Start: 100, End: 200, EstMatches: 500, EstKnown: true}, // older, high priority
+	}
+	shards, _ := runTimeSlicedBackendRequests(t, s, r, searchReq,
+		&blockpack.QueryPlan{Strategy: blockpack.DispatchTimeSliced, Slices: slices})
+	require.Len(t, shards, 2, "two blocks with MostRecentShards=2 must roll into two shards")
+
+	var tracker shardtracker.CompletionTracker
+	tracker.AddShards(shards)
+
+	// Shard 0 (most-recent block group) carries only the low-EstMatches recent slice's job —
+	// the older slice does not overlap bmRecent at all (blockOverlapsSlice's half-open/closed
+	// boundary rule; see TestTimeSlicedDispatch_ShardArrayOrderIsChronologicalNotPriority's
+	// wantShards comment). That one job completes promptly.
+	got := tracker.AddShardIdx(0)
+	require.Equal(t, shards[0].CompletedThroughSeconds, got,
+		"CompletedThroughSeconds must advance to shard 0's boundary once shard 0's job completes")
+
+	// Shard 1 (older block group) carries the highest-EstMatches slice's job — it never
+	// completes at all (simulating a permanently slow high-priority job). The completed
+	// prefix must not regress or block on it.
+	require.Equal(t, shards[0].CompletedThroughSeconds, tracker.CompletedThroughSeconds(),
+		"the completed prefix must not wait on the highest-EstMatches slice's (still-pending) shard")
+}
+
+// TestTimeSlicedDispatch_UniformFallbackDispatchOrderEqualsChronological pins the settled
+// #487 degradation rule (plan-c.md's team-lead final settlement, queryplan's
+// TimeSlice.EstKnown/BuildTimeSlices doc comments): when every slice has EstKnown=false
+// (the plan-wide uniform-width fallback, no VCNT signal to prioritize by), the OBSERVED
+// dispatch order must equal the chronological block/slice iteration order exactly — no
+// est-matches-based reordering exists or should be attempted for an all-EstKnown=false
+// plan.
+func TestTimeSlicedDispatch_UniformFallbackDispatchOrderEqualsChronological(t *testing.T) {
+	s, r, searchReq := twoBlockGroupsForTimeSlicedShardTest()
+
+	// Uniform fallback: EstKnown is the zero value (false) on every slice, EstMatches=0 —
+	// no signal to sort by, per BuildTimeSlices' contract.
+	slices := []blockpack.TimeSlice{
+		{Start: 200, End: 300}, // most recent
+		{Start: 100, End: 200}, // older
+	}
+	_, order := runTimeSlicedBackendRequests(t, s, r, searchReq,
+		&blockpack.QueryPlan{Strategy: blockpack.DispatchTimeSliced, Slices: slices})
+
+	// Expected: for each block in its natural most-recent-first order, for each slice in
+	// Slices' given (already-chronological) order that genuinely overlaps that block —
+	// exactly the shard-array/chronological order, unchanged by any priority reordering
+	// since none applies here. bmRecent[200,300] does not overlap the older slice [100,200)
+	// at all (see TestTimeSlicedDispatch_ShardArrayOrderIsChronologicalNotPriority's wantShards
+	// comment for why), so only its recent-slice job is dispatched; bmOlder[100,200] overlaps
+	// both slices (the recent slice touches bmOlder's inclusive end at second 200).
+	wantOrder := [][2]uint32{
+		{200, 300},             // recent block: recent slice only (older slice does not overlap it)
+		{200, 300}, {100, 200}, // older block: recent slice, then older slice
+	}
+	require.Equal(t, wantOrder, order,
+		"with EstKnown=false on every slice, dispatch order must equal the chronological "+
+			"block/slice iteration order exactly")
+}
+
+// TestBlockOverlapsSlice pins blockOverlapsSlice's boundary semantics directly (team-lead's
+// layer-(a) completion for search's #487 dispatch/count filter): a block's [StartTime, EndTime]
+// is closed on both ends, a TimeSlice's [Start, End) is half-open, so a slice whose exclusive
+// end lands exactly on a block's inclusive start does NOT overlap, while a slice whose
+// inclusive start lands exactly on a block's inclusive end DOES overlap.
+func TestBlockOverlapsSlice(t *testing.T) {
+	m := backend.NewBlockMeta("test", uuid.New(), "wdwad")
+	m.StartTime = time.Unix(200, 0)
+	m.EndTime = time.Unix(300, 0)
+
+	tests := []struct {
+		name  string
+		slice blockpack.TimeSlice
+		want  bool
+	}{
+		{"slice fully inside block", blockpack.TimeSlice{Start: 220, End: 280}, true},
+		{"slice fully contains block", blockpack.TimeSlice{Start: 100, End: 400}, true},
+		{"slice equals block bounds", blockpack.TimeSlice{Start: 200, End: 300}, true},
+		{"slice touches block's inclusive end at its own inclusive start", blockpack.TimeSlice{Start: 300, End: 350}, true},
+		{"slice's exclusive end touches block's inclusive start: no shared second", blockpack.TimeSlice{Start: 100, End: 200}, false},
+		{"slice entirely before block", blockpack.TimeSlice{Start: 0, End: 100}, false},
+		{"slice entirely after block", blockpack.TimeSlice{Start: 400, End: 500}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, blockOverlapsSlice(m, tc.slice))
+		})
+	}
+}
+
+// TestSearchSharder_TimeSlicedDispatch_SkipsNonOverlappingBlockSlicePairs mirrors the
+// metrics sharder's own regression test for the same fix (#161): a (block, slice) pair
+// with no time overlap must be silently skipped in BOTH the job count
+// (SearchJobResponse.TotalJobs / Shard.TotalJobs) and the actual jobs sent to reqCh — the
+// count can never drift out of sync with what is actually dispatched, or
+// shardtracker.CompletionTracker's exact-TotalJobs completion check can never be
+// satisfied, stalling completion tracking forever (see blockOverlapsSlice's doc comment).
+func TestSearchSharder_TimeSlicedDispatch_SkipsNonOverlappingBlockSlicePairs(t *testing.T) {
+	blockA := backend.NewBlockMeta("test", uuid.New(), "wdwad")
+	blockA.StartTime = time.Unix(100, 0)
+	blockA.EndTime = time.Unix(150, 0)
+	blockA.Size_ = defaultTargetBytesPerRequest
+	blockA.TotalRecords = 1
+
+	blockB := backend.NewBlockMeta("test", uuid.New(), "wdwad")
+	blockB.StartTime = time.Unix(500, 0)
+	blockB.EndTime = time.Unix(600, 0)
+	blockB.Size_ = defaultTargetBytesPerRequest
+	blockB.TotalRecords = 1
+
+	s := &asyncSearchSharder{
+		cfg:    SearchSharderConfig{MostRecentShards: defaultMostRecentShards},
+		reader: &mockReader{metas: []*backend.BlockMeta{blockA, blockB}},
+	}
+
+	r := httptest.NewRequest("GET", "/?tags=foo%3Dbar&limit=50&start=100&end=600", nil)
+	searchReq, err := api.ParseSearchRequest(r)
+	require.NoError(t, err)
+
+	// slice1 overlaps ONLY blockA; slice2 overlaps ONLY blockB. The cross product therefore
+	// includes two genuinely disjoint (block, slice) pairs: (blockA, slice2), (blockB, slice1).
+	plan := &blockpack.QueryPlan{
+		Strategy: blockpack.DispatchTimeSliced,
+		Slices: []blockpack.TimeSlice{
+			{Start: 500, End: 600}, // slice2
+			{Start: 100, End: 150}, // slice1
+		},
+	}
+
+	reqCh := make(chan pipeline.Request)
+	ctx, cancelCause := context.WithCancelCause(context.Background())
+	pipelineRequest := pipeline.NewHTTPRequest(r)
+	resp := &combiner.SearchJobResponse{}
+
+	go s.backendRequests(ctx, "test", pipelineRequest, searchReq, resp, plan, reqCh, cancelCause)
+
+	var gotReqs []*tempopb.SearchBlockRequest
+	for pr := range reqCh {
+		parsed, err := api.ParseSearchBlockRequest(pr.HTTPRequest())
+		require.NoError(t, err)
+		gotReqs = append(gotReqs, parsed)
+	}
+	require.NoError(t, ctx.Err())
+
+	// Only the two genuinely overlapping (block, slice) pairs must produce a job; the two
+	// disjoint pairs must be silently skipped, never sent as wasted no-results jobs.
+	require.Len(t, gotReqs, 2)
+
+	sort.Slice(gotReqs, func(i, j int) bool { return gotReqs[i].SearchReq.Start < gotReqs[j].SearchReq.Start })
+	require.Equal(t, uint32(100), gotReqs[0].SearchReq.Start)
+	require.Equal(t, uint32(150), gotReqs[0].SearchReq.End)
+	require.Equal(t, uint32(500), gotReqs[1].SearchReq.Start)
+	require.Equal(t, uint32(600), gotReqs[1].SearchReq.End)
+
+	// Fix for #161 (search-side gap): before blockOverlapsSlice was wired in, timeSlicedJobsFunc
+	// counted the full, unfiltered cross product (4) into TotalJobs/Shard.TotalJobs, even though
+	// the two disjoint pairs above are silently skipped and only 2 jobs are ever dispatched.
+	// shardtracker.CompletionTracker compares foundResponses[shard] against exactly this
+	// TotalJobs value to decide a shard is complete (tracker.go) — an inflated count can never
+	// be reached, stalling completion tracking. TotalJobs (and the sum of every Shard's own
+	// TotalJobs) must equal the number of requests actually sent to reqCh, not the raw block x
+	// slice cross product.
+	require.Equal(t, len(gotReqs), resp.TotalJobs, "TotalJobs must match jobs actually dispatched, not the raw block x slice cross product")
+	var sumShardJobs int
+	for _, sh := range resp.Shards {
+		sumShardJobs += int(sh.TotalJobs)
+	}
+	require.Equal(t, resp.TotalJobs, sumShardJobs, "sum of per-shard TotalJobs must equal the overall TotalJobs")
+}
+
+// TestSearchSharder_TimeSlicedDispatch_CacheKeyUsesWholeQueryWindowNotSliceWindow pins the
+// holistic-review HIGH fix: buildTimeSlicedBackendRequests must compute the job cache key from
+// the whole, unnarrowed query window (searchReq.Start/End), not the slice-narrowed subReq.Start/
+// End. cacheKey's own validity rule (cache_keys.go) requires [start, end) to strictly
+// encapsulate the block — a slice's window is by construction never wider than the block it
+// overlaps, so using the slice window there would make every sliced job's cache key empty
+// ("can't cache"), silently disabling caching for virtually all time-sliced search jobs. Using a
+// block whose bounds exactly equal the slice's own bounds (so the slice-narrowed computation
+// would fail the "strictly encapsulates" check) but sits strictly inside the WHOLE query window
+// (100-300) makes this the sharpest possible regression guard: the two computations disagree in
+// exactly this case.
+func TestSearchSharder_TimeSlicedDispatch_CacheKeyUsesWholeQueryWindowNotSliceWindow(t *testing.T) {
+	bm := backend.NewBlockMeta("test", uuid.New(), "wdwad")
+	bm.StartTime = time.Unix(150, 0)
+	bm.EndTime = time.Unix(160, 0)
+	bm.Size_ = defaultTargetBytesPerRequest
+	bm.TotalRecords = 1
+
+	s := &asyncSearchSharder{
+		cfg:    SearchSharderConfig{MostRecentShards: defaultMostRecentShards},
+		reader: &mockReader{metas: []*backend.BlockMeta{bm}},
+	}
+
+	// The whole query window (100-300) strictly encapsulates the block (150-160), so the FIXED
+	// cache-key computation (using this window) must produce a non-empty key. The slice's own
+	// window exactly equals the block's bounds (150-160) — the BUGGY computation (using the
+	// slice window) would fail cacheKey's strict "start.Before(block.Start)" check and produce
+	// an empty key instead.
+	// q= (not tags=) is required: hashForSearchRequest returns 0 for an empty Query, and
+	// cacheKey's own "if queryHash == 0" guard would produce an empty key regardless of the
+	// start/end fix this test is pinning — a non-zero query hash is a precondition, not the
+	// thing under test here.
+	r := httptest.NewRequest("GET", "/?q=%7B%7D&limit=50&start=100&end=300", nil)
+	searchReq, err := api.ParseSearchRequest(r)
+	require.NoError(t, err)
+
+	plan := &blockpack.QueryPlan{
+		Strategy: blockpack.DispatchTimeSliced,
+		Slices:   []blockpack.TimeSlice{{Start: 150, End: 160}},
+	}
+
+	reqCh := make(chan pipeline.Request)
+	ctx, cancelCause := context.WithCancelCause(context.Background())
+	pipelineRequest := pipeline.NewHTTPRequest(r)
+	resp := &combiner.SearchJobResponse{}
+
+	go s.backendRequests(ctx, "test", pipelineRequest, searchReq, resp, plan, reqCh, cancelCause)
+
+	var gotKeys []string
+	for pr := range reqCh {
+		gotKeys = append(gotKeys, pr.CacheKey())
+	}
+	require.NoError(t, ctx.Err())
+
+	require.Len(t, gotKeys, 1)
+	require.NotEmpty(t, gotKeys[0],
+		"a time-sliced job's cache key must be computed from the whole query window, not the "+
+			"slice-narrowed window — an empty key here means caching regressed to disabled")
 }
 
 func TestIngesterRequests(t *testing.T) {

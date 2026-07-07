@@ -3,6 +3,7 @@ package vblockpack
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -270,7 +271,7 @@ func (b *blockpackBlock) startBlockSpan(ctx context.Context, name string) (conte
 // It delegates to blockpack.ExecuteMetricsTraceQL which uses the intrinsic
 // column fast path — reading only ~10 MB of sorted flat blobs instead of
 // fetching the entire block (~200 MB) via the generic Fetch path.
-func (b *blockpackBlock) QueryRange(ctx context.Context, req *tempopb.QueryRangeRequest, _ common.SearchOptions) (*tempopb.QueryRangeResponse, error) {
+func (b *blockpackBlock) QueryRange(ctx context.Context, req *tempopb.QueryRangeRequest, searchOpts common.SearchOptions) (*tempopb.QueryRangeResponse, error) {
 	ctx, span := b.startBlockSpan(ctx, "vblockpack.backendBlock.QueryRange")
 	defer span.End()
 
@@ -283,18 +284,41 @@ func (b *blockpackBlock) QueryRange(ctx context.Context, req *tempopb.QueryRange
 		StartNano: int64(req.Start),
 		EndNano:   int64(req.End),
 		StepNano:  int64(req.Step),
+		// IndexOnly (issue #487, holistic-review Issue 1/fix A): threads tempo's own
+		// IndexOnly flag into blockpack's OWN inner decline gate (ExecuteTraceMetricsFromVI,
+		// the SECOND, per-block/per-execution decline — an unsupported aggregate shape, a
+		// leaf with no real coverage, or a legacy block with per-span TimeSec == 0). Before
+		// this field existed, ExecuteMetricsTraceQL had no way to know about IndexOnly at
+		// all, so that second decline unconditionally fell back to a full, un-windowed scan
+		// even for a #487 time-slice job — exactly the double-counting risk IndexOnly exists
+		// to prevent. The FIRST gate below (indexCovered) already declines before ever
+		// calling ExecuteMetricsTraceQL when the index has no coverage at all; this field
+		// closes the gap for the deeper, per-block decline that gate cannot see.
+		IndexOnly: searchOpts.IndexOnly,
 	}
 	// Index-driven metrics path (blockpack issue #461): when configured, build a
 	// value-index source for the metrics query so ExecuteMetricsTraceQL can answer
 	// count_over_time()/rate() from the index without a block scan. On no coverage
 	// or any error the source is left nil and ExecuteMetricsTraceQL falls back to
-	// the full-scan metrics path internally — strictly an optimisation.
+	// the full-scan metrics path internally — strictly an optimisation, UNLESS
+	// searchOpts.IndexOnly forbids that fallback (issue #487): a time-slice job's
+	// narrowed [Start, End) window means a full-scan metrics path is not a safe
+	// fallback — it would ignore the slice boundary at the per-span level and could
+	// double-count or over-fetch across overlapping slice jobs.
+	indexCovered := false
 	if vr := getValueIndexQueryReader(); vr != nil {
 		minSec, maxSec := nanoWindowToSec(req.Start, req.End)
 		cache := vr.cacheFor(b.meta.TenantID)
 		if src, ok, berr := blockpack.BuildValueIndexSourceForMetrics(ctx, cache, vr.store, req.Query, minSec, maxSec); berr == nil && ok {
 			opts.ValueIndex = src
+			indexCovered = true
 		}
+	}
+	if searchOpts.IndexOnly && !indexCovered {
+		// A #487 time-slice job whose index declined must fail rather than fall
+		// through to the cube path or the full-scan metrics path below — neither is
+		// a safe substitute for a narrowed-window slice job.
+		return nil, fmt.Errorf("blockpack QueryRange: %w", ErrSliceIndexCoverageGap)
 	}
 
 	// Cube query path: try answering from pre-aggregated cube files before
@@ -308,6 +332,15 @@ func (b *blockpackBlock) QueryRange(ctx context.Context, req *tempopb.QueryRange
 
 	result, err := blockpack.ExecuteMetricsTraceQL(ctx, r, req.Query, opts)
 	if err != nil {
+		// blockpack's own IndexOnly-aware decline (opts.IndexOnly above) surfaces as
+		// blockpack.ErrValueIndexNoCoverage — converted here to this package's own
+		// ErrSliceIndexCoverageGap so every caller (handleError, the combiner, tests)
+		// keeps checking exactly one sentinel for "a #487 slice job's index coverage
+		// gap", regardless of which of the two decline gates (indexCovered above, or
+		// this one) actually caught it.
+		if errors.Is(err, blockpack.ErrValueIndexNoCoverage) {
+			return nil, fmt.Errorf("blockpack QueryRange: %w", ErrSliceIndexCoverageGap)
+		}
 		return nil, fmt.Errorf("blockpack QueryRange: %w", err)
 	}
 
@@ -734,7 +767,7 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 	// authoritative-index contract SPEC-ROOT-019 describes, matching how the
 	// trace-by-id path (NOTE-VI-071) stopped masking the same skew behind a scan.
 	if compiledProgram != nil {
-		im, ok, istats, idxErr := b.tryIndexFetch(ctx, r, compiledProgram, query, queryOpts)
+		im, ok, istats, idxErr := b.tryIndexFetch(ctx, r, compiledProgram, query, queryOpts, opts.IndexOnly)
 		// Record index-path I/O on the span whenever the index was consulted (any
 		// files were read), even if it ultimately declined and we fall back to a
 		// full scan (issue #465).
@@ -747,6 +780,13 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 			)
 		}
 		if idxErr != nil {
+			if errors.Is(idxErr, ErrSliceIndexCoverageGap) {
+				// #487 time-slice job (opts.IndexOnly): the index routinely declined, but a
+				// full scan is not a safe fallback for a narrowed-window slice job — fail
+				// the query rather than double-count/over-fetch across overlapping slices.
+				slog.Error("vblockpack Fetch: index-only slice job hit a coverage gap", "query", query, "err", idxErr)
+				return traceql.FetchSpansResponse{}, fmt.Errorf("vblockpack Fetch: %w", idxErr)
+			}
 			// Authoritative-index inconsistency: fail the query, do not scan.
 			slog.Error("vblockpack Fetch: value index/data inconsistency", "query", query, "err", idxErr)
 			return traceql.FetchSpansResponse{}, fmt.Errorf("vblockpack Fetch: value index inconsistency: %w", idxErr)

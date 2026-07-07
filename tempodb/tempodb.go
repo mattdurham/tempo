@@ -47,6 +47,10 @@ const (
 	BlockIDMin = "00000000-0000-0000-0000-000000000000"
 	// BlockIDMax is the maximum possible value for a block id as a string
 	BlockIDMax = "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF"
+
+	// defaultIndexPrefix mirrors vblockpack.ConfigureValueIndexQuery's own default,
+	// applied by RawReaderProvider.IndexPrefix when value_index_query.index_prefix is unset.
+	defaultIndexPrefix = "indexes"
 )
 
 var (
@@ -123,6 +127,28 @@ type Reader interface {
 	Shutdown()
 }
 
+// RawReaderProvider is an OPTIONAL capability a Reader implementation may satisfy, exposing
+// the backend.RawReader tempodb already builds and holds internally (whichever concrete
+// backend — local/S3/GCS/Azure — the deployment is configured with), plus the configured
+// VCNT/value-index key prefix (cfg.Block.Blockpack.ValueIndexQuery.IndexPrefix — the same
+// prefix the querier's own index-driven query path already reads from; see
+// vblockpack.ConfigureValueIndexQuery's call site). Bundling both on one interface, rather
+// than adding a second new frontend Config/YAML field for the prefix, keeps issue #487's
+// frontend-side VCNT fetch fully config-drift-free — it derives everything from the same
+// already-configured backend/config tempodb itself uses, per team-lead's checkpoint ruling.
+// It is a separate interface from Reader (not a new Reader method) so existing Reader
+// implementations, fakes, and mocks across the codebase are unaffected — callers that need raw,
+// generic List/Read access (issue #487: frontend-side VCNT fetch, which needs to address
+// `<tenant>/indexes/unique_values/...` keys outside Reader's block-oriented key layout) type-
+// assert for this capability rather than requiring every Reader to support it.
+type RawReaderProvider interface {
+	RawReader() backend.RawReader
+	// IndexPrefix returns the configured VCNT/value-index key prefix (default "indexes"
+	// when unset in YAML, matching vblockpack's own default), so a caller doesn't need to
+	// duplicate that default separately.
+	IndexPrefix() string
+}
+
 type Compactor interface {
 	EnableCompaction(ctx context.Context, cfg *CompactorConfig, sharder CompactorSharder, overrides CompactorOverrides) error
 	MarkBlockCompacted(tenantID string, blockID backend.UUID) error
@@ -152,12 +178,16 @@ type WriteableBlock interface {
 	Write(ctx context.Context, w backend.Writer) error
 }
 
-var _ Reader = (*readerWriter)(nil)
+var (
+	_ Reader            = (*readerWriter)(nil)
+	_ RawReaderProvider = (*readerWriter)(nil)
+)
 
 type readerWriter struct {
-	r backend.Reader
-	w backend.Writer
-	c backend.Compactor
+	r    backend.Reader
+	rawR backend.RawReader
+	w    backend.Writer
+	c    backend.Compactor
 
 	cacheProvider cache.Provider
 
@@ -235,6 +265,7 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 	rw := &readerWriter{
 		c:                       c,
 		r:                       r,
+		rawR:                    rawR,
 		w:                       w,
 		cacheProvider:           cacheProvider,
 		cfg:                     cfg,
@@ -672,6 +703,28 @@ func (rw *readerWriter) Shutdown() {
 	}
 	rw.pool.Shutdown()
 	rw.r.Shutdown()
+}
+
+// RawReader implements RawReaderProvider: it returns the backend.RawReader this
+// readerWriter was built with (issue #487), letting a caller (the frontend's VCNT fetch)
+// perform generic, non-block-scoped List/Read against the exact same already-configured
+// backend the rest of tempodb uses — no new object-store client or config.
+func (rw *readerWriter) RawReader() backend.RawReader {
+	return rw.rawR
+}
+
+// IndexPrefix implements RawReaderProvider: it returns the configured VCNT/value-index key
+// prefix (cfg.Block.Blockpack.ValueIndexQuery.IndexPrefix), applying the same "indexes"
+// default vblockpack.ConfigureValueIndexQuery applies when it is unset in YAML, so a caller
+// (the frontend's VCNT fetch) never has to duplicate that default.
+func (rw *readerWriter) IndexPrefix() string {
+	if rw.cfg == nil || rw.cfg.Block == nil {
+		return defaultIndexPrefix
+	}
+	if p := rw.cfg.Block.Blockpack.ValueIndexQuery.IndexPrefix; p != "" {
+		return p
+	}
+	return defaultIndexPrefix
 }
 
 // EnableCompaction activates the compaction/retention loops

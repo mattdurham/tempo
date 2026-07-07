@@ -158,3 +158,24 @@ func compilePipelineToSpec(pipeline *traceqlparser.PipelineStage) (AggregateSpec
 
 	return spec, nil
 }
+
+// MetricsShapeIsVIAnswerable reports whether a compiled metrics query's SHAPE (aggregate
+// function + group-by) is one the value-index metrics engine (executor.ExecuteTraceMetricsFromVI)
+// can answer at all — the exact same static gate that function itself applies, extracted here so
+// both it and a plan-time caller outside this module (blockpack's public
+// CompileTraceQLMetricsFilter, issue #487 holistic-review Issue 2/B) share one rule rather than
+// two independently-maintained copies that could drift.
+//
+// This answers ONLY the static, compile-time-knowable half of ExecuteTraceMetricsFromVI's own
+// decline conditions (currently: only COUNT/RATE, no group-by). It does NOT — and cannot —
+// predict that function's remaining, genuinely per-execution declines (no value-index source,
+// a legacy block with per-span TimeSec == 0, a canceled context, or an unresolvable filter
+// leaf), which depend on the source/context/matched-span data unavailable at compile time.
+func MetricsShapeIsVIAnswerable(spec QuerySpec) bool {
+	switch spec.Aggregate.Function {
+	case FuncNameCOUNT, FuncNameRATE:
+	default:
+		return false
+	}
+	return len(spec.Aggregate.GroupBy) == 0
+}

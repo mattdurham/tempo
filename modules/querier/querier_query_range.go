@@ -78,6 +78,7 @@ func (q *Querier) queryBlock(ctx context.Context, req *tempopb.QueryRangeRequest
 	opts := common.DefaultSearchOptions()
 	opts.StartPage = int(req.StartPage)
 	opts.TotalPages = int(req.PagesToSearch)
+	opts.IndexOnly = req.IndexOnly
 
 	// Parse without optimizations to read hints; optimizations are applied by CompileMetricsQueryRange.
 	expr, err := traceql.ParseNoOptimizations(req.Query)

@@ -419,6 +419,61 @@ func TestParseSearchBlockRequest(t *testing.T) {
 				},
 			},
 		},
+		{
+			// #487: indexOnly present and true.
+			url: "/?tags=foo%3Dbar&start=10&end=20&startPage=0&pagesToSearch=10&blockID=b92ec614-3fd7-4299-b6db-f657e7025a9b&encoding=none&footerSize=2000&indexPageSize=10&totalRecords=11&version=v2&size=1000&indexOnly=true",
+			expected: &tempopb.SearchBlockRequest{
+				SearchReq: &tempopb.SearchRequest{
+					Tags: map[string]string{
+						"foo": "bar",
+					},
+					Start:           10,
+					End:             20,
+					Limit:           defaultLimit,
+					SpansPerSpanSet: defaultSpansPerSpanSet,
+				},
+				StartPage:     0,
+				PagesToSearch: 10,
+				BlockID:       "b92ec614-3fd7-4299-b6db-f657e7025a9b",
+				IndexPageSize: 10,
+				TotalRecords:  11,
+				Version:       "v2",
+				Size_:         1000,
+				FooterSize:    2000,
+				IndexOnly:     true,
+			},
+		},
+		{
+			// #487 (holistic review): a malformed indexOnly value must hard-error, not
+			// silently default to false — IndexOnly is load-bearing (it flips the querier's
+			// error semantics on an index-coverage gap), so silently defaulting to "off" could
+			// mask a slice job quietly falling back to a full scan instead of failing loudly.
+			url:           "/?start=10&end=20&startPage=0&pagesToSearch=10&blockID=b92ec614-3fd7-4299-b6db-f657e7025a9b&encoding=none&footerSize=2000&indexPageSize=10&totalRecords=11&version=v2&size=1000&indexOnly=notabool",
+			expectedError: "invalid indexOnly notabool: strconv.ParseBool: parsing \"notabool\": invalid syntax",
+		},
+		{
+			// #487: indexOnly absent means false — byte-identical to today's shape.
+			url: "/?tags=foo%3Dbar&start=10&end=20&startPage=0&pagesToSearch=10&blockID=b92ec614-3fd7-4299-b6db-f657e7025a9b&encoding=none&footerSize=2000&indexPageSize=10&totalRecords=11&version=v2&size=1000",
+			expected: &tempopb.SearchBlockRequest{
+				SearchReq: &tempopb.SearchRequest{
+					Tags: map[string]string{
+						"foo": "bar",
+					},
+					Start:           10,
+					End:             20,
+					Limit:           defaultLimit,
+					SpansPerSpanSet: defaultSpansPerSpanSet,
+				},
+				StartPage:     0,
+				PagesToSearch: 10,
+				BlockID:       "b92ec614-3fd7-4299-b6db-f657e7025a9b",
+				IndexPageSize: 10,
+				TotalRecords:  11,
+				Version:       "v2",
+				Size_:         1000,
+				FooterSize:    2000,
+			},
+		},
 	}
 
 	for _, tc := range tests {
@@ -506,6 +561,22 @@ func TestBuildSearchBlockRequest(t *testing.T) {
 			},
 			httpReq: httptest.NewRequest("GET", "/test/path", nil),
 			query:   "/test/path?blockID=b92ec614-3fd7-4299-b6db-f657e7025a9b&pagesToSearch=10&size=1000&startPage=0&encoding=none&indexPageSize=0&totalRecords=2&version=vParquet3&footerSize=2000&dc=%5B%7B%22scope%22%3A1%2C%22name%22%3A%22net.sock.host.addr%22%7D%5D",
+		},
+		{
+			// #487: IndexOnly=true is written to the URL; IndexOnly=false (the zero value,
+			// covered by every other case in this table) is omitted entirely.
+			req: &tempopb.SearchBlockRequest{
+				StartPage:     0,
+				PagesToSearch: 10,
+				BlockID:       "b92ec614-3fd7-4299-b6db-f657e7025a9b",
+				IndexPageSize: 10,
+				TotalRecords:  11,
+				Version:       "v2",
+				Size_:         1000,
+				FooterSize:    2000,
+				IndexOnly:     true,
+			},
+			query: "?blockID=b92ec614-3fd7-4299-b6db-f657e7025a9b&pagesToSearch=10&size=1000&startPage=0&encoding=none&indexPageSize=10&totalRecords=11&version=v2&footerSize=2000&indexOnly=true",
 		},
 	}
 
@@ -783,6 +854,44 @@ func TestQueryRangeRoundtrip(t *testing.T) {
 	actualReq, err := ParseQueryRangeRequest(httpReq)
 	require.NoError(t, err)
 	assert.Equal(t, req, actualReq)
+}
+
+// TestQueryRangeRoundtrip_IndexOnly pins the #487 wire-format round-trip for the new
+// IndexOnly field: true survives Build->Parse, and false (the zero value, the common case)
+// is omitted from the URL entirely rather than round-tripping as an explicit "false" param.
+func TestQueryRangeRoundtrip_IndexOnly(t *testing.T) {
+	req := &tempopb.QueryRangeRequest{
+		Query:     "{ foo = `bar` }",
+		Start:     uint64(24 * time.Hour),
+		End:       uint64(25 * time.Hour),
+		Step:      uint64(30 * time.Second),
+		QueryMode: "foo",
+		IndexOnly: true,
+	}
+
+	jsonBytes, err := json.Marshal(req.DedicatedColumns)
+	require.NoError(t, err)
+
+	httpReq := BuildQueryRangeRequest(nil, req, string(jsonBytes))
+	assert.Contains(t, httpReq.URL.String(), "indexOnly=true")
+
+	actualReq, err := ParseQueryRangeRequest(httpReq)
+	require.NoError(t, err)
+	assert.Equal(t, req, actualReq)
+}
+
+// TestParseQueryRangeRequest_IndexOnlyMalformed pins the #487 holistic-review MEDIUM fix: a
+// malformed indexOnly value must hard-error, unified with ParseSearchBlockRequest's own strict
+// handling of the same parameter (search_tags.go) — before this fix ParseQueryRangeRequest
+// silently ignored a parse failure and defaulted IndexOnly to false instead. IndexOnly is
+// load-bearing (it flips the querier's error semantics on an index-coverage gap), so silently
+// defaulting to "off" could mask a slice job quietly falling back to a full scan instead of
+// failing loudly.
+func TestParseQueryRangeRequest_IndexOnlyMalformed(t *testing.T) {
+	r := httptest.NewRequest("GET", "http://tempo/api/metrics/query_range?query=%7Bfoo%3D%60bar%60%7D&start=10&end=20&step=1&indexOnly=notabool", nil)
+
+	_, err := ParseQueryRangeRequest(r)
+	assert.EqualError(t, err, "invalid indexOnly notabool: strconv.ParseBool: parsing \"notabool\": invalid syntax")
 }
 
 func Test_determineBounds(t *testing.T) {

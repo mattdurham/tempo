@@ -1,20 +1,30 @@
 package frontend
 
 import (
+	"context"
 	"net/http/httptest"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/go-kit/log"
 	"github.com/google/uuid"
+	"github.com/grafana/blockpack"
+	"github.com/grafana/dskit/user"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/grafana/tempo/modules/frontend/combiner"
 	"github.com/grafana/tempo/modules/frontend/pipeline"
+	"github.com/grafana/tempo/modules/overrides"
+	"github.com/grafana/tempo/pkg/api"
 	"github.com/grafana/tempo/pkg/tempopb"
 	"github.com/grafana/tempo/tempodb/backend"
+	"github.com/grafana/tempo/tempodb/encoding/vblockpack"
 )
 
 func TestBuildBackendRequestsExemplarsOneBlock(t *testing.T) {
@@ -189,6 +199,210 @@ func extractExemplarsValue(t *testing.T, uri string) int {
 	require.NoError(t, err, "Should be able to parse exemplars value")
 
 	return exemplarsValue
+}
+
+// TestMetricsQueryRangeSharder_TimeSlicedDispatch_UsesQueryPlanSlicesNotBlockPaging is the
+// metrics analog of the search sharder's #487 pin: given a QueryPlan with Strategy:
+// DispatchTimeSliced and a non-empty Slices, backendRequests must emit one job per (block,
+// slice) pair with IndexOnly=true and Start/End narrowed to the slice's window intersected
+// with the block's own overlap (via the same TrimToBlockOverlap narrowing already used
+// today) — NOT the pagesPerRequest-computed page range.
+func TestMetricsQueryRangeSharder_TimeSlicedDispatch_UsesQueryPlanSlicesNotBlockPaging(t *testing.T) {
+	bm := backend.NewBlockMeta("test", uuid.New(), "wdwad")
+	bm.StartTime = time.Unix(100, 0)
+	bm.EndTime = time.Unix(200, 0)
+	bm.Size_ = defaultTargetBytesPerRequest * 2
+	bm.TotalRecords = 2
+	bm.ReplicationFactor = backend.MetricsGeneratorReplicationFactor
+
+	s := &queryRangeSharder{
+		logger: log.NewNopLogger(),
+		cfg:    QueryRangeSharderConfig{StreamingShards: defaultMostRecentShards},
+		reader: &mockReader{metas: []*backend.BlockMeta{bm}},
+	}
+
+	searchReq := tempopb.QueryRangeRequest{
+		Query: "{} | count_over_time()",
+		Start: uint64(100 * time.Second),
+		End:   uint64(200 * time.Second),
+		Step:  uint64(10 * time.Second),
+	}
+
+	plan := &blockpack.QueryPlan{
+		Strategy: blockpack.DispatchTimeSliced,
+		Slices: []blockpack.TimeSlice{
+			{Start: 150, End: 200},
+			{Start: 100, End: 150},
+		},
+	}
+
+	reqCh := make(chan pipeline.Request)
+	ctx := context.Background()
+	pipelineRequest := pipeline.NewHTTPRequest(httptest.NewRequest("GET", "/", nil))
+	jobMetadata := &combiner.QueryRangeJobResponse{}
+	cutoff := time.Unix(1000, 0) // well after the block/slices so nothing is trimmed away
+
+	go s.backendRequests(ctx, "test", pipelineRequest, searchReq, cutoff, defaultTargetBytesPerRequest, plan, reqCh, jobMetadata)
+
+	var gotReqs []*tempopb.QueryRangeRequest
+	for pr := range reqCh {
+		parsed, err := api.ParseQueryRangeRequest(pr.HTTPRequest())
+		require.NoError(t, err)
+		gotReqs = append(gotReqs, parsed)
+	}
+
+	require.Equal(t, 2, jobMetadata.TotalJobs, "one job per (block, slice) pair for the single block")
+	require.Len(t, gotReqs, 2)
+
+	sort.Slice(gotReqs, func(i, j int) bool { return gotReqs[i].Start < gotReqs[j].Start })
+
+	require.Equal(t, uint64(100*time.Second), gotReqs[0].Start)
+	require.Equal(t, uint64(150*time.Second), gotReqs[0].End)
+	require.True(t, gotReqs[0].IndexOnly, "a time-sliced job must set IndexOnly=true")
+
+	require.Equal(t, uint64(150*time.Second), gotReqs[1].Start)
+	require.Equal(t, uint64(200*time.Second), gotReqs[1].End)
+	require.True(t, gotReqs[1].IndexOnly, "a time-sliced job must set IndexOnly=true")
+}
+
+// TestMetricsQueryRangeSharder_TimeSlicedDispatch_SkipsNonOverlappingBlockSlicePairs pins the
+// fix for a HIGH correctness bug found during review: timeSlicedJobsFunc does a full cross
+// product of every block against every slice with no per-pair time-overlap filtering, so a
+// (block, slice) pair with ZERO time overlap is routine, not a contrived edge case, once a
+// query spans multiple blocks with different time ranges. traceql.TrimToBlockOverlap returns
+// an INVERTED range (start > end, not merely start == end) for a genuinely disjoint
+// (block, slice) pair — the guard must catch both shapes and skip silently, never emit a
+// malformed/inverted QueryRangeRequest downstream.
+func TestMetricsQueryRangeSharder_TimeSlicedDispatch_SkipsNonOverlappingBlockSlicePairs(t *testing.T) {
+	blockA := backend.NewBlockMeta("test", uuid.New(), "wdwad")
+	blockA.StartTime = time.Unix(100, 0)
+	blockA.EndTime = time.Unix(150, 0)
+	blockA.Size_ = defaultTargetBytesPerRequest
+	blockA.TotalRecords = 1
+	blockA.ReplicationFactor = backend.MetricsGeneratorReplicationFactor
+
+	blockB := backend.NewBlockMeta("test", uuid.New(), "wdwad")
+	blockB.StartTime = time.Unix(500, 0)
+	blockB.EndTime = time.Unix(600, 0)
+	blockB.Size_ = defaultTargetBytesPerRequest
+	blockB.TotalRecords = 1
+	blockB.ReplicationFactor = backend.MetricsGeneratorReplicationFactor
+
+	s := &queryRangeSharder{
+		logger: log.NewNopLogger(),
+		cfg:    QueryRangeSharderConfig{StreamingShards: defaultMostRecentShards},
+		reader: &mockReader{metas: []*backend.BlockMeta{blockA, blockB}},
+	}
+
+	searchReq := tempopb.QueryRangeRequest{
+		Query: "{} | count_over_time()",
+		Start: uint64(100 * time.Second),
+		End:   uint64(600 * time.Second),
+		Step:  uint64(10 * time.Second),
+	}
+
+	// slice1 overlaps ONLY blockA; slice2 overlaps ONLY blockB. The cross product therefore
+	// includes two genuinely disjoint (block, slice) pairs: (blockA, slice2), (blockB, slice1).
+	plan := &blockpack.QueryPlan{
+		Strategy: blockpack.DispatchTimeSliced,
+		Slices: []blockpack.TimeSlice{
+			{Start: 500, End: 600}, // slice2
+			{Start: 100, End: 150}, // slice1
+		},
+	}
+
+	reqCh := make(chan pipeline.Request)
+	ctx := context.Background()
+	pipelineRequest := pipeline.NewHTTPRequest(httptest.NewRequest("GET", "/", nil))
+	jobMetadata := &combiner.QueryRangeJobResponse{}
+	cutoff := time.Unix(1000, 0)
+
+	go s.backendRequests(ctx, "test", pipelineRequest, searchReq, cutoff, defaultTargetBytesPerRequest, plan, reqCh, jobMetadata)
+
+	var gotReqs []*tempopb.QueryRangeRequest
+	for pr := range reqCh {
+		parsed, err := api.ParseQueryRangeRequest(pr.HTTPRequest())
+		require.NoError(t, err)
+		// The bug under test: a disjoint pair must never reach this point as an inverted
+		// range. Assert the invariant directly on every request that IS emitted.
+		require.LessOrEqual(t, parsed.Start, parsed.End, "must never emit an inverted time range")
+		gotReqs = append(gotReqs, parsed)
+	}
+
+	// Only the two genuinely overlapping (block, slice) pairs must produce a job; the two
+	// disjoint pairs must be silently skipped, not sent as malformed requests.
+	require.Len(t, gotReqs, 2)
+
+	sort.Slice(gotReqs, func(i, j int) bool { return gotReqs[i].Start < gotReqs[j].Start })
+	require.Equal(t, uint64(100*time.Second), gotReqs[0].Start)
+	require.Equal(t, uint64(150*time.Second), gotReqs[0].End)
+	require.Equal(t, uint64(500*time.Second), gotReqs[1].Start)
+	require.Equal(t, uint64(600*time.Second), gotReqs[1].End)
+
+	// Fix for #161: timeSlicedJobsFunc counted the full, unfiltered cross product (4) into
+	// jobMetadata.TotalJobs / Shard.TotalJobs, even though the two disjoint pairs above are
+	// silently skipped and only 2 jobs are ever dispatched. shardtracker.CompletionTracker
+	// compares foundResponses[shard] against exactly this TotalJobs value to decide a shard is
+	// complete (tracker.go) — an inflated count can never be reached, stalling completion
+	// tracking. TotalJobs (and the sum of every Shard's own TotalJobs) must equal the number of
+	// requests actually sent to reqCh, not the raw block x slice cross product.
+	require.Equal(t, len(gotReqs), jobMetadata.TotalJobs, "TotalJobs must match jobs actually dispatched, not the raw block x slice cross product")
+	var sumShardJobs int
+	for _, sh := range jobMetadata.Shards {
+		sumShardJobs += int(sh.TotalJobs)
+	}
+	require.Equal(t, jobMetadata.TotalJobs, sumShardJobs, "sum of per-shard TotalJobs must equal the overall TotalJobs")
+}
+
+// TestMetricsQueryRangeSharder_BlockShardedDispatch_UnchangedWhenStrategyIsBlockSharded pins
+// the parity-and-fallback-first discipline for metrics: a nil plan, and a plan whose Strategy
+// is the zero-value DispatchBlockSharded, must both produce identical job counts to today's
+// block-sharded-only path, with IndexOnly=false (the zero value) on every job.
+func TestMetricsQueryRangeSharder_BlockShardedDispatch_UnchangedWhenStrategyIsBlockSharded(t *testing.T) {
+	bm := backend.NewBlockMeta("test", uuid.New(), "wdwad")
+	bm.StartTime = time.Unix(100, 0)
+	bm.EndTime = time.Unix(200, 0)
+	bm.Size_ = defaultTargetBytesPerRequest * 2
+	bm.TotalRecords = 2
+	bm.ReplicationFactor = backend.MetricsGeneratorReplicationFactor
+
+	newSharder := func() *queryRangeSharder {
+		return &queryRangeSharder{
+			logger: log.NewNopLogger(),
+			cfg:    QueryRangeSharderConfig{StreamingShards: defaultMostRecentShards},
+			reader: &mockReader{metas: []*backend.BlockMeta{bm}},
+		}
+	}
+
+	runWithPlan := func(t *testing.T, plan *blockpack.QueryPlan) int {
+		t.Helper()
+		searchReq := tempopb.QueryRangeRequest{
+			Query: "{} | count_over_time()",
+			Start: uint64(100 * time.Second),
+			End:   uint64(200 * time.Second),
+			Step:  uint64(10 * time.Second),
+		}
+
+		reqCh := make(chan pipeline.Request)
+		ctx := context.Background()
+		pipelineRequest := pipeline.NewHTTPRequest(httptest.NewRequest("GET", "/", nil))
+		jobMetadata := &combiner.QueryRangeJobResponse{}
+		cutoff := time.Unix(1000, 0)
+
+		go newSharder().backendRequests(ctx, "test", pipelineRequest, searchReq, cutoff, defaultTargetBytesPerRequest, plan, reqCh, jobMetadata)
+
+		for pr := range reqCh {
+			parsed, err := api.ParseQueryRangeRequest(pr.HTTPRequest())
+			require.NoError(t, err)
+			require.False(t, parsed.IndexOnly, "block-sharded jobs must have IndexOnly=false")
+		}
+		return jobMetadata.TotalJobs
+	}
+
+	nilJobs := runWithPlan(t, nil)
+	blockShardedJobs := runWithPlan(t, &blockpack.QueryPlan{Strategy: blockpack.DispatchBlockSharded})
+
+	require.Equal(t, nilJobs, blockShardedJobs)
 }
 
 func TestExemplarsForBlock(t *testing.T) {
@@ -439,5 +653,208 @@ func TestExemplarsCutoff(t *testing.T) {
 			assert.Equal(t, tc.expectedBeforeCut, beforeCut, "Exemplars before cutoff should match expected value")
 			assert.Equal(t, tc.expectedAfterCut, afterCut, "Exemplars after cutoff should match expected value")
 		})
+	}
+}
+
+// emptyVIStore is a minimal blockpack.LookupStore + blockpack.ValueIndexFileStore with no files
+// at all, used only to install a genuinely-configured (non-nil) value-index query reader for
+// TestMetricsQueryRangeSharder_TimeSlicedDispatch_ReachesDispatchTimeSlicedThroughRealCompile.
+// An empty store is sufficient: vibuilder.BuildSource's own "at least one leaf resolved" ok
+// (which CheckIndexCoverage's data-availability half relies on) is satisfied by a leaf's
+// SHAPE being buildable, independent of whether any files are actually found for it (see
+// tempodb/encoding/vblockpack's own coverage_decline_test.go for the same "empty store still
+// reports ok=true for a shape-valid leaf" finding) — this test needs the reader configured, not
+// populated with real data, since a genuine VI-write integration is already covered elsewhere
+// (TestQualification_IndexCoverageMatchAllowsTimeSliced).
+type emptyVIStore struct{}
+
+func (emptyVIStore) List(context.Context, string) ([]string, error) { return nil, nil }
+func (emptyVIStore) Get(context.Context, string) ([]byte, error)    { return nil, errNotFoundForTest }
+func (emptyVIStore) Size(string) (int64, error)                     { return 0, errNotFoundForTest }
+func (emptyVIStore) ReadAt(string, []byte, int64) (int, error)      { return 0, errNotFoundForTest }
+
+var errNotFoundForTest = &testNotFoundError{}
+
+type testNotFoundError struct{}
+
+func (*testNotFoundError) Error() string { return "not found (test fake)" }
+
+// mockReaderWithRawReader adds the tempodb.RawReaderProvider capability to mockReader (a plain
+// embed, not a change to the shared mockReader type itself) so a test can exercise the REAL
+// newAsyncQueryRangeSharder constructor's RawReaderProvider type-assertion path — a bare
+// &queryRangeSharder{reader: &mockReader{...}} struct literal (as most of this file's existing
+// tests use) bypasses that constructor entirely and leaves rawR nil forever.
+type mockReaderWithRawReader struct {
+	*mockReader
+	rawR        backend.RawReader
+	indexPrefix string
+}
+
+func (m *mockReaderWithRawReader) RawReader() backend.RawReader { return m.rawR }
+func (m *mockReaderWithRawReader) IndexPrefix() string          { return m.indexPrefix }
+
+// TestMetricsQueryRangeSharder_TimeSlicedDispatch_ReachesDispatchTimeSlicedThroughRealCompile is
+// the REQUIRED end-to-end regression test for holistic-review Issue 2/B: before this fix,
+// buildQueryPlan compiled every query — including every real, piped QueryRangeRequest.Query —
+// with blockpack.CompileTraceQL (filter expressions only), which always errors for a real
+// metrics query, so DispatchTimeSliced was unreachable in production for QueryRange. Every
+// existing time-sliced metrics test hand-constructs a *blockpack.QueryPlan directly and calls
+// backendRequests, bypassing RoundTrip/buildMetricsQueryPlan entirely — exactly the coverage gap
+// that let Issue 2 land unnoticed. This test goes through the REAL queryRangeSharder.RoundTrip
+// with a real, piped query string (`{ span.foo = "bar" } | rate()`), a real RawReaderProvider
+// (local backend), and a real (test-configured) value-index reader, and asserts at least one
+// dispatched job has IndexOnly=true with a window narrower than the whole query range — proof
+// DispatchTimeSliced, not DispatchBlockSharded, was actually used.
+func TestMetricsQueryRangeSharder_TimeSlicedDispatch_ReachesDispatchTimeSlicedThroughRealCompile(t *testing.T) {
+	restore := vblockpack.ConfigureValueIndexQueryForTest(emptyVIStore{}, testIndexPrefix)
+	defer restore()
+
+	bm := backend.NewBlockMeta("test-tenant", uuid.New(), "wdwad")
+	bm.StartTime = time.Unix(100, 0)
+	bm.EndTime = time.Unix(300, 0)
+	bm.Size_ = defaultTargetBytesPerRequest
+	bm.TotalRecords = 1
+	bm.ReplicationFactor = backend.MetricsGeneratorReplicationFactor
+
+	rawR, _ := newLocalRawReadWriter(t)
+	reader := &mockReaderWithRawReader{
+		mockReader:  &mockReader{metas: []*backend.BlockMeta{bm}},
+		rawR:        rawR,
+		indexPrefix: testIndexPrefix,
+	}
+
+	o, err := overrides.NewOverrides(overrides.Config{}, nil, prometheus.NewRegistry())
+	require.NoError(t, err)
+
+	sharder := newAsyncQueryRangeSharder(reader, o, QueryRangeSharderConfig{
+		StreamingShards:    defaultMostRecentShards,
+		ConcurrentRequests: 10,
+	}, nil, false, newJobsPerQueryHistogram(), log.NewNopLogger())
+
+	var (
+		dispatchedMu sync.Mutex
+		dispatched   []*tempopb.QueryRangeRequest
+	)
+	next := pipeline.AsyncRoundTripperFunc[combiner.PipelineResponse](func(r pipeline.Request) (pipeline.Responses[combiner.PipelineResponse], error) {
+		parsed, perr := api.ParseQueryRangeRequest(r.HTTPRequest())
+		require.NoError(t, perr)
+		dispatchedMu.Lock()
+		dispatched = append(dispatched, parsed)
+		dispatchedMu.Unlock()
+		return pipeline.NewAsyncResponse(&combiner.QueryRangeJobResponse{}), nil
+	})
+	testRT := sharder.Wrap(next)
+
+	httpReq := api.BuildQueryRangeRequest(httptest.NewRequest("GET", "/", nil), &tempopb.QueryRangeRequest{
+		Query: `{ span.foo = "bar" } | rate()`,
+		Start: uint64(100 * time.Second),
+		End:   uint64(300 * time.Second),
+		Step:  uint64(10 * time.Second),
+	}, "")
+	httpReq = httpReq.WithContext(user.InjectOrgID(httpReq.Context(), "test-tenant"))
+
+	resps, err := testRT.RoundTrip(pipeline.NewHTTPRequest(httpReq))
+	require.NoError(t, err)
+	for {
+		res, done, rerr := resps.Next(context.Background())
+		require.NoError(t, rerr)
+		if done || res == nil {
+			break
+		}
+	}
+
+	dispatchedMu.Lock()
+	defer dispatchedMu.Unlock()
+
+	require.NotEmpty(t, dispatched, "expected at least one dispatched backend job")
+
+	var sawIndexOnlyNarrowedJob bool
+	fullWindowNanos := uint64(300*time.Second) - uint64(100*time.Second)
+	for _, d := range dispatched {
+		if d.IndexOnly && (d.End-d.Start) < fullWindowNanos {
+			sawIndexOnlyNarrowedJob = true
+		}
+	}
+	require.True(t, sawIndexOnlyNarrowedJob,
+		"expected at least one dispatched job with IndexOnly=true and a window narrower than the "+
+			"whole query range — proof DispatchTimeSliced (not DispatchBlockSharded) was reached "+
+			"through the real compile path (blockpack.CompileTraceQLMetricsFilter)")
+}
+
+// TestMetricsQueryRangeSharder_GroupByQueryStaysBlockSharded is the REQUIRED companion to the
+// above (team-lead's ruling on the combined B+A fix): a group-by metrics query's filter
+// predicate can be fully indexable, but the VALUE-INDEX METRICS ENGINE cannot execute a
+// group-by shape at all (ExecuteTraceMetricsFromVI's own static gate, mirrored by
+// blockpack.CompileTraceQLMetricsFilter's viAnswerableShape). buildMetricsQueryPlan must
+// therefore return nil for a group-by query — never qualifying it for DispatchTimeSliced —
+// so it dispatches with today's ordinary block-sharded jobs (IndexOnly=false, full block
+// windows), never depending on the querier's inner-decline typed-error safety net (fix A) to
+// keep a group-by query working. This is the frontend-side half of holistic-review Issue 1: the
+// ONLY place that can keep an unsupported metrics shape on the safe, already-working path
+// instead of a user-visible ErrSliceIndexCoverageGap failure.
+func TestMetricsQueryRangeSharder_GroupByQueryStaysBlockSharded(t *testing.T) {
+	restore := vblockpack.ConfigureValueIndexQueryForTest(emptyVIStore{}, testIndexPrefix)
+	defer restore()
+
+	bm := backend.NewBlockMeta("test-tenant", uuid.New(), "wdwad")
+	bm.StartTime = time.Unix(100, 0)
+	bm.EndTime = time.Unix(300, 0)
+	bm.Size_ = defaultTargetBytesPerRequest
+	bm.TotalRecords = 1
+	bm.ReplicationFactor = backend.MetricsGeneratorReplicationFactor
+
+	rawR, _ := newLocalRawReadWriter(t)
+	reader := &mockReaderWithRawReader{
+		mockReader:  &mockReader{metas: []*backend.BlockMeta{bm}},
+		rawR:        rawR,
+		indexPrefix: testIndexPrefix,
+	}
+
+	o, err := overrides.NewOverrides(overrides.Config{}, nil, prometheus.NewRegistry())
+	require.NoError(t, err)
+
+	sharder := newAsyncQueryRangeSharder(reader, o, QueryRangeSharderConfig{
+		StreamingShards:    defaultMostRecentShards,
+		ConcurrentRequests: 10,
+	}, nil, false, newJobsPerQueryHistogram(), log.NewNopLogger())
+
+	var (
+		dispatchedMu sync.Mutex
+		dispatched   []*tempopb.QueryRangeRequest
+	)
+	next := pipeline.AsyncRoundTripperFunc[combiner.PipelineResponse](func(r pipeline.Request) (pipeline.Responses[combiner.PipelineResponse], error) {
+		parsed, perr := api.ParseQueryRangeRequest(r.HTTPRequest())
+		require.NoError(t, perr)
+		dispatchedMu.Lock()
+		dispatched = append(dispatched, parsed)
+		dispatchedMu.Unlock()
+		return pipeline.NewAsyncResponse(&combiner.QueryRangeJobResponse{}), nil
+	})
+	testRT := sharder.Wrap(next)
+
+	httpReq := api.BuildQueryRangeRequest(httptest.NewRequest("GET", "/", nil), &tempopb.QueryRangeRequest{
+		Query: `{ span.foo = "bar" } | rate() by (resource.service.name)`,
+		Start: uint64(100 * time.Second),
+		End:   uint64(300 * time.Second),
+		Step:  uint64(10 * time.Second),
+	}, "")
+	httpReq = httpReq.WithContext(user.InjectOrgID(httpReq.Context(), "test-tenant"))
+
+	resps, err := testRT.RoundTrip(pipeline.NewHTTPRequest(httpReq))
+	require.NoError(t, err)
+	for {
+		res, done, rerr := resps.Next(context.Background())
+		require.NoError(t, rerr)
+		if done || res == nil {
+			break
+		}
+	}
+
+	dispatchedMu.Lock()
+	defer dispatchedMu.Unlock()
+
+	require.NotEmpty(t, dispatched, "expected at least one dispatched backend job")
+	for _, d := range dispatched {
+		require.False(t, d.IndexOnly, "a group-by metrics query must dispatch ordinary block-sharded jobs, never IndexOnly=true ones")
 	}
 }

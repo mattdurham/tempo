@@ -119,6 +119,16 @@ func ParseSearchBlockRequest(r *http.Request) (*tempopb.SearchBlockRequest, erro
 		req.DedicatedColumns = dedicatedColumns
 	}
 
+	// indexOnly (#487) is optional; absent (the common, non-slice-job case) means false,
+	// matching the proto field's zero value and today's request shape byte-for-byte.
+	if s = vals.Get(urlParamIndexOnly); s != "" {
+		indexOnly, err := strconv.ParseBool(s)
+		if err != nil {
+			return nil, fmt.Errorf("invalid indexOnly %s: %w", s, err)
+		}
+		req.IndexOnly = indexOnly
+	}
+
 	return req, nil
 }
 

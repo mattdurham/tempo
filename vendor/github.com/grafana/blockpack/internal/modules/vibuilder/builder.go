@@ -283,6 +283,25 @@ func buildPredicate(l *leaf) (valueindex.Predicate, modules_shared.ColumnType, b
 	}
 }
 
+// LeafIndexable reports whether a single leaf RangeNode has a shape the value index can
+// represent at all (single-value equality, range, or regex — see buildPredicate's own switch),
+// with NO discovery/download I/O and independent of whether any value-index files currently
+// exist for it (issue #487, T5b). It is the exact same decision buildPredicate makes for real
+// index-source construction, exposed so a caller outside this package (blockpack's public
+// AllLeavesIndexable, queryplan.AllLeavesIndexable) can determine per-leaf shape resolvability
+// ahead of time — e.g. to require ALL of a program's leaves to be indexable, not just the "at
+// least one" BuildSource itself qualifies on — without re-deriving buildPredicate's rules a
+// second time and risking drift between the two.
+//
+// SPEC-VB-3, NOTE-VI-085.
+func LeafIndexable(n *vm.RangeNode) bool {
+	if n == nil {
+		return false
+	}
+	_, _, ok := buildPredicate(&leaf{node: n})
+	return ok
+}
+
 // buildRangePredicate builds a between/range predicate from a leaf's Min/Max
 // bounds. A two-sided bound becomes a between predicate; a one-sided bound becomes
 // a range predicate with the matching operator.

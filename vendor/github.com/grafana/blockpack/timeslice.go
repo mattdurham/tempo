@@ -66,6 +66,9 @@ const (
 	DispatchBlockSharded = queryplan.DispatchBlockSharded
 	// DispatchTimeSliced is the #487 opt-in narrowing; see DispatchStrategy's doc comment.
 	DispatchTimeSliced = queryplan.DispatchTimeSliced
+	// DefaultK is the recommended default for BuildTimeSlices/BuildQueryPlan's k parameter —
+	// see queryplan.DefaultK's own doc comment (SPEC-QP-2/NOTE-QP-008) for the full rationale.
+	DefaultK = queryplan.DefaultK
 )
 
 // BuildQueryPlan composes a cost-based leaf plan and, when qualified, minute-aligned
@@ -120,4 +123,23 @@ func TimeSliceOracle(
 	data []byte, dir []VCNTChunkDirEntry, minTS, maxTS uint64,
 ) (CostFunc, func(leaf *RangeNode) []MinuteCount) {
 	return queryplan.VCNTCostFunc(data, dir, minTS, maxTS), queryplan.VCNTPerMinuteFunc(data, dir, minTS, maxTS)
+}
+
+// AllLeavesIndexable reports whether EVERY leaf in prog's predicate tree has a shape the value
+// index can represent at all (single-value equality, range, or regex), independent of whether
+// any value-index files currently exist for it — a data-presence question this function does
+// not answer (issue #487, T5b).
+//
+// BuildQueryPlan's allLeavesResolvable parameter needs an ALL-leaves verdict; a caller that
+// derives it purely from a value-index-availability check (e.g. whether BuildValueIndexSource
+// found ANY coverage) is checking a strictly weaker "at least one leaf" condition — see
+// BuildValueIndexSource's own doc comment. AllLeavesIndexable closes that gap: combine it (AND)
+// with the caller's own availability/data-presence check to get a true ALL-leaves-resolvable
+// verdict, rather than reusing the availability check alone.
+//
+// A program with nothing referenced at all (no leaves, no match-all column list) returns false.
+// A match-all query (e.g. `{} | rate()`) returns true — that shape has no per-leaf value
+// predicate to reject.
+func AllLeavesIndexable(prog *Program) bool {
+	return queryplan.AllLeavesIndexable(prog)
 }

@@ -44,6 +44,16 @@ const (
 	maxSlicesPerPlan = 2000
 )
 
+// DefaultK is the recommended default for BuildTimeSlices/BuildQueryPlan's k parameter (issue
+// #487, SPEC-QP-2/NOTE-QP-008; the design doc's desiredSliceCount = concurrentRequests*k formula
+// never pinned a numeric default for k — ruled here). k=1 makes desiredSliceCount exactly
+// concurrentRequests, so the no-VCNT-signal uniform-width fallback partitions the window into
+// precisely what one dispatch round at concurrentRequests can cover — the least-aggressive
+// choice for the case where there is no signal to justify finer slicing. A caller wanting finer
+// ShouldQuit cancellation granularity may still pass k>1 explicitly; DefaultK only fixes the
+// literal a caller would otherwise have to invent on their own.
+const DefaultK = 1
+
 // TimeSlice is one time-bounded sub-window of a query, carrying enough information for a
 // dispatch-priority-ordering caller to reorder without re-deriving signal blockpack already
 // computed. Start/End are minute-aligned unix seconds, [Start, End) half-open, matching the

@@ -246,3 +246,26 @@ leaves), mirroring the string unscoped path.
 
 **Back-ref:** `vm/traceql_compiler.go:extractNeqNode,extractNeqNumericNode`,
 `executor/plan_blocks.go:colStatsRejectsInt64,colStatsRejectsFloat64,numNodeBoundExceedsMax`.
+
+## NOTE-491 — MetricsShapeIsVIAnswerable extracted from ExecuteTraceMetricsFromVI's inline gate, for plan-time reuse (issue #487, holistic-review Issue 2/B)
+
+*Added: 2026-07-07*
+
+`executor.ExecuteTraceMetricsFromVI`'s own shape gate (only `count_over_time()`/`rate()` with no
+group-by are index-answerable) previously lived as an inline `switch` inside that function —
+correct for execution, but unreachable for a plan-time caller that needs the SAME verdict before
+deciding whether to dispatch work at all. #487's time-slice dispatch needs exactly this: tempo's
+frontend must know, before dispatching an `IndexOnly`-mode metrics job, whether the query's SHAPE
+even qualifies for the VI metrics path — re-deriving the switch a second time in a different
+package would risk the two copies silently drifting (one gets a new function added, the other
+doesn't). Extracted to `vm.MetricsShapeIsVIAnswerable` (`SPECS.md` SPEC-VM-1);
+`ExecuteTraceMetricsFromVI` now calls it instead of its own inline switch — same behavior,
+single source of truth. Root `blockpack.CompileTraceQLMetricsFilter` (`metricsfilter.go`) is the
+plan-time consumer, closing a gap where #487's metrics-side time-slice dispatch was otherwise
+unreachable in production (`traceqlparser.ParseTraceQL` never returns a `*FilterExpression` for
+a real `QueryRangeRequest.Query`, which always has an aggregation pipeline — `CompileTraceQL`
+alone cannot serve this call site).
+
+Back-refs: `internal/vm/metrics_compiler.go:MetricsShapeIsVIAnswerable`,
+`internal/modules/executor/metrics_trace.go:ExecuteTraceMetricsFromVI`,
+`metricsfilter.go:CompileTraceQLMetricsFilter`. See `SPECS.md` SPEC-VM-1. Issue #487.

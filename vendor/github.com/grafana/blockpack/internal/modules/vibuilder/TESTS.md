@@ -14,7 +14,7 @@ SPEC-ROOT-009 — distinct from `valueindex/TESTS.md`'s own `TEST-VI-N` counter,
 `SPEC-VB-N`/`SPEC-VI-N` separation established in this package's `SPECS.md`). IDs are assigned
 in ascending order and never reused or renumbered.
 
-Next free ID: **TEST-VB-4**.
+Next free ID: **TEST-VB-5**.
 
 ---
 
@@ -96,3 +96,26 @@ NOTE-VI-049) and the `TestBuildSource_*` suite, both of which route through the 
 `lookupColumn` — no separate ranged-specific fixture is currently maintained for
 `lookupColumnAll` beyond these, since `queryKeysRanged` is the single shared implementation both
 callers use (SPEC-VB-2).
+
+## TEST-VB-4: `LeafIndexable` — per-leaf shape resolvability, all rejected/accepted shapes
+*Added: 2026-07-07 (issue #487, task T5b)*
+
+**Scenario:** `LeafIndexable` (SPEC-VB-3) must accept exactly the leaf shapes `buildPredicate`
+can represent and reject everything else, with no I/O.
+
+**Setup/Assertions (`leaf_indexable_test.go`):**
+
+- `TestLeafIndexable_Nil` — `nil` returns `false`.
+- `TestLeafIndexable_SingleEqualityValue` — a single-value equality leaf returns `true`.
+- `TestLeafIndexable_MultiValueIsNotIndexable` — an equality leaf with more than one value
+  returns `false`.
+- `TestLeafIndexable_Range` — a range/between leaf returns `true`.
+- `TestLeafIndexable_Regex` — a regex leaf with a non-empty `Pattern` returns `true`.
+- `TestLeafIndexable_RequirePresentOnlyIsNotIndexable` — a `RequirePresent`-only leaf returns
+  `false`.
+- `TestLeafIndexable_EmptyLeafIsNotIndexable` — a leaf with no `Values`/`Min`/`Max`/`Pattern`
+  returns `false`.
+
+**Spec invariants tested:** SPEC-VB-3.
+
+Back-ref: `internal/modules/vibuilder/leaf_indexable_test.go`. Issue #487.

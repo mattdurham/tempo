@@ -528,3 +528,127 @@ Back-refs: `internal/modules/queryplan/perminutefrom.go:VCNTPerMinuteFunc`,
 `internal/modules/queryplan/vcnt_cost.go:leafEqualityValue,VCNTCostFunc` (NOTE-QP-001),
 `timeslice.go:TimeSliceOracle` (root package, no separate spec entry). Tests:
 `perminutefrom_test.go`, `timeslice_publicapi_test.go`. See `SPECS.md` SPEC-QP-4. Issue #487.
+
+---
+
+## NOTE-QP-008: DefaultK=1 — ruling the previously-unpinned `k` multiplier in the uniform-width fallback formula (issue #487, team-lead ruling)
+
+*Added: 2026-07-07*
+
+**The gap.** `BuildTimeSlices`' uniform-width no-signal fallback (NOTE-QP-005) and
+`desiredSliceCount = concurrentRequests * k` both depend on a caller-supplied `k`. Issue #487's
+design doc states the formula's *shape* — "default when no signal: window / (ConcurrentRequests
+× k)" — but never pins a numeric value for `k`; its own "Open questions" section explicitly
+lists "Slice-width tuning: equal-estimated-work sizing needs empirical calibration once #484's
+oracle exists" as unresolved. Neither `brainstorm-c.md` nor `plan-c.md` pinned one either — both
+carry the formula's shape forward from the issue without adding a number. Coder-1-c's tempo call
+site used `k=1` as a practical choice, but nothing in blockpack documented that as an intended
+default, and nothing prevented a second call site (or a future tempo change) from silently
+picking a different, undocumented value.
+
+**Ruling: `DefaultK = 1`.** Confirmed by direct read of the issue body (`gh issue view 487`) that
+no numeric default is specified anywhere upstream — this is a genuine gap, not a missed
+cross-reference, so the team lead ruled a default rather than searching further. Rationale:
+`k=1` makes `desiredSliceCount = concurrentRequests` — the uniform-width fallback partitions the
+window into exactly as many slices as one round of dispatch at `concurrentRequests` can cover,
+the least-aggressive default available. This matters specifically for the *no-signal* fallback:
+when there's no VCNT data to justify finer adaptive slicing, over-slicing would add per-slice
+dispatch/fetch overhead (index-file discovery, footer/TOC reads) for no matching benefit. A
+caller that wants finer cancellation granularity (more, narrower slices, so `ShouldQuit` can cut
+off a low-selectivity scan sooner) can pass `k > 1` deliberately — this remains a tuning knob,
+not a value this package can compute or default away, since it depends on cluster-specific
+concurrency/latency tradeoffs the design doc itself defers to "post-deployment empirical
+calibration."
+
+**Why a named constant, not just documentation.** Per the binding rule established at Phase C's
+brainstorm stage ("Slice-width constants config-visible for post-deploy tuning" —
+`brainstorm-prompt-c.md`), `minSliceWidthSeconds`/`maxSliceWidthSeconds`/`maxSlicesPerPlan` are
+all named, documented constants rather than magic numbers scattered across call sites. `k` is
+architecturally different — it's caller-supplied, not `BuildTimeSlices`-internal — but the same
+principle applies: a config-visible `DefaultK` constant lets tempo's frontend (and any other
+future caller) reference one canonical "we have no better idea" value instead of each call site
+independently guessing or hardcoding a literal `1` that could silently drift from blockpack's
+own intended default.
+
+**Implementation status: LANDED.** `const DefaultK = 1` lives in
+`internal/modules/queryplan/slices.go` (alongside `minSliceWidthSeconds`/`maxSliceWidthSeconds`/
+`maxSlicesPerPlan`, exported separately since it is a caller-facing default rather than an
+internal algorithm bound), re-exported at root as `blockpack.DefaultK` in `timeslice.go`
+(mirroring `DispatchBlockSharded`/`DispatchTimeSliced`'s existing re-export pattern). Tempo's
+call sites (`modules/frontend/vcnt_fetch.go`'s `buildQueryPlan`, plus the three `BuildQueryPlan`
+calls in `tempodb/encoding/vblockpack/coverage_decline_test.go`) reference `blockpack.DefaultK`
+instead of a bare literal `1`, closing the drift risk this note originally flagged. Pinned by
+`TestDefaultK_IsOne` (`queryplan` package — also asserts `desiredSliceCount(4, DefaultK) == 4`)
+and `TestDefaultK_RootReexportMatchesQueryplanPackage` (root, cross-checks against
+`queryplan.DefaultK` directly).
+
+Back-refs: `internal/modules/queryplan/slices.go:DefaultK,desiredSliceCount`,
+`timeslice.go:DefaultK` (root re-export). See `SPECS.md` SPEC-QP-2's `DefaultK` ruling bullet.
+Tests: `slices_test.go:TestDefaultK_IsOne`, `timeslice_test.go:TestDefaultK_RootReexportMatchesQueryplanPackage`.
+Issue #487.
+
+---
+
+## NOTE-QP-009: AllLeavesIndexable — closing the ANY-vs-ALL gap in `allLeavesResolvable`'s computation (issue #487, task T5b)
+
+*Added: 2026-07-07*
+
+**The gap.** `BuildQueryPlan`'s `allLeavesResolvable` parameter (SPEC-QP-3, NOTE-QP-006) is
+documented as "the caller-supplied #481 index-coverage verdict," but nothing in this package
+ever specified HOW a caller should correctly compute it. The obvious candidate —
+`vibuilder.BuildValueIndexSource`'s own `ok` return, or `CheckIndexCoverage`'s (#481/T5) reuse of
+it — answers a strictly weaker question: "did AT LEAST ONE leaf resolve against the index," not
+"did EVERY leaf." `vibuilder.BuildSource`'s own doc comment (NOTE-VI-036) is explicit about this:
+a column the builder could not express a predicate for is simply never `Add`ed, and the QUERY
+still proceeds with partial index coverage for a normal (block-sharded) scan — that's the correct
+behavior for `BuildSource`'s own purpose, but wrong to reuse verbatim as `allLeavesResolvable`.
+
+**Concrete failure mode without this fix.** Real TraceQL negation (`{ span.foo != "bar" }`)
+compiles, via NOTE-453's presence+range-OR rewrite, to a mixed shape: one leaf the index CAN
+represent plus one leaf (multi-value OR, or a bare `RequirePresent`) it architecturally cannot.
+Under an ANY-based `allLeavesResolvable`, this mixed-shape query would wrongly qualify for
+`DispatchTimeSliced` — the unindexable leaf's constraint would simply never be applied by the
+per-slice job, silently returning more results than the query asked for. This is exactly the
+class of correctness bug SPEC-QP-3's single-gate contract exists to prevent, but the contract
+itself never said how to correctly *compute* the boolean it gates on until this fix.
+
+**Fix: `AllLeavesIndexable(prog *vm.Program) bool` (SPEC-QP-5).** Flattens `prog`'s predicate
+tree to its leaf `RangeNode`s (mirroring `vibuilder.collectLeaves`' own flat walk — deliberately
+NOT `Plan()`'s AND/OR-structured walk, since this must inspect the exact same leaf set
+`BuildSource` itself touches, independent of boolean structure) and requires
+`vibuilder.LeafIndexable` (`vibuilder/SPECS.md` SPEC-VB-3, `vibuilder/NOTES.md` NOTE-VI-085) to
+hold for EVERY leaf, not just one. A caller now computes `allLeavesResolvable :=
+<availability check> && AllLeavesIndexable(prog)` — combining the existing data-presence check
+with this shape-only check, neither of which alone is sufficient.
+
+**Match-all is a special case, not an oversight.** A match-all-with-column-list query (`{} |
+rate()` — `Nodes` empty, `Columns` populated) returns `true`: `BuildSource`'s own
+`lookupColumnAll` path never rejects a column's shape (NOTE-VI-036), so there is no per-leaf
+predicate to reject here either. A program referencing nothing at all (`Nodes` and `Columns`
+both empty) returns `false`.
+
+**Cross-package design, mirroring NOTE-VI-085's own framing.** `vibuilder.LeafIndexable` is the
+per-leaf primitive (owned by `vibuilder`, since it's a thin wrapper over `buildPredicate`, the
+same package that owns the real index-source-construction decision); `queryplan.AllLeavesIndexable`
+is the ALL-leaves aggregation (owned by `queryplan`, since it needs to walk `vm.Program` the same
+way `Plan`/`Lead` already do and feed `BuildQueryPlan`'s own gate). Neither package duplicates
+the other's logic — `queryplan` calls `vibuilder.LeafIndexable` per leaf rather than re-deriving
+`buildPredicate`'s shape rules, the same delegate-don't-duplicate principle NOTE-QP-004 already
+established for `Lead()`/`leadLeaf`, now applied across a package boundary.
+
+**Root-level re-export, no separate spec entry needed.** Root `timeslice.go` exports a thin
+`AllLeavesIndexable(prog *Program) bool` wrapper (`return queryplan.AllLeavesIndexable(prog)`) —
+per the established root-re-export convention (no separate SPECS/NOTES.md for root files, per
+the `vcnt.go` precedent; see this file's own C5 and Fix-1/`TimeSliceOracle` dispositions),
+`AllLeavesIndexable`'s root re-export needs no entry of its own here.
+
+**Verification.** `indexable_test.go`'s
+`TestAllLeavesIndexable_MixedIndexableAndNegatedLeafIsNotIndexable` is the direct regression
+proof for the concrete failure mode described above. `timeslice_test.go`'s
+`TestAllLeavesIndexable_RootReexportMatchesQueryplanPackage` pins the root wrapper against
+`queryplan.AllLeavesIndexable` directly for both a fully-indexable and a mixed-shape program.
+
+Back-refs: `internal/modules/queryplan/indexable.go:AllLeavesIndexable,collectLeafNodes`,
+`internal/modules/vibuilder/builder.go:LeafIndexable` (NOTE-VI-085). See `SPECS.md` SPEC-QP-5,
+SPEC-QP-3 (the gate this function correctly feeds). Tests: `indexable_test.go`,
+`timeslice_test.go`. Issue #487.

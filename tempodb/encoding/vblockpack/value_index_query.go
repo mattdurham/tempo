@@ -113,6 +113,41 @@ func ConfigureValueIndexQuery(client *minio.Client, bucket, indexPrefix string, 
 	}
 }
 
+// ConfigureValueIndexQueryForTest installs store (satisfying both blockpack.LookupStore and
+// blockpack.ValueIndexFileStore — the same two interfaces minioVIStore implements) as the
+// process-level index-driven query reader, for tests in OTHER packages that need genuine
+// CheckIndexCoverage/tryIndexFetch behavior against a real reader without a live minio client or
+// S3 test harness (e.g. modules/frontend's metrics-sharder end-to-end tests, holistic-review
+// Issue 2/B — proving DispatchTimeSliced is actually reachable through the real compile path,
+// not just via a hand-constructed QueryPlan). Mirrors this package's own (unexported)
+// withVIQueryReader test helper 1:1; exposed here only because that helper cannot be called
+// across a package boundary. A nil store disables the reader, matching ConfigureValueIndexQuery's
+// own nil-client contract. Returns a restore function the caller MUST defer to reset prior
+// process-level state — this is a shared package-level singleton, not per-instance state.
+func ConfigureValueIndexQueryForTest(store interface {
+	blockpack.LookupStore
+	blockpack.ValueIndexFileStore
+}, indexPrefix string) (restore func()) {
+	viQueryReaderMu.Lock()
+	prev := viQueryReaderPtr
+	if store == nil {
+		viQueryReaderPtr = nil
+	} else {
+		viQueryReaderPtr = &viQueryReader{
+			store:       store,
+			caches:      make(map[string]*blockpack.IndexFileCache),
+			indexPrefix: indexPrefix,
+			ttl:         time.Minute,
+		}
+	}
+	viQueryReaderMu.Unlock()
+	return func() {
+		viQueryReaderMu.Lock()
+		viQueryReaderPtr = prev
+		viQueryReaderMu.Unlock()
+	}
+}
+
 // getValueIndexQueryReader returns the configured reader, or nil when the
 // index-driven path is disabled.
 func getValueIndexQueryReader() *viQueryReader {
@@ -158,19 +193,82 @@ type indexFetchStats struct {
 //     non-nil error; tryIndexFetch now propagates it up through Fetch instead of
 //     logging-and-scanning (NOTE-VI-078, issue #481).
 //
+// indexOnly (issue #487) narrows this contract for a time-slice job: a slice job's
+// narrowed [Start, End) window means a full block scan is not a safe fallback the
+// way it is for a normal query (a scan ignores the slice boundary at the per-span
+// level and can double-count or over-fetch across overlapping slice jobs). When
+// indexOnly is true, every ROUTINE DECLINE outcome above is converted into
+// (nil, false, stats, ErrSliceIndexCoverageGap) instead of (nil, false, stats, nil)
+// — the caller must fail the query, never fall through to a scan. This reuses the
+// SAME outcome-3 (typed error) propagation shape NOTE-VI-078 already established;
+// no new error-return convention is introduced. indexOnly has no effect on the
+// other two outcomes: a full index answer is still used as-is, and a genuine
+// index/data inconsistency still returns its own distinct error either way.
+//
 // The returned indexFetchStats captures the download I/O of this attempt
 // regardless of outcome (issue #465).
+// CheckIndexCoverage reports whether the configured value-index query reader (issue #461) has
+// build-time coverage to attempt answering prog from the index over [minSec, maxSec] for
+// tenant — issue #487's frontend-side query-planning need for a block-independent proxy of
+// tryIndexFetch's OWN first decline gate (`if !ok { ...decline...}` right after
+// BuildValueIndexSource, above). It is a REUSE of that exact call, not a new coverage check:
+// same singleton reader, same per-tenant IndexFileCache, same blockpack.BuildValueIndexSource
+// entry point tryIndexFetch itself calls.
+//
+// Returns false whenever the index-driven query path is disabled (viQueryReaderPtr nil, e.g.
+// value_index_query.enabled=false) or BuildValueIndexSource itself errors — both mirror
+// tryIndexFetch's own ROUTINE DECLINE handling for those identical conditions.
+//
+// FIXED (T5b/#162, was a KNOWN LIMITATION under T5/#155): BuildValueIndexSource's own ok
+// return means "at least one leaf has a SHAPE the value index can represent at all"
+// (equality/range/regex), not "every leaf has an indexable shape" — a genuinely
+// empty-but-queried column is itself valid coverage (NOTE-VI-033: a covered-but-empty lookup is
+// an authoritative "zero matches" answer, not a decline), so BuildValueIndexSource's ok alone is
+// a query-SHAPE completeness gap, not a data-presence one: a query mixing one indexable leaf
+// (equality/range/regex) with one leaf the index architecturally cannot represent (multi-value
+// OR, negation, a RequirePresent-only leaf) would report true from ok alone, because BuildSource
+// only requires ONE leaf in the whole program to have a valid shape. blockpack.AllLeavesIndexable
+// (issue #487 T5b) closes exactly that gap — it aggregates the SAME per-leaf shape rule ALL, not
+// ANY, and this function now requires BOTH: BuildValueIndexSource's ok (build-time
+// availability/no-error) AND blockpack.AllLeavesIndexable(prog) (every leaf's shape is
+// representable). Still no second, independently-invented coverage rule: AllLeavesIndexable
+// itself reuses the exact same vibuilder.LeafIndexable decision buildPredicate makes for real
+// index-source construction (blockpack-side, see AllLeavesIndexable's own doc comment).
+//
+// tryIndexFetch's SECOND decline gate — QueryTraceQLFromIndex's own indexOK, which enforces
+// per-query-shape completeness against a specific block's actual data — still requires a
+// *blockpack.Reader over one specific block and therefore still cannot be evaluated at the
+// frontend's block-independent plan time; this function remains a reuse of tryIndexFetch's FIRST
+// gate only, now tightened with the shape-completeness half tryIndexFetch's own executor-level
+// check would otherwise catch downstream.
+func CheckIndexCoverage(ctx context.Context, tenant string, prog *blockpack.Program, minSec, maxSec uint64) bool {
+	if !blockpack.AllLeavesIndexable(prog) {
+		return false
+	}
+	vr := getValueIndexQueryReader()
+	if vr == nil {
+		return false
+	}
+	cache := vr.cacheFor(tenant)
+	_, ok, err := blockpack.BuildValueIndexSource(ctx, cache, vr.store, prog, minSec, maxSec)
+	if err != nil {
+		return false
+	}
+	return ok
+}
+
 func (b *blockpackBlock) tryIndexFetch(
 	ctx context.Context,
 	r *blockpack.Reader,
 	prog *blockpack.Program,
 	query string,
 	opts blockpack.QueryOptions,
+	indexOnly bool,
 ) ([]blockpack.SpanMatch, bool, indexFetchStats, error) {
 	var stats indexFetchStats
 	vr := getValueIndexQueryReader()
 	if vr == nil {
-		return nil, false, stats, nil
+		return declineOutcome(indexOnly, stats)
 	}
 
 	// Derive the query's second-granularity window. A zero bound means "unbounded"
@@ -185,15 +283,16 @@ func (b *blockpackBlock) tryIndexFetch(
 		// corrupt-file decode). This is not the authoritative "index named a block
 		// absent from the data file" inconsistency — the source has not yet
 		// produced any span match — so it remains a routine decline: log and let
-		// the caller fall back to a correct full scan (NOTE-VI-078, issue #481).
+		// the caller fall back to a correct full scan (NOTE-VI-078, issue #481),
+		// unless indexOnly forbids the fallback (issue #487).
 		level.Warn(util_log.Logger).Log("msg", "vblockpack: index fetch: build source error",
 			"block", b.meta.BlockID, "err", err)
-		return nil, false, stats, nil
+		return declineOutcome(indexOnly, stats)
 	}
 	if !ok {
 		level.Info(util_log.Logger).Log("msg", "vblockpack: index fetch: no coverage",
 			"block", b.meta.BlockID, "tenant", b.meta.TenantID, "minSec", minSec, "maxSec", maxSec)
-		return nil, false, stats, nil
+		return declineOutcome(indexOnly, stats)
 	}
 	level.Info(util_log.Logger).Log("msg", "vblockpack: index fetch: coverage found",
 		"block", b.meta.BlockID, "tenant", b.meta.TenantID, "files", src.Stats().FilesRead)
@@ -218,7 +317,8 @@ func (b *blockpackBlock) tryIndexFetch(
 	// path eliminated in NOTE-VI-071 — an authoritative index that names data the
 	// file cannot resolve must be observable as an error, not quietly worked around.
 	// The remaining routine declines (indexOK=false, err=nil) still fall back to a
-	// correct scan below; only genuine index/data skew becomes a hard error.
+	// correct scan below (or fail with ErrSliceIndexCoverageGap under indexOnly,
+	// issue #487); only genuine index/data skew becomes THIS hard error either way.
 	matches, indexOK, err := blockpack.QueryTraceQLFromIndex(
 		ctx, r, src, query, sourceRef, opts,
 	)
@@ -228,10 +328,21 @@ func (b *blockpackBlock) tryIndexFetch(
 		return nil, false, stats, err
 	}
 	if !indexOK {
-		return nil, false, stats, nil
+		return declineOutcome(indexOnly, stats)
 	}
 	stats.Used = true
 	return matches, true, stats, nil
+}
+
+// declineOutcome returns tryIndexFetch's ROUTINE DECLINE outcome: today's
+// (nil, false, stats, nil) when indexOnly is false, or the #487 slice-mode
+// (nil, false, stats, ErrSliceIndexCoverageGap) when indexOnly is true — a slice
+// job must fail rather than let its caller fall through to an unsafe full scan.
+func declineOutcome(indexOnly bool, stats indexFetchStats) ([]blockpack.SpanMatch, bool, indexFetchStats, error) {
+	if indexOnly {
+		return nil, false, stats, ErrSliceIndexCoverageGap
+	}
+	return nil, false, stats, nil
 }
 
 // floorToMinuteSec floors sec down to the same 60-second (minute) alignment as

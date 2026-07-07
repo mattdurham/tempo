@@ -21,7 +21,7 @@ than deleted. `vibuilder/NOTES.md`'s own entries continue to use the separate, s
 counter (spanning `valueindex`/`valueindexcompactor`/`valueindexconsumer`/`executor`/`vibuilder`)
 — this SPEC-VB-N convention applies only to this file and to `TESTS.md`'s parallel `TEST-VB-N`.
 
-Next free ID: **SPEC-VB-3**.
+Next free ID: **SPEC-VB-4**.
 
 ---
 
@@ -125,3 +125,36 @@ Back-ref: `internal/modules/vibuilder/builder.go:lookupColumn,lookupColumnAll,qu
 See `NOTES.md` (`vibuilder`) NOTE-VI-084 for the B-5 rewire's design rationale and NOTE-VI-039's
 addendum, and `valueindex/SPECS.md` SPEC-VI-10 (`QueryBucketFileRanged`'s own contract, which
 this function calls per key).
+
+---
+
+## SPEC-VB-3: `LeafIndexable` — per-leaf value-index shape resolvability, independent of data presence
+*Added: 2026-07-07 (issue #487, task T5b)*
+
+**Contract:** `LeafIndexable(n *vm.RangeNode) bool` reports whether a single leaf has a shape
+`buildPredicate` can represent as a `valueindex.Predicate` at all — single-value equality,
+range/between, or regex — using the exact same decision `buildPredicate` makes for real
+index-source construction (`LeafIndexable` is a thin wrapper: `_, _, ok := buildPredicate(&leaf{node:
+n}); return ok`), so this can never drift from what `BuildSource` itself would do for the same leaf.
+
+**Rules:**
+- `n == nil` returns `false`.
+- Returns `false` for: multi-value leaves (equality with more than one value), a `RequirePresent`
+  leaf, and an empty leaf (no `Values`, `Min`/`Max`, or `Pattern`) — none of these have a
+  `valueindex.Predicate` representation.
+- Returns `true` for: a single-value equality leaf, a one- or two-sided range/between leaf, and a
+  regex leaf with a non-empty `Pattern`.
+- Performs no discovery/download I/O and is independent of whether any value-index files
+  currently exist for the leaf's column — this is a SHAPE question ("could the index represent
+  this leaf at all"), not a data-presence question ("does coverage exist right now"). Contrast
+  with `BuildSource`'s own per-leaf handling, which additionally requires actual file discovery
+  to succeed before a leaf counts as covered.
+
+**Why exposed publicly:** `queryplan.AllLeavesIndexable` (queryplan's own `SPEC-QP-5`) needs to
+apply this exact per-leaf shape decision to every leaf in a program, not just the "at least one"
+condition `BuildSource`'s own `ok` return satisfies. Exposing `LeafIndexable` lets `queryplan`
+reuse `buildPredicate`'s rules verbatim rather than re-deriving them and risking drift between
+the two decisions.
+
+Back-ref: `internal/modules/vibuilder/builder.go:LeafIndexable,buildPredicate`. See `NOTES.md`
+NOTE-VI-085. Test: `leaf_indexable_test.go`. Issue #487.

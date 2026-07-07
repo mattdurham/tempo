@@ -3733,3 +3733,27 @@ equals the total count of stored results regardless of the order `Add`/`RecordFi
 called in.
 
 Back-ref: `internal/modules/executor/metrics_trace_vi_test.go:TestSliceValueIndexSource_StatsAccumulate`.
+
+## EX-VIS-03: `TraceMetricOptions.IndexOnly` — typed decline on every VI non-answer, scan-fallback preserved when false
+*Added: 2026-07-07 (issue #487)*
+
+**Scenario:** `ExecuteMetricsTraceQL` (SPEC-VIS-2) must return `ErrValueIndexNoCoverage` under
+`IndexOnly=true` for both the outer decline (no `ValueIndex`) and every inner decline
+(`ExecuteTraceMetricsFromVI`'s own `ok=false` reasons), and must preserve the existing
+scan-fallback behavior when `IndexOnly=false`.
+
+**Setup/Assertions (`tracemetricoptions_test.go`):**
+- `TestExecuteMetricsTraceQL_IndexOnly_NoValueIndexReturnsTypedError` — `opts.ValueIndex == nil`,
+  `IndexOnly=true` → `errors.Is(err, ErrValueIndexNoCoverage)`, no scan attempted.
+- `TestExecuteMetricsTraceQL_IndexOnly_GroupByDeclineReturnsTypedError` — a group-by query (an
+  unsupported shape per `vm.MetricsShapeIsVIAnswerable`), `IndexOnly=true` →
+  `ErrValueIndexNoCoverage`.
+- `TestExecuteMetricsTraceQL_IndexOnlyFalse_GroupByDeclineFallsBackToScan` — same group-by
+  query, `IndexOnly=false` → falls through to `ExecuteTraceMetrics`, no error, real results
+  (regression guard: `IndexOnly`'s default `false` must not change today's behavior).
+- `TestExecuteMetricsTraceQL_IndexOnly_LegacyTimeSecZeroDeclineReturnsTypedError` — a legacy
+  block with per-span `TimeSec == 0`, `IndexOnly=true` → `ErrValueIndexNoCoverage`.
+
+**Spec invariants tested:** SPEC-VIS-2.
+
+Back-ref: `tracemetricoptions_test.go`. Issue #487.

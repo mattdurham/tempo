@@ -102,6 +102,11 @@ message SearchBlockRequest {
   uint64 size = 10; // total size of data file
   uint32 footerSize = 11; // size of file footer (parquet)
   repeated DedicatedColumn dedicatedColumns = 12;
+  // indexOnly marks a #487 time-slice job: the querier must fail with a typed coverage-gap
+  // error on an index decline instead of silently falling back to a full block scan (a full
+  // scan would ignore the job's narrowed Start/End at the per-span level and could
+  // double-count or over-fetch across overlapping slice jobs).
+  bool indexOnly = 13;
 }
 
 // Configuration for a single dedicated attribute column.
@@ -378,6 +383,12 @@ message QueryRangeRequest {
 
   // names of AST transformations to skip; populated by the frontend from query_frontend.skip_ast_transformations
   repeated string skipASTTransformations = 19;
+
+  // indexOnly marks a #487 time-slice job: the querier must fail with a typed coverage-gap
+  // error on an index decline instead of silently falling back to a full-scan metrics path (a
+  // full scan would ignore the job's narrowed start/end at the per-span level and could
+  // double-count or over-fetch across overlapping slice jobs).
+  bool indexOnly = 20;
 }
 
 enum PartialStatus {

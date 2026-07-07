@@ -1081,3 +1081,49 @@ truly concurrent, not just reordered on a single goroutine.
 
 Back-ref: `internal/modules/executor/metrics_trace.go:SliceValueIndexSource`.
 Tests: `internal/modules/executor/metrics_trace_vi_test.go:TestSliceValueIndexSource_ConcurrentAddAndRecordFileIO_NoRace` (EX-VIS-01).
+
+---
+
+## SPEC-VIS-2: `TraceMetricOptions.IndexOnly` — forbidding `ExecuteMetricsTraceQL`'s internal scan fallback on ANY VI non-answer
+*Added: 2026-07-07 (issue #487, holistic-review Issue 1/fix A)*
+
+**Contract:** `TraceMetricOptions.IndexOnly bool` (root `tracemetricoptions.go`), when `true`,
+forbids `ExecuteMetricsTraceQL`'s (root `api.go`) full-block-scan fallback: on ANY value-index
+non-answer — `opts.ValueIndex == nil` (no index source at all, the OUTER decline) OR
+`ExecuteTraceMetricsFromVI` returning `ok=false` for any of its own decline reasons (unsupported
+shape, no coverage for a leaf, legacy `TimeSec == 0` block, canceled context — the INNER
+decline) — `ExecuteMetricsTraceQL` returns `blockpack.ErrValueIndexNoCoverage`
+(`errors.Is`-comparable) instead of falling through to `executor.ExecuteTraceMetrics` (the full
+scan).
+
+**Why blockpack owns this, unlike the search path.** The search path's analogous decline
+(`executor.QueryTraceQLFromIndex`, `NOTE-VI-035`/`047`/`078`) leaves the decline-to-scan
+decision to its CALLER (tempo's `tryIndexFetch`, which converts a routine decline into its own
+`ErrSliceIndexCoverageGap`) — blockpack's search-path function just returns `(nil, false, nil)`
+and lets the caller decide. The metrics path is architecturally different:
+`ExecuteMetricsTraceQL` owns its VI-decline-to-scan fallback INTERNALLY (it calls
+`ExecuteTraceMetricsFromVI` itself, then falls through to `ExecuteTraceMetrics` itself) — there
+is no external caller decision point to hook into. `IndexOnly` exists to give an external caller
+(tempo's #487 time-slice job dispatch) a way to forbid that internal fallback from outside,
+mirroring the search path's OUTCOME (typed decline signal, no unsafe scan) via a different
+MECHANISM (a boolean flag) required by the different ownership shape.
+
+**Why a narrowed-window job cannot safely fall back to a full scan.** A `#487` per-slice job
+runs the same query over `[sliceStart, sliceEnd)` only. `ExecuteTraceMetrics`'s full block scan
+is un-windowed at the per-span level relative to the slice boundary — it would ignore
+`[sliceStart, sliceEnd)` and could double-count or over-fetch spans across multiple overlapping
+slice jobs dispatched for the same block. Only a typed, fail-fast decline (which the caller
+converts into a fallback to `DispatchBlockSharded` for the WHOLE query, not a per-slice scan)
+is safe.
+
+**`ErrValueIndexNoCoverage`** (root `tracemetricoptions.go`) is the sentinel, `errors.Is`-
+comparable, distinct per its own doc comment from the search path's tempo-owned
+`ErrSliceIndexCoverageGap` (different repos, different ownership, same underlying design
+intent).
+
+Back-ref: `api.go:ExecuteMetricsTraceQL`, `tracemetricoptions.go:TraceMetricOptions.IndexOnly,ErrValueIndexNoCoverage`,
+`internal/modules/executor/metrics_trace.go:ExecuteTraceMetricsFromVI`. See `NOTES.md`
+NOTE-VI-086, NOTE-VI-035/047/078 (the search-path equivalent this mirrors in outcome, not
+mechanism). Tests: `tracemetricoptions_test.go` (`TestExecuteMetricsTraceQL_IndexOnly_NoValueIndexReturnsTypedError`,
+`_IndexOnly_GroupByDeclineReturnsTypedError`, `_IndexOnlyFalse_GroupByDeclineFallsBackToScan`,
+`_IndexOnly_LegacyTimeSecZeroDeclineReturnsTypedError`). Issue #487.

@@ -404,3 +404,43 @@ Back-ref: `internal/modules/vibuilder/builder.go:lookupColumn,lookupColumnAll,qu
 See `SPECS.md` SPEC-VB-1/2, `valueindex/NOTES.md` NOTE-VI-081 (the corresponding `valueindex`-side
 design rationale for the ranged-read path this rewire consumes) and NOTE-VI-084's own forward
 reference from there.
+
+## NOTE-VI-085: LeafIndexable — exposing buildPredicate's shape decision for an ALL-leaves verdict (issue #487, T5b)
+
+*Added: 2026-07-07*
+
+**Why this exists.** `BuildSource`/`BuildValueIndexSource` (NOTE-VI-036) already decides, per
+leaf, whether a `valueindex.Predicate` can represent it — that decision lives inside the
+unexported `buildPredicate`. But `BuildSource`'s own `ok` return is an "at least one leaf
+resolved" verdict (its doc comment: a column the builder could not express a predicate for is
+simply never `Add`ed, so the executor falls back to a full scan for that leaf alone — the *query*
+still proceeds with partial index coverage). #487's `queryplan.AllLeavesIndexable` (queryplan's
+own SPEC-QP-5) needs a stricter, ALL-leaves verdict to correctly compute `BuildQueryPlan`'s
+`allLeavesResolvable` gate (SPEC-QP-3): a query mixing one indexable leaf with one leaf the index
+architecturally cannot represent at all (multi-value OR, negation via NOTE-453's presence+range-OR
+rewrite, or a bare `RequirePresent` leaf) must NOT qualify for `DispatchTimeSliced`, even though
+`BuildSource`'s own "at least one" check would happily proceed with partial coverage for a normal
+scan.
+
+**Design: expose the existing decision, don't duplicate it.** `LeafIndexable(n *vm.RangeNode)
+bool` (SPEC-VB-3) is a thin wrapper — `_, _, ok := buildPredicate(&leaf{node: n}); return ok` —
+over the exact same shape-decision `buildPredicate` already makes. This mirrors the same
+principle NOTE-QP-004 established for `Group.Lead()`/`leadLeaf` (delegate to the existing
+same-package logic rather than re-deriving it) applied across a package boundary instead: rather
+than `queryplan` re-implementing "which `RangeNode` shapes has `valueindex.Predicate` got a
+constructor for" (a second copy of knowledge that already lives in `buildPredicate`'s switch),
+`vibuilder` exposes the one true answer and `queryplan.AllLeavesIndexable` calls it per leaf.
+
+**Shape, not data presence.** `LeafIndexable` performs no discovery/download I/O and does not
+care whether any value-index file currently exists for the leaf's column — it answers "could the
+index represent this leaf's SHAPE at all," independent of whether coverage happens to exist right
+now. This is a deliberate, narrower question than `BuildSource`'s own per-leaf handling (which
+additionally requires real file discovery to succeed). Conflating the two would either wrongly
+decline slice-mode for a shape the index CAN represent but happens to have no files for yet (too
+conservative), or wrongly accept a shape the index can NEVER represent just because some other
+column's files exist (a correctness bug — the mixed-shape case this note exists to prevent).
+
+Back-refs: `internal/modules/vibuilder/builder.go:LeafIndexable,buildPredicate`. See `SPECS.md`
+SPEC-VB-3, `internal/modules/queryplan/NOTES.md` NOTE-QP-009 (the consumer-side rationale for
+`AllLeavesIndexable`), `SPECS.md`(`queryplan`) SPEC-QP-5. Test: `leaf_indexable_test.go`.
+Issue #487.

@@ -51,6 +51,9 @@ const (
 	urlParamSize             = "size"
 	urlParamFooterSize       = "footerSize"
 	urlParamDedicatedColumns = "dc"
+	// urlParamIndexOnly marks a #487 time-slice job: the querier must fail with a typed
+	// coverage-gap error on an index decline instead of falling back to a full scan.
+	urlParamIndexOnly = "indexOnly"
 
 	urlParamSkipASTTransformations = "skip_ast_transformations"
 
@@ -405,6 +408,21 @@ func ParseQueryRangeRequest(r *http.Request) (*tempopb.QueryRangeRequest, error)
 		}
 	}
 
+	// indexOnly (#487) is optional; absent (the common, non-slice-job case) means false,
+	// matching the proto field's zero value and today's request shape byte-for-byte. A
+	// malformed value hard-errors rather than silently defaulting to false: IndexOnly is now
+	// load-bearing (it flips the querier's error semantics on an index-coverage gap, see
+	// ErrSliceIndexCoverageGap), so a malformed value silently defaulting to "off" could mask a
+	// slice job quietly falling back to a full, un-narrowed scan instead of failing loudly —
+	// unified with ParseSearchBlockRequest's own strict handling of the same parameter.
+	if indexOnly, ok := extractQueryParam(vals, urlParamIndexOnly); ok {
+		val, err := strconv.ParseBool(indexOnly)
+		if err != nil {
+			return nil, fmt.Errorf("invalid indexOnly %s: %w", indexOnly, err)
+		}
+		req.IndexOnly = val
+	}
+
 	return req, nil
 }
 
@@ -479,6 +497,10 @@ func BuildQueryRangeRequest(req *http.Request, searchReq *tempopb.QueryRangeRequ
 
 	if len(searchReq.SkipASTTransformations) > 0 {
 		qb.addParam(urlParamSkipASTTransformations, strings.Join(searchReq.SkipASTTransformations, ","))
+	}
+
+	if searchReq.IndexOnly {
+		qb.addParam(urlParamIndexOnly, strconv.FormatBool(searchReq.IndexOnly))
 	}
 
 	req.URL.RawQuery = qb.query()
@@ -756,6 +778,9 @@ func BuildSearchBlockRequest(req *http.Request, searchReq *tempopb.SearchBlockRe
 	qb.addParam(urlParamTotalRecords, strconv.FormatUint(uint64(searchReq.TotalRecords), 10))
 	qb.addParam(urlParamVersion, searchReq.Version)
 	qb.addParam(urlParamFooterSize, strconv.FormatUint(uint64(searchReq.FooterSize), 10))
+	if searchReq.IndexOnly {
+		qb.addParam(urlParamIndexOnly, strconv.FormatBool(searchReq.IndexOnly))
+	}
 	if len(dedicatedColumnsJSON) > 0 && dedicatedColumnsJSON != "null" { // if a caller marshals a nil dedicated cols we will receive the string "null"
 		qb.addParam(urlParamDedicatedColumns, dedicatedColumnsJSON)
 	}

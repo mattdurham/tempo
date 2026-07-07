@@ -646,6 +646,7 @@ func (q *Querier) SearchBlock(ctx context.Context, req *tempopb.SearchBlockReque
 	opts.TotalPages = int(req.PagesToSearch)
 	opts.MaxBytes = q.limits.MaxBytesPerTrace(tenantID)
 	opts.MaxTraces = int(req.SearchReq.Limit)
+	opts.IndexOnly = req.IndexOnly
 
 	if api.IsTraceQLQuery(req.SearchReq) {
 		// Inject the original TraceQL query into context so that encoding backends

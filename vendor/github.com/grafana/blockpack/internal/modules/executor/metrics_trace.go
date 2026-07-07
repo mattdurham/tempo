@@ -949,13 +949,11 @@ func ExecuteTraceMetricsFromVI(
 		}
 	}
 
-	// Gate: only count_over_time() and rate() without group-by are supported.
-	switch spec.Aggregate.Function {
-	case vm.FuncNameCOUNT, vm.FuncNameRATE:
-	default:
-		return nil, false, nil
-	}
-	if len(spec.Aggregate.GroupBy) > 0 {
+	// Gate: only count_over_time() and rate() without group-by are supported. Delegates to
+	// vm.MetricsShapeIsVIAnswerable so this stays the single source of truth for the shape
+	// rule — a plan-time caller (blockpack's public CompileTraceQLMetricsFilter) reuses the
+	// exact same function rather than a second, independently-maintained copy.
+	if !vm.MetricsShapeIsVIAnswerable(spec) {
 		return nil, false, nil
 	}
 

@@ -46,6 +46,11 @@ type SearchOptions struct {
 	RF1After           time.Time // Only blocks with RF1 are selected after this timestamp. RF3 is selected otherwise.
 	MaxTraces          int       // Maximum number of traces to return (0 = unlimited). Used by blockpack to stop streaming early.
 	Streaming          bool      // If true, use streaming (channel-based) iteration for metrics queries to avoid OOM.
+	// IndexOnly marks a #487 time-slice job: the block must answer entirely from the value
+	// index or fail with a typed coverage-gap error, never silently fall back to a full scan
+	// (a full scan would ignore the job's narrowed Start/End at the per-span level and could
+	// double-count or over-fetch across overlapping slice jobs). Used by blockpack.
+	IndexOnly bool
 }
 
 // DefaultSearchOptions is used in a lot of places such as local ingester searches. It is important

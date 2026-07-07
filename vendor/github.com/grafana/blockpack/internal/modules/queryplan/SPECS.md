@@ -20,7 +20,7 @@ ascending order and never reused or renumbered; superseded entries are marked `[
 SPEC-QP-N]` rather than deleted. `queryplan/NOTES.md`'s own entries use the separate `NOTE-QP-00N`
 counter (module-local to this package only, not shared with any other module).
 
-Next free ID: **SPEC-QP-5**.
+Next free ID: **SPEC-QP-6**.
 
 ---
 
@@ -56,7 +56,9 @@ Test: `lead_test.go:TestGroupLead_FindsLowestKnownCostAcrossSubGroups`. Issue #4
 *Added: 2026-07-07. Amended 2026-07-07 (holistic-review Fixes 3/4/5/6): overflow-saturation
 bullet added, "narrower than 60s" exception removed (proven unreachable), negative-Count
 clamp bullet added, slice-count cap bullet added (Fix 6, the boundary story now has three
-parts: minute floor, MaxUint64 saturation, slice-count cap).*
+parts: minute floor, MaxUint64 saturation, slice-count cap). Amended again 2026-07-07
+(team-lead ruling, T-phase design question): DefaultK=1 ruling bullet added, implementation
+pending.*
 
 **Contract:** `BuildTimeSlices(perMinute []valuecounts.MinuteCount, minTS, maxTS uint64,
 concurrentRequests, k int) []TimeSlice` partitions `[minTS, maxTS]` into a fully-covering,
@@ -97,6 +99,22 @@ EstKnown bool; VCNTEmpty bool}` values, `[Start, End)` half-open.
   resulting slice has `EstKnown: true`.
 - When `len(perMinute) == 0`: width is uniform, `window / desiredSliceCount` (clamped). Every
   slice has `EstKnown: false`, `VCNTEmpty: false`, `EstMatches: 0`.
+- **Default `k` — binding ruling, `DefaultK = 1` (issue #487's design doc left this unpinned):**
+  `desiredSliceCount = concurrentRequests * k` (clamped to a minimum of 1) governs both the
+  uniform-width fallback's slice count and the adaptive path's per-slice matches target. The
+  design doc states the formula's shape (`window / (ConcurrentRequests × k)`) but explicitly
+  leaves `k` for post-deployment empirical tuning ("Slice-width tuning" open question) without
+  pinning a value. `DefaultK = 1` is the ruled first-guess default: it sizes the uniform-width
+  fallback so one dispatch round at `concurrentRequests` slices already covers the whole window
+  — the least-aggressive default when no VCNT signal exists to justify finer slicing. `k` itself
+  remains caller-supplied (not `BuildTimeSlices`-internal); `DefaultK` is the config-visible
+  constant callers should reference instead of hardcoding a literal, mirroring the
+  config-visibility convention already established for `minSliceWidthSeconds`/
+  `maxSliceWidthSeconds`/`maxSlicesPerPlan`. A caller MAY pass `k > 1` for narrower slices (more
+  jobs, finer `ShouldQuit` cancellation granularity, more per-slice dispatch/fetch overhead) —
+  this is a tuning knob, not a correctness constraint. `queryplan.DefaultK = 1` (root re-export
+  `blockpack.DefaultK`) is the landed constant — see `NOTES.md` NOTE-QP-008 for the full
+  rationale.
 - **Negative `Count` inputs are clamped to zero (defensive, binding):** `perMinute` is
   caller-supplied (ultimately `BuildQueryPlan`'s `perMinuteForLead`), not guaranteed to route
   through `valuecounts.SelectivityPerMinute`'s own non-negative liveness-rule contract. A
@@ -111,18 +129,19 @@ EstKnown bool; VCNTEmpty bool}` values, `[Start, End)` half-open.
   dispatch order — no further est-matches-based reordering is meaningful or permitted, since no
   slice carries a signal to rank by. See `NOTES.md` NOTE-QP-005.
 
-Back-ref: `internal/modules/queryplan/slices.go:TimeSlice,BuildTimeSlices,maxSafeMaxTS,maxSlicesPerPlan`.
-See `NOTES.md` NOTE-QP-005. Tests: `slices_test.go` (including
+Back-ref: `internal/modules/queryplan/slices.go:TimeSlice,BuildTimeSlices,maxSafeMaxTS,maxSlicesPerPlan,DefaultK`.
+See `NOTES.md` NOTE-QP-005, NOTE-QP-008 (`DefaultK`). Tests: `slices_test.go` (including
 `TestBuildTimeSlices_NearMaxUint64DoesNotOverflow`,
 `TestBuildTimeSlices_NegativeCountFromNonConformingOracleClampedToZero`,
 `TestBuildTimeSlices_HugeWindowIsCappedNotPanicking`,
-`TestBuildTimeSlices_RealisticLongWindowStillSlicesNormally`). Issue #487.
+`TestBuildTimeSlices_RealisticLongWindowStillSlicesNormally`, `TestDefaultK_IsOne`). Issue #487.
 
 ---
 
 ## SPEC-QP-3: `QueryPlan` / `DispatchStrategy` / `BuildQueryPlan` — top-level dispatch qualification contract
 *Added: 2026-07-07. Amended 2026-07-07 (holistic-review Fix 2): added the third
-non-empty-`Slices` qualification condition.*
+non-empty-`Slices` qualification condition. Amended again 2026-07-07 (issue #487 T5b): added
+the binding `allLeavesResolvable`-computation bullet cross-referencing SPEC-QP-5.*
 
 **Contract:** `BuildQueryPlan(prog *vm.Program, cost CostFunc, allLeavesResolvable bool,
 perMinuteForLead func(*vm.RangeNode) []valuecounts.MinuteCount, minTS, maxTS uint64,
@@ -141,6 +160,14 @@ Strategy DispatchStrategy}`.
   real per-minute signal vs. the uniform-width fallback, which for any non-degenerate window
   always yields a non-empty `Slices`. See `NOTES.md` NOTE-QP-006 for the binding ruling
   rejecting a stricter, estimability-gated alternative that was separately considered.
+- **How a caller should correctly COMPUTE `allLeavesResolvable` (binding, issue #487 T5b):** it
+  is NOT simply "some index coverage exists." A caller MUST require
+  `AllLeavesIndexable(prog)` (SPEC-QP-5) — an ALL-leaves shape verdict — in addition to whatever
+  data-availability check it already performs; the availability check alone (e.g.
+  `vibuilder.BuildValueIndexSource`'s own `ok`) is satisfied by ANY ONE resolvable leaf, which
+  would wrongly qualify a mixed-shape query (one indexable leaf plus one leaf the index cannot
+  represent at all) for `DispatchTimeSliced`. See `SPEC-QP-5`/`NOTES.md` NOTE-QP-009 for the full
+  contract and the mixed-shape regression proof.
 - When `Strategy == DispatchBlockSharded`: `Root` is the zero `Group{}` and `Slices` is `nil`
   — no plan/slice work is attempted or returned.
 - When `Strategy == DispatchTimeSliced`: `Root` is `Plan`'s own output (unchanged), and `Slices`
@@ -148,6 +175,9 @@ Strategy DispatchStrategy}`.
   `g.Lead()` (SPEC-QP-1) returns `ok=true` and `perMinuteForLead != nil`, `perMinute =
   perMinuteForLead(lead.Node)`; otherwise `perMinute` is `nil`, which drives `BuildTimeSlices`'s
   uniform-width fallback per SPEC-QP-2.
+- `k` is forwarded unchanged to `BuildTimeSlices` — `BuildQueryPlan` does not special-case it.
+  See `SPEC-QP-2`'s `DefaultK` ruling for the recommended default when a caller has no better
+  value to supply.
 - `perMinuteForLead` is called at most once per `BuildQueryPlan` call, and only for the
   identified lead leaf — never for any other leaf, never before `Lead()` has run, and never at
   all when `allLeavesResolvable` is false or `Lead()` returns `ok=false`.
@@ -190,3 +220,42 @@ parameter.
 
 Back-ref: `internal/modules/queryplan/perminutefrom.go:VCNTPerMinuteFunc`. Tests:
 `perminutefrom_test.go`. Issue #487 (holistic-review Fix 1).
+
+---
+
+## SPEC-QP-5: `AllLeavesIndexable` — the correct ALL-leaves input for `BuildQueryPlan`'s `allLeavesResolvable` gate
+*Added: 2026-07-07 (issue #487, task T5b)*
+
+**Contract:** `AllLeavesIndexable(prog *vm.Program) bool` reports whether EVERY leaf in `prog`'s
+predicate tree has a shape `vibuilder.LeafIndexable` (`vibuilder/SPECS.md` SPEC-VB-3) accepts —
+reusing that exact per-leaf decision verbatim, never re-derived.
+
+**Rules:**
+- `prog == nil` or `prog.Predicates == nil` returns `false`.
+- A program with no `Nodes` and no `Columns` (nothing referenced at all) returns `false`.
+- A match-all query (`Nodes` empty, `Columns` populated — e.g. `{} | rate()`) returns `true`:
+  there is no per-leaf value predicate to reject in this shape.
+- Otherwise, `prog.Predicates.Nodes` is flattened to its leaf `RangeNode`s via a walk that
+  descends into every composite child regardless of AND/OR structure — mirroring
+  `vibuilder.collectLeaves`' own flat walk (NOT `Plan()`'s AND/OR-structured walk), since this
+  function must inspect exactly the same leaf set `BuildSource` itself would touch, independent
+  of the query's boolean structure. If flattening yields zero leaves, returns `false`.
+- Returns `true` only if `vibuilder.LeafIndexable` is `true` for every flattened leaf; returns
+  `false` on the first leaf it isn't.
+
+**This is the ALL-not-ANY correction to a naive `allLeavesResolvable` computation (binding):** a
+caller must NOT derive `BuildQueryPlan`'s `allLeavesResolvable` parameter (SPEC-QP-3) from a
+data-availability check alone (e.g. whether `vibuilder.BuildValueIndexSource`'s own `ok` return
+found ANY coverage) — that is a strictly weaker "at least one leaf resolved" condition
+(`vibuilder/NOTES.md` NOTE-VI-036). A query mixing one indexable leaf with one leaf the index
+architecturally cannot represent (multi-value OR, negation, a bare `RequirePresent` leaf) would
+wrongly qualify for `DispatchTimeSliced` under an ANY-based check. The correct computation is
+`allLeavesResolvable := <availability check> && AllLeavesIndexable(prog)`. See `NOTES.md`
+NOTE-QP-009 for the full rationale and the mixed-shape regression proof.
+
+Back-ref: `internal/modules/queryplan/indexable.go:AllLeavesIndexable,collectLeafNodes`. See
+`NOTES.md` NOTE-QP-009, `SPEC-QP-3` (`BuildQueryPlan`'s gate this function correctly feeds), and
+`vibuilder/SPECS.md` SPEC-VB-3 (`LeafIndexable`, the per-leaf decision this reuses). Tests:
+`indexable_test.go` (including `TestAllLeavesIndexable_MixedIndexableAndNegatedLeafIsNotIndexable`),
+root-level parity test `timeslice_test.go:TestAllLeavesIndexable_RootReexportMatchesQueryplanPackage`.
+Issue #487.

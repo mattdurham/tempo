@@ -7387,3 +7387,33 @@ NOTE-427 (all this file, older plain-numbered convention). See `blockio/writer/N
 NOTE-469/NOTE-V2-004(writer) addenda and `blockio/compaction/NOTES.md` NOTE-104 for the
 writer-side and compaction-side halves of the same investigation.
 `.bob/state/identity-investigation.md` has the full empirical basis.
+
+## NOTE-VI-086 — TraceMetricOptions.IndexOnly: extending the #481 authoritative-index contract to the metrics path (issue #487, holistic-review Issue 1/fix A)
+
+*Added: 2026-07-07*
+
+`NOTE-VI-078` closed the search path's authoritative-index gap in TEMPO (`tryIndexFetch`
+distinguishing routine decline from index/data inconsistency) but explicitly noted "the metrics
+VI path (`ExecuteTraceMetricsFromVI`) has no analogous gap: it... cannot produce an index/data
+inconsistency — it only routine-declines" (i.e., no error-vs-decline split was needed there).
+#487 surfaces a DIFFERENT metrics-path gap, orthogonal to that one: #487's time-slice dispatch
+needs metrics jobs to run in `IndexOnly` mode (no scan fallback at all, for the narrowed-window
+reason `SPECS.md` SPEC-VIS-2 explains), but `ExecuteMetricsTraceQL` had no way to express "never
+scan" — it always fell through to `ExecuteTraceMetrics` on any VI decline.
+`TraceMetricOptions.IndexOnly` (SPEC-VIS-2) closes this by returning `ErrValueIndexNoCoverage`
+instead of scanning, on ANY of the decline reasons `ExecuteTraceMetricsFromVI` can produce
+(unsupported shape — now delegated to `vm.MetricsShapeIsVIAnswerable`, `vm/NOTES.md` NOTE-491 —
+or no coverage for a leaf, or a legacy `TimeSec == 0` block) as well as the "no `ValueIndex`
+configured at all" case that never even reaches `ExecuteTraceMetricsFromVI`.
+
+**Mirrors the search path's outcome, not its mechanism (see SPEC-VIS-2 for the full
+explanation).** The search path pushes the decline-to-scan decision out to its caller (tempo);
+the metrics path makes that decision internally, so it needs an explicit opt-in flag
+(`IndexOnly`) to suppress it instead. Both converge on the same architectural intent: a
+narrowed-window/per-slice job must fail closed rather than silently run an un-windowed
+operation that could double-count or over-fetch.
+
+Back-refs: `api.go:ExecuteMetricsTraceQL`, `tracemetricoptions.go`,
+`internal/modules/executor/metrics_trace.go:ExecuteTraceMetricsFromVI`. See `SPECS.md`
+SPEC-VIS-2, NOTE-VI-035/047/078 (search-path history this extends). Tests:
+`tracemetricoptions_test.go` (see SPEC-VIS-2 for the full list). Issue #487.

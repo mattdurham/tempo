@@ -10,6 +10,7 @@ import (
 	"github.com/go-kit/log" //nolint:all deprecated
 	"github.com/segmentio/fasthash/fnv1a"
 
+	"github.com/grafana/blockpack"
 	"github.com/grafana/tempo/modules/frontend/combiner"
 	"github.com/grafana/tempo/modules/frontend/pipeline"
 	"github.com/grafana/tempo/modules/frontend/shardtracker"
@@ -52,10 +53,31 @@ type asyncSearchSharder struct {
 	skipASTTransformations []string
 	logger                 log.Logger
 	jobsPerQuery           *prometheus.HistogramVec
+
+	// rawR/indexPrefix (issue #487) back the frontend-local VCNT fetch buildQueryPlan uses to
+	// build a real #487 QueryPlan at RoundTrip's backendRequests call site. Derived once, at
+	// construction, from reader via the optional tempodb.RawReaderProvider capability — rawR
+	// is nil whenever reader doesn't implement it (e.g. a test fake), which buildQueryPlan
+	// treats as "no plan available", falling back to today's block-sharded dispatch.
+	//
+	// Captured once, at construction, deliberately — no live-config-reload support exists for
+	// these fields today (no race: both are set once and never mutated, so concurrent
+	// RoundTrip calls are safe). If tempo ever grows a live-config-reload story for
+	// storage/block settings, indexPrefix could then drift from IndexPrefix()'s current value
+	// independently of this sharder's captured snapshot — not actionable today, flagged so a
+	// future reload path treats this as an explicit gap to close, not an implicit oversight.
+	rawR        backend.RawReader
+	indexPrefix string
 }
 
 // newAsyncSearchSharder creates a sharding middleware for search
 func newAsyncSearchSharder(reader tempodb.Reader, o overrides.Interface, cfg SearchSharderConfig, skipASTTransformations []string, jobsPerQuery *prometheus.HistogramVec, logger log.Logger) pipeline.AsyncMiddleware[combiner.PipelineResponse] {
+	var rawR backend.RawReader
+	var indexPrefix string
+	if rrp, ok := reader.(tempodb.RawReaderProvider); ok {
+		rawR = rrp.RawReader()
+		indexPrefix = rrp.IndexPrefix()
+	}
 	return pipeline.AsyncMiddlewareFunc[combiner.PipelineResponse](func(next pipeline.AsyncRoundTripper[combiner.PipelineResponse]) pipeline.AsyncRoundTripper[combiner.PipelineResponse] {
 		return asyncSearchSharder{
 			next:      next,
@@ -66,6 +88,9 @@ func newAsyncSearchSharder(reader tempodb.Reader, o overrides.Interface, cfg Sea
 			skipASTTransformations: skipASTTransformations,
 			logger:                 logger,
 			jobsPerQuery:           jobsPerQuery,
+
+			rawR:        rawR,
+			indexPrefix: indexPrefix,
 		}
 	})
 }
@@ -120,8 +145,23 @@ func (s asyncSearchSharder) RoundTrip(pipelineRequest pipeline.Request) (pipelin
 		return nil, err
 	}
 
+	// plan (issue #487): buildQueryPlan returns nil whenever a real plan can't be built (no
+	// RawReaderProvider capability, compile failure, or nothing plannable in the query) —
+	// backendRequests already treats a nil plan exactly like DispatchBlockSharded, so this is
+	// byte-identical to today's dispatch whenever plan-building doesn't apply.
+	//
+	// Skipped entirely (holistic-review Issue 4) when searchReq.Start/End are zero: backendRequests'
+	// own first check (below) is exactly this same condition ("ingester-only, no backend blocks at
+	// all") and would discard any plan built here unused — building one anyway would pay for
+	// CheckIndexCoverage/fetchVCNTSection for a query that can never reach backendRequests' block
+	// dispatch at all.
+	var plan *blockpack.QueryPlan
+	if searchReq.Start != 0 && searchReq.End != 0 {
+		plan = buildQueryPlan(ctx, s.rawR, tenantID, s.indexPrefix, searchReq.Query, uint64(searchReq.Start), uint64(searchReq.End), s.cfg.ConcurrentRequests)
+	}
+
 	// pass subCtx in requests so we can cancel and exit early
-	s.backendRequests(ctx, tenantID, pipelineRequest, searchReq, jobMetrics, reqCh, func(err error) {
+	s.backendRequests(ctx, tenantID, pipelineRequest, searchReq, jobMetrics, plan, reqCh, func(err error) {
 		// todo: actually find a way to return this error to the user
 		s.logger.Log("msg", "search: failed to build backend requests", "err", err)
 	})
@@ -134,7 +174,15 @@ func (s asyncSearchSharder) RoundTrip(pipelineRequest pipeline.Request) (pipelin
 
 // backendRequest builds backend requests to search backend blocks. backendRequest takes ownership of reqCh and closes it.
 // it returns 3 int values: totalBlocks, totalBlockBytes, and estimated jobs
-func (s *asyncSearchSharder) backendRequests(ctx context.Context, tenantID string, parent pipeline.Request, searchReq *tempopb.SearchRequest, resp *combiner.SearchJobResponse, reqCh chan<- pipeline.Request, errFn func(error)) {
+//
+// plan (issue #487) is the time-slice job plan for this query, or nil if slice-mode wasn't
+// evaluated (today, always nil — wiring a real plan into this call site is T4/#153's job).
+// When plan != nil && plan.Strategy == blockpack.DispatchTimeSliced, dispatch uses
+// timeSlicedJobsFunc/buildTimeSlicedBackendRequests (one job per (block, slice) pair,
+// IndexOnly=true) instead of today's backendJobsFunc/buildBackendRequests (one job per
+// (block, page-range) pair) — backendJobsFunc/buildBackendRequests themselves are untouched,
+// so a nil or DispatchBlockSharded plan is byte-identical to today (parity-first discipline).
+func (s *asyncSearchSharder) backendRequests(ctx context.Context, tenantID string, parent pipeline.Request, searchReq *tempopb.SearchRequest, resp *combiner.SearchJobResponse, plan *blockpack.QueryPlan, reqCh chan<- pipeline.Request, errFn func(error)) {
 	// request without start or end, search only in ingester
 	if searchReq.Start == 0 || searchReq.End == 0 {
 		close(reqCh)
@@ -159,6 +207,29 @@ func (s *asyncSearchSharder) backendRequests(ctx context.Context, tenantID strin
 	resp.TotalBlocks = len(blocks)
 
 	firstShardIdx := len(resp.Shards)
+
+	if plan != nil && plan.Strategy == blockpack.DispatchTimeSliced {
+		// blockOverlapsSlice (team-lead's layer-(a) completion): a (block, slice) pair with no
+		// time overlap dispatches no job at all, in both this count and buildTimeSlicedBackendRequests'
+		// own dispatch loop — see timeSlicedJobsFunc's doc comment for why this needs no
+		// TrimToBlockOverlap-style narrowing the way the metrics sharder's predicate does.
+		blockIter := timeSlicedJobsFunc(blocks, plan.Slices, s.cfg.MostRecentShards, blockOverlapsSlice)
+		blockIter(func(jobs int, sz uint64, completedThroughTime uint32) {
+			resp.TotalJobs += jobs
+			resp.TotalBytes += sz
+
+			resp.Shards = append(resp.Shards, shardtracker.Shard{
+				TotalJobs:               uint32(jobs),
+				CompletedThroughSeconds: completedThroughTime,
+			})
+		}, nil)
+
+		go func() {
+			buildTimeSlicedBackendRequests(ctx, tenantID, parent, searchReq, firstShardIdx, blockIter, reqCh, errFn)
+		}()
+		return
+	}
+
 	blockIter := backendJobsFunc(blocks, s.cfg.TargetBytesPerRequest, s.cfg.MostRecentShards, searchReq.End)
 	blockIter(func(jobs int, sz uint64, completedThroughTime uint32) {
 		resp.TotalJobs += jobs
@@ -480,6 +551,194 @@ func backendJobsFunc(blocks []*backend.BlockMeta, targetBytesPerRequest int, max
 			shardIterCallback(jobsInShard, bytesInShard, 1) // final shard can cover all time. we don't need to be precise
 		}
 	}
+}
+
+// sliceJobIterFn is jobIterFn's #487 time-sliced sibling: instead of a (block, page-range)
+// pair it carries a (block, slice) pair, since a slice job's window is a TimeSlice, not a
+// page count. It intentionally does NOT reuse jobIterFn's signature — a slice's Start/End
+// (uint64 seconds) has no natural encoding as jobIterFn's startPage/pages (int) without
+// overloading their meaning, and keeping the two types distinct makes the two dispatch paths
+// (backendJobsFunc/buildBackendRequests vs. timeSlicedJobsFunc/buildTimeSlicedBackendRequests)
+// impossible to accidentally cross-wire.
+type sliceJobIterFn func(m *backend.BlockMeta, shard int, slice blockpack.TimeSlice)
+
+// blockOverlapsSlice reports whether m's time range and slice's time range share any second.
+// m.StartTime/EndTime are both inclusive (tempo's own block-metadata convention); slice.Start/End
+// are half-open ([Start, End), per TimeSlice's own doc comment). Two integer-second intervals
+// [a1, b1] (closed) and [a2, b2) (half-open) overlap iff a1 <= b2-1 (i.e. a1 < b2, since these are
+// whole seconds) and a2 <= b1 — hence the asymmetric `<` vs `<=` below. Deliberately a plain
+// bounds check with no traceql.TrimToBlockOverlap-style narrowing: search's own dispatch uses the
+// slice's own bounds unmodified (see buildTimeSlicedBackendRequests), so it only needs a yes/no
+// answer, not a computed intersection — a TrimToBlockOverlap-shaped predicate would introduce
+// intricacy (step alignment, instant-query handling) this call site has no use for and no way to
+// keep in sync with, so a second, drift-free implementation is deliberately simpler here rather
+// than reusing the metrics sharder's own more precise predicate (see timeSlicedJobsFunc's doc
+// comment on why each sharder gets its own).
+func blockOverlapsSlice(m *backend.BlockMeta, slice blockpack.TimeSlice) bool {
+	blockStart := uint64(m.StartTime.Unix()) //nolint:gosec // unix seconds, well within int64/uint64 range
+	blockEnd := uint64(m.EndTime.Unix())     //nolint:gosec // unix seconds, well within int64/uint64 range
+	return blockStart < slice.End && slice.Start <= blockEnd
+}
+
+// timeSlicedJobsFunc is backendJobsFunc's #487 time-sliced sibling: one job per (block,
+// slice) pair — every block in the query window gets queried once per slice, since block
+// boundaries and time slices are independent partitions of the same time range. It mirrors
+// backendJobsFunc's shard-rolling shape (roll to a new shard every blocksPerShard blocks) but
+// jobsInBlock is always len(slices) (fixed per block) rather than pagesPerRequest's
+// byte-budget-derived page count. backendJobsFunc itself is untouched by this addition.
+//
+// overlaps (issue #487, team-lead's layer-(a) ruling on #160/#161) is the SINGLE source of
+// truth for whether a (block, slice) pair is dispatched at all: a pair for which overlaps
+// reports false is skipped in BOTH the job COUNT below AND the jobIterCallback dispatch itself,
+// so a non-overlapping pair never reaches the caller's per-job builder — the count can no
+// longer silently drift out of sync with what actually lands in reqCh (the #161 bug this design
+// replaces). nil means "every (block, slice) pair counts and dispatches" (used by no caller
+// today; kept as the safe default for a hypothetical future caller with nothing to filter).
+// Both sharders pass a real predicate: search's blockOverlapsSlice (a plain, drift-free bounds
+// intersection — search's own dispatch needs no narrower bounds than the slice's own, so a
+// simple boolean is enough) and the metrics sharder's own traceql.TrimToBlockOverlap-based
+// closure (metrics additionally needs the PRECISE narrowed start/end/step for the request body,
+// not just a boolean, so it keeps computing that itself; its post-TrimToBlockOverlap `start >=
+// end` check is now defense-in-depth only, since a non-overlapping pair never reaches it).
+func timeSlicedJobsFunc(blocks []*backend.BlockMeta, slices []blockpack.TimeSlice, maxShards int, overlaps func(m *backend.BlockMeta, slice blockpack.TimeSlice) bool) func(shardIterFn, sliceJobIterFn) {
+	blocksPerShard := len(blocks) / maxShards
+	if blocksPerShard == 0 {
+		blocksPerShard = 1
+	}
+
+	return func(shardIterCallback shardIterFn, jobIterCallback sliceJobIterFn) {
+		currentShard := 0
+		jobsInShard := 0
+		bytesInShard := uint64(0)
+		blocksInShard := 0
+
+		for _, b := range blocks {
+			if len(slices) == 0 {
+				continue
+			}
+
+			overlappingJobs := 0
+			for _, slice := range slices {
+				if overlaps != nil && !overlaps(b, slice) {
+					continue
+				}
+				if jobIterCallback != nil {
+					jobIterCallback(b, currentShard, slice)
+				}
+				overlappingJobs++
+			}
+
+			jobsInShard += overlappingJobs
+			bytesInShard += b.Size_
+			blocksInShard++
+
+			// -1 b/c we will likely add a final shard below
+			if blocksInShard >= blocksPerShard && currentShard < maxShards-1 {
+				if shardIterCallback != nil {
+					shardIterCallback(jobsInShard, bytesInShard, uint32(b.EndTime.Unix()))
+				}
+				currentShard++
+
+				jobsInShard = 0
+				bytesInShard = 0
+				blocksInShard = 0
+			}
+		}
+
+		// final shard - same overpacking rationale as backendJobsFunc's own final shard.
+		if shardIterCallback != nil && jobsInShard > 0 {
+			shardIterCallback(jobsInShard, bytesInShard, 1) // final shard can cover all time. we don't need to be precise
+		}
+	}
+}
+
+// buildTimeSlicedBackendRequests is buildBackendRequests' #487 time-sliced sibling: for each
+// (block, slice) pair it builds a SearchBlockRequest with IndexOnly=true and a per-job
+// SearchRequest copy whose Start/End are overridden to the slice's bounds — reusing the SAME
+// per-job Start/End override pattern ingesterRequests' subReq.Start/End already uses (issue
+// #487 T1: no new proto field for the narrowed window, only the new IndexOnly bool).
+// buildBackendRequests itself is untouched by this addition.
+func buildTimeSlicedBackendRequests(ctx context.Context, tenantID string, parent pipeline.Request, searchReq *tempopb.SearchRequest, firstShardIdx int, blockIter func(shardIterFn, sliceJobIterFn), reqCh chan<- pipeline.Request, errFn func(error)) {
+	defer close(reqCh)
+
+	queryHash := hashForSearchRequest(searchReq)
+	colsToJSON := api.NewDedicatedColumnsToJSON()
+
+	blockIter(nil, func(m *backend.BlockMeta, shard int, slice blockpack.TimeSlice) {
+		blockID := m.BlockID.String()
+
+		dedColsJSON, err := colsToJSON.JSONForDedicatedColumns(m.DedicatedColumns)
+		if err != nil {
+			errFn(fmt.Errorf("failed to convert dedicated columns. block: %s tempopb: %w", blockID, err))
+			return
+		}
+
+		// Per-job SearchRequest narrowed to the slice's window — a copy, so concurrent jobs
+		// for other slices/blocks never see each other's Start/End (mirrors
+		// ingesterRequests' subReq pattern).
+		//
+		// A non-overlapping (block, slice) pair never reaches this callback at all: blockIter's
+		// own overlaps predicate (blockOverlapsSlice, passed at this sharder's RoundTrip call
+		// site) already filtered it out of both the job count and this dispatch loop — see
+		// timeSlicedJobsFunc's doc comment. This body therefore does not need its own
+		// TrimToBlockOverlap-style narrowing the way the metrics sharder's builder does: the
+		// slice's own bounds are used unmodified below, since every (block, slice) pair reaching
+		// here is already known to genuinely overlap the block.
+		subReq := *searchReq
+		subReq.Start = uint32(slice.Start)
+		subReq.End = uint32(slice.End)
+
+		pipelineR, err := cloneRequestforQueriers(parent, tenantID, func(r *http.Request) (*http.Request, error) {
+			r, err = api.BuildSearchBlockRequest(r, &tempopb.SearchBlockRequest{
+				SearchReq: &subReq,
+				BlockID:   blockID,
+				IndexOnly: true,
+				// StartPage/PagesToSearch are meaningless for an IndexOnly job (the
+				// querier answers from the value index, never by page range) but
+				// ParseSearchBlockRequest requires PagesToSearch > 0 — set a harmless
+				// placeholder covering the whole block so a slice job's request still
+				// parses cleanly through the same validation every other job uses.
+				StartPage:     0,
+				PagesToSearch: 1,
+				IndexPageSize: m.IndexPageSize,
+				TotalRecords:  m.TotalRecords,
+				Version:       m.Version,
+				Size_:         m.Size_,
+				FooterSize:    m.FooterSize,
+			}, dedColsJSON)
+
+			return r, err
+		})
+		if err != nil {
+			errFn(fmt.Errorf("failed to build search block request. block: %s tempopb: %w", blockID, err))
+			return
+		}
+
+		// cacheKey's validity check requires [start, end) to fully encapsulate the block
+		// ([StartTime, EndTime]) — using the slice-narrowed subReq.Start/End here (rather than
+		// the whole, unnarrowed query window) would almost always fail that check, since a
+		// slice's window is by construction narrower than or equal to the block it overlaps
+		// (this is what actually happened before this fix: caching was silently disabled for
+		// virtually every time-sliced job). Use searchReq's own unnarrowed bounds instead,
+		// exactly like buildBackendRequests (the block-sharded path, above) and the metrics
+		// sharder's own buildTimeSlicedMetricsBackendRequests both already do.
+		startTime := time.Unix(int64(searchReq.Start), 0)
+		endTime := time.Unix(int64(searchReq.End), 0)
+		// startPage/pagesToSearch have no meaning for an IndexOnly job (there is no page
+		// range); slice.Start/width are threaded through those cache-key slots instead so
+		// two different slices over the same small block (one that happens to fully
+		// encapsulate it) never collide on the same cache key.
+		key := searchJobCacheKey(tenantID, queryHash, startTime, endTime, m, int(slice.Start), int(slice.End-slice.Start)) //nolint:gosec // slice bounds are unix seconds, well within int range
+		pipelineR.SetCacheKey(key)
+		pipelineR.SetResponseData(firstShardIdx + shard)
+
+		select {
+		case reqCh <- pipelineR:
+		case <-ctx.Done():
+			// ignore the error if there is one. it will be handled elsewhere
+			return
+		}
+	})
 }
 
 // mergeSkipASTTransformations merges and deduplicates AST transformations skip-lists

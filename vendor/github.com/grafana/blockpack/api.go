@@ -529,7 +529,8 @@ func ExecuteMetricsTraceQL(
 	// when it answers, that answer is complete. ExecuteTraceMetricsFromVI returns
 	// ok=false ONLY when the index genuinely cannot answer — an unsupported metric
 	// shape or a leaf column with no coverage — in which case we fall back to the
-	// full block scan.
+	// full block scan, UNLESS opts.IndexOnly forbids that fallback (issue #487,
+	// holistic-review Issue 1/fix A — see IndexOnly's own doc comment).
 	if opts.ValueIndex != nil {
 		viResult, ok, viErr := modules_executor.ExecuteTraceMetricsFromVI(ctx, opts.ValueIndex, prog, *spec)
 		if viErr != nil {
@@ -538,6 +539,10 @@ func ExecuteMetricsTraceQL(
 		if ok {
 			return viResult, nil
 		}
+	}
+
+	if opts.IndexOnly {
+		return nil, ErrValueIndexNoCoverage
 	}
 
 	return modules_executor.ExecuteTraceMetrics(ctx, r, prog, spec)
