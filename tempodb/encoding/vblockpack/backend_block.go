@@ -79,13 +79,6 @@ func (p *tempoReaderProvider) ReadAt(buf []byte, off int64, _ blockpack.DataType
 	return len(buf), nil
 }
 
-// ConfigureLRU is a no-op retained for API compatibility.
-// The SharedLRU raw-byte cache was removed — pprof showed it was allocating
-// ~76 GB/s under load while providing no benefit: blocks (10-200 MB) exceeded
-// the 32 MB limit and were never stored; objectcache already caches parsed
-// metadata/sketches/intrinsic columns at a higher level.
-func ConfigureLRU(_ int64) {}
-
 // blockpackCache is the process-level TypedTieredCache for blockpack section reads.
 // It is built once via getCache() using NewTypedTieredCache. A nil SectionCache is safe —
 // all reads fall through to the provider.
@@ -98,7 +91,6 @@ var (
 		fileMaxBytes       int64
 		memServers         []string
 		metadataMemServers []string
-		memoryCacheBytes   int64
 	}
 )
 
@@ -106,31 +98,20 @@ var (
 // Concurrent calls are safe. The first call before any getCache invocation wins.
 // Later calls update the struct under the mutex but have no effect on the
 // already-initialized cache. All callers should set the same config.
-func ConfigureCache(filePath string, fileMaxBytes int64, memServers []string, memoryCacheBytes int64) {
-	ConfigureCacheTiered(filePath, fileMaxBytes, memServers, nil, memoryCacheBytes)
+func ConfigureCache(filePath string, fileMaxBytes int64, memServers []string) {
+	ConfigureCacheTiered(filePath, fileMaxBytes, memServers, nil)
 }
 
 // ConfigureCacheTiered sets the cache configuration with separate metadata and data memcache tiers.
 // When metadataMemServers is non-empty, metadata (ToC, bloom, range index, intrinsic columns) and
 // block data use separate remote cache instances — matching parquet's parquet-footer vs parquet-page split.
-func ConfigureCacheTiered(filePath string, fileMaxBytes int64, dataMemServers, metadataMemServers []string, memoryCacheBytes int64) {
+func ConfigureCacheTiered(filePath string, fileMaxBytes int64, dataMemServers, metadataMemServers []string) {
 	blockpackCacheMu.Lock()
 	defer blockpackCacheMu.Unlock()
 	blockpackCacheCfg.filePath = filePath
 	blockpackCacheCfg.fileMaxBytes = fileMaxBytes
 	blockpackCacheCfg.memServers = dataMemServers
 	blockpackCacheCfg.metadataMemServers = metadataMemServers
-	blockpackCacheCfg.memoryCacheBytes = memoryCacheBytes
-	// blockpack #466 removed all in-process memory caching (decoded columns, parsed ToC) and
-	// the in-process MemoryCache tier. Only disk + remote memcache remain, shrinking and
-	// stabilizing the querier's memory footprint. memoryCacheBytes is retained in the config
-	// plumbing for compatibility but no longer builds an in-process tier.
-}
-
-// ConfigureFileCache is a deprecated wrapper around ConfigureCache retained for backward compatibility.
-// Callers should switch to ConfigureCache to gain the full 3-tier chain.
-func ConfigureFileCache(path string, maxBytes int64) {
-	ConfigureCache(path, maxBytes, nil, 0)
 }
 
 // getCache initializes (once) the process-level TypedTieredCache and returns it.

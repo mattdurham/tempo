@@ -37,6 +37,15 @@ func EncodeVCNTRecords(records []VCNTRecord, perChunk int) ([]byte, []VCNTChunkD
 	return valuecounts.EncodeRecords(records, perChunk)
 }
 
+// EncodeVCNTFile encodes a pre-sorted slice of VCNTRecords into a self-describing
+// .vcnt file: the same snappy-chunked body EncodeVCNTRecords produces, plus an
+// embedded chunk directory and trailer, so any consumer can decode the file
+// directly from object storage without a side-channel directory. perChunk ≤ 0
+// uses the package default (4096).
+func EncodeVCNTFile(records []VCNTRecord, perChunk int) []byte {
+	return valuecounts.EncodeVCNTFile(records, perChunk)
+}
+
 // CompactVCNTRecords merges records via delta accounting: records are grouped
 // by (ColumnName, TimeStart, TimeEnd, Value), Count is summed per group, and
 // groups whose summed Count is <= 0 are dropped. The returned slice is sorted
@@ -107,20 +116,30 @@ func VCNTObjectKey(tenant, indexPrefix, colName, id string) string {
 // section (dir may be empty), which CheckCardinality treats as "no VCNT coverage" —
 // the gate then passes by default for the affected dimension, matching prior
 // best-effort behavior. See NOTE-VC-012.
-func VCNTBuildSectionFromObjects(objects [][]byte) ([]byte, []VCNTChunkDirEntry) {
+//
+// DEV-ONLY HAND-PATCH (holistic-review/go-presubmit Fix 4, 2026-07-07): this vendored
+// copy predates a blockpack change that also returns the count of skipped objects, so
+// callers get operator visibility into legacy/undecodable objects instead of silence.
+// Hand-patched here, mirroring the A-Tempo-1 pattern, so tempo's non-vendor call site can
+// already consume the new 3-value return before the real revendor lands. Minimal — will
+// be replaced wholesale at the next `go mod vendor`.
+func VCNTBuildSectionFromObjects(objects [][]byte) (data []byte, dir []VCNTChunkDirEntry, skipped int) {
 	var all []VCNTRecord
 	for _, obj := range objects {
 		if len(obj) == 0 {
+			skipped++
 			continue
 		}
 		recs, err := valuecounts.DecodeVCNTObject(obj)
 		if err != nil {
+			skipped++
 			continue // skip undecodable object; other dims still gate correctly
 		}
 		all = append(all, recs...)
 	}
 	merged := valuecounts.Compact(all)
-	return valuecounts.EncodeRecords(merged, 0)
+	data, dir = valuecounts.EncodeRecords(merged, 0)
+	return data, dir, skipped
 }
 
 // VIFileMeta holds the parsed metadata from a v2 value-index filename.

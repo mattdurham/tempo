@@ -10,6 +10,7 @@ package vblockpack
 import (
 	"context"
 	"path"
+	"strings"
 	"time"
 
 	"github.com/go-kit/log/level"
@@ -126,7 +127,17 @@ func buildVCNTSection(
 	if len(objects) == 0 {
 		return nil, nil
 	}
-	return blockpack.VCNTBuildSectionFromObjects(objects)
+	data, dir, skipped := blockpack.VCNTBuildSectionFromObjects(objects)
+	if skipped > 0 {
+		level.Warn(util_log.Logger).Log(
+			"msg", "vblockpack: buildVCNTSection: skipped unreadable .vcnt objects",
+			"tenant", tenant,
+			"dims", strings.Join(dims, ","),
+			"skipped", skipped,
+			"total", len(objects),
+		)
+	}
+	return data, dir
 }
 
 func (s *viBackfillSource) LookupColumn(

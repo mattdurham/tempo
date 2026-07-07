@@ -91,9 +91,11 @@ type BlockpackConfig struct {
 	// FileCacheMaxBytes is the maximum size of the disk cache in bytes (default: 4GB).
 	FileCacheMaxBytes int64 `yaml:"file_cache_max_bytes"`
 
-	// LRUCacheBytes is the maximum size of the process-level in-memory LRU cache in bytes.
-	// This cache holds footer and file metadata only — sketch/bloom data should not be
-	// retained here. Defaults to 32MB.
+	// Deprecated: LRUCacheBytes has no effect. The SharedLRU raw-byte cache it once sized
+	// was removed (pprof showed it allocating ~76 GB/s under load while providing no
+	// benefit); vblockpack.ConfigureLRU, the no-op that consumed this field, was deleted
+	// under #490's tempo shim removal. Kept only so existing YAML configs setting
+	// lru_cache_bytes don't fail to parse.
 	LRUCacheBytes int64 `yaml:"lru_cache_bytes"`
 
 	// MemCacheServers is a list of memcache server addresses for raw block data
@@ -106,8 +108,11 @@ type BlockpackConfig struct {
 	// When empty, all data shares the same cache tier (MemCacheServers).
 	MetadataMemCacheServers []string `yaml:"metadata_memcache_servers"`
 
-	// MemoryCacheBytes is the size of the in-process LRU memory cache (default: 256MB).
-	// 256 MB in-process LRU cache is always on; set to 0 to disable.
+	// Deprecated: MemoryCacheBytes has no effect. blockpack #466 removed the in-process
+	// memory tier this field once sized (only disk + remote memcache remain); it was never
+	// read past being stored in vblockpack's internal cache config, which #490's tempo shim
+	// removal deleted. Kept only so existing YAML configs setting memory_cache_bytes don't
+	// fail to parse.
 	MemoryCacheBytes int64 `yaml:"memory_cache_bytes"`
 
 	// ValueIndexConsumer configures the value-index consumer Tempo target

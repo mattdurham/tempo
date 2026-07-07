@@ -167,7 +167,7 @@ func (a *vcntAccumulator) flush(store blockpack.ObjectPutter, tenant, indexPrefi
 			}
 		}
 		blockpack.SortVCNTRecords(records)
-		data, _ := blockpack.EncodeVCNTRecords(records, 0)
+		data := blockpack.EncodeVCNTFile(records, 0)
 		id := blockpack.VCNTNewID()
 		key := blockpack.VCNTObjectKey(tenant, indexPrefix, colName, id)
 		if putErr := store.Put(key, data); putErr != nil {

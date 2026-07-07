@@ -260,7 +260,6 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 			bp.FileCacheMaxBytes,
 			bp.MemCacheServers,
 			bp.MetadataMemCacheServers,
-			bp.MemoryCacheBytes,
 		)
 	}
 	// Writer-side synchronous value-index write path (blockpack NOTE-VI-042,

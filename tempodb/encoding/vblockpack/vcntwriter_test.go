@@ -66,26 +66,50 @@ func stringsContains(s, substr string) bool {
 	return false
 }
 
+// vcntFileTrailerSize is the fixed byte size of the self-describing VCNT file trailer
+// EncodeVCNTFile appends: dirCount[4] + bodyLen[4] + magic[4] (valuecounts/selfdescribing.go).
+const vcntFileTrailerSize = 12
+
+// vcntFileMagic mirrors valuecounts/selfdescribing.go's vcntFileMagic ("VCN1"); used to
+// confirm decodeVCNTObjectForTest is actually parsing EncodeVCNTFile's self-describing
+// trailer, not silently misparsing an unrelated tail as a bogus bodyLen.
+const vcntFileMagic uint32 = 0x56434E31
+
 // decodeVCNTObjectForTest decodes a .vcnt object written by vcntAccumulator.flush.
 //
-// flush() writes via blockpack.EncodeVCNTRecords, which is a thin re-export of
-// blockpack's internal valuecounts.EncodeRecords — a single snappy-compressed
-// chunk for the small record counts these tests produce, with NO directory
-// persisted alongside it (that gap is tracked separately, NOTE-VC-005, and is
-// out of scope here). blockpack's public API (vcnt.go) exports CompactVCNTRecords
-// (used below) but still has no decode function, and this test's package
-// (vblockpack, module github.com/grafana/tempo) cannot import blockpack's
-// internal valuecounts package directly (Go's internal-import-path rule scopes
-// internal/ to importers whose path is rooted at github.com/grafana/blockpack/),
-// so this helper decodes the wire format directly using the same encoding
-// documented in valuecounts/section.go's encodeChunkPayload comment:
+// flush() writes via blockpack.EncodeVCNTFile (NOTE-VC-005's self-describing VCNT file
+// format, A-Tempo-1/#490): the same snappy-chunked body EncodeVCNTRecords/EncodeRecords
+// produces, followed by an embedded chunk directory and a fixed 12-byte trailer
+// (dirCount[4] + bodyLen[4] + magic[4]). This helper strips the trailer and directory and
+// decodes only the body — for the small record counts these tests produce, that body is
+// always a single snappy-compressed chunk, identical to the pre-#490 wire format.
+// blockpack's public API (vcnt.go) exports CompactVCNTRecords (used below) but still has
+// no decode-back-to-records function, and this test's package (vblockpack, module
+// github.com/grafana/tempo) cannot import blockpack's internal valuecounts package
+// directly (Go's internal-import-path rule scopes internal/ to importers whose path is
+// rooted at github.com/grafana/blockpack/), so this helper decodes the wire format
+// directly using the same encoding documented in valuecounts/section.go's
+// encodeChunkPayload comment:
 //
 //	record_count[2] + (col_len[2] + col[N] + time_start[8] + time_end[8] +
 //	val_len[4] + val[M] + count[8 signed])*
 //
 // using only golang/snappy, an already-vendored public dependency.
 func decodeVCNTObjectForTest(data []byte) []blockpack.VCNTRecord {
-	raw, err := snappy.Decode(nil, data)
+	if len(data) < vcntFileTrailerSize {
+		return nil
+	}
+	trailer := data[len(data)-vcntFileTrailerSize:]
+	if le32(trailer[8:12]) != vcntFileMagic {
+		return nil
+	}
+	bodyLen := int(le32(trailer[4:8]))
+	if bodyLen < 0 || bodyLen > len(data)-vcntFileTrailerSize {
+		return nil
+	}
+	body := data[:bodyLen]
+
+	raw, err := snappy.Decode(nil, body)
 	if err != nil {
 		return nil
 	}

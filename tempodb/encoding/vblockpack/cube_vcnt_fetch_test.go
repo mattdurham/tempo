@@ -82,9 +82,9 @@ func vcntObj(t *testing.T, column string, values map[string]int64) []byte {
 		})
 	}
 	blockpack.SortVCNTRecords(recs)
-	// EncodeVCNTRecords is legacy single-chunk; wrap so DecodeVCNTObject can read it.
-	data, _ := blockpack.EncodeVCNTRecords(recs, 0)
-	return data
+	// EncodeVCNTFile is the self-describing format the real block-builder writes
+	// (issue #490 A-Tempo-1) and the only format DecodeVCNTObject accepts post-#490 A-3.
+	return blockpack.EncodeVCNTFile(recs, 0)
 }
 
 // TEST-483-fetch-1: buildVCNTSection lists+fetches per-dim .vcnt objects and merges
@@ -101,11 +101,35 @@ func TestBuildVCNTSection_MergesPerDim(t *testing.T) {
 		t.Fatalf("expected a non-empty section, got data=%d dir=%d", len(data), len(dir))
 	}
 
+	// Assert real record content survived, not merely a non-empty byte count: a section
+	// built entirely from silently-skipped undecodable objects (VCNTBuildSectionFromObjects
+	// tolerates per-object decode failures) can still produce non-zero data/dir lengths from
+	// the empty-but-valid encoding, so length alone cannot distinguish "records merged" from
+	// "every input was skipped."
+	for _, want := range []struct {
+		column string
+		value  string
+		count  int64
+	}{
+		{"resource.service.name", "api", 5},
+		{"resource.service.name", "web", 3},
+		{"span:kind", "server", 8},
+	} {
+		est, err := blockpack.VCNTSelectivityInRange(data, dir, want.column, []byte(want.value), 0, 120)
+		if err != nil {
+			t.Fatalf("VCNTSelectivityInRange(%s=%s): %v", want.column, want.value, err)
+		}
+		if !est.Covered {
+			t.Fatalf("VCNTSelectivityInRange(%s=%s): not covered, want Count=%d", want.column, want.value, want.count)
+		}
+		if est.Count != want.count {
+			t.Fatalf("VCNTSelectivityInRange(%s=%s): Count=%d, want %d", want.column, want.value, est.Count, want.count)
+		}
+	}
+
 	// Re-run the exact read the cardinality gate performs via a second, independent
 	// section builder call to confirm both dims are present and gate-queryable.
-	// (The distinct-value semantics themselves are covered by blockpack's own tests;
-	// here we assert the tempo glue produced a section spanning both dims.)
-	sameData, sameDir := blockpack.VCNTBuildSectionFromObjects([][]byte{
+	sameData, sameDir, _ := blockpack.VCNTBuildSectionFromObjects([][]byte{
 		store.objects[vcntObjKey(tenant, "resource.service.name", "L0-aaa")],
 		store.objects[vcntObjKey(tenant, "span:kind", "L0-bbb")],
 	})
@@ -129,6 +153,17 @@ func TestBuildVCNTSection_IgnoresNonVCNTKeys(t *testing.T) {
 	data, dir := buildVCNTSection(context.Background(), store, tenant, []string{"span:kind"}, 0, 120)
 	if len(data) == 0 || len(dir) == 0 {
 		t.Fatalf("expected a section from the one valid .vcnt file, got data=%d dir=%d", len(data), len(dir))
+	}
+
+	// Confirm the one real .vcnt object's record survived alongside the ignored junk key
+	// (not merely that a non-empty section was produced — see TestBuildVCNTSection_MergesPerDim).
+	est, err := blockpack.VCNTSelectivityInRange(data, dir, "span:kind", []byte("server"), 0, 120)
+	if err != nil {
+		t.Fatalf("VCNTSelectivityInRange: %v", err)
+	}
+	if !est.Covered || est.Count != 1 {
+		t.Fatalf("VCNTSelectivityInRange(span:kind=server): Covered=%v Count=%d, want Covered=true Count=1",
+			est.Covered, est.Count)
 	}
 }
 

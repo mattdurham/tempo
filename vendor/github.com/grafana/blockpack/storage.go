@@ -337,15 +337,21 @@ type CompactionConfig = modules_compaction.Config
 // cfg controls staging directory, output file size limits, and spans per block.
 // output receives the compacted files via its Put method.
 //
-// Returns the relative paths of all output files written to output.
+// Returns the relative paths of all output files written to output, and the count of
+// spans dropped due to genuine (trace:id, span:id) duplication.
+//
+// DEV-ONLY HAND-PATCH (holistic-review Fix 3, 2026-07-07): this vendored copy predates a
+// blockpack change surfacing droppedSpans through this wrapper instead of discarding it.
+// Hand-patched here, mirroring the A-Tempo-1 pattern, so tempo's non-vendor call sites can
+// already consume the new 3-value return before the real revendor lands. Minimal — will be
+// replaced wholesale at the next `go mod vendor`.
 func CompactBlocks(
 	ctx context.Context,
 	providers []ReaderProvider,
 	cfg CompactionConfig,
 	output WritableStorage,
-) ([]string, error) {
-	paths, _, err := modules_compaction.CompactBlocks(ctx, providers, cfg, output)
-	return paths, err
+) ([]string, int64, error) {
+	return modules_compaction.CompactBlocks(ctx, providers, cfg, output)
 }
 
 // CompactionProviderFunc lazily opens a single input blockpack provider on demand.
@@ -362,12 +368,16 @@ type CompactionProviderFunc = modules_compaction.ProviderFunc
 //
 // providers are opened sequentially in slice order; each closure should download/open
 // exactly one block and must not capture references that pin earlier blocks in memory.
+//
+// Returns the relative paths of all output files written to output, and the count of
+// spans dropped due to genuine (trace:id, span:id) duplication.
+//
+// DEV-ONLY HAND-PATCH (holistic-review Fix 3, 2026-07-07): see CompactBlocks above.
 func CompactBlocksStreaming(
 	ctx context.Context,
 	providers []CompactionProviderFunc,
 	cfg CompactionConfig,
 	output WritableStorage,
-) ([]string, error) {
-	paths, _, err := modules_compaction.CompactBlocksStreaming(ctx, providers, cfg, output)
-	return paths, err
+) ([]string, int64, error) {
+	return modules_compaction.CompactBlocksStreaming(ctx, providers, cfg, output)
 }

@@ -129,9 +129,7 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 		c.opts.BlockConfig.Blockpack.FileCachePath,
 		c.opts.BlockConfig.Blockpack.FileCacheMaxBytes,
 		c.opts.BlockConfig.Blockpack.MemCacheServers,
-		c.opts.BlockConfig.Blockpack.MemoryCacheBytes,
 	)
-	ConfigureLRU(c.opts.BlockConfig.Blockpack.LRUCacheBytes)
 
 	// Always use the current config's dedicated columns (set by the caller from
 	// per-tenant overrides via DedicatedColumnsForTenant). This ensures compaction
@@ -144,14 +142,9 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 	cfg := blockpack.CompactionConfig{
 		MaxSpansPerBlock: maxSpansFromConfig(&c.opts.BlockConfig),
 		DedicatedColumns: dedicatedColumnsToBlockpack(compactDedicatedCols),
-		// blockpack NOTE-476 (issue #394): drop identity columns from compacted output's
-		// IntrinsicTOC (~26% of L1 file size); identity is served from the SpanTree. Source
-		// blocks written with this flag have their identity sourced from their own SpanTree
-		// during recompaction. Matches the ingest writer (create.go).
-		OmitIntrinsicIdentityColumns: true,
 	}
 
-	outputPaths, err := blockpack.CompactBlocksStreaming(ctx, providers, cfg, out)
+	outputPaths, droppedSpans, err := blockpack.CompactBlocksStreaming(ctx, providers, cfg, out)
 	if err != nil {
 		return nil, fmt.Errorf("blockpack.CompactBlocks: %w", err)
 	}
@@ -166,6 +159,7 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 		"input_blocks", len(inputs),
 		"output_blocks", len(outputPaths),
 		"compaction_level", maxCompactionLevel+1,
+		"dropped_spans", droppedSpans,
 	)
 
 	if c.opts.ObjectsWritten != nil {
