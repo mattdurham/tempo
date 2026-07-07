@@ -128,13 +128,21 @@ no longer occur. DeltaDictionary is not a cost candidate (its index-stream win r
 clustered indexes, established only via the override table). No wire-format change — selection only.
 
 **AllPresent selection (NOTE-AP-001):** when a column is fully present
-(`presentCount == nRows`, `nRows > 0`) and `Config.DisableAllPresentEncoding` is false, the
-writer emits the AllPresent variant of the chosen dense kind (`shared.AllPresentKindFor`):
-Dictionary→15, InlineBytes→16, DeltaUint64→17, RLEIndexes→18, XORBytes→19, PrefixBytes→20,
-DeltaDictionary→21. The AllPresent wire format is identical to its base kind except the
-presence-RLE segment is omitted (the kind byte signals full presence). Sparse kinds, VectorF32,
-and zero-row columns never select an AllPresent variant. Reading is unaffected by the flag —
-readers accept both forms (SPECS §9.0).
+(`presentCount == nRows`, `nRows > 0`), the writer emits the AllPresent variant of the chosen
+dense kind (`shared.AllPresentKindFor`): Dictionary→15, DeltaUint64→17,
+RLEIndexes→18, XORBytes→19, PrefixBytes→20, DeltaDictionary→21. (`InlineBytes→16` was part of
+this mapping historically but base kind `InlineBytes` (kind 3) is **removed** — see
+`blockio/SPECS.md`'s Encoding Kind Registry / reader NOTE-490 — and has zero writer callers, so
+`AllPresentKindFor` is never invoked with it from writer code; kind 16 is permanently retired
+alongside kind 3, not a live writer outcome.) The AllPresent wire format is
+identical to its base kind except the presence-RLE segment is omitted (the kind byte signals
+full presence). Sparse kinds, VectorF32 (also removed, see `blockio/SPECS.md`), and zero-row
+columns never select an AllPresent variant. Reading is unaffected by selection — readers accept
+both forms (SPECS §9.0).
+**[Updated 2026-07-07, issue #490, task A-15/#109]** selection was previously additionally
+gated on `Config.DisableAllPresentEncoding` being false; that rollout flag is removed outright
+(see writer NOTE-AP-001's addendum) — selection is now unconditional whenever the presence
+condition alone holds.
 
 **Bit-packed DeltaUint64 selection (NOTE-215):** when a uint64 column has been chosen for delta
 encoding (per `shouldUseDeltaEncoding`) and `Config.DisableBitPackedDelta` is false, the writer

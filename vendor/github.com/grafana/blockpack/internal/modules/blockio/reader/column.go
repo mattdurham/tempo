@@ -78,13 +78,6 @@ const (
 	presentRowsScratchMaxCap  = 65536 // above this, return a fresh small slice instead
 )
 
-// VectorF32 column header field offsets.
-// Header layout: enc_version[1]+kind[1]+dim[2]+row_count[4]+rle_len[4] = 12 bytes.
-const (
-	vf32HdrSize   = 1 + 1 + 2 + 4 + 4 // VectorF32 column header: enc_version[1]+kind[1]+dim[2]+row_count[4]+rle_len[4] = 12 bytes
-	vf32RleLenOff = 8                 // byte offset of rle_len field within VectorF32 header
-)
-
 // NOTE-007: Eliminates per-call make([]int, 0, presentCount) in collectPresentRows.
 // Cap guard: slices larger than presentRowsScratchMaxCap entries are replaced with a fresh small slice before
 // pool return to avoid retaining large backing arrays indefinitely.
@@ -123,30 +116,6 @@ var getZstdDecoder = sync.OnceValue(func() *zstd.Decoder { //nolint:gochecknoglo
 	}
 	return dec
 })
-
-// decompressZstdScratch decompresses a length-prefixed zstd-compressed segment from data[pos:].
-// The returned slice is valid only until the next call with the same scratch pointer.
-// Used only for the vectorF32 column decoder path.
-func decompressZstdScratch(data []byte, pos int, scratch *[]byte) ([]byte, int, error) {
-	if pos+4 > len(data) {
-		return nil, pos, fmt.Errorf("decompressZstd: need 4 bytes for length at pos %d, have %d", pos, len(data))
-	}
-	cLen := int(binary.LittleEndian.Uint32(data[pos:]))
-	pos += 4
-	if pos+cLen > len(data) {
-		return nil, pos, fmt.Errorf(
-			"decompressZstd: need %d compressed bytes at pos %d, have %d",
-			cLen, pos, len(data),
-		)
-	}
-	*scratch = (*scratch)[:0]
-	result, err := getZstdDecoder().DecodeAll(data[pos:pos+cLen], *scratch)
-	if err != nil {
-		return nil, pos, fmt.Errorf("decompressZstd: %w", err)
-	}
-	*scratch = result
-	return result, pos + cLen, nil
-}
 
 // readRawSegment reads a length-prefixed raw segment (raw_len[4]+raw_data) from data[pos:].
 // Returns the raw bytes slice and the new position after the segment.
@@ -313,13 +282,6 @@ func readColumnEncoding(data []byte, spanCount int, colType shared.ColumnType, c
 		return nil, fmt.Errorf("column encoding: data too short (%d bytes)", len(data))
 	}
 
-	// NOTE-011 (shared/NOTES.md): ColumnTypeVectorF32 uses a custom wire format where
-	// only the float data is zstd-compressed. Dispatch by colType so decodeVectorF32 can
-	// handle the mixed compressed/uncompressed format directly.
-	if colType == shared.ColumnTypeVectorF32 {
-		return decodeVectorF32(data, spanCount, ctx)
-	}
-
 	encVersion := data[0]
 	if encVersion != shared.VersionBlockEncV3 {
 		return nil, fmt.Errorf("column encoding: unsupported version %d (only enc_version=3 supported)", encVersion)
@@ -336,8 +298,6 @@ func readColumnEncoding(data []byte, spanCount int, colType shared.ColumnType, c
 	switch baseKind {
 	case shared.KindDictionary, shared.KindSparseDictionary:
 		return decodeDictionary(data[2:], baseKind, spanCount, colType, ctx, allPresent)
-	case shared.KindInlineBytes, shared.KindSparseInlineBytes:
-		return decodeInlineBytes(data[2:], baseKind, spanCount, allPresent)
 	case shared.KindDeltaUint64:
 		return decodeDeltaUint64(data[2:], spanCount, colType, ctx, allPresent)
 	case shared.KindDeltaUint64BitPacked:
@@ -744,97 +704,6 @@ func expandSparseIndexes(sparse []uint32, present []byte, spanCount int) []uint3
 	}
 
 	return dense
-}
-
-// decodeInlineBytes decodes kind 3/4 (InlineBytes/SparseInlineBytes).
-// data starts after enc_version + kind bytes.
-func decodeInlineBytes(data []byte, kind uint8, spanCount int, allPresent bool) (*Column, error) {
-	col := &Column{SpanCount: spanCount}
-
-	if len(data) < 4 {
-		return nil, fmt.Errorf("inline_bytes: data too short")
-	}
-
-	rowCount := int(binary.LittleEndian.Uint32(data[0:]))
-	pos := 4
-
-	if rowCount != spanCount {
-		return nil, fmt.Errorf("inline_bytes: row_count %d != spanCount %d", rowCount, spanCount)
-	}
-
-	present, newPos, presentCount, err := decodePresenceMaybe(data, pos, spanCount, allPresent)
-	if err != nil {
-		return nil, fmt.Errorf("inline_bytes: %w", err)
-	}
-
-	pos = newPos
-	col.Present = present
-
-	// For inline bytes we need a dense slice: nil for absent rows.
-	col.BytesInline = make([][]byte, spanCount)
-
-	switch kind {
-	case shared.KindInlineBytes: // dense: rowCount × {len[4] + bytes}
-		for i := range rowCount {
-			if pos+4 > len(data) {
-				return nil, fmt.Errorf("inline_bytes(dense): short at row %d", i)
-			}
-
-			bLen := int(binary.LittleEndian.Uint32(data[pos:]))
-			pos += 4
-			if pos+bLen > len(data) {
-				return nil, fmt.Errorf("inline_bytes(dense): data overrun at row %d", i)
-			}
-
-			b := make([]byte, bLen)
-			copy(b, data[pos:pos+bLen])
-			col.BytesInline[i] = b
-			pos += bLen
-		}
-
-	case shared.KindSparseInlineBytes: // sparse: present_count[4] + presentCount × {len[4] + bytes}
-		if pos+4 > len(data) {
-			return nil, fmt.Errorf("inline_bytes(sparse): missing present_count")
-		}
-
-		sparseCnt := int(binary.LittleEndian.Uint32(data[pos:]))
-		pos += 4
-		if sparseCnt != presentCount {
-			return nil, fmt.Errorf(
-				"inline_bytes(sparse): present_count %d != presentCount %d",
-				sparseCnt, presentCount,
-			)
-		}
-
-		si := 0
-		for i := range spanCount {
-			if !shared.IsPresent(present, i) {
-				continue
-			}
-
-			if si >= sparseCnt {
-				break
-			}
-
-			if pos+4 > len(data) {
-				return nil, fmt.Errorf("inline_bytes(sparse): short at present row %d", si)
-			}
-
-			bLen := int(binary.LittleEndian.Uint32(data[pos:]))
-			pos += 4
-			if pos+bLen > len(data) {
-				return nil, fmt.Errorf("inline_bytes(sparse): data overrun at present row %d", si)
-			}
-
-			b := make([]byte, bLen)
-			copy(b, data[pos:pos+bLen])
-			col.BytesInline[i] = b
-			pos += bLen
-			si++
-		}
-	}
-
-	return col, nil
 }
 
 // decodeDeltaUint64 decodes kind 5 (DeltaUint64).
@@ -2084,90 +1953,6 @@ func decodeDeltaDictionary(data []byte, kind uint8, spanCount int, ctx *decodeCt
 	}
 
 	col.BytesIdx = denseIdx
-	return col, nil
-}
-
-// decodeVectorF32 decodes a ColumnTypeVectorF32 column.
-// data is the raw column blob (output of vectorF32ColumnBuilder.buildData):
-//
-//	enc_version[1] + kind[1] + dim[2 LE] + row_count[4 LE] +
-//	presence_rle_len[4 LE] + presence_rle[N] +
-//	float_data_compressed_len[4 LE] + zstd(flat_float32_LE[present_count * dim * 4])
-//
-// Returns a Column with BytesInline populated: BytesInline[i] holds the raw LE float32 bytes
-// for present row i (length = dim*4). BytesInline[i] is nil for absent rows.
-// NOTE-011 (shared/NOTES.md): ColumnTypeVectorF32 encoding — only float data is zstd-compressed.
-func decodeVectorF32(data []byte, spanCount int, ctx *decodeCtx) (*Column, error) {
-	// Header: enc_version[1] + kind[1] + dim[2] + row_count[4] + rle_len[4] = 12 bytes minimum.
-	if len(data) < vf32HdrSize {
-		return nil, fmt.Errorf("vectorF32: data too short: %d bytes", len(data))
-	}
-
-	dim := int(binary.LittleEndian.Uint16(data[2:4]))
-	rowCount := int(binary.LittleEndian.Uint32(data[4:8]))
-	rleLen := int(binary.LittleEndian.Uint32(data[vf32RleLenOff : vf32RleLenOff+4]))
-
-	if rowCount != spanCount {
-		return nil, fmt.Errorf("vectorF32: row_count %d != spanCount %d", rowCount, spanCount)
-	}
-
-	off := vf32HdrSize
-	if off+rleLen > len(data) {
-		return nil, fmt.Errorf("vectorF32: presence RLE truncated: need %d bytes at offset %d", rleLen, off)
-	}
-	rleData := data[off : off+rleLen]
-	off += rleLen
-
-	// Decode presence bitset.
-	bitset, err := shared.DecodePresenceRLE(rleData, spanCount)
-	if err != nil {
-		return nil, fmt.Errorf("vectorF32: presence RLE: %w", err)
-	}
-
-	// SPEC-ROOT-012: compute needed size before decompression to prevent decompression bomb.
-	presentCount := shared.CountPresent(bitset, spanCount)
-	needed := int64(presentCount) * int64(dim) * 4
-	if needed > shared.MaxBlockSize {
-		return nil, fmt.Errorf(
-			"vectorF32: float data would exceed MaxBlockSize: needed=%d, dim=%d, presentCount=%d",
-			needed, dim, presentCount,
-		)
-	}
-
-	// Read length-prefixed zstd float data (size already validated above).
-	// Use ctx.scratch if set (pooled caller), else use a local scratch buffer.
-	scratchPtr := ctx.scratch
-	var localScratch []byte
-	if scratchPtr == nil {
-		scratchPtr = &localScratch
-	}
-	floatBytes, _, err := decompressZstdScratch(data, off, scratchPtr)
-	if err != nil {
-		return nil, fmt.Errorf("vectorF32: float data: %w", err)
-	}
-	if len(floatBytes) < int(needed) {
-		return nil, fmt.Errorf("vectorF32: float data too short: need %d bytes, have %d", needed, len(floatBytes))
-	}
-
-	col := &Column{
-		SpanCount:   spanCount,
-		Present:     bitset,
-		BytesInline: make([][]byte, spanCount),
-		Type:        shared.ColumnTypeVectorF32,
-	}
-
-	presentRow := 0
-	for i := range spanCount {
-		if !shared.IsPresent(bitset, i) {
-			continue
-		}
-		vecStart := int64(presentRow) * int64(dim) * 4
-		raw := make([]byte, dim*4)
-		copy(raw, floatBytes[vecStart:vecStart+int64(dim)*4])
-		col.BytesInline[i] = raw
-		presentRow++
-	}
-
 	return col, nil
 }
 

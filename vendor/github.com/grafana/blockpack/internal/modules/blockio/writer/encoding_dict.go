@@ -92,10 +92,10 @@ func encodeDictionaryKind(
 	// Auto-upgrade to RLE encoding when dictionary is small enough.
 	if dictSize <= rleCardinalityThreshold {
 		switch kind {
-		case KindDictionary:
-			kind = KindRLEIndexes
-		case KindSparseDictionary:
-			kind = KindSparseRLEIndexes
+		case shared.KindDictionary:
+			kind = shared.KindRLEIndexes
+		case shared.KindSparseDictionary:
+			kind = shared.KindSparseRLEIndexes
 		}
 	}
 
@@ -124,7 +124,7 @@ func encodeDictionaryKind(
 	// The indexes slice from buildXxxDict already contains only present-row indexes.
 	// For dense, we need full-row indexes (null rows get index 0).
 	var fullIndexes []uint32
-	if baseKind == KindDictionary || baseKind == KindRLEIndexes {
+	if baseKind == shared.KindDictionary || baseKind == shared.KindRLEIndexes {
 		// Dense: build full row indexes — null rows point to index 0.
 		fullIndexes = make([]uint32, nRows)
 		pi := 0
@@ -153,7 +153,7 @@ func encodeDictionaryKind(
 	buf = appendUint32LE(buf, uint32(nRows)) //nolint:gosec // safe: nRows bounded by MaxBlockSpans (65535)
 	buf = appendPresenceSegment(buf, rleData, allPresent)
 
-	if baseKind == KindRLEIndexes || baseKind == KindSparseRLEIndexes {
+	if baseKind == shared.KindRLEIndexes || baseKind == shared.KindSparseRLEIndexes {
 		// RLE index encoding.
 		rleIndexData, err := shared.EncodeIndexRLE(fullIndexes)
 		if err != nil {
@@ -167,7 +167,7 @@ func encodeDictionaryKind(
 		buf = append(buf, rleIndexData...)
 	} else {
 		// Raw index array.
-		if baseKind == KindSparseDictionary {
+		if baseKind == shared.KindSparseDictionary {
 			buf = appendUint32LE(buf, uint32(len(fullIndexes))) //nolint:gosec // safe: index count bounded by MaxBlockSpans
 		}
 		for _, idx := range fullIndexes {
@@ -222,7 +222,7 @@ func encodeDeltaDictionaryKind(
 	// Dense (kind 12): one delta per row (including null rows).
 	// Sparse (kind 13): one delta per present row only.
 	var deltaRows []uint32
-	if baseKind == KindDeltaDictionary {
+	if baseKind == shared.KindDeltaDictionary {
 		// Dense: full row delta stream.
 		fullIndexes := make([]uint32, nRows)
 		pi := 0

@@ -2,7 +2,10 @@
 //
 // NOTE: Core invariant — spans are copied via Writer.AddRow (native columnar path),
 // not via OTLP object reconstruction. Deduplication is keyed on (trace:id, span:id).
-// Spans with missing or invalid IDs are silently dropped and counted in droppedSpans.
+// A source block whose trace:id/span:id identity is missing or malformed (NOTE-469
+// legacy shape, or a malformed row) returns a typed error rather than being silently
+// dropped — see NOTE-104 in NOTES.md. droppedSpans counts ONLY genuine duplicate
+// (trace:id, span:id) drops during normal operation.
 package compaction
 
 import (
@@ -15,18 +18,6 @@ import (
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	modules_rw "github.com/grafana/blockpack/internal/modules/rw"
 )
-
-// blockIDPair holds the pre-fetched trace:id and span:id for a single row.
-// Built once per block by buildDedupeIndex; looked up O(1) by dedupeKey.
-
-// buildDedupeIndex previously pre-fetched per-row (trace:id, span:id) identity from the
-// IntrinsicTOC or SpanTree. Both were removed (#433 IntrinsicTOC, #434 SpanTree, #436
-// intrinsic distinction), and every block now stores identity columns in its payload.
-// Identity is therefore sourced directly from block columns in dedupeKey, so this always
-// returns nil (the documented "fall back to block columns" path).
-func buildDedupeIndex(_ *modules_reader.Reader, _ int) map[uint16]blockIDPair {
-	return nil
-}
 
 // Config configures the compaction operation.
 
@@ -65,7 +56,8 @@ func buildDedupeIndex(_ *modules_reader.Reader, _ int) map[uint16]blockIDPair {
 // CompactBlocks reads input blockpack providers, merges spans, deduplicates them,
 // and writes compacted output to outputStorage.
 // Returns relative paths of all output files written and the count of spans dropped
-// due to missing trace:id or span:id columns.
+// due to genuine (trace:id, span:id) duplication. A source block with missing or
+// malformed trace:id/span:id identity returns an error instead (see NOTE-104).
 //
 // All providers are passed already materialized; if the caller holds every input
 // block fully in memory before calling this, peak memory is sum(all blocks). To
@@ -217,14 +209,9 @@ func (s *compactionState) processProvider(provider modules_rw.ReaderProvider) (r
 }
 
 // processBlock iterates all rows in block and adds each span to the current writer.
-// Builds a per-block deduplication index once (O(N)) to avoid O(N^2) IntrinsicBytesAt
-// calls across the per-row loop.
 func (s *compactionState) processBlock(r *modules_reader.Reader, blockIdx int, block *modules_reader.Block) error {
-	// Build intrinsic ID index once per block; O(N) over intrinsic columns.
-	// dedupeKey uses this for O(1) per-row lookups instead of O(N) linear scans.
-	idIndex := buildDedupeIndex(r, blockIdx)
 	for rowIdx := range block.SpanCount() {
-		if err := s.addSpanFromBlock(r, blockIdx, block, rowIdx, idIndex); err != nil {
+		if err := s.addSpanFromBlock(r, blockIdx, block, rowIdx); err != nil {
 			return fmt.Errorf("row %d: %w", rowIdx, err)
 		}
 	}
@@ -232,66 +219,79 @@ func (s *compactionState) processBlock(r *modules_reader.Reader, blockIdx int, b
 }
 
 // dedupeKey builds a 24-byte deduplication key from trace:id (16 bytes) and span:id (8 bytes).
-// Falls back to the pre-built idIndex (O(1) lookup) only when a block lacks the trace:id/span:id
-// columns; current files carry both per-block identity columns and the intrinsic section.
-// idIndex is built once per block by buildDedupeIndex; pass nil to disable intrinsic fallback.
-// Returns the key and true if both IDs are present and non-empty; false otherwise.
-func dedupeKey(block *modules_reader.Block, rowIdx int, idIndex map[uint16]blockIDPair) ([24]byte, bool) {
+//
+// NOTE-469/#490 A-10 (re-scoped per .bob/state/identity-investigation.md): identity is
+// read exclusively from block columns — every block written since the v2 self-contained
+// format (issue #420) carries trace:id/span:id as block columns. The prior "intrinsic
+// index" fallback (buildDedupeIndex) was provably dead: it unconditionally returned nil
+// after #433 (IntrinsicTOC removal)/#434 (SpanTree removal)/#436 (intrinsic/attribute
+// distinction removal), so this branch could never fire; deleted along with it.
+//
+// NOTE-104 (holistic-review Fix 2): mirrors writer.go's AddRowFromReader two-branch
+// treatment of the identical NOTE-469 legacy condition exactly, rather than silently
+// folding it into a per-row skip. A source block that entirely lacks the trace:id block
+// column (the #389-#420 intrinsic-only shape) returns the shared greppable family error
+// so it aborts loudly and is retried via re-compaction, instead of vanishing into the
+// dedupe-drop counter indistinguishably from ordinary duplicates. A block that carries the
+// trace:id column but has a malformed/absent value for this one row returns a distinct,
+// row-scoped error. span:id is validated the same way (column-absent or malformed value)
+// since a key cannot be built without it, but is not part of the NOTE-469 legacy-block
+// family (that family is defined solely by trace:id's block-column presence, matching
+// writer_block.go's buildBlock guard).
+func dedupeKey(block *modules_reader.Block, rowIdx int) ([24]byte, error) {
 	var key [24]byte
 
-	// PATTERN: block-column-first with intrinsic-section fallback (shared across
-	// compaction.go, writer/writer.go, executor/executor.go, executor/metrics_trace.go).
-	// v3 files store identity columns in block payloads; v4 files store them exclusively
-	// in the intrinsic section. Try the block column first for backwards compat.
-
-	// trace:id — try block column first, then O(1) index lookup.
-	var traceID []byte
-	if traceCol := block.GetColumn("trace:id"); traceCol != nil && traceCol.IsPresent(rowIdx) {
-		traceID, _ = traceCol.BytesValue(rowIdx)
-	} else if idIndex != nil {
-		traceID = idIndex[uint16(rowIdx)].traceID //nolint:gosec // rowIdx bounded by SpanCount (≤65535)
+	traceCol := block.GetColumn("trace:id")
+	if traceCol == nil {
+		return key, fmt.Errorf(
+			"compaction: dedupeKey: legacy intrinsic-only source block unsupported (missing trace:id block column, see NOTES.md NOTE-469) — re-compact",
+		)
 	}
-	if len(traceID) != 16 {
-		return key, false
+	traceID, _ := traceCol.BytesValue(rowIdx)
+	if !traceCol.IsPresent(rowIdx) || len(traceID) != 16 {
+		return key, fmt.Errorf("compaction: dedupeKey: trace:id missing or malformed at row %d", rowIdx)
 	}
 
-	// span:id — try block column first, then O(1) index lookup.
-	var spanID []byte
-	if spanCol := block.GetColumn("span:id"); spanCol != nil && spanCol.IsPresent(rowIdx) {
-		spanID, _ = spanCol.BytesValue(rowIdx)
-	} else if idIndex != nil {
-		spanID = idIndex[uint16(rowIdx)].spanID //nolint:gosec // rowIdx bounded by SpanCount (≤65535)
+	spanCol := block.GetColumn("span:id")
+	if spanCol == nil {
+		return key, fmt.Errorf("compaction: dedupeKey: span:id missing or malformed at row %d", rowIdx)
 	}
-	if len(spanID) != 8 {
-		return key, false
+	spanID, _ := spanCol.BytesValue(rowIdx)
+	if !spanCol.IsPresent(rowIdx) || len(spanID) != 8 {
+		return key, fmt.Errorf("compaction: dedupeKey: span:id missing or malformed at row %d", rowIdx)
 	}
 
 	copy(key[0:16], traceID)
 	copy(key[16:24], spanID)
-	return key, true
+	return key, nil
 }
 
 // addSpanFromBlock adds one row from block at rowIdx to the current writer via the
 // native columnar path, deduplicating by (trace:id, span:id) and respecting the
-// output file size limit. idIndex is the pre-built per-block dedup index (may be nil).
+// output file size limit.
+//
+// NOTE-104 (holistic-review Fix 2): droppedSpans now counts ONLY genuine dedupe drops
+// (the (trace:id, span:id) pair was already seen earlier in this compaction) — normal,
+// expected operation. It no longer absorbs legacy-input loss: dedupeKey's two error
+// branches (block-level identity absent, row-level identity malformed) propagate as
+// real errors instead.
 func (s *compactionState) addSpanFromBlock(
 	r *modules_reader.Reader,
 	blockIdx int,
 	block *modules_reader.Block,
 	rowIdx int,
-	idIndex map[uint16]blockIDPair,
 ) error {
 	if err := s.ensureWriter(); err != nil {
 		return fmt.Errorf("ensure writer: %w", err)
 	}
 
-	key, ok := dedupeKey(block, rowIdx, idIndex)
-	if !ok {
-		s.droppedSpans++
-		return nil // skip rows without valid trace:id or span:id
+	key, err := dedupeKey(block, rowIdx)
+	if err != nil {
+		return err
 	}
 	if _, seen := s.seenSpans[key]; seen {
-		return nil
+		s.droppedSpans++
+		return nil // genuine duplicate: same (trace:id, span:id) already written
 	}
 	s.seenSpans[key] = struct{}{}
 
@@ -331,10 +331,6 @@ func (s *compactionState) ensureWriter() error {
 		// the output block so all of compaction's disk I/O stays on the configured scratch
 		// volume rather than the default /tmp.
 		ScratchDir: s.stagingDir,
-		// NOTE-476 (issue #394): legacy flag. The IntrinsicTOC (#433) and SpanTree (#434)
-		// identity stores have been removed; v2 identity lives in block columns, so this
-		// should remain OFF (no fallback store exists).
-		OmitIntrinsicIdentityColumns: s.cfg.OmitIntrinsicIdentityColumns,
 		// NOTE: EnableV2Format removed (2026-06-29, v2 unconditional).
 	})
 	if err != nil {

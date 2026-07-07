@@ -44,20 +44,32 @@ func CompactBlocks(
 
 - `outputPaths`: relative paths of output files written to `outputStorage`, in creation order.
   Each path is a filename of the form `"compacted-NNNNN.blockpack"`.
-- `droppedSpans`: count of spans silently dropped due to missing or invalid `trace:id` or
-  `span:id` columns (see §4).
-- `error`: non-nil on I/O errors, context cancellation, or output write failures.
+- `droppedSpans`: count of spans silently dropped due to genuine `(trace:id, span:id)`
+  duplication across inputs — i.e. the normal, expected dedupe case (see §4). It does
+  **not** count legacy/malformed-identity input; that now returns an error instead (holistic
+  review Fix 2/NOTE-104).
+- `error`: non-nil on I/O errors, context cancellation, output write failures, or a source
+  block whose `trace:id`/`span:id` identity is missing or malformed (see §4).
+
+This return value is also surfaced by the public `blockpack.CompactBlocks`/
+`blockpack.CompactBlocksStreaming` wrappers in the root package (holistic review Fix 3;
+previously discarded there).
 
 ### 2.3 Invariants
 
 - **No false negatives:** every span present in any input file with valid (trace:id, span:id)
   appears in exactly one output file — deduplicated, not omitted.
 - **Deduplication:** if the same (trace:id, span:id) pair appears in multiple input files,
-  only the first occurrence (in provider order) is written to output.
+  only the first occurrence (in provider order) is written to output; later occurrences are
+  silently dropped and counted in `droppedSpans`.
 - **Column preservation:** all column values for a span are preserved verbatim via the
   native columnar copy path (`Writer.AddRow`).
 - **Empty input:** when `providers` is empty or nil, returns `(nil, 0, nil)`.
 - **Nil outputStorage:** returns an error immediately.
+- **Legacy/malformed identity input:** a source block that entirely lacks the `trace:id`
+  block column (the NOTE-469 #389-#420 intrinsic-only legacy shape), or that carries the
+  column but has a malformed/absent value for a specific row, aborts compaction with a
+  typed error rather than being silently dropped — see §4.
 
 ---
 
@@ -87,22 +99,41 @@ This is independent of `MaxOutputFileSize` — both limits can trigger output fi
 
 ---
 
-## 4. Span Dropping Semantics
+## 4. Span Dropping and Identity-Error Semantics
 
-Spans with missing or invalid `trace:id` or `span:id` columns are **silently dropped**.
-The count of dropped spans is returned as `droppedSpans`. A span is dropped when:
+**NOTE-104 (holistic-review Fix 2, 2026-07-07):** `dedupeKey` mirrors
+`writer.go:AddRowFromReader`'s treatment of the NOTE-469 legacy-identity condition
+exactly, distinguishing two error cases from the one legitimate silent-drop case:
 
-- The `trace:id` column is absent from the block.
-- The `trace:id` value is not present for this row (`IsPresent` returns false).
-- The `trace:id` value is not 16 bytes long.
-- The `span:id` column is absent from the block.
-- The `span:id` value is not present for this row.
-- The `span:id` value is not 8 bytes long.
+1. **Block-level identity absent (typed error, NOTE-469 family):** the `trace:id` block
+   column is entirely absent from the source block — the #389-#420 intrinsic-only legacy
+   shape. `dedupeKey` returns the shared greppable error
+   `"...legacy intrinsic-only source block unsupported (missing trace:id block column, see
+   NOTES.md NOTE-469) — re-compact"` (prefixed `"compaction: dedupeKey:"`), which propagates
+   through `addSpanFromBlock`/`processBlock`/`processProvider` and aborts `CompactBlocks`/
+   `CompactBlocksStreaming` with that error. This block can no longer be compacted; it must
+   be re-compacted through an older code path or otherwise regenerated first.
+2. **Row-level identity malformed (typed error, distinct from case 1):** the `trace:id` or
+   `span:id` column is present on the block, but this specific row's value is absent or
+   malformed (`trace:id` not 16 bytes, `span:id` not 8 bytes, or `IsPresent` false for
+   either). `dedupeKey` returns a distinct, row-scoped error (e.g. `"trace:id missing or
+   malformed at row %d"` / `"span:id missing or malformed at row %d"`), which likewise
+   aborts compaction. This is not expected in practice — the production writer always
+   populates both columns together when present — but is checked explicitly rather than
+   assumed, matching `AddRowFromReader`.
+3. **Genuine duplicate (silent drop, normal operation):** both IDs are present and
+   well-formed, but the exact `(trace:id, span:id)` pair was already written earlier in
+   this compaction (from an earlier provider or an earlier row). This is the only case
+   counted in `droppedSpans`.
 
-**Rationale:** Spans without valid identifiers cannot be deduplicated. Silently dropping
-them preserves the output's structural validity.
+**Rationale:** Cases 1 and 2 represent an unsupported or corrupt source block — silently
+dropping those spans would be indistinguishable from ordinary deduplication and would lose
+data with no operator-visible signal, violating the "typed errors for still-reachable
+legacy inputs" invariant. Case 3 is expected, high-volume, and harmless, so it remains a
+cheap counter rather than an error.
 
-Back-ref: `internal/modules/blockio/compaction/compaction.go:dedupeKey`
+Back-ref: `internal/modules/blockio/compaction/compaction.go:dedupeKey`,
+`compaction.go:addSpanFromBlock`
 
 ---
 

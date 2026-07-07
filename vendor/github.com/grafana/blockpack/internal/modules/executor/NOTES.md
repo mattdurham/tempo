@@ -106,6 +106,11 @@ Lifetime safety: the structural row loop copies the value-typed identity fields
 synchronously and returns a `uint8` — nothing retains a pointer into the slice past the loop,
 and the defer fires after `releaseBlockColumnProvider`. Error paths release before returning nil.
 
+**Correction (2026-07-07, issue #490, task A-11/#105):** the "(legacy-file branch)" label on
+`identityFieldsFromBlockColsTyped` above is wrong — it is the SOLE and current identity-population
+mechanism for the structural path, not a legacy-only branch. See NOTE-VI-080 for the full
+correction.
+
 ## NOTE-348: share the POPCNT rank index between time-bucket scatter and group-by scan
 
 The compact N=1 count/rate group-by path (`streamCountRateN1Compact`, the M4/M6 `rate() by (…)`
@@ -2566,6 +2571,11 @@ old map's `!ok` case. For bytes columns specifically, the getter returns `(nil, 
 **Back-ref:** `internal/modules/executor/stream_structural.go:collectBlockStructuralSpanRecs`
 **Back-ref:** `internal/modules/executor/stream_structural.go:computeNodeMatchForRow`
 **Back-ref:** `internal/modules/executor/predicates.go:rowSatisfiesIntrinsicNodesTyped`
+
+**Correction (2026-07-07, issue #490, task A-11/#105):** the "legacy path (no intrinsic
+section)" label on `identityFieldsFromBlockColsTyped` above is wrong — it is the SOLE and
+current identity-population mechanism for the structural path. See NOTE-VI-080 for the full
+correction.
 
 ---
 
@@ -6194,6 +6204,11 @@ unreachable. Byte-identical semantics.
 **Back-ref:** `internal/modules/executor/intrinsic_row.go:copy8`, `storeTypedField` (trace:id),
           `identityFieldsFromBlockColsTyped` (trace:id)
 
+**Correction (2026-07-07, issue #490, task A-11/#105):** the "legacy no-intrinsic-section
+identity build" label on `identityFieldsFromBlockColsTyped` above (and the same label a few
+lines up) is wrong — it is the SOLE and current identity-population mechanism for the
+structural/ref-driven paths. See NOTE-VI-080 for the full correction.
+
 ## NOTE-432: Precompute structural per-row predicate-match bitmask (eliminate per-row binary search)
 
 **Path:** `collectBlockStructuralSpanRecs` → per-row `computeNodeMatchForRow` (structural `>>`/`<<`
@@ -7181,7 +7196,7 @@ serial leaf loop, one `Add`/`RecordFileIO` call at a time.
 That assumption stopped holding once vibuilder's leaf-predicate loop was parallelized to fix
 a production timeout: `vibuilder.downloadAll` and related loops were issuing up to ~930
 sequential S3 round trips per TraceQL query, causing 33s-2m38s query timeouts on
-tempo-dev-test-03. The fix bounds concurrency in vibuilder's download and leaf-evaluation
+the dev test cluster. The fix bounds concurrency in vibuilder's download and leaf-evaluation
 loops (see `vibuilder/NOTES.md`'s corresponding entry for the full root-cause and
 concurrency-bound rationale), which means multiple leaf-predicate goroutines now call
 `Add`/`RecordFileIO` on the *same* `SliceValueIndexSource` instance concurrently — a
@@ -7322,3 +7337,53 @@ Back-ref: tempo `tempodb/encoding/vblockpack/value_index_query.go:tryIndexFetch`
 SPEC: SPEC-ROOT-019 (root `SPEC.md`, Addendum 2026-07-06 / issue #481).
 Blockpack-side error production: `search_trace_vi.go:QueryTraceQLFromIndex` (unchanged),
 `search_trace_vi_test.go:TestQueryTraceQLFromIndex_InconsistentIndexIsError`.
+
+---
+
+## NOTE-VI-080 — identityFieldsFromBlockColsTyped confirmed as the sole/correct modern identity mechanism; A-11 dropped (issue #490)
+
+Date: 2026-07-07
+
+A #490-driven investigation into whether `identityFieldsFromBlockColsTyped` was a legacy
+fallback (as originally assumed by task A-11) found the opposite: it is the SOLE identity-
+population mechanism for the structural query path post-#436 (the intrinsic-index-based
+alternative, `rowSatisfiesIntrinsicNodesTyped`/`lookupIntrinsicFieldsTyped`'s pre-#436
+intrinsic-section-driven callers, was deleted under #436, not merely superseded). Confirmed
+correct on modern blocks by a real structural-query test (`{ kind = server } >> { kind = client
+&& ... }` via `collectAllStructuralSpans`) — both parent and child records carried fully
+correct, non-zero, correctly-matched identity.
+
+This note corrects the stale "legacy path" framing inherited from a since-reversed NOTE-469-era
+characterization (`writer/NOTES.md:1310`'s back-reference — see that file's own NOTE-469
+addendum for the writer-side half of this same inversion) in three places, all in this file:
+**NOTE-081** (labeled it "the legacy path (no intrinsic section)"), **NOTE-349** (labeled it
+"(legacy-file branch)"), and **NOTE-427** (labeled it "the legacy no-intrinsic-section identity
+build", twice). Each has a short in-place correction pointing back to this note. **Correction to
+this project's own earlier drafting:** the originally-circulated task scope named "NOTE-349 and
+NOTE-432" as the two notes needing correction; a direct verification while writing this entry
+found NOTE-432 (`Precompute structural per-row predicate-match bitmask`) does not actually
+reference `identityFieldsFromBlockColsTyped` or any legacy-path framing at all — the second
+note actually carrying the stale claim is **NOTE-427**, not NOTE-432. This entry documents the
+verified-correct set (NOTE-081, NOTE-349, NOTE-427), not the originally-assumed one.
+
+No code or test changes accompany this note beyond the doc-only fixes: `intrinsic_lookup.go`'s
+header (states plainly `identityFieldsFromBlockColsTyped` is the current design, not legacy),
+`stream_structural.go`'s `collectBlockStructuralSpanRecs` docstring (previously described a
+two-path "intrinsic-section files" vs. "legacy (no-intrinsic) files" model that no longer
+exists — rewritten to point at the single current design, cross-referencing NOTE-436 40 lines
+above it in the same file), and `blockio/reader/testsupport.go`'s `BuildSyntheticIdentityBlock`
+header (previously claimed to build the legacy shape to exercise a fallback decode path —
+exactly backwards; it builds the MODERN shape. The genuinely-legacy shape is built by the
+NEW helper `BuildBlockMissingIdentityColumns`, added under task A-9/#103. Also fixed a false
+"anchored in `cmd/deadcode/main.go`" claim on the same helper — that file does not import the
+reader package at all).
+
+Back-refs: `internal/modules/executor/intrinsic_lookup.go:identityFieldsFromBlockColsTyped`,
+`internal/modules/executor/stream_structural.go:collectBlockStructuralSpanRecs` (NOTE-372's
+in-code docstring correction — see that comment's own `NOTE-372 (superseded by NOTE-436,
+corrected #490 A-11)` header), `internal/modules/blockio/reader/testsupport.go:
+BuildSyntheticIdentityBlock` (header correction, helper retained). Corrects: NOTE-081, NOTE-349,
+NOTE-427 (all this file, older plain-numbered convention). See `blockio/writer/NOTES.md`
+NOTE-469/NOTE-V2-004(writer) addenda and `blockio/compaction/NOTES.md` NOTE-104 for the
+writer-side and compaction-side halves of the same investigation.
+`.bob/state/identity-investigation.md` has the full empirical basis.

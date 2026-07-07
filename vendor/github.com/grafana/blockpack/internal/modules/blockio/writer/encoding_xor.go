@@ -18,8 +18,8 @@ import (
 //
 //	val_len[4 LE] + xor_bytes
 //
-// NOTE-AP-001: for the dense kind (KindXORBytes) when every row is present,
-// KindXORBytesAllPresent is emitted and the presence_rle segment is omitted.
+// NOTE-AP-001: for the dense kind (shared.KindXORBytes) when every row is present,
+// shared.KindXORBytesAllPresent is emitted and the presence_rle segment is omitted.
 //
 // NOTE-217: when every present value shares the same byte length (uniformLen > 0), the
 // uniform variant (encodeXORBytesUniform) is selected instead — it drops the per-row len[4]
@@ -131,7 +131,7 @@ func uniformValueLen(values [][]byte, present []bool, nRows, presentCount int) (
 // The XOR computation is identical to encodeXORBytes; only the framing differs (no per-row
 // length prefix). uniformLen is guaranteed > 0 and equal for every present row by the caller
 // (uniformValueLen). The dense kind composes with NOTE-AP-001: a fully-present column emits
-// KindXORBytesUniformAllPresent and omits the presence segment.
+// shared.KindXORBytesUniformAllPresent and omits the presence segment.
 func encodeXORBytesUniform(
 	kind uint8,
 	values [][]byte,

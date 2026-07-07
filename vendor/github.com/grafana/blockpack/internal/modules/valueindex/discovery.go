@@ -29,8 +29,8 @@ type Lister interface {
 // (Level ASC, WallMinSec ASC, WallMaxSec ASC) — lowest compaction level first —
 // so callers traverse the freshest, least-merged files before compacted ones.
 //
-// v1 filenames (no embedded time range) are always included: their FileMeta has
-// zero WallMinSec/WallMaxSec and IsInTimeRange treats that as "matches all".
+// Legacy v1 filenames (L<level>-<id>, no embedded time range) fail ParseFilenameV2
+// and are skipped like any other unparseable key — the v1 fallback was removed.
 //
 // When no files overlap the window, returns (nil, nil).
 func DiscoverIndexFiles(

@@ -34,11 +34,10 @@ type Writer struct {
 	// NOTE: colStatsByBlock removed (2026-06-29, in-file block pruning removal).
 	// Value index is now the authoritative source for pruning.
 
-	// addRowIntrinsicCache caches per-block intrinsic indexes built during AddRowFromReader
-	// calls. Key: (srcReader pointer, srcBlockIdx). Value: pre-built row→field map.
-	// Avoids O(N) IntrinsicBytesAt/IntrinsicDictStringAt scans on every per-row call,
-	// reducing AddRowFromReader from O(N^2) to O(N) per block.
-	addRowIntrinsicCache map[addRowCacheKey]intrinsicRowFields
+	// NOTE-469/#490 A-9: addRowIntrinsicCache (per-block intrinsic-index cache for
+	// AddRowFromReader's fallback) removed — the fallback it backed, buildIntrinsicBlockIndex,
+	// was provably dead (it re-read the same source block whose column the caller had
+	// already established was absent) and is now a hard compaction error instead.
 
 	// dedicatedCols is the pre-built set of full column names (e.g. "span.http.method")
 	// configured as dedicated in cfg.DedicatedColumns. Built once in NewWriterWithConfig
@@ -107,9 +106,6 @@ func NewWriterWithConfig(cfg Config) (*Writer, error) {
 	if cfg.MinBlockSpans == 0 {
 		cfg.MinBlockSpans = defaultMinBlockSpans
 	}
-	// NOTE-AP-001: apply the AllPresent encoding rollout flag. Default is enabled; setting
-	// Config.DisableAllPresentEncoding forces the legacy presence-RLE form for every column.
-	setAllPresentEncodingEnabled(!cfg.DisableAllPresentEncoding)
 	// NOTE-215: apply the bit-packed DeltaUint64 rollout flag. Default is enabled; setting
 	// Config.DisableBitPackedDelta forces the legacy byte-width form (kind 5).
 	setBitPackedDeltaEnabled(!cfg.DisableBitPackedDelta)
@@ -136,8 +132,8 @@ func NewWriterWithConfig(cfg Config) (*Writer, error) {
 	// no file-level IntrinsicTOC section is written.
 	// Default auto-flush at 5× block size. Caps live proto memory to one batch of
 	// 5 blocks while preserving enough lookahead for MinHash sort quality.
-	// NOTE: EnableV2Format/OmitIntrinsicIdentityColumns mutual exclusion check removed (2026-06-29).
-	// V2 lean format is now unconditional.
+	// NOTE: EnableV2Format mutual exclusion check removed (2026-06-29). V2 lean format is now
+	// unconditional.
 	if cfg.MaxBufferedSpans == 0 {
 		cfg.MaxBufferedSpans = 5 * cfg.MaxBlockSpans
 	}
@@ -621,15 +617,15 @@ func (w *Writer) spillBlockAccumulators(i int, s blockSlice, results []builtBloc
 	return nil
 }
 
-// addRowCacheKey identifies a unique (reader, blockIdx) pair for the AddRowFromReader
-// per-block intrinsic index cache.
-
 // AddRowFromReader adds one row from the source block at rowIdx, reading required
-// identity fields (trace:id, span:id, span:start) from the source block columns when
-// present and falling back to the source reader's intrinsic section only for blocks that
-// lack those columns.
-// Uses a per-Writer cache to build the intrinsic index once per (reader, blockIdx) pair,
-// reducing the trace:id and svcName lookups from O(N) per row to O(1).
+// identity fields (trace:id, span:id, span:start) from the source block columns.
+//
+// NOTE-469/NOTE-V2-004(writer) (#490 A-9, re-scoped per
+// .bob/state/identity-investigation.md): identity columns are always block columns for
+// any source written since the v2 self-contained-block format (issue #420); a source
+// block missing trace:id predates that format (the #389-#420 intrinsic-only window) and
+// its file-level IntrinsicTOC/SpanTree fallback was deleted under #433/#434, so there is
+// no longer an index fallback to try — the block-column read below is the sole path.
 func (w *Writer) AddRowFromReader(block *reader.Block, rowIdx int, srcReader *reader.Reader, srcBlockIdx int) error {
 	if block == nil {
 		return fmt.Errorf("writer: AddRowFromReader: block is nil")
@@ -638,30 +634,27 @@ func (w *Writer) AddRowFromReader(block *reader.Block, rowIdx int, srcReader *re
 		return fmt.Errorf("writer: AddRowFromReader: rowIdx %d out of range [0, %d)", rowIdx, block.SpanCount())
 	}
 
-	// Acquire single-use guard before any access to w.addRowIntrinsicCache.
+	// Acquire single-use guard for pendingSpan append below.
 	if !w.inUse.CompareAndSwap(false, true) {
 		panic("writer: concurrent use detected")
 	}
 	defer w.inUse.Store(false)
 
-	// PATTERN: block-column-first with intrinsic-section fallback (shared across
-	// compaction/compaction.go, writer.go, executor/executor.go, executor/metrics_trace.go).
-	// v3 files store identity columns in block payloads; v4 files store them exclusively
-	// in the intrinsic section. Try the block column first for backwards compat.
-
-	// Resolve trace:id — block column if present, otherwise O(1) index lookup.
-	var traceBytes []byte
-	if col := block.GetColumn("trace:id"); col != nil {
-		traceBytes, _ = col.BytesValue(rowIdx)
+	// Distinguish the two ways trace:id can be missing: the whole block predates the v2
+	// self-contained-block format (NOTE-469) and never carries the column at all — the same
+	// legacy-input condition buildBlock's compaction guard rejects (A-9) — versus this one
+	// row's value being individually absent/malformed on an otherwise-modern block (not
+	// expected in practice, since the writer always populates trace:id when present, but
+	// checked explicitly rather than assumed).
+	traceCol := block.GetColumn("trace:id")
+	if traceCol == nil {
+		return fmt.Errorf(
+			"writer: AddRowFromReader: legacy intrinsic-only source block unsupported (missing trace:id block column, see NOTES.md NOTE-469) — re-compact",
+		)
 	}
-	if len(traceBytes) != 16 && srcReader != nil {
-		idx := w.getOrBuildAddRowIndex(srcReader, srcBlockIdx)
-		if entry, ok := idx.get(rowIdx); ok {
-			traceBytes = entry.traceID
-		}
-	}
+	traceBytes, _ := traceCol.BytesValue(rowIdx)
 	if len(traceBytes) != 16 {
-		return fmt.Errorf("writer: AddRowFromReader: trace:id missing at row %d", rowIdx)
+		return fmt.Errorf("writer: AddRowFromReader: trace:id missing or malformed at row %d", rowIdx)
 	}
 
 	var tid [16]byte
@@ -697,25 +690,6 @@ func (w *Writer) AddRowFromReader(block *reader.Block, rowIdx int, srcReader *re
 	}
 
 	return nil
-}
-
-// getOrBuildAddRowIndex returns the cached per-block intrinsic index for the given
-// (srcReader, srcBlockIdx) pair, building it on first access via buildIntrinsicBlockIndex.
-// Called by AddRowFromReader to avoid O(N) IntrinsicBytesAt/IntrinsicDictStringAt scans.
-// Must be called while w.inUse is held (AddRowFromReader acquires the CAS guard first).
-func (w *Writer) getOrBuildAddRowIndex(r *reader.Reader, blockIdx int) intrinsicRowFields {
-	k := addRowCacheKey{r, blockIdx}
-	if w.addRowIntrinsicCache != nil {
-		if idx, ok := w.addRowIntrinsicCache[k]; ok {
-			return idx
-		}
-	}
-	idx := buildIntrinsicBlockIndex(r, blockIdx)
-	if w.addRowIntrinsicCache == nil {
-		w.addRowIntrinsicCache = make(map[addRowCacheKey]intrinsicRowFields)
-	}
-	w.addRowIntrinsicCache[k] = idx
-	return idx
 }
 
 // CurrentSize returns estimated buffered size in bytes.

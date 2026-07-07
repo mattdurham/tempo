@@ -13,11 +13,8 @@ package valueindex
 import (
 	"context"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"sort"
-
-	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
 
 // MergeBucketFiles merges any number of BucketFiles into a single output file. All groups
@@ -174,75 +171,6 @@ func SplitIntoBlocks(f *BucketFile, groupsPerBlock int) {
 		blocks = append(blocks, blk)
 	}
 	f.Blocks = blocks
-}
-
-// CompactBucketFiles decodes, retention-filters, merges, and re-splits a set of v2
-// BucketGroup files (NOTE-VI-045, issue #429). It mirrors CompactFiles' semantics for the
-// BucketGroup format: dead-source BucketBlockRefs are dropped (per cfg.Checker), the
-// remaining refs are merged via MergeBucketFiles, and the result is split into blocks of at
-// most groupsPerBlock groups. output is called once with the serialized merged file bytes.
-// It returns CompactStats counting retained vs dropped BucketBlockRefs.
-func CompactBucketFiles(
-	ctx context.Context,
-	files [][]byte,
-	cfg CompactConfig,
-	groupsPerBlock int,
-	output func([]byte) error,
-) (CompactStats, error) {
-	if len(files) == 0 {
-		return CompactStats{}, nil
-	}
-	if groupsPerBlock <= 0 {
-		groupsPerBlock = shared.ValueIndexBucketGroupsPerBlock
-	}
-
-	decoded := make([]*BucketFile, 0, len(files))
-	var stats CompactStats
-	for _, data := range files {
-		f, err := DecodeBucketFile(data)
-		if err != nil {
-			if errors.Is(err, ErrNotBucketFile) {
-				// Not a v2 BucketGroup file at all (bad magic) — a legacy pre-v2
-				// file. It holds no v2 postings, so skipping it cannot drop any live
-				// posting from the merged output. Skip, do not abort.
-				continue
-			}
-			// A genuine decode failure on a real v2 file. Silently skipping it would
-			// permanently drop this file's postings from the compacted output (a
-			// merge is a rewrite, not a hint), silently under-counting the index —
-			// the same silent-partial-result bug class the trace-by-id review caught
-			// (NOTE-VI-046). Abort so the compaction is retried rather than emitting
-			// a lossy merged file. Mirrors NewDiskBucketFileIterator's discipline.
-			return CompactStats{}, fmt.Errorf("valueindex: CompactBucketFiles: decode: %w", err)
-		}
-		if cfg.Checker != nil {
-			filtered, fstats, ferr := filterDeadRefs(ctx, f, cfg.Checker)
-			if ferr != nil {
-				return CompactStats{}, ferr
-			}
-			stats.Retained += fstats.Retained
-			stats.Dropped += fstats.Dropped
-			f = filtered
-		} else {
-			stats.Retained += countBucketRefs(f)
-		}
-		decoded = append(decoded, f)
-	}
-
-	merged, err := MergeBucketFiles(decoded...)
-	if err != nil {
-		return CompactStats{}, fmt.Errorf("valueindex: CompactBucketFiles: merge: %w", err)
-	}
-	SplitIntoBlocks(merged, groupsPerBlock)
-
-	out, err := EncodeBucketFile(merged)
-	if err != nil {
-		return CompactStats{}, fmt.Errorf("valueindex: CompactBucketFiles: encode: %w", err)
-	}
-	if err := output(out); err != nil {
-		return CompactStats{}, err
-	}
-	return stats, nil
 }
 
 // filterDeadRefs returns a copy of f with every BucketBlockRef whose SourceRef is confirmed

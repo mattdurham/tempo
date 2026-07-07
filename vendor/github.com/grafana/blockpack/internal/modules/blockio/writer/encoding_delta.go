@@ -17,12 +17,12 @@ import (
 //	+ base[8 LE] + width[1]
 //	  if width > 0: offset_data_len[4 LE] + raw_offsets  (no zstd — outer snappy per column)
 //
-// NOTE-AP-001: when every row is present, kind KindDeltaUint64AllPresent is emitted and the
+// NOTE-AP-001: when every row is present, kind shared.KindDeltaUint64AllPresent is emitted and the
 // presence_rle_len[4] + presence_rle_data segment is omitted entirely.
 func encodeDeltaUint64(values []uint64, present []bool, nRows int) ([]byte, error) {
 	bitset, presentCount := buildPresenceBitset(present, nRows)
 
-	kind, allPresent := selectAllPresent(KindDeltaUint64, presentCount, nRows)
+	kind, allPresent := selectAllPresent(shared.KindDeltaUint64, presentCount, nRows)
 
 	var rleData []byte
 	if !allPresent {

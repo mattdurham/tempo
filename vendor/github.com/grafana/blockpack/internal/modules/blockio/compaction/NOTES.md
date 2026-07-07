@@ -143,3 +143,86 @@ a trivial factory and delegates to `CompactBlocksStreaming`, keeping one merge/d
 
 Back-ref: `compaction.go:CompactBlocksStreaming`, `compaction.go:openAndProcess`,
 `storage.go:CompactBlocksStreaming`
+
+---
+
+## NOTE-104 — dedupeKey block-column-first fallback removed as dead code (issue #490, task A-10/#104)
+
+Date: 2026-07-07
+
+**Addendum (2026-07-07, holistic-review Fix 2 — supersedes the "cleanly dropped via
+droppedSpans" framing below):** the original landing of this task (recorded unchanged
+further down) left the NOTE-469 legacy condition — a source block entirely lacking the
+`trace:id` block column — as a silent per-row skip counted in `droppedSpans`. A holistic
+cross-task review found this made `writer.go:AddRowFromReader`'s equivalent typed-error
+guard for the identical condition structurally unreachable from compaction (its only
+production caller always calls `dedupeKey` first, which drained every row of a legacy
+block before `AddRowFromReader` was ever invoked), and that the public
+`blockpack.CompactBlocks`/`CompactBlocksStreaming` wrappers discarded `droppedSpans`
+entirely, so this "clean drop" was actually silent, unrecoverable data loss for any caller
+of the sanctioned public API.
+
+`dedupeKey`'s signature changed from `(key [24]byte, ok bool)` to
+`(key [24]byte, err error)`. It now mirrors `AddRowFromReader`'s two-branch treatment of
+the identical condition exactly:
+- `trace:id` block column entirely absent → the shared greppable NOTE-469 error family
+  (`"...legacy intrinsic-only source block unsupported...— re-compact"`, prefixed
+  `"compaction: dedupeKey:"`), propagated up through `addSpanFromBlock` and aborting
+  `CompactBlocks`/`CompactBlocksStreaming`.
+- `trace:id`/`span:id` column present but this row's value absent/malformed → a distinct
+  row-scoped error (`"trace:id missing or malformed at row %d"` /
+  `"span:id missing or malformed at row %d"`).
+
+`droppedSpans` now counts **only** the genuine-duplicate case in `addSpanFromBlock` (the
+`(trace:id, span:id)` pair was already seen) — never legacy-input or malformed-row loss.
+See `SPECS.md` §4 for the full three-case breakdown. `storage.go`'s public
+`CompactBlocks`/`CompactBlocksStreaming` wrappers now also return this count instead of
+discarding it (holistic-review Fix 3).
+
+Back-refs (addendum): `compaction.go:dedupeKey`, `compaction.go:addSpanFromBlock`,
+`storage.go:CompactBlocks`, `storage.go:CompactBlocksStreaming`. Tests:
+`dedupekey_test.go:TestDedupeKey_MissingIdentityColumns_ErrorsOnLegacyIntrinsicOnlySourceBlock`,
+`TestDedupeKey_MalformedRowTraceID_ErrorsDistinctlyFromLegacyBlock`,
+`TestDedupeKey_MissingSpanIDColumn_Errors`,
+`compaction_test.go:TestCompactBlocks_MalformedRowIdentity_ReturnsTypedError`,
+`TestCompactBlocks_NativeColumns_Dedup` (now also asserts `droppedSpans == 1`).
+
+**Reframing note: this landed as a dead-code deletion, not a typed-error conversion** — the
+original task description expected `dedupeKey`'s `idIndex`-based fallback to need converting to
+a typed error for a reachable legacy case. Investigation confirmed `buildDedupeIndex` had
+unconditionally returned `nil` since #433/#434/#436 (its own doc comment already said so
+accurately) — the fallback was provably, permanently unreachable by construction, not merely
+"assumed migrated" or "legacy-data reachable." Deleted outright instead: `buildDedupeIndex()`,
+the `blockIDPair` type (`blockidpair.go`, whole file removed), and the `idIndex` parameter
+threaded through `dedupeKey`/`processBlock`/`addSpanFromBlock`. `dedupeKey` now reads
+`trace:id`/`span:id` exclusively from block columns, unconditionally.
+
+The equivalent `writer/writer.go:AddRowFromReader` site (originally scoped to this task) was
+instead completed as a direct consequence of task A-9/#103's fix (same underlying
+`buildIntrinsicBlockIndex` root cause, two call sites) — see `blockio/writer/NOTES.md` NOTE-469's
+addendum. `executor/executor.go:SpanMatchFromRow` was already clean (NOTE-436).
+`executor/metrics_trace.go` was re-verified via broad grep and confirmed to have no
+identity-dedup pattern at all — not a target.
+
+**Separately, unrelated to the above (a wholly different dead config knob, not part of the
+identity-mechanism confusion this note's main entry addresses):** `compaction.go:334-337`'s
+`Config.OmitIntrinsicIdentityColumns` threading was deleted (task A-12/#106) along with the
+`Config` field itself and its counterparts at `compaction/config.go:28-33`/
+`writer/config.go:173-178` — already non-functional per its own docs, SpanTree is the sole
+identity store for every writer output unconditionally. See `blockio/writer/NOTES.md` NOTE-476's
+addendum for the full detail; this is recorded there (not here) since NOTE-476 is that
+change's home note.
+
+Back-refs: `internal/modules/blockio/compaction/compaction.go:dedupeKey` (deleted
+`buildDedupeIndex`, simplified signature), deleted `blockidpair.go`. Test:
+`dedupekey_test.go:TestDedupeKey_BlockColumnsOnly`,
+`TestDedupeKey_MissingIdentityColumns_ErrorsOnLegacyIntrinsicOnlySourceBlock` (using
+`reader.BuildSyntheticIdentityBlock` and `reader.BuildBlockMissingIdentityColumns`
+respectively). **Correction (see the 2026-07-07 addendum above):** this originally claimed
+the latter test confirms a genuinely legacy-shaped block is "cleanly dropped via the
+existing `droppedSpans` counter, not silently mishandled" — that was true only in
+isolation, not for compaction's only production caller graph, and not for the public
+`storage.go` wrappers. As of the addendum, this case is a typed error (the shared NOTE-469
+family), not a `droppedSpans` increment; see `SPECS.md` §4 for the corrected semantics.
+See `.bob/state/identity-investigation.md` for the full empirical basis (same
+investigation as writer NOTE-469/NOTE-V2-004 addenda and executor NOTE-VI-080).

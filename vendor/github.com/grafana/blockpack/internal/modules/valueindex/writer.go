@@ -479,7 +479,8 @@ func (w *writerImpl) assemble(level uint8, source func(yield func(rawEntry) erro
 	// NOTE-VI-028 (#432): always use v3 when any BlockRef is present (new files are v2+).
 	// v3 adds a string table for SourceRef deduplication.
 	var vinxSection []byte
-	if anyBlockRef {
+	switch {
+	case anyBlockRef:
 		// Build string table for SourceRef deduplication.
 		table := NewStringTable()
 		// Always use v4 (string table + SpanID + RowIdx). v4 supplants v3 (#432/#428).
@@ -497,8 +498,19 @@ func (w *writerImpl) assemble(level uint8, source func(yield func(rawEntry) erro
 		default:
 			vinxSection = encodeVINXSectionVer4(v4ChunkDir, v4ChunkData, table)
 		}
-	} else {
-		vinxSection = encodeVINXSectionVer(chunkDir, chunkData, shared.ValueIndexEntriesVersionV1)
+	case !seen:
+		// No entries at all: the encoded body is empty either way, but new files must
+		// never carry a V1 tag — even a decode-inert one — now that V1 write support is
+		// retired (NOTE-VI-014). Preserves the "always produce a (possibly empty) output
+		// file" contract relied on by compaction.go's writeCompacted.
+		vinxSection = encodeVINXSectionVer(chunkDir, chunkData, shared.ValueIndexEntriesVersion)
+	default:
+		// NOTE-VI-014: write support for legacy pre-BlockRef (V1) entries is retired —
+		// all data was assumed fully migrated to v2+ BlockRefs by the time this branch
+		// would be reached. V1 read support remains intentionally unchanged.
+		return nil, fmt.Errorf(
+			"valueindex: legacy pre-BlockRef entries unsupported — data was not fully migrated as assumed (see NOTES.md NOTE-VI-014)",
+		)
 	}
 
 	// Footer offsets.

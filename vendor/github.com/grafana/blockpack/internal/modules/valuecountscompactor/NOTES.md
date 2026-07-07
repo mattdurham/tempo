@@ -13,10 +13,10 @@ blockevents/valueindex/valueindexconsumer/valueindexcompactor/vibuilder. See spe
 ruling (2026-07-02): `valuecounts` and `valuecountscompactor` are the analogous
 core-format/compactor-service pair for VCNT that `valueindex`/`valueindexcompactor` are for VI.
 
-`valuecounts/NOTES.md` currently holds NOTE-VC-001 through NOTE-VC-006 and NOTE-VC-008
-(NOTE-VC-007 was left explicitly reserved for this file — see the inline note in
-`valuecounts/NOTES.md` at that point in the sequence). This file also holds NOTE-VC-009. Next
-free ID: **NOTE-VC-010**.
+`valuecounts/NOTES.md` currently holds NOTE-VC-001 through NOTE-VC-006, NOTE-VC-008, and
+NOTE-VC-015 (NOTE-VC-007 was left explicitly reserved for this file — see the inline note in
+`valuecounts/NOTES.md` at that point in the sequence). This file also holds NOTE-VC-009 and
+NOTE-VC-010. Next free ID: **NOTE-VC-011**.
 
 ---
 
@@ -148,3 +148,43 @@ Back-ref: `internal/modules/valuecountscompactor/service.go` (`mergeLevel`, `del
 `deleteMaxAttempts`, `deleteRetryBackoff`), `internal/modules/valuecountscompactor/metrics.go`
 (`compactorMetrics.mergeDeleteFailedAfterRetry`, `incDeleteFailedAfterRetry`),
 `internal/modules/valuecountscompactor/doc.go` (corrected "multiple instances are safe" bullet).
+
+---
+
+## NOTE-VC-010 — Test fixture helpers were writing legacy EncodeRecords format; fixed to EncodeVCNTFile (issue #490, task A-3/#110 fallout)
+
+Date: 2026-07-07
+
+**The bug:** `service_test.go`'s `putL0`/`putL0Multi` and `service_internal_test.go`'s `putVCNT`
+test helpers wrote fixture files using `valuecounts.EncodeRecords` (the plain, non-self-describing
+wire format), with comments explicitly stating this simulated "today's `vcntwriter.go` write
+path." This was accurate when written (2026-07-02) but became stale once task A-Tempo-1/#111
+(tempo-mrd, out of this repo's scope) shipped: `vcntwriter.go` now writes self-describing
+`EncodeVCNTFile` output unconditionally, so no real production write path produces the
+`EncodeRecords` shape anymore.
+
+The staleness became a real, silent test-suite bug once `valuecounts`'s own legacy decode
+fallback (`DecodeLegacyVCNTFile`/`DecodeVCNTObject`'s dispatch) was removed under task A-3/#110
+(see `valuecounts/NOTES.md` NOTE-VC-005's addendum): with the fallback gone, `EncodeRecords`-shaped
+fixtures became flatly undecodable. This broke `TestRunOnce_MultipleTenantsAndColumns` and, more
+seriously, `TestRunOnce_UndecodableInputQuarantinedNotBlocking` — the latter's fixtures were ALL
+undecodable (not just its one deliberately-corrupt input), so it was silently passing for the
+wrong reason: it looked like it was testing "one corrupt input among valid ones is quarantined
+without blocking the rest," but every input was actually being quarantined, masking a bug in the
+quarantine test's own blast radius.
+
+**Fix:** all three helpers (`putL0`, `putL0Multi`, `putVCNT`) switched to
+`valuecounts.EncodeVCNTFile`; their doc comments updated to describe the current (self-describing)
+write path instead of the retired one.
+
+**General lesson (see `valuecounts/NOTES.md` NOTE-VC-015 for the cross-reference to a second,
+independent occurrence of the same bug class in tempo's own test suite):** a test-fixture helper
+that hand-constructs a wire format can silently drift out of sync with the real write path it
+claims to simulate, and that drift is invisible until something downstream (here, a legacy decode
+fallback's removal) stops tolerating the stale shape. Fixture-generation helpers that hand-build a
+wire format should be treated as a first-class audit target whenever the corresponding write or
+decode path changes, not just the production code paths themselves.
+
+Back-refs: `internal/modules/valuecountscompactor/service_test.go` (`putL0`, `putL0Multi`),
+`internal/modules/valuecountscompactor/service_internal_test.go` (`putVCNT`). See
+`internal/modules/valuecounts/NOTES.md` NOTE-VC-005 (addendum), NOTE-VC-015; `SPECS.md` SPEC-VC-4.

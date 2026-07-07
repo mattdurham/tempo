@@ -16,7 +16,7 @@ module's SPECS.md numbers from 1, per the established convention in
 independent per-file counters). IDs are assigned in ascending order and never reused or
 renumbered; superseded entries are marked `[SUPERSEDED by SPEC-VC-N]` rather than deleted.
 
-Next free ID: **SPEC-VC-4**.
+Next free ID: **SPEC-VC-6**.
 
 ---
 
@@ -74,8 +74,12 @@ length-prefixed, little-endian conventions.
 
 - Reads the trailing 12 bytes; if `len(data) < 12` or the magic field doesn't match
   `0x56434E31`, returns `ErrNotSelfDescribing` (wrapped via `%w`, `errors.Is`-comparable).
-  **This is not an error condition for the caller to treat as corrupt data** — it signals "try
-  `DecodeLegacyVCNTFile` instead."
+  **[Updated by SPEC-VC-4, issue #490, task A-3/#110]** As of the legacy-decoder removal, this
+  is no longer a signal to retry via a different decoder — `DecodeVCNTFile` is now the sole
+  decode path (see SPEC-VC-4), so `ErrNotSelfDescribing` on real data represents a genuine
+  format error. It remains a distinct sentinel (not folded into a generic decode error) because
+  it still usefully distinguishes "not shaped like a self-describing file at all" from "shaped
+  like one but has a malformed trailer/directory."
 - Validates `bodyLen` is within `[0, len(data)-trailerSize]` before slicing; out-of-bounds
   `bodyLen` is a genuine decode error (not `ErrNotSelfDescribing`).
 - The trailer-supplied `dirCount` is validated against `len(dirBytes)/minDirEntrySize` before
@@ -86,34 +90,37 @@ length-prefixed, little-endian conventions.
   remaining bytes could possibly hold is a decode error, not a panic.
 - On success, delegates to `DecodeAll(body, dir)` using the embedded directory.
 
-**`DecodeLegacyVCNTFile(data []byte) ([]Record, error)` rules:**
+**`DecodeLegacyVCNTFile(data []byte) ([]Record, error)` rules: [SUPERSEDED by SPEC-VC-4 —
+function removed outright, issue #490, task A-3/#110, 2026-07-07]**
 
-- Reconstructs a single-entry directory (`ChunkDirEntry{CompOff: 0, CompLen: len(data)}`)
-  covering the entire payload and decodes via `DecodeAll`.
-- Valid **only** for objects that never exceeded one snappy chunk. Multi-chunk data fed
-  through this path returns an error — `snappy.Decode` fails on a payload of multiple
-  independently-compressed chunks concatenated together — it never returns partial or garbage
-  records (SPEC-ROOT-010).
+- ~~Reconstructs a single-entry directory (`ChunkDirEntry{CompOff: 0, CompLen: len(data)}`)
+  covering the entire payload and decodes via `DecodeAll`.~~
+- ~~Valid only for objects that never exceeded one snappy chunk. Multi-chunk data fed through
+  this path returns an error.~~
+- Kept below for history only; see SPEC-VC-4 for the current (single-decode-path) contract.
 
-**`DecodeVCNTObject(data []byte) ([]Record, error)` rules:**
+**`DecodeVCNTObject(data []byte) ([]Record, error)` rules: [REVISED by SPEC-VC-4 — issue #490,
+task A-3/#110, 2026-07-07; the function itself is NOT removed]**
 
-- Tries `DecodeVCNTFile` first. On success, returns its result.
-- If `DecodeVCNTFile` returns `ErrNotSelfDescribing`, falls back to `DecodeLegacyVCNTFile`.
-- Any other error from `DecodeVCNTFile` (e.g. malformed self-describing trailer/directory) is
-  propagated directly — it is not treated as a legacy-format signal.
-- This is the compactor's per-input-file decode entry point: it must transparently accept both
-  self-describing files (this package's own future output) and legacy files (today's real
-  `vcntwriter.go` write-path output, see NOTE-VC-005).
+- ~~Tries `DecodeVCNTFile` first. On success, returns its result. If `DecodeVCNTFile` returns
+  `ErrNotSelfDescribing`, falls back to `DecodeLegacyVCNTFile`.~~ Now calls `DecodeVCNTFile`
+  directly and propagates any error unchanged — there is no fallback decoder left to dispatch to.
+- Retained as its own named function (not inlined into callers) because it has real production
+  callers (`valuecountscompactor/service.go`, `vcnt.go:VCNTBuildSectionFromObjects`) that
+  shouldn't need churn if a future VCNT format variant is ever added.
+- See SPEC-VC-4 for the current authoritative contract.
 
-**Rationale:** `vcntwriter.go` (tempo-mrd, out of this repo's scope) discards the
-`[]ChunkDirEntry` that `EncodeRecords` returns, so no persisted VCNT object today carries its
-own directory. `EncodeVCNTFile`/`DecodeVCNTFile` close that gap for this package's own output;
-`DecodeLegacyVCNTFile` and `DecodeVCNTObject` let a compactor built on this package correctly
-read files written by the existing, un-migrated write path in the interim.
+**Rationale (historical):** `vcntwriter.go` (tempo-mrd, out of this repo's scope) used to
+discard the `[]ChunkDirEntry` that `EncodeRecords` returns, so no persisted VCNT object could
+carry its own directory. `EncodeVCNTFile`/`DecodeVCNTFile` closed that gap for this package's own
+output; `DecodeLegacyVCNTFile` and `DecodeVCNTObject` let a compactor built on this package
+correctly read files written by that un-migrated write path in the interim. **As of task
+A-Tempo-1/#111 (2026-07-07), `vcntwriter.go` itself writes self-describing `EncodeVCNTFile`
+output unconditionally, closing the gap at the source — see SPEC-VC-4.**
 
-Back-ref: `internal/modules/valuecounts/selfdescribing.go` (`EncodeVCNTFile` line 35,
-`DecodeVCNTFile` line 51, `decodeDirEntries` line 137, `DecodeLegacyVCNTFile` line 82,
-`DecodeVCNTObject` line 95).
+Back-ref: `internal/modules/valuecounts/selfdescribing.go` (`EncodeVCNTFile`,
+`DecodeVCNTFile`, `decodeDirEntries`, `DecodeVCNTObject` — `DecodeLegacyVCNTFile` deleted, see
+SPEC-VC-4).
 
 ---
 
@@ -135,12 +142,70 @@ test-local reimplementation of `Compact`'s grouping/summing/drop rules that coul
 drift from the real logic. `VCNTRecord` (`vcnt.go:21`) is already a type alias for
 `valuecounts.Record`, so no data conversion occurs at the wrapper boundary.
 
-**Scope note:** this is the only new root-package (`blockpack`) public API surface added for
-this purpose — root `CLAUDE.md` requires explicit user permission before adding new public API
-surface, obtained for this addition specifically; it should not be read as license to add
-further `valuecounts` re-exports without the same explicit approval.
+**Scope note:** this was originally the only new root-package (`blockpack`) public API surface
+added for this purpose under root `CLAUDE.md`'s per-addition-approval rule. **Superseded
+2026-07-07:** the maintainer granted blanket public-API change permission for the read-path
+modernization project (see `NOTES.md` NOTE-VC-015), which now covers further `valuecounts`
+root-package re-export additions/removals without per-addition approval — see SPEC-VC-4/SPEC-VC-5
+for the changes made under that grant.
 
 Back-refs: `vcnt.go:46` (`CompactVCNTRecords`), `internal/modules/valuecounts/compaction.go:25`
 (`Compact`, SPEC-VC-1). Consumer: tempo-mrd's `tempodb/encoding/vblockpack/vcntwriter_test.go`
 (`TestVCNTFlush_CrossBlockMinuteCoalescing`, out of this repo's scope — tempo-mrd has no
 SPECS.md/NOTES.md convention for this code). See `NOTES.md` NOTE-VC-011.
+
+---
+
+## SPEC-VC-4: DecodeVCNTFile is the sole supported decode path (legacy single-chunk reconstruction removed)
+*Added: 2026-07-07*
+
+**Contract:** `DecodeVCNTFile` is the only supported decode path for VCNT objects in this
+package. The legacy single-chunk reconstruction fallback (`DecodeLegacyVCNTFile`, formerly
+described under SPEC-VC-2) is removed — issue #490, task A-3/#110 — now that the write path
+(tempo-mrd's `vcntwriter.go`, task A-Tempo-1/#111) always emits self-describing output
+unconditionally, and the project-wide stored-data wipe retires any pre-existing legacy-shaped
+objects.
+
+**Rules:**
+
+- `DecodeVCNTFile(data []byte) ([]Record, error)` behavior is UNCHANGED from SPEC-VC-2's
+  original description (trailer/magic validation, `bodyLen` bounds check, `dirCount` OOM guard)
+  — only its role changes, from "one of two dispatch targets" to "the only decode path."
+- `ErrNotSelfDescribing` is KEPT as a distinct sentinel (still `errors.Is`-comparable) — it
+  still usefully distinguishes "not shaped like a self-describing file" from a genuine
+  malformed-trailer/directory decode error on data that IS self-describing. It no longer
+  signals "retry via a different decoder" (there is none); on real input it represents a
+  genuine format error.
+- `DecodeVCNTObject(data []byte) ([]Record, error)` is KEPT as a named function — it now calls
+  `DecodeVCNTFile` directly and propagates any error unchanged (no fallback dispatch). It
+  remains the compactor's per-input-file decode entry point (`valuecountscompactor/service.go`,
+  `vcnt.go:VCNTBuildSectionFromObjects`).
+- No migration/dual-read window is provided or needed: the project's stored-data wipe (issue
+  #490) removes any object that could still be in the legacy shape before this ships.
+
+**Rationale:** One encoder, one decoder, per this project's no-backward-compatibility directive
+— see `NOTES.md` NOTE-VC-015 for the full three-task sequencing (A-1/A-3/A-17) this contract is
+the end-state of.
+
+Back-refs: `internal/modules/valuecounts/selfdescribing.go` (`DecodeVCNTFile`, `DecodeVCNTObject`
+— `DecodeLegacyVCNTFile` deleted). `NOTES.md` NOTE-VC-005 (addendum), NOTE-VC-015.
+
+---
+
+## SPEC-VC-5: EncodeVCNTFile — public re-export of EncodeVCNTFile for external callers
+*Added: 2026-07-07*
+
+**Contract:** `blockpack.EncodeVCNTFile(records []VCNTRecord, perChunk int) []byte` (root
+package, `vcnt.go`) is a thin, behavior-preserving public wrapper around this package's
+`EncodeVCNTFile` (SPEC-VC-2): `return valuecounts.EncodeVCNTFile(records, perChunk)`. It
+introduces no new semantics — every rule in SPEC-VC-2's `EncodeVCNTFile` contract (wire
+format, trailer layout) applies identically through this entry point.
+
+**Note:** the root package's older `EncodeVCNTRecords` re-export (a non-self-describing,
+single-chunk-only encoder) is REMOVED (issue #490, task A-17/#121, 2026-07-07) — it had zero
+remaining consumers once tempo-mrd's `vcntwriter.go` switched to this function. `EncodeVCNTFile`
+is now the sole root-package VCNT encoder. See `NOTES.md` NOTE-VC-015.
+
+Back-refs: `vcnt.go:EncodeVCNTFile`, `internal/modules/valuecounts/selfdescribing.go:EncodeVCNTFile`
+(SPEC-VC-2). Test: `vcnt_test.go:TestEncodeVCNTFile_RoundTrip`. Consumer: tempo-mrd's
+`vcntwriter.go` (out of this repo's scope).

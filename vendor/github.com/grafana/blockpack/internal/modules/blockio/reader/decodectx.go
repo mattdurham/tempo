@@ -1,6 +1,5 @@
 package reader
 
 type decodeCtx struct {
-	intern  map[string]string
-	scratch *[]byte
+	intern map[string]string
 }

@@ -202,7 +202,6 @@ const (
 )
 
 // Encoding kind constants per SPECS §9.
-// Canonical definitions — writer/constants.go re-exports these as aliases for backward compatibility.
 const (
 	KindDictionary       uint8 = 1
 	KindSparseDictionary uint8 = 2
@@ -422,15 +421,6 @@ const (
 	ValueIndexEntriesVersionV4 uint8 = 0x04 // V3 + SpanID[8] + RowIdx[2] per entry (issue #428, default)
 	ValueIndexKLLVersion       uint8 = 0x01
 
-	// ValueIndexTraceVersion is the encode version for the legacy flat-blob TraceID
-	// index payload (TraceGroup/SpanEntry parent-child structure, issue #428,
-	// NOTE-VI-038). This is the v1 whole-object format: a single snappy stream with
-	// no offset table, no per-block metadata, and no bloom, so every trace-by-id
-	// lookup required a full download + full decode. Retained only for reading old
-	// files during the rollover window (NOTE-VI-047); new files use the v2 batched
-	// TraceBlockGroup format (magic "VTG2", ValueIndexTraceGroupsPerBlock).
-	ValueIndexTraceVersion uint8 = 0x01
-
 	// ValueIndexTraceGroupsPerBlock is the maximum number of TraceGroups packed into
 	// a single block of a v2 batched TraceGroup index file (issue #476). Each block
 	// carries its own min/max TraceID, min/max TimeSec, and a bloom over its trace
@@ -473,11 +463,6 @@ const (
 	ValueIndexCompactThresholdBytes = 64 << 20 // 64 MiB
 	// ValueIndexCompactMaxLevel is the max compaction level (0 = unlimited).
 	ValueIndexCompactMaxLevel = 0
-
-	// ValueIndexFilenamePattern is fmt.Sprintf(ValueIndexFilenamePattern, level, id).
-	//
-	// Deprecated: use ValueIndexFilenamePatternV2 which embeds wall time range.
-	ValueIndexFilenamePattern = "L%d-%s.blockpack"
 
 	// ValueIndexFilenamePatternV2 embeds wall-clock time range for O(1) file discovery.
 	// fmt.Sprintf(ValueIndexFilenamePatternV2, level, wallMinSec, wallMaxSec, id)

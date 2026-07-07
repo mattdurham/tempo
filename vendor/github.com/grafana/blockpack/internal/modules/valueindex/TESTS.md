@@ -10,7 +10,7 @@ Entries in this file use the module-local, sequential prefix `TEST-VI-N` (file-s
 SPEC-ROOT-009 — distinct from the `NOTE-VI-N` numbering in `NOTES.md`). IDs are assigned in
 ascending order and never reused or renumbered.
 
-Next free ID: **TEST-VI-13**.
+Next free ID: **TEST-VI-15**.
 
 ---
 
@@ -318,3 +318,55 @@ contract, described in `NOTES.md` NOTE-VI-053, not a formal SPECS.md invariant.
 Back-ref: `internal/modules/valueindex/temp_cleanup_test.go:TestSweepOrphanedMergeTempFiles_RemovesOnlyMatchingPrefix`,
 `TestSweepOrphanedMergeTempFiles_ToleratesMissingDir`,
 `TestSweepOrphanedMergeTempFiles_ExportedWrapperUsesOSTempDir`.
+
+---
+
+## TEST-VI-13: TestWriter_ReturnsErrorOnLegacyV1EncodeAttempt
+*Added: 2026-07-07*
+
+**Scenario:** issue #490, task A-8/#102 — write support for V1 (pre-BlockRef) entries is
+retired; `writer.go`'s `assemble()` must return a typed error rather than silently encoding a
+V1-shaped VINX section.
+
+**Setup:** An `AddEntry()`-only (v1 API) batch — at least one entry, none carrying a v2+
+`BlockRef`/`SpanID` (`seen && !anyBlockRef`) — flushed via the writer.
+
+**Assertions:** `Flush()` returns a non-nil error matching
+`"valueindex: legacy pre-BlockRef entries unsupported — data was not fully migrated as assumed
+(see NOTES.md NOTE-VI-014)"`. A zero-entry batch is unaffected — it still succeeds via the
+empty-file encoding path, now tagged `shared.ValueIndexEntriesVersion` (V2) rather than V1
+(task #116's fix).
+
+**Spec invariants tested:** NOTE-VI-014 (addendum).
+
+Back-ref: `internal/modules/valueindex/writer_test.go:TestWriter_ReturnsErrorOnLegacyV1EncodeAttempt`.
+
+---
+
+## TEST-VI-14: TestDecodeTraceGroups_ImplausibleGroupCountRejected (rewritten against v2 decoder)
+*Added: 2026-07-07*
+
+**Scenario:** issue #490, task A-2/#97 — the pre-allocation `groupCount` bounds check for
+`DecodeTraceGroups` must still be exercised after the legacy v1 flat-blob decode path was
+removed (NOTE-VI-079). This test previously built its corrupted-`groupCount` fixture using the
+legacy v1 encoding; it is rewritten to call `decodeTraceBlockBody` (the v2 per-block decoder)
+directly with a corrupted `groupCount`, preserving the same regression coverage against the
+current-format code path.
+
+**Setup:** A hand-built v2 per-block payload with a `groupCount` field set to an implausible
+value relative to the remaining payload bytes.
+
+**Assertions:** `decodeTraceBlockBody` returns a non-nil error; does not attempt an
+oversized allocation.
+
+**Spec invariants tested:** NOTE-VI-079, SPEC-ROOT-001.
+
+Back-ref: `internal/modules/valueindex/traceindex_test.go:TestDecodeTraceGroups_ImplausibleGroupCountRejected`.
+
+**Also superseded by NOTE-VI-079 (issue #490, task A-2/#97):** `TestTraceV2_LegacyBlobStillDecodes`
+and its `makeLegacyTraceBlob` fixture (`traceindexquery_test.go`) — deleted, no replacement
+needed (the legacy blob format itself is retired, not merely a decode variant to keep testing).
+`TestFilenameV1Compatibility` (`filename_v2_test.go`) — superseded by
+`TestParseFilenameV2_RejectsV1Filename` (issue #490, task A-5/#99, see NOTES.md NOTE-VI-037
+addendum). `TestDiscoverIndexFiles_V1FilenameAlwaysIncluded` (`discovery_test.go`) — superseded
+by `TestDiscoverIndexFiles_V1FilenameSkipped` (same task).

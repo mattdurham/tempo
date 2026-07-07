@@ -169,55 +169,27 @@ func buildBlock(
 	bb.intrinsicBlockID = uint16(blockID) //nolint:gosec // safe: blockID bounded by 65534 (checked by caller)
 	bb.v2IdentityInBlock = v2IdentityInBlock
 
-	// Pre-build per-(reader, srcBlockIdx) intrinsic index to avoid O(N) linear scans
-	// inside feedIntrinsicsFromIndex. Index is built once per unique (reader, blockIdx)
-	// pair; each row then does an O(1) slice index (NOTE-471).
-	type readerBlockKey struct {
-		r        *modules_reader.Reader
-		blockIdx int
-	}
-	var intrinsicIndexCache map[readerBlockKey]intrinsicRowFields
-	for i := range pending {
-		ps := &pending[i]
-		if ps.srcReader == nil {
-			continue
-		}
-		k := readerBlockKey{ps.srcReader, ps.srcBlockIdx}
-		if intrinsicIndexCache == nil {
-			intrinsicIndexCache = make(map[readerBlockKey]intrinsicRowFields)
-		}
-		if _, already := intrinsicIndexCache[k]; !already {
-			intrinsicIndexCache[k] = buildIntrinsicBlockIndex(ps.srcReader, ps.srcBlockIdx)
-		}
-	}
-
 	for rowIdx := range pending {
 		ps := &pending[rowIdx]
 		switch {
 		case ps.srcBlock != nil:
-			bb.addRowFromBlock(ps.srcBlock, ps.srcRowIdx, rowIdx)
-			if ps.srcReader != nil {
-				k := readerBlockKey{ps.srcReader, ps.srcBlockIdx}
-				// feedIntrinsicsFromIndex is only needed for v4+ blocks that store
-				// identity columns (trace:id, span:id, span:parent_id) exclusively in
-				// the intrinsic section. For legacy dual-storage blocks (same fields in
-				// both block columns and the intrinsic section), addRowFromBlock has
-				// already written these fields via applyTraceID and friends — the block
-				// column iteration in addRowFromBlock visits each identity column.
-				// Calling feedIntrinsicsFromIndex for a dual-storage block would
-				// append a second entry to the intrinsic accumulator for the same
-				// (blockIdx, rowIdx), causing GetTraceByID to return each span twice.
-				//
-				// NOTE-469 (issue #389): freshly-written and recompacted v4+ blocks have
-				// no trace:id block column, so this gate routes them through
-				// feedIntrinsicsFromIndex, which carries all three identity columns
-				// (incl. span:parent_id) from the source intrinsic section.
-				// For v2 source blocks, identity IS in the block column; addRowFromBlock
-				// handled it already via applyTraceID, so the check still works.
-				if ps.srcBlock.GetColumn(traceIDColumnName) == nil {
-					bb.feedIntrinsicsFromIndex(intrinsicIndexCache[k], ps.srcRowIdx, rowIdx)
-				}
+			// NOTE-469/NOTE-V2-004(writer) (#490 A-9, re-scoped per
+			// .bob/state/identity-investigation.md): identity columns (trace:id,
+			// span:id, span:parent_id) are always block columns for any source written
+			// since the v2 self-contained-block format (issue #420) — the per-column
+			// switch inside addRowFromBlock below always applies them via
+			// applyTraceID/applySpanID/applySpanParentID. A source block genuinely
+			// missing the trace:id column predates that format (the #389-#420
+			// intrinsic-only window, NOTE-469); the file-level IntrinsicTOC/SpanTree
+			// section that once carried identity for those files was deleted under
+			// #433/#434, so there is no fallback left to recover it from — such a
+			// block can no longer be compacted.
+			if ps.srcBlock.GetColumn(traceIDColumnName) == nil {
+				return builtBlock{}, bb, fmt.Errorf(
+					"writer: legacy intrinsic-only source block unsupported (missing trace:id block column, see NOTES.md NOTE-469) — re-compact",
+				)
 			}
+			bb.addRowFromBlock(ps.srcBlock, ps.srcRowIdx, rowIdx)
 		case ps.tempoSpan != nil:
 			bb.addRowFromTempoProto(ps, rowIdx)
 		default:
@@ -741,13 +713,14 @@ func readDynAttrValue(col *modules_reader.Column, rowIdx int, baseType shared.Co
 	return val, true
 }
 
-// applyTraceID feeds trace:id into the intrinsic accumulator (NOTE-469: intrinsic-only,
-// no block column). For v2 output (b.v2IdentityInBlock), also writes to the block payload.
+// applyTraceID copies trace:id from a source block column to the destination block.
 // Returns the extracted traceID and whether it was valid.
 //
-// NOTE-469: fires only when compacting a legacy dual-storage source block that carries
-// the trace:id block column. v4+ sources carry identity via feedIntrinsicsFromIndex.
-// applyTraceID copies trace:id from source to destination block. After #433, always writes to block column.
+// NOTE-V2-004(writer)/NOTE-469 (#490 A-9): this is the sole, unconditional identity path —
+// every source block reaching addRowFromBlock carries trace:id as a block column (the v2
+// self-contained format, issue #420); buildBlock's caller returns a typed error before
+// addRowFromBlock is invoked at all when that column is absent (the #389-#420
+// intrinsic-only-era shape, now unsupported).
 func (b *blockBuilder) applyTraceID(
 	col *modules_reader.Column,
 	srcRowIdx, dstRowIdx int,
@@ -762,11 +735,9 @@ func (b *blockBuilder) applyTraceID(
 	return traceID, false
 }
 
-// applySpanID feeds span:id into the intrinsic accumulator (NOTE-469: intrinsic-only,
-// no block column). For v2 output (b.v2IdentityInBlock), also writes to the block payload.
-// Legacy-source path only — see applyTraceID.
+// applySpanID copies span:id from a source block column to the destination block.
+// Sole, unconditional identity path — see applyTraceID.
 func (b *blockBuilder) applySpanID(col *modules_reader.Column, srcRowIdx, dstRowIdx int) {
-	// After #433 (IntrinsicTOC removal), always write to block columns.
 	if v, ok := col.BytesValue(srcRowIdx); ok && len(v) > 0 {
 		b.feedIntrinsicBytes(spanIDColumnName, shared.ColumnTypeBytes, v, dstRowIdx)
 		b.addPresent(dstRowIdx, spanIDColumnName, shared.ColumnTypeBytes,
@@ -774,8 +745,8 @@ func (b *blockBuilder) applySpanID(col *modules_reader.Column, srcRowIdx, dstRow
 	}
 }
 
-// applySpanParentID feeds span:parent_id into the intrinsic accumulator and block column.
-// After #433 (IntrinsicTOC removal), always writes to block payload.
+// applySpanParentID copies span:parent_id from a source block column to the destination
+// block. Sole, unconditional identity path — see applyTraceID.
 func (b *blockBuilder) applySpanParentID(col *modules_reader.Column, srcRowIdx, dstRowIdx int) {
 	if v, ok := col.BytesValue(srcRowIdx); ok && len(v) > 0 {
 		b.feedIntrinsicBytes(spanParentIDColumnName, shared.ColumnTypeBytes, v, dstRowIdx)
@@ -967,14 +938,6 @@ func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx
 			continue
 		}
 
-		// NOTE-480 (issue #472): VectorF32 columns (legacy __embedding__) are no longer
-		// written — the embedder integration was removed. Legacy source blocks may still
-		// carry a VectorF32 column; drop it during merge rather than re-emitting it. The
-		// reader still decodes VectorF32 so existing blocks remain queryable.
-		if baseType == shared.ColumnTypeVectorF32 {
-			continue
-		}
-
 		// Dynamic attribute columns: read typed value and call addPresent to write to block column.
 		val, ok := readDynAttrValue(col, srcRowIdx, baseType)
 		if !ok {
@@ -1049,161 +1012,6 @@ func (b *blockBuilder) finalizeRowBookkeeping(
 	// (T-TS-2 implied-timestamp sketch removed with the KLL sketch index in #435.)
 
 	b.spanCount++
-}
-
-// intrinsicRowEntry holds the per-row identity field values for a single source-block
-// row. The three identity columns (trace:id, span:id, span:parent_id) are all bytes
-// columns, so each field is a []byte view that aliases the decoded column buffer
-// (no per-row copy). A nil field means that column had no value at this row.
-//
-// NOTE-471 (issue #391): replaces the previous per-row map[string]any. The old
-// representation allocated one map (≈10-entry backing array) per span row, which on a
-// 2.6M-span L1 block produced ~170 GB of live heap across compaction workers and drove
-// GC to ~22% CPU. A fixed three-field struct in a single dense slice removes all
-// per-row allocation and map-iteration overhead while preserving O(1) row lookup.
-type intrinsicRowEntry struct {
-	traceID  []byte
-	spanID   []byte
-	parentID []byte
-}
-
-// intrinsicRowFields is a per-row value cache built once per source block during
-// compaction. It is a dense slice indexed by rowIdx (bounded by SpanCount ≤ 65535).
-//
-// NOTE-471 (issue #391): a single backing slice replaces the prior
-// map[uint16]map[string]any to eliminate O(spans) map allocations.
-type intrinsicRowFields struct {
-	rows []intrinsicRowEntry
-}
-
-// get returns the entry for rowIdx and whether it is in range. The bool mirrors the
-// presence semantics of the old map lookup so callers can early-return on a miss.
-func (f intrinsicRowFields) get(rowIdx int) (intrinsicRowEntry, bool) {
-	if rowIdx < 0 || rowIdx >= len(f.rows) {
-		return intrinsicRowEntry{}, false
-	}
-	return f.rows[rowIdx], true
-}
-
-// valid reports whether the index was actually built (vs. a zero value returned when
-// the source reader has no intrinsic section).
-func (f intrinsicRowFields) valid() bool {
-	return f.rows != nil
-}
-
-// buildIntrinsicBlockIndex builds a per-row intrinsic field cache for the given
-// (reader, srcBlockIdx) pair. Each intrinsic column is read once (O(N) over the
-// column's BlockRefs), avoiding the O(N) per-row linear scan done by IntrinsicBytesAt
-// and friends. Returns the zero value (valid()==false) when r has no intrinsic section.
-//
-// NOTE-471 (issue #391): the result is a dense slice of intrinsicRowEntry indexed by
-// rowIdx. Each identity field is a []byte view aliasing the column's decoded buffer; no
-// per-row allocation is performed beyond the single slice grow.
-func buildIntrinsicBlockIndex(r *modules_reader.Reader, srcBlockIdx int) intrinsicRowFields {
-	if r == nil {
-		return intrinsicRowFields{}
-	}
-	// NOTE: IsV2Format() check removed (2026-06-29, v2 unconditional).
-	// V2 files (now unconditional) store identity columns in block payload.
-	// buildIntrinsicBlockIndex is a no-op; addRowFromBlock handles them directly.
-	// (Kept fallback logic below for legacy block handling.)
-	// Only scan identity columns that v4+ blocks store exclusively in the intrinsic
-	// section. All other intrinsic columns (span:kind, span:status, resource.service.name,
-	// span:start, span:duration, span:name, etc.) are present in block columns and are
-	// already written by addRowFromBlock — rebuilding them here would be redundant and was
-	// the dominant CPU cost (dict-entry scan at ~40% of compaction CPU).
-	//
-	// NOTE-469 (issue #389): span:parent_id joins trace:id and span:id here. With the block
-	// column dropped, addRowFromBlock no longer visits span:parent_id, so it must be carried
-	// from the source intrinsic section during compaction or it would be lost on recompaction.
-
-	// Pre-allocate rows using the known span count for this block to avoid incremental
-	// slice growth (which was O(N²) copy cost when rowIdx values are non-monotonic).
-	spanCount := 0
-	if srcBlockIdx < r.BlockCount() {
-		spanCount = int(r.BlockMeta(srcBlockIdx).SpanCount)
-	}
-	out := intrinsicRowFields{
-		rows: make([]intrinsicRowEntry, spanCount),
-	}
-	setField := func(rowIdx uint16, colName string, val []byte) {
-		idx := int(rowIdx)
-		if idx >= len(out.rows) {
-			// Safety: grow if rowIdx exceeds pre-allocated size (should not happen).
-			grown := make([]intrinsicRowEntry, idx+1)
-			copy(grown, out.rows)
-			out.rows = grown
-		}
-		switch colName {
-		case traceIDColumnName:
-			out.rows[idx].traceID = val
-		case spanIDColumnName:
-			out.rows[idx].spanID = val
-		case spanParentIDColumnName:
-			out.rows[idx].parentID = val
-		}
-	}
-	identityOnly := []string{traceIDColumnName, spanIDColumnName, spanParentIDColumnName}
-
-	// After #433 (IntrinsicTOC removal), identity fields come from block columns.
-	// Identity fields are now written to block columns by feedSpanIdentifiers.
-	if srcBlockIdx < r.BlockCount() {
-		if bwb, bErr := r.GetBlockWithBytes(srcBlockIdx, nil); bErr == nil && bwb != nil {
-			block := bwb.Block
-			for _, colName := range identityOnly {
-				col := block.GetColumn(colName)
-				if col == nil {
-					continue
-				}
-				for rowIdx := range block.SpanCount() {
-					v, ok := col.BytesValue(rowIdx)
-					if !ok {
-						continue
-					}
-					setField(uint16(rowIdx), colName, v) //nolint:gosec // rowIdx bounded by SpanCount
-				}
-			}
-		}
-	}
-
-	if out.rows == nil {
-		out.rows = []intrinsicRowEntry{}
-	}
-	return out
-}
-
-// feedIntrinsicsFromIndex copies trace:id, span:id, and span:parent_id from a pre-built
-// per-block identity index into this block's intrinsic accumulator at dstRowIdx. Only
-// these columns require the index because v4+ blocks store them exclusively in the
-// intrinsic section (not in block columns, NOTE-469). All other intrinsic values
-// (span:kind, resource.service.name, span:status, span:duration, etc.) are present in
-// block columns and are already written by addRowFromBlock — no index needed for them.
-//
-// NOTE-469 (issue #389): for v1 output, feeds the intrinsic accumulator only — no addPresent
-// block-column write. For v2 output (b.v2IdentityInBlock), also writes to the block payload
-// so identity is self-contained in the block bytes (NOTE-V2-003, issue #417).
-// feedIntrinsicsFromIndex copies trace:id, span:id, span:parent_id to block columns.
-// After #433 (IntrinsicTOC removal), always writes to block payload.
-func (b *blockBuilder) feedIntrinsicsFromIndex(index intrinsicRowFields, srcRowIdx, dstRowIdx int) {
-	if !index.valid() {
-		return
-	}
-	fields, ok := index.get(srcRowIdx)
-	if !ok {
-		return
-	}
-	if fields.traceID != nil {
-		b.addPresent(dstRowIdx, traceIDColumnName, shared.ColumnTypeBytes,
-			shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: fields.traceID})
-	}
-	if fields.spanID != nil {
-		b.addPresent(dstRowIdx, spanIDColumnName, shared.ColumnTypeBytes,
-			shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: fields.spanID})
-	}
-	if fields.parentID != nil {
-		b.addPresent(dstRowIdx, spanParentIDColumnName, shared.ColumnTypeBytes,
-			shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: fields.parentID})
-	}
 }
 
 // internColName returns the full column name for the given attribute key and prefix,

@@ -338,13 +338,10 @@ type CompactionConfig = modules_compaction.Config
 // output receives the compacted files via its Put method.
 //
 // Returns the relative paths of all output files written to output, and the count of
-// spans dropped due to genuine (trace:id, span:id) duplication.
-//
-// DEV-ONLY HAND-PATCH (holistic-review Fix 3, 2026-07-07): this vendored copy predates a
-// blockpack change surfacing droppedSpans through this wrapper instead of discarding it.
-// Hand-patched here, mirroring the A-Tempo-1 pattern, so tempo's non-vendor call sites can
-// already consume the new 3-value return before the real revendor lands. Minimal — will be
-// replaced wholesale at the next `go mod vendor`.
+// spans dropped due to genuine (trace:id, span:id) duplication (holistic-review Fix 3 —
+// this signal was previously discarded here; see internal/modules/blockio/compaction
+// NOTES.md NOTE-104). A source block with missing or malformed trace:id/span:id identity
+// now returns an error instead of contributing to this count.
 func CompactBlocks(
 	ctx context.Context,
 	providers []ReaderProvider,
@@ -370,9 +367,10 @@ type CompactionProviderFunc = modules_compaction.ProviderFunc
 // exactly one block and must not capture references that pin earlier blocks in memory.
 //
 // Returns the relative paths of all output files written to output, and the count of
-// spans dropped due to genuine (trace:id, span:id) duplication.
-//
-// DEV-ONLY HAND-PATCH (holistic-review Fix 3, 2026-07-07): see CompactBlocks above.
+// spans dropped due to genuine (trace:id, span:id) duplication (holistic-review Fix 3 —
+// this signal was previously discarded here; see internal/modules/blockio/compaction
+// NOTES.md NOTE-104). A source block with missing or malformed trace:id/span:id identity
+// now returns an error instead of contributing to this count.
 func CompactBlocksStreaming(
 	ctx context.Context,
 	providers []CompactionProviderFunc,

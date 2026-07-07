@@ -156,3 +156,28 @@ V14 column. All goroutines see identical decoded values; no data race is reporte
 decompressOnce ensures exactly one snappy decode; decodeOnce serializes full column decode;
 decoded atomic.Bool signals completion to concurrent callers.
 **Spec invariant:** NOTE-CONC-001 — decoded atomic.Bool is the cross-goroutine signal; SPEC-V14-002 decompression is concurrent-safe.
+
+---
+
+## READER-TEST-017: Removed InlineBytes Kinds Rejected
+**Function:** `TestReadColumnEncoding_RejectsRemovedInlineBytesKinds`
+**File:** `internal/modules/blockio/reader/encoding_removed_kinds_test.go`
+**What it tests:** A column blob naming `shared.KindInlineBytes` (3) or
+`shared.KindSparseInlineBytes` (4) now errors at decode time (`"column encoding: unknown kind
+%d"`) instead of decoding — issue #490, task A-14/#108 removed these reader-only legacy decode
+arms since the current writer never emits them and the project-wide stored-data wipe retires any
+file that could still name them.
+**Spec invariant:** reader NOTE-490 (issue #490).
+
+---
+
+## READER-TEST-018: Legacy VectorF32 Decode Removed
+**File:** `internal/modules/blockio/reader/legacy_vectorf32_test.go` — **DELETED (issue #490, task
+A-6/#100, 2026-07-07)**
+**What changed:** this file's entire test suite exercised `decodeVectorF32`/`Column.VectorF32Value`
+(deleted). A block still physically carrying a VectorF32 column now hard-errors at decode time
+instead of decoding gracefully — see writer NOTE-480's addendum for the full deliberate
+behavior-change rationale. No replacement negative-case test was added under this file's own
+convention since the removed dispatch arm falls through to the same pre-existing "unknown kind"
+error path documented by READER-TEST-017 (same failure mode, different removed kind).
+**Spec invariant:** writer/NOTES.md NOTE-480 (addendum, issue #490).

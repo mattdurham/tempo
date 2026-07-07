@@ -58,3 +58,19 @@ baseline; further slowdown is not.
 + peak-memory bound contract, `internal/modules/valueindex/SPECS.md`).
 
 Back-ref: `internal/modules/valueindex/stream_compaction_bench_test.go:BenchmarkCompactBucketFiles_OldVsStreaming`.
+
+**Updated (2026-07-07, issue #490, task A-4/#98):** the `_old` (`CompactBucketFiles`) comparison
+arm no longer exists — that function is deleted (zero remaining production callers, see
+`NOTES.md` NOTE-VI-053 addendum). The benchmark is renamed `BenchmarkStreamCompactBucketFiles`
+(top-level, no longer a `b.Run` subtest) and now stands alone as a baseline for the streaming
+path only. **The historical `_old`/`_streaming` comparison numbers above are RETAINED, not
+deleted, per this file's regression-threshold convention** — they remain the last known
+old-path baseline for historical reference, but are no longer an active regression comparison
+target since there is no old path left to compare against.
+
+**Regression threshold, updated:** flag if `BenchmarkStreamCompactBucketFiles`'s `allocs/op` or
+`B/op` regresses past the `_streaming` baseline above (284,190 allocs/op, 16.97 MB/op) — the
+old-path comparison columns are historical context only, not a live threshold. The `ns/op`
+threshold (> ~39.3 ms) from the original entry still applies unchanged.
+
+Back-ref (updated): `internal/modules/valueindex/stream_compaction_bench_test.go:BenchmarkStreamCompactBucketFiles`.

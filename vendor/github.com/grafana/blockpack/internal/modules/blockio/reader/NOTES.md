@@ -1604,8 +1604,11 @@ passes an `allPresent bool` to the relevant `decode*` function. The shared
 unchanged position, consuming zero bytes. All downstream index/value logic is unchanged because the
 base dense decoders already read a full `rowCount`-length index array independent of presence.
 
-Old files (and files written with `DisableAllPresentEncoding`) continue to use the base kinds and
-the existing `decodePresenceRLEFromSlice` path; both forms decode to identical columns.
+Old files continue to use the base kinds and the existing `decodePresenceRLEFromSlice` path;
+both forms decode to identical columns. **Addendum (2026-07-07, issue #490, task A-15/#109):**
+the `DisableAllPresentEncoding` rollout flag this sentence used to reference is removed outright
+(see writer NOTE-AP-001's own addendum) — AllPresent selection is now unconditional whenever a
+column is fully present; only genuinely pre-cutover files still use the base kinds.
 
 Back-ref: `reader/column.go:readColumnEncoding`/`decodePresenceMaybe`,
           `shared/presence_rle.go:AllPresentBitset`, `shared/constants.go:BaseKindFor`,
@@ -3459,6 +3462,21 @@ sole consumer (tempo) can branch on them without importing the internal reader p
 `UnsupportedFormatVersionError`, `readFooter`, `tryReadFooterMagic18`), `reader.go` (aliases).
 Tests: `reader/reader_test.go` (`TestFooterVersionDetection`).
 
+**Reframed (2026-07-07, issue #490, task A-13/#107):** the "route around a stale block during
+mixed-cluster rollout" contract this note originally described was never actually implemented
+by any consumer — confirmed via a full check that tempo has zero `errors.Is`/`errors.As` call
+sites on `ErrUnsupportedFormatVersion` anywhere. `ErrUnsupportedFormatVersion`/
+`UnsupportedFormatVersionError` are KEPT (still have diagnostic value — a typed, inspectable
+error is strictly better than an untyped one even with no active routing consumer), but this
+note's framing is corrected from "mixed-cluster rollout routing contract" to "typed,
+diagnosable error; routing contract not implemented by any consumer." A stale comment on
+`TypedTieredCache` (`reader.go:202`, unrelated to this sentinel but nearby) that referenced a
+nonexistent `NewTieredCache` function was deleted (factually wrong, not merely outdated).
+`reader.go:276`'s "version < 12" comment is left as-is (stale-ish but not factually wrong).
+
+Back-refs (addendum): `internal/modules/blockio/reader/reader.go:202` (deleted stale comment),
+`internal/modules/blockio/reader/parser.go` (sentinel kept, unchanged).
+
 ## NOTE-479 (#466): Remove all in-process memory caching — disk + memcache only
 
 **Problem:** the querier's memory footprint was dominated by in-process caches layered on top
@@ -3466,7 +3484,7 @@ of the disk + remote (memcached) tiers that already serve the same data. Under t
 sometimes VPA-managed limits this unbounded/heuristically-sized in-process consumer sat on top
 of already-substantial per-query working sets (decode buffers, sort/merge scratch), making OOM
 behavior hard to reason about and contributing to TraceQL timeouts + OOMKills on
-tempo-dev-test-03.
+the dev test cluster.
 
 **Change:** removed both in-process mechanisms entirely, leaving only disk (`filecache`) +
 remote (`memcache`):
@@ -3500,3 +3518,43 @@ disk/memcache load for a smaller, more predictable querier memory footprint.
 **Back-ref:** `reader/parser.go`, `reader/columnar_read.go`, `reader/block_parser.go`,
 `reader/column.go`, `reader/block.go`, `reader/reader.go`, top-level `reader.go`/`api.go`,
 `tieredcache/typed.go`. Tempo: `tempodb/encoding/vblockpack/backend_block.go`.
+
+## NOTE-490 — KindInlineBytes/KindSparseInlineBytes decode arms removed (issue #490)
+
+Date: 2026-07-07
+
+`shared.KindInlineBytes` (=3) and `shared.KindSparseInlineBytes` (=4) were reader-only legacy
+decode arms — per their own in-code comment, "emitted by earlier writer versions... current
+writer never selects these kinds." Issue #490's project-wide stored-data wipe removes the only
+files that could ever have named these kinds, so the corresponding reader decode arms are
+deleted.
+
+**Fix.** `column.go`'s `readColumnEncoding` dispatch arm for kinds 3/4 is deleted;
+`decodeInlineBytes` (dense) and its sparse counterpart are deleted in full (zero remaining
+callers). `layout.go`'s `encodingKindNames` debug-name map entries for kinds 3/4 are removed.
+The dispatch switch's pre-existing `default` arm already produces `"column encoding: unknown
+kind %d"` — no new error was added; a block naming kind 3/4 now falls into that pre-existing
+path. `shared.KindInlineBytesAllPresent` (16), which maps back to kind 3 via `BaseKindFor`, has
+zero active writer callers either and now also falls through to the same "unknown kind" error
+path via the same dispatch removal — no extra code change needed.
+
+**Consequence.** `shared.KindInlineBytes`/`KindSparseInlineBytes`/`KindInlineBytesAllPresent`
+constants are LEFT DEFINED in `shared/constants.go` — a full grep after this change confirmed
+non-zero remaining references (`shared/constants.go`'s `BaseKindFor`/`toAllPresent`
+AllPresent-mapping functions, and (until task A-7/#101 removed the alias block entirely)
+`writer/constants.go`'s alias re-exports). The canonical `internal/modules/blockio/SPECS.md`
+Encoding Kind Registry table marks kind numbers 3, 4, and 16 as `removed (issue #490, see this
+note)` — permanently retired, never reallocated to a future kind, per that table's own
+never-reused convention.
+
+New test: `encoding_removed_kinds_test.go:TestReadColumnEncoding_RejectsRemovedInlineBytesKinds`
+— constructs a minimal enc_version+kind blob for both kind bytes, asserts decode now errors. No
+existing test had asserted successful decode of these two kinds (confirmed via grep) — nothing
+to delete on the test side, only this new negative-case test was added.
+
+Back-refs: `internal/modules/blockio/reader/column.go:readColumnEncoding` (deleted dispatch arm,
+`decodeInlineBytes`), `internal/modules/blockio/reader/layout.go` (`encodingKindNames`),
+`internal/modules/blockio/shared/constants.go` (`KindInlineBytes`, `KindSparseInlineBytes`,
+`KindInlineBytesAllPresent` — definitions kept, see Consequence). Cross-ref:
+`blockio/shared/NOTES.md` (one-line pointer to this note), `internal/modules/blockio/SPECS.md`
+(Encoding Kind Registry table update). Test: `encoding_removed_kinds_test.go`.

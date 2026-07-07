@@ -26,8 +26,8 @@ import (
 //
 //	prefix_idx[prefix_index_width bytes LE] + suffix_len[4 LE] + suffix_bytes
 //
-// NOTE-AP-001: for the dense kind (KindPrefixBytes) when every row is present,
-// KindPrefixBytesAllPresent is emitted and the presence_rle segment is omitted.
+// NOTE-AP-001: for the dense kind (shared.KindPrefixBytes) when every row is present,
+// shared.KindPrefixBytesAllPresent is emitted and the presence_rle segment is omitted.
 func encodePrefixBytes(
 	kind uint8,
 	values [][]byte,

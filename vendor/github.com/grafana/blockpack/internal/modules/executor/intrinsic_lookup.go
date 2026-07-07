@@ -1,8 +1,14 @@
 package executor
 
-// intrinsic_lookup.go — stubs/implementations for lookupIntrinsicFields* functions
-// after IntrinsicTOC removal (#433/#436).
-// After removal, identity and well-known fields come from block columns.
+// intrinsic_lookup.go — identity field extraction for the structural query path.
+//
+// NOTE-436 (corrected #490 A-11, per .bob/state/identity-investigation.md): the file-level
+// IntrinsicTOC/SpanTree sections and the intrinsic-index-based lookupIntrinsicFieldsTyped/
+// rowSatisfiesIntrinsicNodesTyped functions that once read from them were deleted under
+// #433/#434/#436. identityFieldsFromBlockColsTyped below — reading identity directly from
+// block payload columns — is the SOLE and CURRENT identity-population mechanism for the
+// structural query path, for every file; it is not a legacy fallback and has no alternative
+// to fall back from.
 
 import (
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"

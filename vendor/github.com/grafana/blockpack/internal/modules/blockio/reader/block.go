@@ -5,9 +5,7 @@ package reader
 
 import (
 	"bytes"
-	"encoding/binary"
 	"encoding/hex"
-	"math"
 	"sync"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
@@ -366,35 +364,6 @@ func (c *Column) MatchingBytesRows(target []byte, dst []int) []int {
 		}
 	}
 	return dst
-}
-
-// VectorF32Value returns the []float32 embedding vector at idx for ColumnTypeVectorF32 columns.
-// Returns (nil, false) when the row is not present or the column is not ColumnTypeVectorF32.
-// The raw bytes stored by decodeVectorF32 are dim*4 bytes in LE byte order.
-func (c *Column) VectorF32Value(idx int) ([]float32, bool) {
-	if c.needsDecode() {
-		c.decodeNow()
-	}
-	if c.Type != shared.ColumnTypeVectorF32 {
-		return nil, false
-	}
-	if !c.IsPresent(idx) {
-		return nil, false
-	}
-	raw := c.bytesInlineAt(idx)
-	if raw == nil {
-		return nil, false
-	}
-	if len(raw)%4 != 0 {
-		return nil, false
-	}
-	dim := len(raw) / 4
-	vec := make([]float32, dim)
-	for i := range dim {
-		bits := binary.LittleEndian.Uint32(raw[i*4 : i*4+4])
-		vec[i] = math.Float32frombits(bits)
-	}
-	return vec, true
 }
 
 // ColIterEntry is a single entry in the pre-computed deduplicated column iteration list.

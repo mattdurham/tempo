@@ -26,22 +26,15 @@ type VCNTChunkDirEntry = valuecounts.ChunkDirEntry
 
 // SortVCNTRecords sorts records into canonical VCNT order:
 // (ColumnName ASC, TimeStart ASC, Value ASC, Count ASC).
-// Must be called before EncodeVCNTRecords.
+// Must be called before EncodeVCNTFile.
 func SortVCNTRecords(records []VCNTRecord) {
 	valuecounts.Sort(records)
 }
 
-// EncodeVCNTRecords encodes a pre-sorted slice of VCNTRecords into snappy-chunked
-// wire bytes plus a chunk directory. perChunk ≤ 0 uses the package default (4096).
-func EncodeVCNTRecords(records []VCNTRecord, perChunk int) ([]byte, []VCNTChunkDirEntry) {
-	return valuecounts.EncodeRecords(records, perChunk)
-}
-
 // EncodeVCNTFile encodes a pre-sorted slice of VCNTRecords into a self-describing
-// .vcnt file: the same snappy-chunked body EncodeVCNTRecords produces, plus an
-// embedded chunk directory and trailer, so any consumer can decode the file
-// directly from object storage without a side-channel directory. perChunk ≤ 0
-// uses the package default (4096).
+// .vcnt file: a snappy-chunked body plus an embedded chunk directory and trailer,
+// so any consumer can decode the file directly from object storage without a
+// side-channel directory. perChunk ≤ 0 uses the package default (4096).
 func EncodeVCNTFile(records []VCNTRecord, perChunk int) []byte {
 	return valuecounts.EncodeVCNTFile(records, perChunk)
 }
@@ -102,8 +95,8 @@ func VCNTObjectKey(tenant, indexPrefix, colName, id string) string {
 	return path.Join(tenant, indexPrefix, "unique_values", colHash, filename)
 }
 
-// VCNTBuildSectionFromObjects decodes each raw .vcnt object (self-describing or
-// legacy — via DecodeVCNTObject), merges all records via delta-accounting Compact,
+// VCNTBuildSectionFromObjects decodes each raw .vcnt object (self-describing —
+// via DecodeVCNTObject), merges all records via delta-accounting Compact,
 // and re-encodes them into a single consolidated VCNT section (data + dir). The
 // result is the exact (data, dir) shape CubeCreationTrigger.TryCreate /
 // CheckCardinality consume, so a caller that has fetched the .vcnt objects covering
@@ -117,12 +110,12 @@ func VCNTObjectKey(tenant, indexPrefix, colName, id string) string {
 // the gate then passes by default for the affected dimension, matching prior
 // best-effort behavior. See NOTE-VC-012.
 //
-// DEV-ONLY HAND-PATCH (holistic-review/go-presubmit Fix 4, 2026-07-07): this vendored
-// copy predates a blockpack change that also returns the count of skipped objects, so
-// callers get operator visibility into legacy/undecodable objects instead of silence.
-// Hand-patched here, mirroring the A-Tempo-1 pattern, so tempo's non-vendor call site can
-// already consume the new 3-value return before the real revendor lands. Minimal — will
-// be replaced wholesale at the next `go mod vendor`.
+// The skip-don't-fail design is deliberate and unchanged (holistic-review/go-presubmit
+// Fix 4), but the count of skipped objects (empty or undecodable) is now returned so a
+// wave of unreadable objects is operator-visible instead of silently under-reporting
+// cardinality — matching the visibility discipline the sibling
+// valuecountscompactor/service.go:mergeLevel already applies to the identical
+// DecodeVCNTObject failure via its filesQuarantined counter.
 func VCNTBuildSectionFromObjects(objects [][]byte) (data []byte, dir []VCNTChunkDirEntry, skipped int) {
 	var all []VCNTRecord
 	for _, obj := range objects {

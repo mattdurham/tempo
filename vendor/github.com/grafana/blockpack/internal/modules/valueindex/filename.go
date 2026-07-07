@@ -60,7 +60,9 @@ type FileMeta struct {
 }
 
 // ParseFilenameV2 parses a v2 value-index filename into its components.
-// Returns (meta, nil) on success. Falls back to ParseFilename for v1 filenames.
+// Returns (meta, nil) on success, or an error if name is not a v2 filename (the v1
+// L<level>-<id> fallback was removed once every value-index file writer moved to v2 —
+// see NOTE-VI-030).
 func ParseFilenameV2(name string) (FileMeta, error) {
 	base := strings.TrimSuffix(name, ".blockpack")
 	if !strings.HasPrefix(base, "L") {
@@ -68,41 +70,32 @@ func ParseFilenameV2(name string) (FileMeta, error) {
 	}
 	parts := strings.SplitN(base[1:], "-", 4)
 	// v2: L<level>-<minTS>-<maxTS>-<id> (4 parts after stripping "L")
-	if len(parts) == 4 {
-		lv, err := strconv.Atoi(parts[0])
-		if err != nil {
-			return FileMeta{}, fmt.Errorf("valueindex: filename %q level not an integer: %w", name, err)
-		}
-		minTS, err := strconv.ParseUint(parts[1], 10, 64)
-		if err != nil {
-			return FileMeta{}, fmt.Errorf("valueindex: filename %q wallMinSec not an integer: %w", name, err)
-		}
-		maxTS, err := strconv.ParseUint(parts[2], 10, 64)
-		if err != nil {
-			return FileMeta{}, fmt.Errorf("valueindex: filename %q wallMaxSec not an integer: %w", name, err)
-		}
-		return FileMeta{
-			Filename:   name,
-			Level:      lv,
-			WallMinSec: minTS,
-			WallMaxSec: maxTS,
-			ID:         parts[3],
-		}, nil
+	if len(parts) != 4 {
+		return FileMeta{}, fmt.Errorf("valueindex: filename %q is not a v2 filename (expected L<level>-<minTS>-<maxTS>-<id>.blockpack)", name)
 	}
-	// v1 fallback: L<level>-<id>
-	lv, id, err := ParseFilename(name)
+	lv, err := strconv.Atoi(parts[0])
 	if err != nil {
-		return FileMeta{}, err
+		return FileMeta{}, fmt.Errorf("valueindex: filename %q level not an integer: %w", name, err)
 	}
-	return FileMeta{Filename: name, Level: lv, ID: id}, nil
+	minTS, err := strconv.ParseUint(parts[1], 10, 64)
+	if err != nil {
+		return FileMeta{}, fmt.Errorf("valueindex: filename %q wallMinSec not an integer: %w", name, err)
+	}
+	maxTS, err := strconv.ParseUint(parts[2], 10, 64)
+	if err != nil {
+		return FileMeta{}, fmt.Errorf("valueindex: filename %q wallMaxSec not an integer: %w", name, err)
+	}
+	return FileMeta{
+		Filename:   name,
+		Level:      lv,
+		WallMinSec: minTS,
+		WallMaxSec: maxTS,
+		ID:         parts[3],
+	}, nil
 }
 
 // IsInTimeRange reports whether the file covers any part of the query window [minTS, maxTS].
-// Files with zero WallMinSec/WallMaxSec (v1 filenames) always match.
 func (m *FileMeta) IsInTimeRange(queryMinSec, queryMaxSec uint64) bool {
-	if m.WallMinSec == 0 && m.WallMaxSec == 0 {
-		return true // v1 filename without time range — must include
-	}
 	// File covers [WallMinSec, WallMaxSec]; query window [queryMinSec, queryMaxSec].
 	// Overlap iff: file.maxSec >= query.minSec && file.minSec <= query.maxSec
 	return m.WallMaxSec >= queryMinSec && m.WallMinSec <= queryMaxSec

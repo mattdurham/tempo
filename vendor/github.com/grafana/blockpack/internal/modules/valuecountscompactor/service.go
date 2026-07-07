@@ -266,8 +266,8 @@ func (s *Service) compactColumn(ctx context.Context, colDir string, objs []Objec
 }
 
 // mergeLevel reads files at one level (stopping early if MaxRecordsPerMerge is reached),
-// decodes each via valuecounts.DecodeVCNTObject (self-describing output format or legacy
-// single-chunk fallback — Phase 13), accumulates their records, merges/sums/nets them via
+// decodes each via valuecounts.DecodeVCNTObject (the self-describing EncodeVCNTFile format —
+// the only format written since #490 A-3/A-Tempo-1), accumulates their records, merges/sums/nets them via
 // valuecounts.Compact, writes the result at level+1 using the self-describing EncodeVCNTFile
 // format, then deletes only the inputs actually processed. Write-then-delete: inputs are only
 // removed after the merged output's Put succeeds. Files left unprocessed because the record
@@ -308,9 +308,9 @@ func (s *Service) mergeLevel(ctx context.Context, colDir string, files []levelFi
 		}
 		recs, err := valuecounts.DecodeVCNTObject(data)
 		if err != nil {
-			// DecodeVCNTObject already tries both the self-describing and legacy
-			// single-chunk formats internally -- any error here means this file's
-			// data is unrecoverable with this codebase, not a transient read glitch.
+			// DecodeVCNTObject only understands the self-describing format now (#490
+			// A-3) -- any error here means this file's data is unrecoverable with this
+			// codebase, not a transient read glitch.
 			// Retrying changes nothing for a deterministic decode failure, so quarantine
 			// (delete) it immediately rather than leaving it to block every future
 			// compaction attempt for this column forever. This is a deliberate,

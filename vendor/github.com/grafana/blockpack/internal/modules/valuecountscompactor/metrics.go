@@ -59,12 +59,12 @@ type compactorMetrics struct {
 	filesSkipped prometheus.Counter // unparseable filenames
 
 	// filesQuarantined counts input files deleted after a permanent (non-transient)
-	// decode failure -- valuecounts.DecodeVCNTObject already tries both the
-	// self-describing and legacy single-chunk formats internally, so any error it
-	// returns means the file's data is unrecoverable with this codebase, not a
-	// transient read glitch. Retrying changes nothing for a deterministic decode
-	// failure, so mergeLevel quarantines (deletes) the file immediately rather than
-	// leaving it to block every future compaction attempt for its column forever.
+	// decode failure -- valuecounts.DecodeVCNTObject only understands the
+	// self-describing format (#490 A-3), so any error it returns means the file's
+	// data is unrecoverable with this codebase, not a transient read glitch.
+	// Retrying changes nothing for a deterministic decode failure, so mergeLevel
+	// quarantines (deletes) the file immediately rather than leaving it to block
+	// every future compaction attempt for its column forever.
 	// Each increment is a deliberate, logged data-loss event -- alert if non-zero.
 	filesQuarantined prometheus.Counter
 

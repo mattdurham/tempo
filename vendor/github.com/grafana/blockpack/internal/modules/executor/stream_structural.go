@@ -500,14 +500,14 @@ func buildStructuralBlockPlan(
 // by blockIdx for later use. The block-independent plan (bp) is built once per query
 // (buildStructuralBlockPlan) and shared read-only across all blocks — see NOTE-373.
 //
-// NOTE-372: for intrinsic-section files, ALL intrinsic predicate columns (span:kind,
-// span:duration, span:status, resource.service.name, span:name, …) and identity columns
-// (trace:id, span:id, span:parent_id) are omitted from bp.wantColumns. These are served from
-// the intrinsic section via the per-program nodesList post-filter (computeNodeMatchForRow →
-// rowSatisfiesIntrinsicNodesTyped reading idFields) and predicate evaluation runs against the
-// pre-derived user-attr program set, so the parser never fetches/decodes the redundant
-// block-payload copy of each intrinsic column. Legacy (no-intrinsic) files keep the full set
-// including identity columns, which must be decoded from block payloads.
+// NOTE-372 (superseded by NOTE-436, corrected #490 A-11): this comment previously described
+// an intrinsic-section post-filter (rowSatisfiesIntrinsicNodesTyped reading a
+// separately-populated idFields) that no longer exists — the file-level IntrinsicTOC/SpanTree
+// sections and that function were deleted under #433/#434/#436. There is no "intrinsic-section
+// files" vs. "legacy (no-intrinsic) files" distinction anymore: every file uses the single
+// current design described by buildStructuralBlockPlan's own NOTE-436 comment above — identity
+// and predicate columns are all regular per-row block columns, included in bp.wantColumns and
+// decoded directly from the block below via identityFieldsFromBlockColsTyped.
 func collectBlockStructuralSpanRecs(
 	r *modules_reader.Reader,
 	blockIdx int,

@@ -661,8 +661,8 @@ determines the remainder of the wire format.
 |------|---|---|---|
 | 1  | `KindDictionary` | landed | All types — default |
 | 2  | `KindSparseDictionary` | landed | All types — >50% nulls |
-| 3  | `KindInlineBytes` | landed | Bytes |
-| 4  | `KindSparseInlineBytes` | landed | Bytes + >50% nulls |
+| 3  | `KindInlineBytes` | **removed (issue #490, see reader NOTE-490)** | ~~Bytes~~ — reader-only legacy, writer never emitted; decode arm deleted, unknown-kind error now fires |
+| 4  | `KindSparseInlineBytes` | **removed (issue #490, see reader NOTE-490)** | ~~Bytes + >50% nulls~~ — same as kind 3 |
 | 5  | `KindDeltaUint64` | landed | Uint64 — timestamps, monotonic data |
 | 6  | `KindRLEIndexes` | landed | All types — low cardinality |
 | 7  | `KindSparseRLEIndexes` | landed | All types — low cardinality + >50% nulls |
@@ -672,9 +672,9 @@ determines the remainder of the wire format.
 | 11 | `KindSparsePrefixBytes` | landed | Bytes — URL/path columns + >50% nulls |
 | 12 | `KindDeltaDictionary` | landed | Bytes — trace:id (sorted, sequential) |
 | 13 | `KindSparseDeltaDictionary` | landed | Bytes — trace:id + >50% nulls |
-| 14 | `KindVectorF32` | landed | Float32 vectors |
+| 14 | `KindVectorF32` | **removed (issue #490)** | ~~Float32 vectors~~ — `decodeVectorF32` and the `colType == shared.ColumnTypeVectorF32` interception deleted from `readColumnEncoding`; the switch never had an independent `case shared.KindVectorF32` arm, so any column carrying this kind byte now falls through to the generic `default: unknown kind %d` typed error, identical in effect to kinds 3/4/16 |
 | 15 | `KindDictionaryAllPresent` | landed | All types — fully-present dictionary column |
-| 16 | `KindInlineBytesAllPresent` | landed | Bytes — fully-present inline bytes |
+| 16 | `KindInlineBytesAllPresent` | **removed (issue #490, see reader NOTE-490)** | ~~Bytes — fully-present inline bytes~~ — zero writer callers, falls through to the same removed dispatch arm |
 | 17 | `KindDeltaUint64AllPresent` | landed | Uint64 — fully-present timestamps/monotonic |
 | 18 | `KindRLEIndexesAllPresent` | landed | All types — fully-present low-cardinality |
 | 19 | `KindXORBytesAllPresent` | landed | Bytes — fully-present ID columns |
@@ -692,6 +692,10 @@ determines the remainder of the wire format.
 | 40 | `KindGorillaFloat64` | landed | Float64 — high-cardinality value-correlated floats |
 | 41 | `KindGorillaFloat64AllPresent` | landed | Float64 — fully-present, as kind 40 |
 | 42+ | — | unallocated | Next sequential number(s) claimed by the implementing PR |
+
+(Kind numbers 3, 4, 14, and 16 are removed per issue #490 but remain permanently retired — see the
+Status column above — and must never be reallocated to a future encoding kind, per this table's
+own never-reused convention.)
 
 #### Allocation rules
 
@@ -720,9 +724,11 @@ vector of `span_count` bits without reading any presence bytes.
 There are no sparse AllPresent variants (sparse-with-all-present is a contradiction). An
 all-absent column is represented by omitting the column from the block TOC, so it needs no kind.
 
-Selection is gated by the writer flag `Config.DisableAllPresentEncoding` (default: AllPresent
-on). New kind IDs are additive — `enc_version` is unchanged and old readers reject unknown kinds.
-See writer NOTE-AP-001 / reader NOTE-AP-001.
+AllPresent selection is unconditional whenever a column is fully present (`presentCount ==
+nRows`, `nRows > 0`) — see writer NOTE-AP-001 (issue #490, task A-15) for the removed
+rollout-flag history. New kind IDs are additive — `enc_version` is unchanged and old readers
+reject unknown kinds.
+See also reader NOTE-AP-001 for the decode-side mirror of this change.
 
 ### 9.1 Presence RLE
 

@@ -199,7 +199,6 @@ type TypedConfig = modules_tieredcache.TypedConfig
 // TypedTieredCache routes cache operations to one of seven sub-caches based on
 // section type (Footer, TOC, Bloom, Metadata, TraceIdx, Block, Intrinsic).
 // It implements sectioncache.SectionCache via typed method dispatch — no key parsing.
-// Prefer this over the deprecated NewTieredCache binary router.
 type TypedTieredCache = modules_tieredcache.TypedTieredCache
 
 // DefaultTypedConfig returns a TypedConfig with the recommended tier mapping:
@@ -562,77 +561,26 @@ func findTraceGroupInCandidates(
 	for _, key := range keys {
 		// v2 batched files (issue #476) resolve with targeted partial reads
 		// (footer + block directory + only the surviving block), so an oversized
-		// index file no longer forces a whole-object download + full decode. A
-		// file that is not a v2 file (isTraceV2 false) is a legacy v1 flat-blob
-		// file with no footer/TOC to seek within — read whole via Get and decode
-		// (rollover-window compat, NOTE-VI-047).
-		isV2, probeErr := probeTraceV2(lister, key)
-		if probeErr != nil {
+		// index file never forces a whole-object download + full decode. A
+		// candidate whose footer magic doesn't match v2 (e.g. a pre-#476 legacy
+		// v1 flat-blob file) is a hard error — v1 read support was removed once
+		// the v2 rollover window closed (NOTE-VI-047 -> retired).
+		g, ok, lerr := valueindex.LookupTraceGroupPartial(
+			ctx, lister, key, traceID, queryMinSec, queryMaxSec,
+		)
+		if lerr != nil {
 			return valueindex.TraceGroup{}, false, fmt.Errorf(
-				"GetTraceByID: probe index candidate %q: %w", key, probeErr,
+				"GetTraceByID: partial lookup index candidate %q: %w", key, lerr,
 			)
 		}
-		if isV2 {
-			g, ok, lerr := valueindex.LookupTraceGroupPartial(
-				ctx, lister, key, traceID, queryMinSec, queryMaxSec,
-			)
-			if lerr != nil {
-				return valueindex.TraceGroup{}, false, fmt.Errorf(
-					"GetTraceByID: partial lookup index candidate %q: %w", key, lerr,
-				)
-			}
-			if ok {
-				mergeGroup(&g)
-			}
-			continue
-		}
-
-		data, getErr := lister.Get(ctx, key)
-		if getErr != nil {
-			return valueindex.TraceGroup{}, false, fmt.Errorf(
-				"GetTraceByID: fetch index candidate %q: %w", key, getErr,
-			)
-		}
-		groups, decErr := valueindex.DecodeTraceGroups(data)
-		if decErr != nil {
-			return valueindex.TraceGroup{}, false, fmt.Errorf(
-				"GetTraceByID: decode index candidate %q: %w", key, decErr,
-			)
-		}
-		for gi := range groups {
-			if groups[gi].TraceID != traceID {
-				continue
-			}
-			mergeGroup(&groups[gi])
+		if ok {
+			mergeGroup(&g)
 		}
 	}
 	if !found {
 		return valueindex.TraceGroup{}, false, nil
 	}
 	return merged, true, nil
-}
-
-// probeTraceV2 reports whether the trace-index file at key is a v2 batched
-// TraceGroup file (magic "VTG2" in both header and footer) by reading only the
-// fixed-size footer via a ranged tail read. A file too short to hold a footer, or
-// whose footer magic does not match, is treated as a legacy v1 flat-blob file
-// (read whole via Get). This costs one small ranged read per candidate but avoids
-// downloading a 200MB body just to discover its format — the whole point of the
-// v2 redesign (issue #476).
-func probeTraceV2(store LookupStore, key string) (bool, error) {
-	size, err := store.Size(key)
-	if err != nil {
-		return false, fmt.Errorf("size %q: %w", key, err)
-	}
-	if size < int64(valueindex.TraceFooterSize) {
-		return false, nil
-	}
-	buf := make([]byte, valueindex.TraceFooterSize)
-	if _, rerr := store.ReadAt(key, buf, size-int64(valueindex.TraceFooterSize)); rerr != nil {
-		return false, fmt.Errorf("read footer %q: %w", key, rerr)
-	}
-	_, ferr := valueindex.DecodeTraceFooter(buf)
-	return ferr == nil, nil
 }
 
 // materializeTraceGroup resolves every SpanEntry in group to an exact block+row in r and

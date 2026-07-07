@@ -95,7 +95,7 @@ func float64PresenceAndCardinality(values []float64, present []bool, nRows int) 
 func encodeGorillaFloat64(values []float64, present []bool, nRows int) ([]byte, error) {
 	bitset, presentCount := buildPresenceBitset(present, nRows)
 
-	kind, allPresent := selectAllPresent(KindGorillaFloat64, presentCount, nRows)
+	kind, allPresent := selectAllPresent(shared.KindGorillaFloat64, presentCount, nRows)
 
 	var rleData []byte
 	if !allPresent {

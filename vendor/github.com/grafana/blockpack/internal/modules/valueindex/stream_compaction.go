@@ -122,8 +122,9 @@ func (it *BucketFileIterator) skipEmptyBlocks() {
 	}
 }
 
-// DecodeFilteredBucketFile decodes data and applies retention filtering (mirrors the
-// per-input step inside CompactBucketFiles). It returns (nil, stats, nil) — not an error —
+// DecodeFilteredBucketFile decodes data and applies retention filtering (the per-input
+// decode-and-filter step feeding StreamCompactBucketFiles' k-way merge). It returns
+// (nil, stats, nil) — not an error —
 // ONLY for a bad-magic file (ErrNotBucketFile), a legacy pre-v2 input that holds no v2
 // postings and so can be skipped without dropping any live posting. Every other decode
 // failure is a genuine corrupt v2 file and is returned as an error: silently skipping it

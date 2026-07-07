@@ -18,15 +18,15 @@ func buildPresenceBitset(present []bool, nRows int) (bitset []byte, presentCount
 }
 
 // selectAllPresent decides whether the AllPresent variant of baseKind should be used for a
-// column with presentCount present rows out of nRows. AllPresent is chosen only when every
-// row is present (presentCount == nRows), nRows > 0, the rollout flag is enabled, and baseKind
-// actually has an AllPresent variant. Returns the kind to emit and whether the presence_rle
-// segment must be omitted (allPresent == true).
+// column with presentCount present rows out of nRows. AllPresent is chosen whenever every
+// row is present (presentCount == nRows), nRows > 0, and baseKind actually has an AllPresent
+// variant. Returns the kind to emit and whether the presence_rle segment must be omitted
+// (allPresent == true).
 //
 // NOTE-AP-001: omitting the presence segment for fully-present columns saves ~nRows/8 bytes
 // plus the per-column RLE encode, and makes the reader's presence synthesis allocation-only.
 func selectAllPresent(baseKind uint8, presentCount, nRows int) (kind uint8, allPresent bool) {
-	if !allPresentEnabled() || nRows == 0 || presentCount != nRows {
+	if nRows == 0 || presentCount != nRows {
 		return baseKind, false
 	}
 	variant, ok := shared.AllPresentKindFor(baseKind)

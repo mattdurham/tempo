@@ -96,15 +96,6 @@ type Config struct {
 	// and footer are written only at the final Flush().
 	MaxBufferedSpans int
 
-	// DisableAllPresentEncoding turns off selection of the AllPresent encoding kinds
-	// (NOTE-AP-001). When false (the default), fully-present dense columns are written
-	// using the compact AllPresent variant that omits the presence_rle segment. Set to
-	// true during rollout to force the legacy presence-RLE form for every column, so a
-	// writer can be deployed ahead of readers that understand the new kinds.
-	//
-	// Reading is unaffected by this flag — readers always accept both forms.
-	DisableAllPresentEncoding bool
-
 	// DisableBitPackedDelta turns off selection of the bit-packed DeltaUint64 encoding kind
 	// (NOTE-215). When false (the default), uint64 columns chosen for delta encoding are
 	// written using the bit-packed variant whenever it saves a meaningful fraction of the
@@ -169,11 +160,4 @@ type Config struct {
 	// so any V15 reader decodes zstd blobs without a further version bump. Defaults OFF so it
 	// can be rolled out deliberately and reverted by toggle without a format change.
 	EnableZstdColumns bool
-
-	// OmitIntrinsicIdentityColumns historically dropped the three identity columns (trace:id,
-	// span:id, span:parent_id) from the persisted IntrinsicTOC (NOTE-476, issue #394) on the
-	// assumption that the SpanTree section carried identity as a fallback. Both the IntrinsicTOC
-	// (#433/#436) and the SpanTree (#434) have since been removed; v2 identity lives in block
-	// columns. This flag no longer has a fallback identity store and should remain OFF.
-	OmitIntrinsicIdentityColumns bool
 }

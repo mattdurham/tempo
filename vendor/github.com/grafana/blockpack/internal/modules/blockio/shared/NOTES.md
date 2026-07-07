@@ -261,6 +261,18 @@ the reader-side `decodeVectorF32` / `Column.VectorF32Value`, and the `VectorInde
 compaction/merge path silently drops any legacy VectorF32 source column instead of
 re-emitting it.
 
+**Addendum (2026-07-07, issue #490, task A-6/#100):** the "KEPT so that blocks previously
+written with a `__embedding__` column still decode without error" behavior described
+immediately above is REMOVED. The reader-side `decodeVectorF32`/`Column.VectorF32Value` are
+deleted; a block that still physically carries a VectorF32 column now hard-errors at column
+decode time instead of decoding gracefully. `reader/legacy_vectorf32_test.go` (the test cited
+above as proof of the old behavior) is deleted in full. `ColumnTypeVectorF32` (=13) and
+`KindVectorF32` (=14) enum values REMAIN defined (referenced by `valueindex/hash.go`'s
+indexability-exclusion check and this package's own enum list) — only the reader decode path
+is removed, not the type/kind constants themselves. See `blockio/writer/NOTES.md` NOTE-480's
+own addendum for the full deliberate-behavior-change rationale (this is a loud-rejection choice,
+not an oversight) and `blockio/reader/TESTS.md` READER-TEST-018.
+
 ---
 
 ## NOTE-012: Snappy Decode Buffer Pool for Intrinsic Column Decoding (2026-04-14)
@@ -2591,3 +2603,20 @@ metadata/index subtypes alongside the value-index subtypes. trace:id is resolved
 value-index now (`MayContainTraceID` stays conservatively true, `TraceEntries` nil,
 `TraceBloomRaw` nil — graceful no-op stubs). No perf change: pure dead-code removal of
 sections that were already never emitted.
+
+---
+
+## NOTE-490 — cross-reference: KindInlineBytes/KindSparseInlineBytes reader decode arms removed (issue #490)
+
+Date: 2026-07-07
+
+Pointer entry only — the substantive design note lives in `blockio/reader/NOTES.md` NOTE-490
+(the decode-arm switch logic lives in the reader; this package only defines the constants).
+`shared.KindInlineBytes` (=3) and `shared.KindSparseInlineBytes` (=4) reader decode arms were
+removed (task A-14/#108); the constants themselves remain defined here (non-zero remaining
+references — `BaseKindFor`/`toAllPresent` AllPresent-mapping functions). See
+`internal/modules/blockio/SPECS.md`'s Encoding Kind Registry table for the canonical
+kind-number status (3/4/16 marked removed, permanently retired).
+
+Back-ref: `internal/modules/blockio/shared/constants.go` (`KindInlineBytes`,
+`KindSparseInlineBytes`, `KindInlineBytesAllPresent`). See `blockio/reader/NOTES.md` NOTE-490.

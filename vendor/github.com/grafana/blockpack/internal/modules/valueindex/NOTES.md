@@ -94,6 +94,32 @@ Back-ref: `internal/modules/valueindex/entries.go:Entry`,
 `internal/modules/valueindex/predicate.go:compareCanonical`,
 `internal/modules/valueindex/writer.go:buildKLL`
 
+**Addendum (2026-07-07, issue #490, tasks A-8/#102 + #116):** WRITE support for V1
+(pre-BlockRef) entries is retired. `writer.go`'s `assemble()` function now returns
+`fmt.Errorf("valueindex: legacy pre-BlockRef entries unsupported — data was not fully migrated
+as assumed (see NOTES.md NOTE-VI-014)")` when a `Flush()` batch has at least one entry but none
+carries a v2+ `BlockRef`/`SpanID` (`seen && !anyBlockRef`), instead of silently encoding a
+V1-shaped VINX section. A batch with ZERO entries still succeeds via the pre-existing
+empty-file encoding, now tagged `shared.ValueIndexEntriesVersion` (V2) rather than V1 (task
+#116's fix — the V1 tag on new empty files was functionally inert but left the one-format
+write directive incompletely closed) — this preserves `compaction.go`'s `writeCompacted()`
+"always produce at least one output file, even when there are no entries" contract, unrelated
+to legacy V1 data, while ensuring literally no new file of any shape carries a V1 tag.
+
+READ support (decode dispatch) for V1 is intentionally UNCHANGED — `entries.go:220`'s `case
+shared.ValueIndexEntriesVersionV1` and `reader.go`'s dispatch still decode V1-shaped files
+during the transition period. `shared.ValueIndexEntriesVersionV1` therefore remains defined
+and in active use for decode — it is NOT deleted by this change. `ValueIndexEntriesVersionV3`
+confirmed to have zero production write call sites (decode dispatch and tests only) — no
+action needed on that constant.
+
+Back-refs: `internal/modules/valueindex/writer.go:assemble` (the `else` branch of `if
+anyBlockRef`, and the `!seen` empty-batch branch, now a `switch`), `internal/modules/valueindex/
+writer_test.go:TestWriter_ReturnsErrorOnLegacyV1EncodeAttempt`,
+`internal/modules/valueindex/entries.go:220` (read dispatch, unchanged),
+`internal/modules/blockio/compaction/compaction.go:writeCompacted` (the empty-batch contract
+this change must not break). Test: `TESTS.md` TEST-VI-13.
+
 ## NOTE-VI-024 — ColTypeName bucket helper (issue #409)
 
 Date: 2026-06-28
@@ -336,6 +362,11 @@ Back-refs:
 - `internal/modules/valueindex/filename.go:ParseFilenameV2`, `IsInTimeRange`, `SortFileMetas`
 - `internal/modules/valueindexconsumer/service.go:indexKeyV2` (the layout this mirrors)
 
+**Addendum (2026-07-07, issue #490, task A-5/#99):** the "v1 filenames... always match" behavior
+described above (item 3 of "Key decisions") is REMOVED — see NOTE-VI-037's addendum for the full
+detail. Every filename discovered going forward is v2-formatted; `ParseFilenameV2` now hard-errors
+on a v1-shaped filename instead of falling back to `ParseFilename`.
+
 ## NOTE-VI-034 — IndexFileCache: in-process value-index file-discovery cache (issue #462)
 
 Date: 2026-06-30
@@ -419,6 +450,26 @@ Back-refs:
 - `internal/modules/valueindex/filecache.go:IndexFileCache.AddFile`, `RemoveFiles`
 - `internal/modules/valueindexcompactor/service.go` (V2-named output)
 - `internal/modules/valueindex/filename.go:FormatFilenameV2`, `IsInTimeRange`
+
+**Addendum (2026-07-07, issue #490, task A-5/#99):** `ParseFilenameV2`'s v1-fallback call site
+and `FileMeta.IsInTimeRange`'s corresponding "v1 filename → match all" zero-time special case
+(both referenced above and in NOTE-VI-032) are removed — `ParseFilenameV2` now hard-errors on a
+non-4-part (v1-shaped) filename instead of falling back to `ParseFilename`. Every filename
+produced going forward is v2-formatted (`FormatFilenameV2`, embedding an explicit wall-clock
+time range — this note's own item 1 already made the compactor's output V2-named), so there is
+no longer a legitimate v1-shaped VI name to special-case. The deprecated
+`ValueIndexFilenamePattern` constant in `shared/constants.go` is deleted alongside it.
+**`ParseFilename` itself (the generic `L<level>-<id>` parser) is NOT deleted** — it remains live
+for the unrelated BucketGroup/VCNT filename family (`valueindexcompactor/service.go:337`,
+`valuecountscompactor/service.go:220`).
+
+Back-refs (addendum): `internal/modules/valueindex/filename.go:ParseFilenameV2`/
+`IsInTimeRange`, `internal/modules/blockio/shared/constants.go` (deleted
+`ValueIndexFilenamePattern`), `internal/modules/valueindex/discovery.go` (stale comment
+corrected), `internal/modules/valueindexcompactor/service.go` (stale comment corrected). Tests:
+`filename_v2_test.go:TestParseFilenameV2_RejectsV1Filename` (replaces
+`TestFilenameV1Compatibility`), `discovery_test.go:TestDiscoverIndexFiles_V1FilenameSkipped`
+(replaces `TestDiscoverIndexFiles_V1FilenameAlwaysIncluded`).
 
 ---
 
@@ -990,6 +1041,17 @@ Back-refs: `internal/modules/valueindex/disk_iterator.go` (`diskBucketFileIterat
 `internal/modules/valueindexcompactor/NOTES.md` NOTE-VI-052 (the `mergeLevel`/input-staging
 half of this same redesign).
 
+**Addendum (2026-07-07, issue #490, task A-4/#98):** the non-streaming `CompactBucketFiles`
+function this note contrasts `StreamCompactBucketFiles` against (see NOTE-VI-046's original
+framing) is now deleted outright — zero remaining production callers confirmed
+(`valueindexcompactor/service.go` only ever called `StreamCompactBucketFiles`). The streaming
+path documented in this note is the sole compaction implementation for BucketGroup files.
+Dedicated tests (`bucketcompact_test.go`, `TestCompactBucketFilesErrorsOnCorruptV2`,
+`TestStreamCompactBucketFiles_MatchesNonOverlapping` and its `groupTuple`/`groupTuples`
+comparison helpers) removed alongside it; `BenchmarkCompactBucketFiles_OldVsStreaming` is now
+`BenchmarkStreamCompactBucketFiles`, a standalone baseline rather than an old-vs-new comparison
+(see `BENCHMARKS.md` BENCH-VI-1).
+
 ## NOTE-VI-063 — `traceindex.go` gets its first real callers: extraction → consumer flush wiring (issue #428 wiring, Stage 1-2)
 
 Date: 2026-07-04
@@ -1104,7 +1166,7 @@ Issue #468 wired `GetTraceByID` to consult a real `LookupStore` when `value_inde
 `TraceGroup` entry was `valueindexconsumer`'s `bufferTraceRow`/`flushTraceGroups`
 (NOTE-VI-063/traceflush.go) — an async, Redis-Streams-consumer path. `value-index-consumer`
 (the Kubernetes deployment running that consumer) was confirmed at 0 replicas on
-tempo-dev-test-03, "replaced by inline `ValueIndexSink`" per `setup.sh`'s own comment. The
+the dev test cluster, "replaced by inline `ValueIndexSink`" per `setup.sh`'s own comment. The
 inline sink is `WriteValueIndexL0` (root `valueindex_l0write.go`, NOTE-VI-042) — the only
 value-index write path that has actually run against live production data. Before this note,
 it only knew enough about the TraceGroup format to *exclude* `trace:id` from the standard
@@ -1455,3 +1517,33 @@ Tests: `stream_compaction_test.go`
 `TestStreamCompactBucketFiles_MaxOutputBytesNoSplitWhenUnderCap`);
 `service_test.go` (`TestMergeLevel_MaxOutputBytesSplitsIntoMultipleFiles`). See `SPECS.md`
 SPEC-VI-2 (Addendum 2026-07-06).
+
+---
+
+## NOTE-VI-079 — Legacy v1 flat-blob TraceGroup decode removed; trace-by-id is v2-only (issue #490, task A-2/#97)
+
+Date: 2026-07-07
+
+Issue #490's project-wide stored-data wipe makes the v1 flat-blob TraceGroup format
+(superseded by the v2 batched format, NOTE-VI-075) unreachable — no stored file can still be in
+that shape. Trace-by-id lookups and `DecodeTraceGroups` are now v2-only: a candidate/file that
+isn't the v2 batched TraceGroup format (magic `"VTG2"`) is a hard decode error instead of
+falling back to a whole-object `Get`+legacy-decode.
+
+**Fix.** Root `reader.go`'s `findTraceGroupInCandidates` now calls
+`valueindex.LookupTraceGroupPartial` unconditionally (deleted the `probeTraceV2` dispatch +
+whole-object fallback branch; `probeTraceV2` itself deleted). `traceindex.go`'s
+`DecodeTraceGroups` now errors immediately if `!isTraceV2(data)` (deleted
+`decodeLegacyTraceGroups`). `shared.ValueIndexTraceVersion` deleted (confirmed zero remaining
+production references before deletion).
+
+**Not touched:** `valueindexcompactor/traceindex_dispatch.go:82` is a plain call into the
+now-v2-only `DecodeTraceGroups`, not a distinct dispatch branch — nothing to delete there.
+
+Back-refs: root `reader.go:findTraceGroupInCandidates` (deleted `probeTraceV2`),
+`internal/modules/valueindex/traceindex.go:DecodeTraceGroups` (deleted
+`decodeLegacyTraceGroups`), `internal/modules/blockio/shared/constants.go` (deleted
+`ValueIndexTraceVersion`). See NOTE-VI-075 (the v2 format this completes the cutover to).
+Tests: `traceindexquery_test.go` (`TestTraceV2_FormatDetection`, legacy fixture deleted),
+`traceindex_test.go` (`TestDecodeTraceGroups_ImplausibleGroupCountRejected`, rewritten against
+the v2 per-block decoder). See `TESTS.md` TEST-VI-14.

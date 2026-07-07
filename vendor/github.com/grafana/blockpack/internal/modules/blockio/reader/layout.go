@@ -237,8 +237,6 @@ func columnTypeName(t shared.ColumnType) string {
 var encodingKindNames = map[uint8]string{ //nolint:gochecknoglobals
 	shared.KindDictionary:            "Dictionary",
 	shared.KindSparseDictionary:      "SparseDictionary",
-	shared.KindInlineBytes:           "InlineBytes",
-	shared.KindSparseInlineBytes:     "SparseInlineBytes",
 	shared.KindDeltaUint64:           "DeltaUint64",
 	shared.KindRLEIndexes:            "RLEIndexes",
 	shared.KindSparseRLEIndexes:      "SparseRLEIndexes",

@@ -8,31 +8,9 @@ import (
 
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
 
-// allPresentEncodingEnabled is the process-level rollout toggle for AllPresent encoding
-// kinds (NOTE-AP-001). It defaults to true (compact AllPresent form selected for fully-present
-// dense columns). NewWriterWithConfig sets it from Config.DisableAllPresentEncoding. It is an
-// atomic.Bool because the encoders (which run on per-block goroutines) read it while a new
-// writer construction may write it; the value is a deploy-level constant in practice, so the
-// rare write/read overlap is benign — atomic access just removes the data race.
-var allPresentEncodingEnabled atomic.Bool //nolint:gochecknoglobals // process-level rollout flag
-
-func init() { //nolint:gochecknoinits // one-time default for the rollout flag
-	allPresentEncodingEnabled.Store(true)
-}
-
-// setAllPresentEncodingEnabled sets the process-level AllPresent rollout flag.
-func setAllPresentEncodingEnabled(v bool) {
-	allPresentEncodingEnabled.Store(v)
-}
-
-// allPresentEnabled reports whether AllPresent encoding selection is active.
-func allPresentEnabled() bool {
-	return allPresentEncodingEnabled.Load()
-}
-
 // bitPackedDeltaEnabled is the process-level rollout toggle for the bit-packed DeltaUint64
 // encoding kind (NOTE-215). It defaults to true. NewWriterWithConfig sets it from
-// Config.DisableBitPackedDelta. Atomic for the same reason as allPresentEncodingEnabled:
+// Config.DisableBitPackedDelta. Atomic for the same reason as gorillaFloat64EncodingEnabled:
 // a deploy-level constant in practice, atomic access just removes the data race between
 // per-block encoder goroutines and a concurrent writer construction.
 var bitPackedDeltaEncodingEnabled atomic.Bool //nolint:gochecknoglobals // process-level rollout flag
@@ -74,7 +52,7 @@ func pagedDeltaEnabled() bool {
 
 // uniformBytesEncodingEnabled is the process-level rollout toggle for the uniform-length
 // XORBytes encoding kinds (NOTE-217). It defaults to true. NewWriterWithConfig sets it from
-// Config.DisableUniformBytes. Atomic for the same reason as allPresentEncodingEnabled.
+// Config.DisableUniformBytes. Atomic for the same reason as bitPackedDeltaEncodingEnabled.
 var uniformBytesEncodingEnabled atomic.Bool //nolint:gochecknoglobals // process-level rollout flag
 
 func init() { //nolint:gochecknoinits // one-time default for the rollout flag
@@ -93,7 +71,7 @@ func uniformBytesEnabled() bool {
 
 // gorillaFloat64EncodingEnabled is the process-level rollout toggle for the Gorilla-XOR Float64
 // encoding kinds (NOTE-219). It defaults to true. NewWriterWithConfig sets it from
-// Config.DisableGorillaFloat64. Atomic for the same reason as allPresentEncodingEnabled:
+// Config.DisableGorillaFloat64. Atomic for the same reason as bitPackedDeltaEncodingEnabled:
 // a deploy-level constant in practice, atomic access just removes the data race between
 // per-block encoder goroutines and a concurrent writer construction.
 var gorillaFloat64EncodingEnabled atomic.Bool //nolint:gochecknoglobals // process-level rollout flag
@@ -117,7 +95,7 @@ func gorillaFloat64Enabled() bool {
 // that V14-only readers cannot read; a writer must be deployed AFTER readers understand
 // V15. When true, NewWriterWithConfig emits VersionBlockV15 blocks and tiny columns whose
 // raw blob is strictly smaller inline are stored directly in the TOC entry. Atomic for the
-// same reason as allPresentEncodingEnabled: a deploy-level constant in practice, atomic
+// same reason as bitPackedDeltaEncodingEnabled: a deploy-level constant in practice, atomic
 // access just removes the data race between per-block encoder goroutines and a concurrent
 // writer construction.
 var inlineColumnsEnabled atomic.Bool //nolint:gochecknoglobals // process-level rollout flag
@@ -172,49 +150,6 @@ func emittedBlockVersion() uint8 {
 	}
 	return shared.VersionBlockV14
 }
-
-// Encoding kind constants per SPECS §9 — canonical definitions live in shared.Kind*.
-// These aliases are preserved so writer-internal code continues to compile unchanged.
-const (
-	KindDictionary            = shared.KindDictionary
-	KindSparseDictionary      = shared.KindSparseDictionary
-	KindInlineBytes           = shared.KindInlineBytes
-	KindSparseInlineBytes     = shared.KindSparseInlineBytes
-	KindDeltaUint64           = shared.KindDeltaUint64
-	KindRLEIndexes            = shared.KindRLEIndexes
-	KindSparseRLEIndexes      = shared.KindSparseRLEIndexes
-	KindXORBytes              = shared.KindXORBytes
-	KindSparseXORBytes        = shared.KindSparseXORBytes
-	KindPrefixBytes           = shared.KindPrefixBytes
-	KindSparsePrefixBytes     = shared.KindSparsePrefixBytes
-	KindDeltaDictionary       = shared.KindDeltaDictionary
-	KindSparseDeltaDictionary = shared.KindSparseDeltaDictionary
-
-	// AllPresent encoding kinds — re-exported from shared (NOTE-AP-001).
-	KindDictionaryAllPresent      = shared.KindDictionaryAllPresent
-	KindInlineBytesAllPresent     = shared.KindInlineBytesAllPresent
-	KindDeltaUint64AllPresent     = shared.KindDeltaUint64AllPresent
-	KindRLEIndexesAllPresent      = shared.KindRLEIndexesAllPresent
-	KindXORBytesAllPresent        = shared.KindXORBytesAllPresent
-	KindPrefixBytesAllPresent     = shared.KindPrefixBytesAllPresent
-	KindDeltaDictionaryAllPresent = shared.KindDeltaDictionaryAllPresent
-
-	// Bit-packed DeltaUint64 kinds — re-exported from shared (NOTE-215).
-	KindDeltaUint64BitPacked           = shared.KindDeltaUint64BitPacked
-	KindDeltaUint64BitPackedAllPresent = shared.KindDeltaUint64BitPackedAllPresent
-
-	// Uniform-length byte-column kinds — re-exported from shared (NOTE-217).
-	KindXORBytesUniform           = shared.KindXORBytesUniform
-	KindSparseXORBytesUniform     = shared.KindSparseXORBytesUniform
-	KindXORBytesUniformAllPresent = shared.KindXORBytesUniformAllPresent
-
-	// Per-page DeltaUint64 kind — re-exported from shared (NOTE-218).
-	KindDeltaUint64Paged = shared.KindDeltaUint64Paged
-
-	// Gorilla Float64 kinds — re-exported from shared (NOTE-219).
-	KindGorillaFloat64           = shared.KindGorillaFloat64
-	KindGorillaFloat64AllPresent = shared.KindGorillaFloat64AllPresent
-)
 
 // Trace intrinsic column name constants — aliases to canonical definitions in shared.
 const (

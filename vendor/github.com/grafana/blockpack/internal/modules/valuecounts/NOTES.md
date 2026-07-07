@@ -142,6 +142,41 @@ in-progress implementation (Phases 8–12).
 Back-ref: `internal/modules/valuecountscompactor/` (service.go, store.go, config.go — under
 active implementation).
 
+**Addendum (2026-07-07, issue #490, task A-3/#110):** `DecodeLegacyVCNTFile` (the single-chunk
+reconstruction fallback for pre-self-describing objects) is deleted — tempo's `vcntwriter.go`
+now writes self-describing `EncodeVCNTFile` output unconditionally (task A-Tempo-1/#111), so no
+live write path can produce the legacy shape anymore, and the project-wide stored-data wipe
+retires any that already exist. `DecodeVCNTObject` is simplified to call `DecodeVCNTFile`
+directly (no more `errors.Is(err, ErrNotSelfDescribing)` dispatch) but is KEPT as its own named
+function (real production callers: `valuecountscompactor/service.go`,
+`vcnt.go:VCNTBuildSectionFromObjects`). `ErrNotSelfDescribing` is KEPT — it still distinguishes
+"not a self-describing file" from a genuine malformed-trailer decode error on data that IS
+self-describing, independent of the now-removed fallback consumer.
+
+Back-refs: `internal/modules/valuecounts/selfdescribing.go` (deleted `DecodeLegacyVCNTFile`,
+simplified `DecodeVCNTObject`). Tests: removed `TestDecodeLegacyVCNTFile_SingleChunkReconstruction`
+(TEST-VC-3), `TestDecodeLegacyVCNTFile_MultiChunkDataErrors` (TEST-VC-4),
+`TestDecodeVCNTObject_TriesSelfDescribingThenLegacy` (TEST-VC-5, superseded); added
+`TestDecodeVCNTObject_DecodesSelfDescribing` (TEST-VC-7). Cross-repo fallout:
+`valuecountscompactor`'s `putL0`/`putL0Multi`/`putVCNT` test-fixture helpers were writing stale
+legacy-format fixtures (accurate before `A-Tempo-1`/#111, wrong after) — fixed to use
+`EncodeVCNTFile`, resolving two resulting test failures (one of which had silently broadened a
+quarantine test's blast radius). See `valuecountscompactor/NOTES.md` for that module's own
+addendum.
+
+**Addendum, part 2 (2026-07-07, issue #490, task A-7/#101 — found as fallout during an
+unrelated task):** root package `vcnt_test.go`'s
+`TestVCNTBuildSectionFromObjects_LegacyAndSelfDescribing` (written during task A-1/#96, testing
+legacy+self-describing VCNT object merging) became dead functionality once A-3/#110 removed
+`DecodeVCNTObject`'s legacy fallback — deleted, along with its now-unused `legacyVCNTObjectFor`
+helper. `vcnt.go`'s `VCNTBuildSectionFromObjects` doc comment ("decode each object via
+`DecodeVCNTObject` (handles both the self-describing and legacy single-chunk formats
+transparently)") is corrected to drop the "legacy" claim. This root-package test lived outside
+`internal/modules/valuecounts/`'s own directory, so it was not caught by A-3's own
+grep/verification scope — the general lesson: a legacy-format removal's blast radius can extend
+to root-package tests exercising the internal package's public re-exports, not just the internal
+package's own test suite.
+
 ---
 
 ## NOTE-VC-006 — Self-describing file format decision, and the vcntwriter.go bug it works around
@@ -185,8 +220,14 @@ re-exports with `EncodeVCNTFile`/`DecodeVCNTFile` aliases — root `CLAUDE.md` r
 user permission before adding new public API surface. Flag this as a follow-up decision if/when
 `tempo-mrd` wiring to the new format starts.
 
+**Historical note (2026-07-07, issue #490):** the "out of scope" caveat above was resolved —
+`blockpack.EncodeVCNTFile` was added under task A-1/#96, and the `DecodeLegacyVCNTFile` fallback
+this entry describes was removed under task A-3/#110. See NOTE-VC-005's addendum and NOTE-VC-015
+for the full disposition; `SPECS.md` SPEC-VC-4/SPEC-VC-5 for the current contracts.
+
 Back-refs: `internal/modules/valuecounts/selfdescribing.go` (`EncodeVCNTFile`,
-`DecodeVCNTFile`, `DecodeLegacyVCNTFile`, `DecodeVCNTObject`), `SPECS.md` SPEC-VC-2.
+`DecodeVCNTFile`, `DecodeLegacyVCNTFile` [removed, see NOTE-VC-005 addendum], `DecodeVCNTObject`),
+`SPECS.md` SPEC-VC-2.
 
 ---
 
@@ -252,10 +293,14 @@ re-exported).
 - This follows the same re-export pattern already established for `SortVCNTRecords` and
   `EncodeVCNTRecords` (`vcnt.go:30`, `vcnt.go:36`) — `CompactVCNTRecords` completes the trio of
   publicly-reachable VCNT record operations (sort, encode, compact) rather than introducing a
-  new kind of public surface.
+  new kind of public surface. **Historical note (2026-07-07, issue #490, task A-17/#121):**
+  `EncodeVCNTRecords` itself is since removed — see NOTE-VC-015. This sentence is left as
+  written for historical accuracy about why `CompactVCNTRecords` was added at the time.
 - Per root `CLAUDE.md`, new public API surface on the root `blockpack` package requires
-  explicit user permission — obtained for this specific addition. This is not a blanket
-  license for further ad hoc `valuecounts` re-exports.
+  explicit user permission — obtained for this specific addition. **Superseded by the blanket
+  public-API change permission granted 2026-07-07 for the read-path modernization project — see
+  NOTE-VC-015 — which now covers further `valuecounts` re-export changes without per-addition
+  approval.**
 - A deadcode-anchor call (`_ = blockpack.CompactVCNTRecords(nil)`, `cmd/deadcode/main.go:395`)
   was added alongside the other VCNT* wrapper anchors there, required for `make precommit`'s
   deadcode check — mechanical, not a design decision.
@@ -294,10 +339,14 @@ gate was a permanent no-op in production (issue #483).
 ### What was added
 
 `blockpack.VCNTBuildSectionFromObjects(objects [][]byte) ([]byte, []VCNTChunkDirEntry)` (`vcnt.go`):
-decode each object via `DecodeVCNTObject` (handles both the self-describing and legacy single-chunk
-formats transparently), concatenate all records, run `Compact` (delta accounting — so a later
-retention/compaction delta correctly nets a value out of the merged live set), and re-encode via
-`EncodeRecords`. The output is byte-for-byte the same section shape the gate already consumes.
+decode each object via `DecodeVCNTObject`, concatenate all records, run `Compact` (delta
+accounting — so a later retention/compaction delta correctly nets a value out of the merged live
+set), and re-encode via `EncodeRecords`. The output is byte-for-byte the same section shape the
+gate already consumes. **Historical note (2026-07-07, issue #490, task A-3/#110):**
+`DecodeVCNTObject` no longer "handles both the self-describing and legacy single-chunk formats
+transparently" — its legacy fallback was removed; it now decodes only the self-describing
+format. This function's own doc comment was corrected accordingly (see NOTE-VC-005 addendum,
+part 2).
 
 ### Design decisions
 
@@ -320,8 +369,25 @@ tempo `cube_backfill.go:buildVCNTSection` lists+downloads the `.vcnt` files unde
 no embedded time range (unlike VI files), so all of a column's files are fetched and the query window
 is applied at the record level by the gate's `ValuesInRange` decode.
 
+**Addendum (2026-07-07, go-presubmit Fix 4):** the skip-on-error design above is unchanged, but it
+previously gave zero operator visibility into how many objects were skipped, unlike the sibling
+`valuecountscompactor/service.go:mergeLevel` consumer of the identical `DecodeVCNTObject` failure
+(which increments a `filesQuarantined` Prometheus counter documented as "a deliberate, logged
+data-loss event -- alert if non-zero"). `VCNTBuildSectionFromObjects` now returns a third value,
+`skipped int`, counting both empty (`len(obj)==0`) and undecodable objects:
+
+```go
+func VCNTBuildSectionFromObjects(objects [][]byte) (data []byte, dir []VCNTChunkDirEntry, skipped int)
+```
+
+tempo's `buildVCNTSection` call site now logs a warning when `skipped > 0`; no metrics/alerting
+plumbing was added (deliberately out of scope — a debug-level operational signal is sufficient here,
+unlike `mergeLevel`'s counter, since a bad `.vcnt` object for one dimension is expected to
+self-correct on the next compaction/flush cycle rather than representing a permanent loss).
+
 Back-refs: `vcnt.go:VCNTBuildSectionFromObjects`, `internal/modules/cube/cardinality.go:CheckCardinality`,
-`internal/modules/valuecounts/selfdescribing.go:DecodeVCNTObject`. Issue #483.
+`internal/modules/valuecounts/selfdescribing.go:DecodeVCNTObject`. Issue #483. Test:
+`vcnt_test.go:TestVCNTBuildSectionFromObjects_SkipsCorruptAndEmpty` (asserts `skipped == 3`).
 
 ---
 
@@ -407,3 +473,61 @@ genuine zero population. The queryplan classifier reads `!Covered` (or a non-pos
 
 Back-refs: `ColumnTotalInRange`, `ColumnTotal` in query.go. Issue #486
 (`queryplan.Classify`, NOTE-QP-002, is the consumer).
+
+---
+
+## NOTE-VC-015 — VCNT write/decode path consolidated to self-describing EncodeVCNTFile; EncodeVCNTRecords removed (issue #490, tasks A-1/#96, A-3/#110, A-17/#121)
+
+Date: 2026-07-07
+
+This note records the umbrella sequencing across three tasks that together retire VCNT's
+pre-self-describing write/decode path in favor of a single self-describing format everywhere:
+
+1. **Prerequisite (task A-Tempo-1/#111, tempo-mrd, out of this repo's scope):** tempo's
+   `vcntwriter.go` switched to persisting the `[]ChunkDirEntry` it previously discarded, writing
+   self-describing `EncodeVCNTFile` output unconditionally. This had to land FIRST — removing the
+   reader-side legacy fallback (step 3 below) before this shipped would have made a live,
+   currently-written object unreadable.
+2. **`blockpack.EncodeVCNTFile(records []VCNTRecord, perChunk int) []byte`** (`vcnt.go`, task
+   A-1/#96, coder-2-3) — a new public root-package re-export, added so tempo-mrd's
+   `vcntwriter.go` could call the self-describing encoder without importing the internal
+   `valuecounts` package. `VCNTRecord` is already a type alias for `valuecounts.Record` (predates
+   this change), so this is a pure pass-through: `func EncodeVCNTFile(records []VCNTRecord,
+   perChunk int) []byte { return valuecounts.EncodeVCNTFile(records, perChunk) }`. Round-trip
+   tested by `vcnt_test.go:TestEncodeVCNTFile_RoundTrip`. Its `cmd/deadcode/main.go` anchor
+   (`_ = blockpack.EncodeVCNTFile(nil, 0)`) was caught missing from the original A-1 landing and
+   added as a follow-up fix (2026-07-07, coder-2-3).
+3. **`DecodeLegacyVCNTFile`/`DecodeVCNTObject`'s fallback-dispatch role removed** (task A-3/#110,
+   coder-1-3) — see NOTE-VC-005's addendum above for the full detail (deleted symbols, kept
+   symbols, test changes, and the cross-repo `valuecountscompactor` fixture fallout this surfaced).
+4. **`blockpack.EncodeVCNTRecords` removed** (`vcnt.go`, task A-17/#121, coder-2-3) — it had zero
+   remaining consumers once tempo's `vcntwriter.go` switched to `EncodeVCNTFile` (step 1) and
+   tempo's `cube_vcnt_fetch_test.go` test helper (`vcntObj()`) was updated to match (that helper
+   was still hand-constructing legacy-format fixtures — a latent, not-yet-manifesting break since
+   tempo's *vendored* blockpack copy had not yet received step 3's decode-side removal; fixed
+   forward-compatibly ahead of the eventual `A-Tempo-3` revendor). Its `cmd/deadcode/main.go`
+   anchor and root-package `vcnt_test.go` test were removed alongside it. One encoder, one format.
+
+> Blanket public-API change permission granted by maintainer for the read-path modernization
+> project (2026-07-07), superseding per-addition approval; API-level backward compatibility
+> explicitly out of scope — public shims/aliases may be removed and signatures changed freely,
+> with the sole consumer (tempo) updated in lockstep.
+
+**Cross-cutting pattern, worth flagging beyond this specific removal:** the `cube_vcnt_fetch_test.go`
+`vcntObj()` fixture bug (step 4) is the SECOND instance in this project of the same bug class —
+the first was `valuecountscompactor`'s `putL0`/`putL0Multi`/`putVCNT` fixtures (step 3's
+addendum, NOTE-VC-005 above). Both were test helpers that silently kept hand-constructing a
+legacy wire format after the corresponding decoder's legacy-fallback path was removed or
+scheduled for removal, masked because the consuming code (`VCNTBuildSectionFromObjects`,
+`DecodeVCNTObject`'s old fallback) treats decode failure as skip-not-error. Neither was caught by
+`deadcode`/`go vet`/compilation — only by an explicit consumer/fixture audit. Fixture-generation
+helpers that hand-construct a wire format should be treated as a first-class audit target
+whenever a legacy decode path is removed.
+
+Back-refs: `vcnt.go:EncodeVCNTFile` (added, task A-1), `vcnt.go:EncodeVCNTRecords` (deleted, task
+A-17), `internal/modules/valuecounts/selfdescribing.go` (`DecodeLegacyVCNTFile` deleted,
+`DecodeVCNTObject` simplified — task A-3; see NOTE-VC-005 addendum). Test:
+`vcnt_test.go:TestEncodeVCNTFile_RoundTrip`. Cross-repo: tempo-mrd's `vcntwriter.go` (task
+A-Tempo-1/#111), `cube_vcnt_fetch_test.go:vcntObj()` (task A-17/#121, forward-compatible fix
+ahead of `A-Tempo-3`'s revendor). See `SPECS.md` SPEC-VC-4 (decode contract) and SPEC-VC-5
+(EncodeVCNTFile contract).

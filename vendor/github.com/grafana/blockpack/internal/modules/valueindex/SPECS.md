@@ -37,8 +37,11 @@ lookahead or re-sort required.
 **Caveat:** This is an emergent property of `SplitIntoBlocks`'s implementation, not an
 independently enforced/validated invariant — `DecodeBucketFile` does not assert group
 ordering on read. It holds for every `BucketFile` produced by this codebase's writer
-(`writerImpl.assembleBucket`) and compactor (`CompactBucketFiles`/`MergeBucketFiles`) paths,
-both of which route through `SplitIntoBlocks`. It is not verified against untrusted or
+(`writerImpl.assembleBucket`) and compactor (`MergeBucketFiles`, invoked today via
+`StreamCompactBucketFiles`) paths, both of which route through `SplitIntoBlocks`. **[Updated
+2026-07-07, issue #490, task A-4/#98]** the non-streaming `CompactBucketFiles` this sentence
+originally named is deleted (see `NOTES.md` NOTE-VI-053 addendum) — zero remaining production
+callers. It is not verified against untrusted or
 hand-corrupted input.
 
 Back-refs: `internal/modules/valueindex/bucketmerge.go:SplitIntoBlocks`,

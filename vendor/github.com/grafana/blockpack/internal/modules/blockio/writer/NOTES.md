@@ -576,6 +576,35 @@ Back-ref: `shared/constants.go` (kinds + `AllPresentKindFor`/`BaseKindFor`/`IsAl
           `writer/encoding_presence.go`, `writer/encoding_{delta,xor,prefix,dict}.go`,
           `reader/column.go:readColumnEncoding`/`decodePresenceMaybe`, NOTE-007.
 
+**Superseded paragraph note:** the "Rollout flag" paragraph above (`Config.DisableAllPresentEncoding`)
+is superseded by the addendum below — issue #490, task A-15/#109.
+
+**Addendum (2026-07-07, issue #490, task A-15/#109):** `DisableAllPresentEncoding` is removed
+outright — not merely defaulted differently. Rationale: this is a mixed-version-**binary**
+rollout mechanism (letting a writer be deployed ahead of readers that understand the new kinds),
+not an old-*data*-compat fallback like the rest of this project's removals — but this
+environment deploys every component from a single image in lockstep, so "fleet rollout complete"
+is trivially, permanently true by construction; the project directive's old-binary-fallback
+clause applies. AllPresent encoding (`encoding_presence.go:selectAllPresent`) is now
+unconditionally enabled whenever `presentCount == nRows && nRows > 0` — no config check. The
+process-level `allPresentEncodingEnabled atomic.Bool` and its setter/getter (`constants.go`) are
+deleted; `SetAllPresentEncodingEnabledForTest` and its two save/restore call sites
+(`encoding_gorilla_test.go`) are deleted; `reader/allpresent_roundtrip_test.go`'s
+`TestAllPresent_RoundTrip_DisabledFlagMatches` (the toggle-off comparison) is deleted, general
+AllPresent round-trip coverage (`TestAllPresent_RoundTrip_FullyPresent`,
+`TestAllPresent_RoundTrip_OneAbsent`) is kept. **This does NOT touch**
+`DisableBitPackedDelta`/`DisablePagedDelta`/`DisableUniformBytes`/`DisableGorillaFloat64` (NOTE-
+215/218/217/219 respectively) — out of scope for this task; their own rollout flags are
+unaffected.
+
+Back-refs (addendum): `internal/modules/blockio/writer/config.go` (deleted field),
+`internal/modules/blockio/writer/writer.go:NewWriterWithConfig` (deleted call site),
+`internal/modules/blockio/writer/constants.go` (deleted toggle machinery),
+`internal/modules/blockio/writer/encoding_presence.go:selectAllPresent` (now unconditional). See
+`internal/modules/blockio/reader/NOTES.md` NOTE-AP-001's own addendum for the reader-side mirror
+of this change; `internal/modules/blockio/SPECS.md:723`, `writer/SPECS.md:131` for the
+corresponding in-place SPECS.md corrections.
+
 ## NOTE-215: bit-packed DeltaUint64 (kinds 22/23)
 
 `encodeDeltaUint64` (kind 5) snaps every offset to a byte width (1/2/4/8 bytes). Real ingest
@@ -1329,6 +1358,65 @@ files, larger for ID-heavy ones).
 `internal/modules/blockio/writer/writer_block.go:buildIntrinsicBlockIndex`/`feedIntrinsicsFromIndex`,
 `internal/modules/blockio/reader/testsupport.go:BuildSyntheticIdentityBlock` (legacy-path test support).
 
+**Addendum (2026-07-07, issue #490, task A-9/#103):** the `appendBlockBuilders`/`buildBlock` gate
+this entry and NOTE-V2-004's addendum describe is COLLAPSED: `applyTraceID`/`applySpanID`/
+`applySpanParentID` (this note's own subject — the block-column-present branch) become the sole,
+unconditional identity-population mechanism for compaction, confirmed as the CURRENT design (not
+legacy) by `.bob/state/identity-investigation.md`'s 2026-07-07 empirical verification (a real
+build-and-run test showing the writer emits these as ordinary block columns with no special
+config). **Correction to this note's own framing above:** the "compaction of legacy dual-storage
+source blocks" parenthetical describing `applyTraceID`/`applySpanID`/`applySpanParentID` was
+itself the stale, since-reversed characterization (predating NOTE-V2-004(#420)'s reversal) that
+originally caused this branch to be misidentified as legacy during this project's investigation —
+it is the modern, sole mechanism, not a legacy-only path.
+
+The opposite branch — `feedIntrinsicsFromIndex`/`buildIntrinsicBlockIndex` (originally described
+in this note as reached via `GetColumn(traceIDColumnName) == nil`) — is the ACTUAL legacy path
+(files from the #389 (this note) to #420 (NOTE-V2-004) window) and is converted to a typed error
+in `writer_block.go`'s `buildBlock()`:
+
+```
+"writer: legacy intrinsic-only source block unsupported (missing trace:id block column, see NOTES.md NOTE-469) — re-compact"
+```
+
+**Deleted:** `feedIntrinsicsFromIndex` (blockBuilder method), `buildIntrinsicBlockIndex`
+(function), `intrinsicRowFields`/`intrinsicRowEntry` (types, NOTE-471). **Independent bonus
+finding, a real SPEC-ROOT-010 bug, not just a #490 formality:** `buildIntrinsicBlockIndex`'s
+implementation re-read `block.GetColumn(colName)` from the SAME source block its caller had
+already established lacked that column — it was structurally incapable of ever producing
+non-empty identity in the one scenario it was gated on. A genuinely legacy (#389-#420-window)
+source block handed to this code would have silently produced BLANK identity (no error) rather
+than working or failing loudly. Converting this branch to a typed error fixes this bug as a side
+effect. Doc comments on `applyTraceID`/`applySpanID`/`applySpanParentID` (previously "NOTE-469:
+intrinsic-only, no block column" / "Legacy-source path only" — the exact stale framing that
+caused the original misclassification) are corrected to state plainly they are the sole,
+unconditional identity path.
+
+**Part 2 — folded into this same task rather than left for A-10 (same underlying broken-re-read
+root cause, two call sites):** `writer.go`'s `AddRowFromReader` shared the identical bug via its
+own `getOrBuildAddRowIndex` fallback. It now reads `trace:id` directly from the source block's
+column, erroring `"trace:id missing at row %d"` if absent/short. `getOrBuildAddRowIndex`
+(method), `addRowIntrinsicCache` (Writer field), and the entire `addrowcachekey.go` file
+(`addRowCacheKey` type) are deleted as now-fully-unused. Task A-10/#104's remaining scope was
+correspondingly reduced to `blockio/compaction/compaction.go`'s dead-fallback deletion only (see
+`blockio/compaction/NOTES.md` NOTE-104) — this `writer/writer.go` site is done here, not there.
+
+**All read paths described above under "All read paths are served from the intrinsic section (or
+the SpanTree)" are UNAFFECTED by this change** — this addendum only concerns compaction's
+identity-population source, not any read-path dispatch.
+
+Back-refs (addendum): `internal/modules/blockio/writer/writer_block.go:buildBlock` (typed-error
+guard, not `appendBlockBuilders`), deleted `feedIntrinsicsFromIndex`, `buildIntrinsicBlockIndex`,
+`intrinsicRowFields`, `intrinsicRowEntry` (NOTE-471); `internal/modules/blockio/writer/writer.go`
+(deleted `getOrBuildAddRowIndex`, `addRowIntrinsicCache`, `addrowcachekey.go`). New tests:
+`internal/modules/blockio/writer/identity_compaction_test.go`
+(`TestBuildBlock_ErrorsOnLegacyIntrinsicOnlySourceBlock`,
+`TestBuildBlock_ModernSourceBlockCompactsIdentity`); new test-support
+`internal/modules/blockio/reader/testsupport.go:BuildBlockMissingIdentityColumns` (distinct from
+`BuildSyntheticIdentityBlock`, which builds the MODERN shape — see `executor/NOTES.md` NOTE-VI-080
+for the corresponding doc-only correction to that helper's own header). See
+`.bob/state/identity-investigation.md` for the full empirical basis.
+
 ## NOTE-471 — Typed intrinsic row index: kill per-row map allocation (issue #391)
 
 `buildIntrinsicBlockIndex` previously returned `map[uint16]map[string]any` — one inner
@@ -1397,6 +1485,32 @@ understands the SpanTree section.
 `compaction/compaction.go:buildDedupeIndexFromSpanTree`. Tests:
 `compaction/compaction_test.go:TestCompactBlocks_OmitIdentity_SpanTreeRecompaction`,
 top-level `omit_intrinsic_identity_test.go`.
+
+**Addendum (2026-07-07, issue #490, task A-12/#106):** `Config.OmitIntrinsicIdentityColumns`
+(this note's own subject) is DELETED outright, along with `compaction.Config`'s equivalent field
+and `compaction.go`'s pass-through of it into `WriterConfig` — this note is now historical/
+superseded, not a live toggle. **Rationale (more precise than "a config knob whose false setting
+produces legacy dual-storage output"):** the flag was already NON-FUNCTIONAL before this
+deletion — no consumer of `cfg.OmitIntrinsicIdentityColumns` existed in the writer's actual
+encode path; it was only ever passed through, never read (the IntrinsicTOC/SpanTree machinery
+this note's "Defaults OFF" toggle referred to was removed under #433/#434). SpanTree is the sole
+identity store for every writer output, unconditionally, regardless of this flag's prior value —
+this is unaffected by, and unrelated to, the separate NOTE-469/NOTE-V2-004 identity-mechanism
+inversion finding above (a wholly separate dead config knob, not part of that confusion).
+
+**Bonus fix found during zero-refs verification:** `v2_e2e_test.go`'s header comment described
+three file variants under test ("v1", "v1o" naming `OmitIntrinsicIdentityColumns`, and "v2"), but
+the actual test code only ever built/iterated two (`e2eFileV1`, `e2eFileV2` — no `e2eFileV1o`
+exists). Corrected to describe two variants. `compaction/compaction_test.go`'s dangling orphaned
+doc comment for `TestCompactBlocks_OmitIdentity_SpanTreeRecompaction` (the function itself no
+longer existed, removed in a prior pass alongside #433/#434) was also deleted.
+
+Back-refs (addendum): `internal/modules/blockio/writer/config.go` (deleted field),
+`internal/modules/blockio/compaction/config.go` (deleted field),
+`internal/modules/blockio/compaction/compaction.go` (deleted pass-through),
+`internal/modules/blockio/writer/writer.go:~135` (stale historical comment corrected, identifier
+removed), `internal/modules/blockio/writer/v2_e2e_test.go` (header comment corrected). Confirmed
+via `grep -rn OmitIntrinsicIdentityColumns --include=*.go`: zero hits repo-wide.
 
 ## NOTE-478 — Prefer SpanTree over IntrinsicTOC for identity decode (issue #396)
 
@@ -1522,6 +1636,22 @@ count == 1 and span count preserved after a toggle-on recompaction round trip).
 `internal/modules/blockio/compaction/config.go:Config.RestoreIdentityBlockColumns`,
 `internal/modules/blockio/writer/identity_block_cols_test.go`.
 
+**Addendum (2026-07-07, issue #490, task A-9/#103):** this note's own load-bearing sentence —
+*"present block column ⇒ identity carried by `addRowFromBlock`; absent block column (old v4+
+intrinsic-only source) ⇒ identity carried by `feedIntrinsicsFromIndex`"* — already correctly
+identified which branch is modern and which is legacy; the confusion that produced this
+project's original (wrong) scoping for A-9 came from NOTE-469's own framing (this same package,
+different note), which pre-dated this note's reversal and had not been updated to match it. As
+of this change, the `feedIntrinsicsFromIndex` branch this note describes is retired to a typed
+error (see NOTE-469's addendum above); the `addRowFromBlock` branch becomes unconditional —
+`Config.RestoreIdentityBlockColumns`'s "Defaults OFF" toggle framing above is also now stale
+(empirically confirmed unconditionally ON in the current writer, per
+`.bob/state/identity-investigation.md`'s Q1 test) and should be read as describing the
+mechanism's *origin*, not its current on/off status.
+
+Back-refs (addendum): see NOTE-469's addendum above for the full deleted-symbol list and exact
+typed-error text (same underlying change, documented once there to avoid duplication).
+
 ## NOTE-V2-005 (issue #421) — skip the file-level IntrinsicTOC for v2 self-contained blocks
 
 The v2 format (#417) makes every inner block self-contained: all intrinsic columns already
@@ -1594,3 +1724,63 @@ re-emitting it — new blocks never carry the column, old blocks still read.
 `internal/modules/blockio/writer/writer.go:flushBlocks`,
 `internal/modules/blockio/writer/writer_block.go:addRowFromBlock`/`addSpanAttr`,
 `internal/modules/blockio/reader/legacy_vectorf32_test.go`.
+
+**Addendum (2026-07-07, issue #490, task A-6/#100):** the "Legacy-block correctness" section
+above is REVERSED — this note previously kept the reader-side `ColumnTypeVectorF32` decode and
+the writer-side `addRowFromBlock` skip specifically "so that blocks previously written with a
+`__embedding__` column still decode without error." Both are now REMOVED. `writer_block.go`'s
+`addRowFromBlock` no longer skips `ColumnTypeVectorF32` columns during merge; `reader/column.go`'s
+`readColumnEncoding` no longer dispatches to `decodeVectorF32` (function deleted, along with
+`decompressZstdScratch` and the `vf32HdrSize`/`vf32RleLenOff` constants); `Column.VectorF32Value`
+deleted (zero callers repo-wide); `decodeCtx.scratch` deleted (only ever populated by the deleted
+decoder). `legacy_vectorf32_test.go` deleted in full.
+
+**Deliberate behavior change, not just dead-code removal:** a block that still physically
+carries a VectorF32 column now HARD-ERRORS at column decode time instead of decoding it
+gracefully as before — and this error is not limited to explicit reads of that column:
+`addRowFromBlock`'s `col.IsPresent(srcRowIdx)` triggers lazy decode on every column in a source
+block during merge/compaction, so merging or compacting ANY block containing a VectorF32 column
+now fails entirely, not just direct reads of that column. This graceful-degrade-to-loud-abort
+tradeoff was accepted deliberately — embedding generation was disabled months before this
+project, and the end-of-project stored-data wipe makes any remaining VectorF32-bearing
+stragglers moot; loud rejection matches this project's tier-b philosophy of failing loudly on an
+assumption violation rather than silently tolerating it. **Contingent on no VectorF32-bearing
+source data remaining in any tenant's retention window by the time this ships** — flagged by the
+implementing coder as worth a final confirmation before the Phase A gate, not something to treat
+as unconditionally proven.
+
+**Explicitly out of scope:** `shared.ColumnTypeVectorF32`/`shared.KindVectorF32` enum values
+remain defined (referenced by `valueindex/hash.go`'s indexability-exclusion check and
+`shared/types.go`'s enum list — unrelated packages). `layout.go`'s `columnTypeNames`/
+`encodingKindNames` debug-name maps are untouched (cosmetic forensic-tool lookups).
+
+Back-refs (addendum): `internal/modules/blockio/writer/writer_block.go:addRowFromBlock` (deleted
+VectorF32 skip), `internal/modules/blockio/reader/column.go:readColumnEncoding` (deleted
+VectorF32 dispatch, `decodeVectorF32`, `decompressZstdScratch`, `vf32HdrSize`/`vf32RleLenOff`),
+`internal/modules/blockio/reader/block.go` (deleted `Column.VectorF32Value`),
+`internal/modules/blockio/reader/decodectx.go` (deleted `scratch` field). Test:
+`legacy_vectorf32_test.go` deleted in full. See `reader/TESTS.md` READER-TEST-018.
+
+## NOTE-101 — writer/constants.go Kind* alias re-exports removed; all call sites requalified to shared.Kind* (issue #490, task A-7/#101)
+
+Date: 2026-07-07
+
+`writer/constants.go` previously re-exported every `shared.Kind*` encoding-kind constant under a
+same-named local alias (`KindDictionary = shared.KindDictionary`, etc. — ~40 constants spanning
+base/AllPresent/bit-packed/uniform/paged/Gorilla groups), explicitly documented as kept "for
+backward compatibility" (`shared/constants.go:205`'s own comment, the literal item named in issue
+#490's enumerated removal list). The alias block is deleted outright; every bare `KindXXX` call
+site in `internal/modules/blockio/writer/` (~24 files, production and test) is requalified to
+`shared.KindXXX` directly. Purely mechanical — no behavior change, no wire-format change.
+
+**This is NOT a revision to NOTE-AP-001/NOTE-215/NOTE-217/NOTE-218/NOTE-219** — those notes
+document the aliased ENCODINGS themselves (AllPresent selection, bit-packed delta, uniform
+bytes, per-page delta, Gorilla float64 respectively), not the now-removed aliasing pattern. Their
+own back-ref lines already cite canonical `shared.*`-prefixed names directly (confirmed by
+inspection — none of them cited a bare `writer/constants.go`-local alias name in prose), so the
+"back-ref audit" this project's earlier notes flagged as a follow-up mechanical checklist item is
+satisfied with no further edits needed to those five notes.
+
+Back-refs: `internal/modules/blockio/writer/constants.go` (deleted alias block),
+`internal/modules/blockio/shared/constants.go:205` (deleted backward-compatibility comment, the
+canonical `Kind*` block itself unchanged).

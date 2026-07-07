@@ -537,10 +537,10 @@ func (s *Service) mergeLevel(ctx context.Context, colDir string, files []levelFi
 		}
 		// NOTE-VI-037 (#431): embed the merged file's wall time range in the output
 		// filename so DiscoverIndexFiles/IndexFileCache can prune compacted files by
-		// time exactly as it prunes L0 files. Writing v1 filenames (no range) here
-		// would force every compacted file to "always match" the time filter,
-		// silently defeating discovery pruning for all data above level 0. The
-		// BucketGroup footer carries file-level min/max time_sec directly.
+		// time exactly as it prunes L0 files. Writing a v1 filename (no range) here
+		// would make the output unparseable by ParseFilenameV2 (the v1 fallback was
+		// removed), so it would be silently skipped by discovery entirely rather than
+		// found. The BucketGroup footer carries file-level min/max time_sec directly.
 		var wallMinSec, wallMaxSec uint64
 		if ft, ferr := valueindex.DecodeBucketFooter(data); ferr == nil {
 			wallMinSec, wallMaxSec = ft.MinTimeSec, ft.MaxTimeSec

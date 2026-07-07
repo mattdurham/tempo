@@ -61,7 +61,7 @@ func shouldUseBitPackedDelta(maxOffset uint64, presentCount int) bool {
 //	+ base[8 LE] + bit_width[1]   // 0..64
 //	+ packed_len[4 LE] + packed_offsets   // LSB-first bit stream, ceil(nPresent*bit_width/8) bytes
 //
-// NOTE-AP-001: when every row is present, kind KindDeltaUint64BitPackedAllPresent is emitted and
+// NOTE-AP-001: when every row is present, kind shared.KindDeltaUint64BitPackedAllPresent is emitted and
 // the presence_rle_len[4] + presence_rle_data segment is omitted entirely.
 //
 // Callers select this encoder via shouldUseBitPackedDelta; it does not re-validate that the
@@ -69,7 +69,7 @@ func shouldUseBitPackedDelta(maxOffset uint64, presentCount int) bool {
 func encodeDeltaUint64BitPacked(values []uint64, present []bool, nRows int) ([]byte, error) {
 	bitset, presentCount := buildPresenceBitset(present, nRows)
 
-	kind, allPresent := selectAllPresent(KindDeltaUint64BitPacked, presentCount, nRows)
+	kind, allPresent := selectAllPresent(shared.KindDeltaUint64BitPacked, presentCount, nRows)
 
 	var rleData []byte
 	if !allPresent {

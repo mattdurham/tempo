@@ -19,7 +19,8 @@ import (
 const vcntFileMagic uint32 = 0x56434E31 // "VCN1"
 
 // ErrNotSelfDescribing is returned by DecodeVCNTFile when data's trailing magic doesn't
-// match — the caller should fall back to DecodeLegacyVCNTFile, not treat it as corruption.
+// match, distinguishing "this isn't a self-describing VCNT file" from a generic decode
+// error (a malformed trailer/directory on data that IS self-describing) — errors.Is-comparable.
 var ErrNotSelfDescribing = errors.New("valuecounts: not a self-describing VCNT file")
 
 // vcntTrailerSize is the fixed byte size of the self-describing file trailer:
@@ -31,7 +32,7 @@ const vcntTrailerSize = 4 + 4 + 4
 // trailer (dirCount[4] + bodyLen[4] + magic[4]), so any consumer can decode the file directly
 // from object storage without a side-channel directory (fixes the vcntwriter.go gap where
 // EncodeRecords' returned []ChunkDirEntry is discarded — see NOTES.md).
-// SPEC-VC-2: self-describing file format contract (see DecodeVCNTFile/DecodeLegacyVCNTFile).
+// SPEC-VC-2: self-describing file format contract (see DecodeVCNTFile).
 func EncodeVCNTFile(records []Record, perChunk int) []byte {
 	body, dir := EncodeRecords(records, perChunk)
 	buf := make([]byte, 0, len(body)+dirEncodedSize(dir)+vcntTrailerSize)
@@ -46,8 +47,7 @@ func EncodeVCNTFile(records []Record, perChunk int) []byte {
 }
 
 // DecodeVCNTFile decodes a file produced by EncodeVCNTFile. Returns ErrNotSelfDescribing
-// (wrapped, errors.Is-comparable) if data's trailing magic doesn't match — callers should
-// fall back to DecodeLegacyVCNTFile in that case, not treat it as corruption.
+// (wrapped, errors.Is-comparable) if data's trailing magic doesn't match.
 func DecodeVCNTFile(data []byte) ([]Record, error) {
 	if len(data) < vcntTrailerSize {
 		return nil, fmt.Errorf("valuecounts: %w: file too short (%d bytes)", ErrNotSelfDescribing, len(data))
@@ -72,35 +72,14 @@ func DecodeVCNTFile(data []byte) ([]Record, error) {
 	return DecodeAll(body, dir)
 }
 
-// DecodeLegacyVCNTFile decodes a pre-self-describing VCNT object (written by EncodeRecords
-// without persisting its returned directory) by reconstructing a single-chunk directory
-// covering the whole payload. Valid only for objects that never exceeded one chunk (every
-// object written by today's vcntwriter.go, per its one-column-one-flush write pattern).
-// Returns an error, not partial/garbage data, if the single-chunk assumption doesn't hold
-// (SPEC-ROOT-010): a payload of more than one independently-snappy-compressed chunk fails to
-// decode as a single snappy stream.
-func DecodeLegacyVCNTFile(data []byte) ([]Record, error) {
-	dir := []ChunkDirEntry{{CompOff: 0, CompLen: uint32(len(data))}} //nolint:gosec // bounded
-	recs, err := DecodeAll(data, dir)
-	if err != nil {
-		return nil, fmt.Errorf("valuecounts: legacy VCNT file: %w", err)
-	}
-	return recs, nil
-}
-
-// DecodeVCNTObject decodes a VCNT object of either format: self-describing (DecodeVCNTFile)
-// first, falling back to the legacy single-chunk reconstruction (DecodeLegacyVCNTFile) only
-// when the data isn't self-describing. This is the compactor's per-input-file decode entry
-// point.
+// DecodeVCNTObject decodes a VCNT object. Since #490 A-3, EncodeVCNTFile's self-describing
+// format is the only format ever written (A-Tempo-1 switched tempo's vcntwriter.go off the
+// legacy EncodeVCNTRecords path), so this is now a direct call to DecodeVCNTFile — kept as
+// its own function because it has real callers (valuecountscompactor and
+// VCNTBuildSectionFromObjects) that shouldn't need to change on a future format addition.
+// This is the compactor's per-input-file decode entry point.
 func DecodeVCNTObject(data []byte) ([]Record, error) {
-	recs, err := DecodeVCNTFile(data)
-	if err == nil {
-		return recs, nil
-	}
-	if !errors.Is(err, ErrNotSelfDescribing) {
-		return nil, err
-	}
-	return DecodeLegacyVCNTFile(data)
+	return DecodeVCNTFile(data)
 }
 
 // dirEncodedSize returns the exact byte length appendDirEntry will produce for dir.

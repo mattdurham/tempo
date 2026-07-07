@@ -11,7 +11,7 @@ SPEC-ROOT-009 — this file's own sequence, numbering from 1, independent of
 `internal/modules/valuecountscompactor/TESTS.md`'s own separate `TEST-VC-N` sequence). IDs are
 assigned in ascending order and never reused or renumbered.
 
-Next free ID: **TEST-VC-7**.
+Next free ID: **TEST-VC-8**.
 
 ---
 
@@ -34,75 +34,47 @@ Back-ref: `internal/modules/valuecounts/selfdescribing_test.go:TestEncodeDecodeV
 ## TEST-VC-2: TestDecodeVCNTFile_RejectsNonSelfDescribing
 *Added: 2026-07-02*
 
-**Scenario:** `DecodeVCNTFile` must distinguish "not self-describing" from generic corruption
-so callers know to fall back to `DecodeLegacyVCNTFile` rather than treat the data as garbage.
+**Scenario:** `DecodeVCNTFile` must distinguish "not self-describing" from generic corruption.
 
-**Setup:** Legacy `EncodeRecords` output (no embedded directory/trailer) fed directly to
+**Setup:** Non-self-describing bytes (no embedded directory/trailer) fed directly to
 `DecodeVCNTFile`.
 
 **Assertions:** Returns a non-nil error, and `errors.Is(err, ErrNotSelfDescribing)` is true.
 
-**Spec invariants tested:** SPEC-VC-2.
+**Spec invariants tested:** SPEC-VC-2, SPEC-VC-4.
 
 Back-ref: `internal/modules/valuecounts/selfdescribing_test.go:TestDecodeVCNTFile_RejectsNonSelfDescribing`.
 
 ---
 
-## TEST-VC-3: TestDecodeLegacyVCNTFile_SingleChunkReconstruction
+## TEST-VC-3: TestDecodeLegacyVCNTFile_SingleChunkReconstruction — REMOVED (issue #490, task A-3/#110, 2026-07-07)
 *Added: 2026-07-02*
 
-**Scenario:** `DecodeLegacyVCNTFile` must correctly recover records from today's real
-write-path shape: `EncodeRecords` output with its returned directory discarded (the
-`vcntwriter.go` gap described in NOTE-VC-006).
-
-**Setup:** Two records sharing `(ColumnName, TimeStart, TimeEnd)` encoded via `EncodeRecords`
-with `perChunk=0` (verified by test setup to produce exactly 1 chunk); only the body bytes are
-passed to `DecodeLegacyVCNTFile` (directory discarded, matching production behavior).
-
-**Assertions:** Decoded records exactly match the input records (order-independent comparison).
-
-**Spec invariants tested:** SPEC-VC-2.
-
-Back-ref: `internal/modules/valuecounts/selfdescribing_test.go:TestDecodeLegacyVCNTFile_SingleChunkReconstruction`.
+**Removed:** `DecodeLegacyVCNTFile` (the function this test exercised) was deleted once
+tempo-mrd's `vcntwriter.go` write path switched to self-describing `EncodeVCNTFile` output
+(task A-Tempo-1/#111) and the project's stored-data wipe retired any legacy-shaped objects. ID
+retained (not reused) per the file's numbering convention. See `NOTES.md` NOTE-VC-005 addendum,
+NOTE-VC-015; `SPECS.md` SPEC-VC-4.
 
 ---
 
-## TEST-VC-4: TestDecodeLegacyVCNTFile_MultiChunkDataErrors
+## TEST-VC-4: TestDecodeLegacyVCNTFile_MultiChunkDataErrors — REMOVED (issue #490, task A-3/#110, 2026-07-07)
 *Added: 2026-07-02*
 
-**Scenario:** SPEC-ROOT-010 guardrail — `DecodeLegacyVCNTFile`'s single-chunk assumption must
-fail loudly, not silently produce partial or wrong data, when fed data that actually spans
-multiple chunks.
-
-**Setup:** 10 records encoded via `EncodeRecords` with `perChunk=3` (verified by test setup to
-produce 2+ chunks), body bytes only (directory discarded) passed to `DecodeLegacyVCNTFile`.
-
-**Assertions:** Returns a non-nil error (multi-chunk snappy payload fails to decode as a single
-stream) rather than succeeding with truncated/garbage records.
-
-**Spec invariants tested:** SPEC-VC-2, SPEC-ROOT-010.
-
-Back-ref: `internal/modules/valuecounts/selfdescribing_test.go:TestDecodeLegacyVCNTFile_MultiChunkDataErrors`.
+**Removed:** same removal as TEST-VC-3 — `DecodeLegacyVCNTFile` deleted in full. ID retained
+(not reused) per the file's numbering convention. See `NOTES.md` NOTE-VC-005 addendum,
+NOTE-VC-015; `SPECS.md` SPEC-VC-4.
 
 ---
 
-## TEST-VC-5: TestDecodeVCNTObject_TriesSelfDescribingThenLegacy
+## TEST-VC-5: TestDecodeVCNTObject_TriesSelfDescribingThenLegacy — SUPERSEDED by TEST-VC-7 (issue #490, task A-3/#110, 2026-07-07)
 *Added: 2026-07-02*
 
-**Scenario:** `DecodeVCNTObject` — the compactor's per-input-file decode entry point — must
-correctly handle all three object shapes it will encounter in production: self-describing
-files, legacy single-chunk files, and genuinely corrupt data.
-
-**Setup:** Table-driven with three cases: (1) `EncodeVCNTFile` output, (2) legacy
-`EncodeRecords` (single-chunk) output, (3) arbitrary bytes (`{0x01, 0x02, 0x03}`) matching
-neither format.
-
-**Assertions:** Cases 1 and 2 decode successfully and match their respective input records;
-case 3 returns a non-nil error.
-
-**Spec invariants tested:** SPEC-VC-2.
-
-Back-ref: `internal/modules/valuecounts/selfdescribing_test.go:TestDecodeVCNTObject_TriesSelfDescribingThenLegacy`.
+**Superseded:** this table-driven test's legacy-decode case (case 2) and corrupt-data case
+(case 3) no longer apply to a single function once `DecodeVCNTObject`'s fallback dispatch was
+removed. Replaced by TEST-VC-7 (`TestDecodeVCNTObject_DecodesSelfDescribing`), which covers
+`DecodeVCNTObject`'s remaining (self-describing-only) contract. See `NOTES.md` NOTE-VC-005
+addendum, NOTE-VC-015; `SPECS.md` SPEC-VC-4.
 
 ---
 
@@ -124,3 +96,21 @@ panic).
 **Spec invariants tested:** SPEC-VC-2, SPEC-ROOT-001.
 
 Back-ref: `internal/modules/valuecounts/selfdescribing_test.go:TestDecodeVCNTFile_RejectsImpossibleDirCount`.
+
+---
+
+## TEST-VC-7: TestDecodeVCNTObject_DecodesSelfDescribing
+*Added: 2026-07-07*
+
+**Scenario:** `DecodeVCNTObject` (now a direct, no-fallback call to `DecodeVCNTFile`) still
+decodes self-describing VCNT objects correctly after the legacy-fallback dispatch was removed
+(issue #490, task A-3/#110).
+
+**Setup:** `EncodeVCNTFile` output fed to `DecodeVCNTObject`.
+
+**Assertions:** Returns no error; decoded records match the input set (order-independent
+comparison).
+
+**Spec invariants tested:** SPEC-VC-4.
+
+Back-ref: `internal/modules/valuecounts/selfdescribing_test.go:TestDecodeVCNTObject_DecodesSelfDescribing`.

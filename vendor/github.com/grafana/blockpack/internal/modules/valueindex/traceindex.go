@@ -286,18 +286,17 @@ func appendTraceBlockIndex(out []byte, dir []traceBlockDirEntry) []byte {
 }
 
 // DecodeTraceGroups decodes a full TraceGroup index payload into every group it
-// holds. It dispatches on format: a v2 batched file (magic "VTG2") is decoded
-// block by block; a legacy flat-blob file (snappy stream leading with
-// ValueIndexTraceVersion) is decoded via decodeLegacyTraceGroups so old files
-// written before the v2 rollover (issue #476) still read (NOTE-VI-047 migration
-// discipline). This whole-file decode is used by the compactor's merge path
-// (which must read every group) and by tests; the trace-by-id read path uses the
-// partial, block-pruning helpers in traceindexquery.go instead.
+// holds. Only the v2 batched format (magic "VTG2") is supported — the legacy v1
+// flat-blob format's rollover window (NOTE-VI-047, issue #476) has closed, and a
+// file that doesn't carry the v2 magic is now a hard decode error, not a
+// fallback candidate. This whole-file decode is used by the compactor's merge
+// path (which must read every group) and by tests; the trace-by-id read path
+// uses the partial, block-pruning helpers in traceindexquery.go instead.
 func DecodeTraceGroups(data []byte) ([]TraceGroup, error) {
-	if isTraceV2(data) {
-		return decodeTraceV2(data)
+	if !isTraceV2(data) {
+		return nil, fmt.Errorf("valueindex: trace index is not a v2 batched file (legacy v1 flat-blob format is no longer supported)")
 	}
-	return decodeLegacyTraceGroups(data)
+	return decodeTraceV2(data)
 }
 
 // isTraceV2 reports whether data is a v2 batched TraceGroup file: long enough to
@@ -464,54 +463,6 @@ func decodeTraceBlockIndex(data []byte) ([]traceBlockDirEntry, error) {
 		dir = append(dir, d)
 	}
 	return dir, nil
-}
-
-// decodeLegacyTraceGroups decodes a v1 flat-blob TraceGroup payload (a single
-// snappy stream leading with ValueIndexTraceVersion). Retained for the v2
-// rollover window so files written before issue #476 still read.
-func decodeLegacyTraceGroups(compressed []byte) ([]TraceGroup, error) {
-	raw, err := snappy.Decode(nil, compressed)
-	if err != nil {
-		return nil, fmt.Errorf("valueindex: trace index snappy decode: %w", err)
-	}
-	if len(raw) < 1 {
-		return nil, fmt.Errorf("valueindex: trace index payload empty")
-	}
-	ver := raw[0]
-	if ver != shared.ValueIndexTraceVersion {
-		return nil, fmt.Errorf("valueindex: trace index unsupported version %d", ver)
-	}
-	pos := 1
-
-	table, consumed, err := DecodeStringTable(raw[pos:])
-	if err != nil {
-		return nil, fmt.Errorf("valueindex: trace index string table: %w", err)
-	}
-	pos += consumed
-
-	if pos+4 > len(raw) {
-		return nil, fmt.Errorf("valueindex: trace index truncated group count")
-	}
-	groupCount := int(binary.LittleEndian.Uint32(raw[pos : pos+4]))
-	pos += 4
-
-	if groupCount < 0 || pos+groupCount*minGroupWireSize > len(raw) {
-		return nil, fmt.Errorf(
-			"valueindex: trace index group count %d implausible for remaining %d bytes",
-			groupCount, len(raw)-pos,
-		)
-	}
-
-	groups := make([]TraceGroup, 0, groupCount)
-	for gi := range groupCount {
-		g, npos, gerr := decodeTraceGroupAt(raw, pos, table)
-		if gerr != nil {
-			return nil, fmt.Errorf("valueindex: trace index group %d: %w", gi, gerr)
-		}
-		pos = npos
-		groups = append(groups, g)
-	}
-	return groups, nil
 }
 
 // sortTraceGroups sorts groups by (TraceID ASC, TimeSec ASC) and each group's

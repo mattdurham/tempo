@@ -24,11 +24,4 @@ type Config struct {
 	StagingDir       string
 	DedicatedColumns []modules_blockio.DedicatedColumn
 	MaxSpansPerBlock int
-
-	// OmitIntrinsicIdentityColumns historically dropped trace:id/span:id/span:parent_id from
-	// the compacted output's IntrinsicTOC (NOTE-476, issue #394), relying on the SpanTree as a
-	// fallback identity store. The IntrinsicTOC (#433) and SpanTree (#434) have been removed;
-	// v2 identity lives in block columns. See WriterConfig.OmitIntrinsicIdentityColumns —
-	// should remain OFF.
-	OmitIntrinsicIdentityColumns bool
 }
