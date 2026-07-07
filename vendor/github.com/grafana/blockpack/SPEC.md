@@ -757,6 +757,26 @@ Back-refs: `internal/modules/executor/search_trace_vi.go:QueryTraceQLFromIndex`,
 `valueindex_query.go` (querier-flow doc). External: tempo
 `tempodb/encoding/vblockpack/value_index_query.go`, `backend_block.go`.
 
+**Addendum 2026-07-06 (issue #481, NOTE-VI-078) — the inconsistency error is now ENFORCED
+end-to-end.** The blockpack executor already returned `(nil, false, err)` for an index/data
+inconsistency (above). The tempo consumer, however, still *masked* it: `tryIndexFetch` logged the
+error and fell through to a full block scan, so index corruption was silently worked around
+rather than surfaced. As of NOTE-VI-078 the tempo search path (`tryIndexFetch` → `Fetch`)
+PROPAGATES that error and FAILS the query — no scan. This makes SPEC-ROOT-019's "inconsistency is
+an error" clause true at the querier boundary, not only inside the executor, matching how
+SPEC-ROOT-018's trace-by-ID path (NOTE-VI-071) stopped masking the same skew behind a scan.
+
+**Still in force after NOTE-VI-078:** the three ROUTINE DECLINE categories above (no-coverage
+negation/unindexable leaf; non-filter query; unsupported metrics shape) STILL fall back to a
+correct full scan — they are "the index cannot answer this query SHAPE," not corruption.
+Removing *those* fallbacks (issue #481's full directive) additionally requires the
+selectivity-aware execution strategy of #481 part 2 (recognizing low-selectivity predicates like
+`kind=server` where index pruning cannot help), which is an open design question, not yet
+scoped into its own issue. NOTE-VI-078 deliberately closes only the inconsistency-masking gap,
+which is safe to flip in isolation because it never changes behaviour for a query the index could
+legitimately answer or legitimately decline — only for one it answered against data that no
+longer exists.
+
 ---
 
 ## SPEC-FORMAT-001: All Metadata Sections Must Be ToC-Driven for Selective Decoding

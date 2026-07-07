@@ -7274,3 +7274,51 @@ Back-ref: `internal/modules/executor/search_trace_vi.go:QueryTraceQLFromIndex`,
 `_ANDPartialCoverageFallsBack`, `_LargeResultSetIsAuthoritative`, `_InconsistentIndexIsError`),
 `api_test.go:TestQueryTraceQLFromIndex_Public*`. External: tempo
 `tempodb/encoding/vblockpack/value_index_query.go`, `backend_block.go`.
+
+## NOTE-VI-078 — Search-path index/data inconsistency now FAILS the query in tempo, not masked by a silent scan (issue #481)
+
+*Added: 2026-07-06*
+
+Issue #481's directive is "remove the search/metrics full-scan fallback everywhere — the value
+index must be authoritative." The blockpack executor side of that contract was already correct
+after NOTE-VI-047: `QueryTraceQLFromIndex` returns `(nil, false, err)` when a matched span names
+a block/page absent from the data file (index/data inconsistency), distinct from a routine
+`(nil, false, nil)` decline (no coverage / unindexable leaf). **The remaining gap was entirely in
+the tempo consumer:** `vblockpack/value_index_query.go:tryIndexFetch` LOGGED that error and then
+`return nil, false, stats` — i.e. it fell through to a full block scan, silently masking index
+corruption behind a slower path that could reproduce a possibly-wrong result. That is exactly the
+silent-scan-masks-corruption anti-pattern the trace-by-id path eliminated in NOTE-VI-071
+(`GetTraceByID`: a matched `SpanEntry` the reader cannot resolve is an error, never a fallback).
+
+**What changed (tempo only; no blockpack code change).** `tryIndexFetch` gained a fourth return
+value, an explicit `error`, and now returns three distinct outcomes rather than conflating them
+in a single bool: index answered `(matches, true, stats, nil)`; ROUTINE DECLINE
+`(nil, false, stats, nil)` — the index genuinely cannot answer this query SHAPE (index disabled,
+no coverage for a leaf, an unindexable/negation predicate, a non-filter query, or a build-time
+coverage miss), caller falls back to a correct scan, unchanged; INDEX/DATA INCONSISTENCY
+`(nil, false, stats, err)` — the index HAD coverage and matched spans but named unresolvable
+pages, so `Fetch` FAILS the query with that error instead of scanning. `Fetch` propagates the
+error as `"vblockpack Fetch: value index inconsistency: %w"`.
+
+**Scope boundary — what #481 still leaves open (deliberate, not overlooked).** #481 has five
+parts. Part 1 (BucketGroup `MaxOutputBytes` cap) shipped as #482 (NOTE-VI-077). Part 2 —
+selectivity-aware execution: recognizing that a low-selectivity predicate like `kind=server`
+matches almost everything, so index pruning cannot help and a pointed-recent-block-first strategy
+would beat building an index source over the whole window — is an OPEN "bigger design question"
+with NO companion issue yet, and it is the true blocker on removing the REMAINING routine
+declines. The three surviving decline categories (no-coverage negation/unindexable leaf,
+structural/pipeline query, unsupported metrics shape) are ARCHITECTURAL "the index cannot answer
+this query SHAPE" cases: hard-erroring them would make common negation/low-selectivity queries
+fail every time instead of scanning — precisely what #481's own body warns against doing before
+part 2 is solved. NOTE-VI-078 therefore closes only the one authoritative-contract gap that is
+safe to flip now (enforce the inconsistency ERROR the index already produces); it does NOT remove
+the routine-decline scan fallback. The metrics VI path (`ExecuteTraceMetricsFromVI`) has no
+analogous gap: it resolves from `TimeSec` alone without a `BlockIndexForPage`/`ReadBlocks` step,
+so it cannot produce an index/data inconsistency — it only routine-declines.
+
+Back-ref: tempo `tempodb/encoding/vblockpack/value_index_query.go:tryIndexFetch`,
+`backend_block.go:Fetch`, `value_index_inconsistency_test.go`
+(`TestFetch_IndexDataInconsistencyFailsQuery`, `TestFetch_NoIndexReaderFallsBackToScan`).
+SPEC: SPEC-ROOT-019 (root `SPEC.md`, Addendum 2026-07-06 / issue #481).
+Blockpack-side error production: `search_trace_vi.go:QueryTraceQLFromIndex` (unchanged),
+`search_trace_vi_test.go:TestQueryTraceQLFromIndex_InconsistentIndexIsError`.
