@@ -370,3 +370,40 @@ while `Covered` stays true. Accuracy only needs to be directionally correct for 
 #484), so this clamp is safe.
 
 Back-refs: `SelectivityInRange`, `SelectivityEstimate` in query.go. Issue #484.
+
+---
+
+## NOTE-VC-014 — ColumnTotalInRange: the selectivity DENOMINATOR
+
+Date: 2026-07-06
+
+`ColumnTotalInRange(data, dir, column, minTS, maxTS)` is the population-side counterpart to
+NOTE-VC-013's `SelectivityInRange` and the primitive #486 (selectivity-aware execution) needs
+to recognize a low-selectivity predicate. `SelectivityInRange` gives the NUMERATOR — the net
+live span count for one `column = value` pair; `ColumnTotalInRange` gives the DENOMINATOR — the
+total live span count across ALL values of the column over the window. Their ratio is a leaf's
+selectivity fraction: a `column = value` whose value accounts for most of the column's spans is
+low-selectivity, so value-index pruning on it would skip almost nothing (the `kind=server`
+case in #481/#486).
+
+### Sum of LIVE per-value counts, not a raw record sum
+
+It reuses `sumLiveValues` (the same primitive behind `ValuesInRange`/`CardinalityInRange`) and
+sums the returned per-value counts. This is deliberately the sum of the LIVE values (each net
+count > 0, NOTE-VC-001) rather than a raw sum over `DecodeTimeRange` records: a raw sum would
+fold in a value's negative retention/compaction delta before its matching introduction is seen
+and could read a genuinely-populated column as a smaller (or transiently negative) total. Because
+`ColumnTotalInRange` is a denominator, an under-count there would INFLATE a leaf's computed
+selectivity fraction and wrongly flag a selective predicate as low-selectivity. Summing live
+per-value counts keeps `ColumnTotal >= sum of the same column's SelectivityInRange numerators`
+by construction, so a leaf's fraction is always in `[0, 1]`.
+
+### `Covered` mirrors SelectivityEstimate.Covered
+
+Like the numerator, the result carries a `Covered` flag distinct from a zero `Total`: no VCNT
+record for the column at all is "no signal" (caller applies its no-coverage policy), NOT a
+genuine zero population. The queryplan classifier reads `!Covered` (or a non-positive total) as
+`UnknownSelectivity` and leaves the strategy choice to the caller's default.
+
+Back-refs: `ColumnTotalInRange`, `ColumnTotal` in query.go. Issue #486
+(`queryplan.Classify`, NOTE-QP-002, is the consumer).
