@@ -5,6 +5,16 @@ package vblockpack
 // source (discover + download + per-leaf predicate) and try the index path before
 // falling back to a full block scan.
 //
+// Authoritative-index contract (SPEC-ROOT-019, NOTE-VI-047 / NOTE-VI-078): for a
+// query shape the index CAN answer, its result is complete and correct — there is
+// no speculative "index answered but a scan is cheaper" fallback. Fallback to a
+// full scan is reserved for ROUTINE DECLINES only (a query shape the index
+// architecturally cannot answer: an unindexable/negation leaf, a non-filter query,
+// or no coverage). An index/data INCONSISTENCY — the index had coverage and matched
+// spans but named a block/page the data file cannot resolve — is index corruption:
+// it now FAILS the query (NOTE-VI-078, issue #481) instead of being masked by a
+// silent scan, mirroring the trace-by-id path's NOTE-VI-071 posture.
+//
 // The reader is a process-level singleton, configured once at querier startup via
 // ConfigureValueIndexQuery, mirroring the embedder/cache singletons. When it is
 // nil (the default, value_index_query.enabled=false) every query path is
@@ -128,22 +138,39 @@ type indexFetchStats struct {
 }
 
 // tryIndexFetch attempts to answer a compiled filter program from the value index.
-// It returns (matches, true) when the index fully answered the query for this
-// block, and (nil, false) when the caller must fall back to a full block scan
-// (index disabled, no coverage, unsupported predicate, or any error — the index
-// path never fails a query, it only declines). The returned indexFetchStats
-// captures the download I/O of this attempt regardless of outcome (issue #465).
+// It returns three distinct outcomes, mirroring the authoritative contract the
+// blockpack executor now enforces (SPEC-ROOT-019, NOTE-VI-047 / NOTE-VI-078):
+//
+//   - (matches, true, stats, nil) — the index fully answered the query for this
+//     block. The caller uses the result and does NOT scan.
+//   - (nil, false, stats, nil) — a ROUTINE DECLINE: the index genuinely cannot
+//     answer this query shape (index disabled, no coverage for a leaf, an
+//     unindexable/negation predicate, a non-filter query, or a build-time
+//     coverage miss). The caller falls back to a correct full block scan. This is
+//     a documented, still-standing exception, not an error.
+//   - (nil, false, stats, err) — an INDEX/DATA INCONSISTENCY: the index HAD
+//     coverage and produced matches, but one names a block/page absent from the
+//     data file. Because the value index is authoritative for the columns it
+//     covers, this is index corruption, not a routine miss. The caller must FAIL
+//     the query with this error rather than masking it with a silent scan — the
+//     silent-scan-masks-corruption anti-pattern the trace-by-id path eliminated in
+//     NOTE-VI-071. blockpack.QueryTraceQLFromIndex already surfaces this as a
+//     non-nil error; tryIndexFetch now propagates it up through Fetch instead of
+//     logging-and-scanning (NOTE-VI-078, issue #481).
+//
+// The returned indexFetchStats captures the download I/O of this attempt
+// regardless of outcome (issue #465).
 func (b *blockpackBlock) tryIndexFetch(
 	ctx context.Context,
 	r *blockpack.Reader,
 	prog *blockpack.Program,
 	query string,
 	opts blockpack.QueryOptions,
-) ([]blockpack.SpanMatch, bool, indexFetchStats) {
+) ([]blockpack.SpanMatch, bool, indexFetchStats, error) {
 	var stats indexFetchStats
 	vr := getValueIndexQueryReader()
 	if vr == nil {
-		return nil, false, stats
+		return nil, false, stats, nil
 	}
 
 	// Derive the query's second-granularity window. A zero bound means "unbounded"
@@ -154,14 +181,19 @@ func (b *blockpackBlock) tryIndexFetch(
 	cache := vr.cacheFor(b.meta.TenantID)
 	src, ok, err := blockpack.BuildValueIndexSource(ctx, cache, vr.store, prog, minSec, maxSec)
 	if err != nil {
+		// A build-time error is an object-store/discovery failure (List error,
+		// corrupt-file decode). This is not the authoritative "index named a block
+		// absent from the data file" inconsistency — the source has not yet
+		// produced any span match — so it remains a routine decline: log and let
+		// the caller fall back to a correct full scan (NOTE-VI-078, issue #481).
 		level.Warn(util_log.Logger).Log("msg", "vblockpack: index fetch: build source error",
 			"block", b.meta.BlockID, "err", err)
-		return nil, false, stats
+		return nil, false, stats, nil
 	}
 	if !ok {
 		level.Info(util_log.Logger).Log("msg", "vblockpack: index fetch: no coverage",
 			"block", b.meta.BlockID, "tenant", b.meta.TenantID, "minSec", minSec, "maxSec", maxSec)
-		return nil, false, stats
+		return nil, false, stats, nil
 	}
 	level.Info(util_log.Logger).Log("msg", "vblockpack: index fetch: coverage found",
 		"block", b.meta.BlockID, "tenant", b.meta.TenantID, "files", src.Stats().FilesRead)
@@ -174,24 +206,32 @@ func (b *blockpackBlock) tryIndexFetch(
 
 	sourceRef := blockObjectKey(b.meta.TenantID, b.meta.BlockID.String())
 	// The value index is authoritative for the columns it covers (blockpack
-	// NOTE-VI-047, issue #474): QueryTraceQLFromIndex no longer speculatively
-	// declines a large-but-correct result set. A non-nil err now signals an
-	// index/data inconsistency (the index named a block/page absent from the
-	// file) rather than a routine miss; log it and fall back to a correct full
-	// scan, but surface it so the inconsistency is observable.
+	// NOTE-VI-047/SPEC-ROOT-019): QueryTraceQLFromIndex does not speculatively
+	// decline a large-but-correct result set. A non-nil err signals an index/data
+	// inconsistency (the index named a block/page absent from the data file) — the
+	// index HAD coverage and produced matches, so this is index corruption, not a
+	// routine "cannot answer" miss.
+	//
+	// NOTE-VI-078 (issue #481): this error is now PROPAGATED to the caller so Fetch
+	// FAILS the query, instead of being logged-and-masked by a silent full scan.
+	// Masking corruption behind a scan is exactly the anti-pattern the trace-by-id
+	// path eliminated in NOTE-VI-071 — an authoritative index that names data the
+	// file cannot resolve must be observable as an error, not quietly worked around.
+	// The remaining routine declines (indexOK=false, err=nil) still fall back to a
+	// correct scan below; only genuine index/data skew becomes a hard error.
 	matches, indexOK, err := blockpack.QueryTraceQLFromIndex(
 		ctx, r, src, query, sourceRef, opts,
 	)
 	if err != nil {
-		level.Warn(util_log.Logger).Log("msg", "vblockpack: index fetch: index/data inconsistency, falling back to scan",
+		level.Error(util_log.Logger).Log("msg", "vblockpack: index fetch: index/data inconsistency, failing query (NOTE-VI-078)",
 			"block", b.meta.BlockID, "tenant", b.meta.TenantID, "err", err)
-		return nil, false, stats
+		return nil, false, stats, err
 	}
 	if !indexOK {
-		return nil, false, stats
+		return nil, false, stats, nil
 	}
 	stats.Used = true
-	return matches, true, stats
+	return matches, true, stats, nil
 }
 
 // floorToMinuteSec floors sec down to the same 60-second (minute) alignment as

@@ -744,11 +744,16 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 	// covers (blockpack NOTE-VI-047, issue #474): when it answers, that answer is
 	// the complete, correct result and we do not scan — there is no speculative
 	// "the index answered but a scan is cheaper" fallback. We fall through to the
-	// full-scan paths below ONLY when the index genuinely cannot answer: no
-	// coverage for a leaf (negation/unindexable predicate), a non-filter query, or
-	// an index/data inconsistency (logged in tryIndexFetch, then a correct scan).
+	// full-scan paths below ONLY when the index genuinely cannot answer (a routine
+	// decline): no coverage for a leaf (negation/unindexable predicate), a
+	// non-filter query, or a build-time coverage miss. An index/data INCONSISTENCY
+	// (the index had coverage but named a block/page the data file cannot resolve)
+	// is NOT a routine decline: it is index corruption and now FAILS the query
+	// rather than being masked by a silent scan (NOTE-VI-078, issue #481) — the
+	// authoritative-index contract SPEC-ROOT-019 describes, matching how the
+	// trace-by-id path (NOTE-VI-071) stopped masking the same skew behind a scan.
 	if compiledProgram != nil {
-		im, ok, istats := b.tryIndexFetch(ctx, r, compiledProgram, query, queryOpts)
+		im, ok, istats, idxErr := b.tryIndexFetch(ctx, r, compiledProgram, query, queryOpts)
 		// Record index-path I/O on the span whenever the index was consulted (any
 		// files were read), even if it ultimately declined and we fall back to a
 		// full scan (issue #465).
@@ -759,6 +764,11 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 				attribute.Int64("index.bytes_read", istats.BytesRead),
 				attribute.Int("index.hits", istats.Hits),
 			)
+		}
+		if idxErr != nil {
+			// Authoritative-index inconsistency: fail the query, do not scan.
+			slog.Error("vblockpack Fetch: value index/data inconsistency", "query", query, "err", idxErr)
+			return traceql.FetchSpansResponse{}, fmt.Errorf("vblockpack Fetch: value index inconsistency: %w", idxErr)
 		}
 		if ok {
 			matches = im
