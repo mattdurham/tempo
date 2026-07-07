@@ -91,12 +91,12 @@ func DefaultTypedConfig(hot, warm filecache.Cache) TypedConfig {
 
 // TwoTierTypedConfig returns a TypedConfig that splits caching across two remote caches:
 //   - meta: Footer, TOC, Bloom, Metadata, TraceIdx — small, high-reuse entries
-//     that benefit from a shared cache with low eviction pressure (e.g. memcached-01).
+//     that benefit from a shared cache with low eviction pressure (e.g. a shared metadata cache instance).
 //   - page: Block — large column-page blobs where a separate cache avoids evicting
-//     the small metadata entries (e.g. memcached-blockpack-page-01).
+//     the small metadata entries (e.g. a dedicated page-cache instance).
 //
-// This mapping matches the tempo-dev-test-03 cache topology where memcached-01 is wired
-// for metadata and memcached-blockpack-page-01 for page data.
+// This mapping matches the dev test cluster cache topology where one instance is wired
+// for metadata and a dedicated instance for page data.
 func TwoTierTypedConfig(meta, page filecache.Cache) TypedConfig {
 	return TypedConfig{
 		Footer:   meta,

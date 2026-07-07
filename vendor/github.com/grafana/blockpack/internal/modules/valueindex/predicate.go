@@ -193,3 +193,81 @@ func compareCanonical(colType shared.ColumnType, a, b []byte) int {
 		return bytes.Compare(a, b)
 	}
 }
+
+// SPEC-VI-9: isNumericColType reports whether colType's canonical little-endian byte encoding
+// is NOT lex-order-preserving (NOTE-VI-011: e.g. uint64(255) < uint64(256) numerically, but LE
+// bytes [255,0,...] > [0,1,...] lexicographically). Mirrors compareCanonical's numeric branches
+// exactly — these are the types blockExcludedByValue must never value-prune by directory bytes
+// alone.
+func isNumericColType(colType shared.ColumnType) bool {
+	switch colType {
+	case shared.ColumnTypeUint64, shared.ColumnTypeRangeUint64,
+		shared.ColumnTypeInt64, shared.ColumnTypeRangeInt64, shared.ColumnTypeRangeDuration,
+		shared.ColumnTypeFloat64, shared.ColumnTypeRangeFloat64:
+		return true
+	default:
+		return false
+	}
+}
+
+// SPEC-VI-9: blockExcludedByValue reports whether every value in [minValue, maxValue] (a
+// BlockDirEntry's per-block value range) is excluded by pred, letting a ranged reader
+// (QueryBucketFileRanged, B-4) skip a block's body ReadAt entirely, using only information
+// already present in the block directory — no bloom filter is consulted anywhere in the
+// matchGroupsInBlock call chain either path uses (NOTE-VI-082).
+//
+// Ruling 14 (binding — see task-breakdown.md B-3, supersedes the simpler "equality + simple
+// range" framing considered earlier): the containment check MUST use compareCanonicalBytes
+// (plain lexicographic, with length-prefix tiebreak), NOT compareCanonical (numeric-decode-
+// aware). BlockDirEntry.MinValue/MaxValue are themselves computed at write time using
+// compareCanonicalBytes (bucketfile.go's ComputeBlockMeta), so checking containment with a
+// different comparator than the one that built the bounds risks a false-negative prune —
+// silently dropping a block that actually contains a match, a correctness regression.
+//
+// This makes the prune sound for: (a) equality predicates, any column type — self-consistency
+// holds regardless of whether the byte order carries numeric meaning — and (b) range/between
+// predicates on non-numeric types (string, bytes, UUID, RangeString, RangeBytes), where
+// compareCanonical and compareCanonicalBytes already agree. Range/between predicates on numeric
+// types (uint64, int64, float64, and their Range* variants) get NO value-range prune: persisted
+// MinValue/MaxValue are lex-byte extremes of LE-encoded numbers, which carry no numeric meaning
+// — a genuine capability gap in the current on-disk format, not something to paper over with an
+// unsound comparator choice. A future writer-side order-preserving numeric encoding for
+// directory bounds could close this gap but is out of scope for #488 (candidate follow-up, not
+// attempted here). Numeric range/between predicates fall through to matchGroupsInBlock's
+// per-group TimeSec check + pred.Match, exactly matching pre-B-4 behavior — no bloom filter is
+// consulted anywhere in this call chain (NOTE-VI-082).
+//
+// Returns false ("cannot decide, don't prune") for predicate kinds this cheap directory-only
+// test can't reason about (neq, regex, nil) — those still fall through to matchGroupsInBlock's
+// per-group TimeSec check + pred.Match (NOTE-VI-082).
+func blockExcludedByValue(pred Predicate, minValue, maxValue []byte) bool {
+	switch p := pred.(type) {
+	case *eqPredicate:
+		return compareCanonicalBytes(p.canonical, minValue) < 0 ||
+			compareCanonicalBytes(p.canonical, maxValue) > 0
+	case *rangePredicate:
+		if isNumericColType(p.colType) {
+			return false
+		}
+		switch p.op {
+		case OpGT:
+			return compareCanonicalBytes(maxValue, p.threshold) <= 0
+		case OpGTE:
+			return compareCanonicalBytes(maxValue, p.threshold) < 0
+		case OpLT:
+			return compareCanonicalBytes(minValue, p.threshold) >= 0
+		case OpLTE:
+			return compareCanonicalBytes(minValue, p.threshold) > 0
+		default:
+			return false
+		}
+	case *betweenPredicate:
+		if isNumericColType(p.colType) {
+			return false
+		}
+		return compareCanonicalBytes(maxValue, p.lo) < 0 ||
+			compareCanonicalBytes(minValue, p.hi) > 0
+	default: // neqPredicate, regexPredicate, nil predicate
+		return false
+	}
+}

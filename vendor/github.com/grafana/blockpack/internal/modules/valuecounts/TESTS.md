@@ -11,7 +11,7 @@ SPEC-ROOT-009 — this file's own sequence, numbering from 1, independent of
 `internal/modules/valuecountscompactor/TESTS.md`'s own separate `TEST-VC-N` sequence). IDs are
 assigned in ascending order and never reused or renumbered.
 
-Next free ID: **TEST-VC-8**.
+Next free ID: **TEST-VC-9**.
 
 ---
 
@@ -114,3 +114,31 @@ comparison).
 **Spec invariants tested:** SPEC-VC-4.
 
 Back-ref: `internal/modules/valuecounts/selfdescribing_test.go:TestDecodeVCNTObject_DecodesSelfDescribing`.
+
+## TEST-VC-8: SelectivityPerMinute — bucketing, liveness, isolation, and time-bound coverage
+*Added: 2026-07-07*
+
+**Scenario:** `SelectivityPerMinute` (SPEC-VC-6) must bucket a value's summed count by
+`Record.TimeStart`, apply the same net-`<=`-0 liveness drop as the rest of the package, and
+isolate its target `(column, value)` from unrelated columns/values sharing the same minute.
+
+**Setup/Assertions (`perminute_test.go`):**
+
+- `TestSelectivityPerMinute_BucketsByTimeStart` — four records across three minutes (60, 120,
+  300), two of which share minute 60. Asserts three ascending-`Minute` `MinuteCount` results,
+  with the shared-minute pair summed (`{60,7}`, `{120,3}`, `{300,9}`).
+- `TestSelectivityPerMinute_DropsNetNonPositiveMinutes` — a net-zero minute (5 + -5) and a
+  net-negative minute (a single -1 record, minute 180) are both dropped; only the one net-positive minute
+  (`{120,3}`) survives.
+- `TestSelectivityPerMinute_IgnoresOtherColumnsAndValues` — records for a different value
+  ("POST") and a different column ("resource.service.name") sharing the same minute must not
+  contribute to the target `(column="span:name", value="GET")`'s sums.
+- `TestSelectivityPerMinute_TimeBounded` — a `[minTS, maxTS]` window excludes a record outside
+  it; only the in-window minute's bucket is returned.
+
+**Assertions (common):** no error; returned slice is exactly the expected `[]MinuteCount`
+(order-sensitive, ascending by `Minute`).
+
+**Spec invariants tested:** SPEC-VC-6.
+
+Back-ref: `internal/modules/valuecounts/perminute_test.go`. Issue #487, task C1.

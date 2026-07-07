@@ -1547,3 +1547,103 @@ Back-refs: root `reader.go:findTraceGroupInCandidates` (deleted `probeTraceV2`),
 Tests: `traceindexquery_test.go` (`TestTraceV2_FormatDetection`, legacy fixture deleted),
 `traceindex_test.go` (`TestDecodeTraceGroups_ImplausibleGroupCountRejected`, rewritten against
 the v2 per-block decoder). See `TESTS.md` TEST-VI-14.
+
+---
+
+## NOTE-VI-081 — Ranged-read path for v2 BucketGroup files: shared metadata decode, extracted matching (issue #488, B-2/B-4)
+
+Date: 2026-07-07
+
+Issue #488's read-path modernization replaces vibuilder's whole-file download + in-memory
+`QueryBucketFiles` scan with a partial-read path that fetches only the footer, block directory,
+and surviving block bodies. Two design choices make this safe rather than a second,
+independently-maintained implementation of the v2 `BucketGroup` binary format:
+
+**Shared metadata decode (`RangedSource`/`ReadBucketFileMetadata`, SPEC-VI-7/8).**
+`disk_iterator.go`'s pre-existing `readBucketFileMetadata` (compaction's disk-streaming path,
+SPEC-VI-5's `GroupIterator` lineage) already did footer→string-table→block-directory decoding
+against a local `*os.File`. Rather than write a second version of this offset arithmetic against
+vibuilder's `FileStore`, `bucketfile_metadata.go` extracts a store-agnostic
+`ReadBucketFileMetadata(src RangedSource)` and rewrites `disk_iterator.go`'s version as a thin
+`*os.File`-adapter wrapper over it, unchanged in signature/behavior. `RangedSource` is
+deliberately minimal (`Size`/`ReadAt` only) so both a local file and an object-storage adapter
+(`vibuilder.storeRangedSource`, NOTE-VI-084) satisfy it without either depending on the other's
+concrete type.
+
+**Extracted, shared block matching (`matchGroupsInBlock`).** `QueryBucketFiles`' inner
+per-block loop (time-range check, then predicate/group matching) is extracted into
+`matchGroupsInBlock` and called identically by both `QueryBucketFiles` (whole-file) and the new
+`QueryBucketFileRanged` (SPEC-VI-10). This is a correctness-by-construction choice, not just
+code reuse: a hand-duplicated second copy of the matching logic in the ranged path would be one
+more place a future predicate-type addition or edge-case fix could be applied to only one of the
+two paths, silently reintroducing exactly the kind of read-path divergence issue #476/NOTE-VI-046
+warned about for trace-by-id lookups. With the shared helper, the two paths are structurally
+incapable of disagreeing on which groups a given block yields — the only remaining difference is
+which blocks' bodies get read at all (SPEC-VI-9's directory-level value prune, new in the ranged
+path only, since `QueryBucketFiles` already has the whole block decoded by the time matching
+happens and has nothing left to prune before reading).
+
+Back-refs: `internal/modules/valueindex/bucketfile_metadata.go`,
+`internal/modules/valueindex/bucketquery.go:QueryBucketFiles,matchGroupsInBlock`,
+`internal/modules/valueindex/bucketquery_ranged.go:QueryBucketFileRanged`,
+`internal/modules/valueindex/disk_iterator.go:readBucketFileMetadata` (the adapter). See
+`SPECS.md` SPEC-VI-7/8/9/10.
+
+## NOTE-VI-082 — Corrected stale premise: no post-read bloom check exists in `QueryBucketFiles`; `QueryBucketFileRanged` correctly adds none (issue #488, B-4)
+
+Date: 2026-07-07
+
+`plan.md` and `task-breakdown.md` §B-4 described the ranged-read design as including a "bloom
+check (post-read, unchanged)" step, implying `QueryBucketFiles` already performed one after
+decoding a block and that the new ranged path should replicate it. **Verified by direct read,
+oracle-checked (spec-oracle-b, 2026-07-07): this step never existed.** `QueryBucketFiles`'
+per-block loop (`bucketquery.go:QueryBucketFiles`) does exactly two things per block —
+`OverlapsTimeRange` (time prune), then `matchGroupsInBlock` (group/predicate matching) — with no
+call to `BucketBlock.MayContainValue` (the bloom test) anywhere in between or afterward.
+`matchGroupsInBlock` itself (`bucketquery.go:matchGroupsInBlock`, the function `QueryBucketFileRanged`
+shares per NOTE-VI-081) checks only `g.TimeSec` bounds and `pred.Match(g.CanonicalValue)` per
+group — again, no bloom involvement.
+
+`BucketBlock.MayContainValue`/`TestValueBloom` (`bucketquery.go:MayContainValue`) exist in this package and
+remain available, but are unused by the `QueryBucketFiles`/`matchGroupsInBlock`/
+`QueryBucketFileRanged` call chain as of this writing (whether they are called from elsewhere in
+the package — e.g. a different, non-`QueryBucketFiles` caller — was not checked as part of this
+finding and is out of scope for it).
+
+**No code change follows from this correction.** `QueryBucketFileRanged` deliberately does not
+add a bloom check that `QueryBucketFiles` never had — doing so would be new, unrequested
+behavior beyond parity, not a gap-fill. Cross-path parity between the two read functions is
+guaranteed structurally by both calling the literally-shared `matchGroupsInBlock` (NOTE-VI-081),
+not by independently replicating a step that turned out not to be real. This is recorded here,
+following the same pattern established in this project's Phase A work (a plan/breakdown
+description verified absent from actual code rather than implemented as described), and is
+called out in the issue #488 closing-comment draft (task B-8) as a second documented scope
+clarification alongside the ruling-14 numeric-range-pruning boundary (SPEC-VI-9).
+
+Back-refs: `internal/modules/valueindex/bucketquery.go:QueryBucketFiles,matchGroupsInBlock,BucketBlock.MayContainValue`,
+`internal/modules/valueindex/bucketquery_ranged.go:QueryBucketFileRanged`. See `SPECS.md`
+SPEC-VI-10 (states this explicitly as part of `QueryBucketFileRanged`'s contract).
+
+## NOTE-VI-083 — `DecodeBucketFooter` wraps `ErrNotBucketFile` on both branches, enabling footer-only skip classification (issue #488, B-4)
+
+Date: 2026-07-07
+
+`DecodeBucketFooter` (`bucketquery.go:DecodeBucketFooter`) now wraps `ErrNotBucketFile` on
+**both** of its error branches — data too short to hold a footer and bad footer magic — rather
+than returning a plain, unwrapped error on either. This lets a **footer-only** reader (code that
+has read only the fixed-size footer bytes, not a whole decoded `BucketFile`) use a single
+`errors.Is(err, ErrNotBucketFile)` check as its complete skip-vs-abort signal, exactly mirroring
+how `QueryBucketFiles`' whole-file path already classifies `DecodeBucketFile`'s magic-mismatch
+case (`bucketquery.go:QueryBucketFiles`'s `ErrNotBucketFile`-skip branch). `QueryBucketFileRanged`'s
+`readBucketFileFooter` helper (`bucketfile_metadata.go`) is the first, and as of this writing
+only, consumer of this footer-only classification.
+
+**Behavior classification: additive, not breaking.** Confirmed by grep across the repository
+that no existing caller of `DecodeBucketFooter` checked its returned error by string text or by
+any means other than a plain non-nil check; widening the returned error to additionally satisfy
+`errors.Is(_, ErrNotBucketFile)` cannot break an existing non-nil-only check, since every such
+check still observes a non-nil error exactly when it did before.
+
+Back-refs: `internal/modules/valueindex/bucketquery.go:DecodeBucketFooter`,
+`internal/modules/valueindex/bucketfile_metadata.go:readBucketFileFooter` (the consumer). See
+`SPECS.md` SPEC-VI-8.

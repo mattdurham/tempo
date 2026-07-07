@@ -10,7 +10,7 @@ Entries in this file use the module-local, sequential prefix `TEST-VI-N` (file-s
 SPEC-ROOT-009 — distinct from the `NOTE-VI-N` numbering in `NOTES.md`). IDs are assigned in
 ascending order and never reused or renumbered.
 
-Next free ID: **TEST-VI-15**.
+Next free ID: **TEST-VI-22**.
 
 ---
 
@@ -370,3 +370,209 @@ needed (the legacy blob format itself is retired, not merely a decode variant to
 `TestParseFilenameV2_RejectsV1Filename` (issue #490, task A-5/#99, see NOTES.md NOTE-VI-037
 addendum). `TestDiscoverIndexFiles_V1FilenameAlwaysIncluded` (`discovery_test.go`) — superseded
 by `TestDiscoverIndexFiles_V1FilenameSkipped` (same task).
+
+---
+
+## TEST-VI-15: `ReadBucketFileMetadata` matches `disk_iterator.go`'s prior behavior
+*Added: 2026-07-07*
+
+**Scenario:** The extracted, store-agnostic `ReadBucketFileMetadata` (SPEC-VI-8) must decode a
+v2 `BucketGroup` file's footer, string table, and block directory identically to
+`disk_iterator.go`'s pre-extraction `readBucketFileMetadata`, now that the latter is a thin
+`*os.File`-adapter wrapper over the former.
+
+**Setup:** `TestReadBucketFileMetadata_MatchesDiskIteratorBehavior`
+(`bucketfile_metadata_test.go`) builds a multi-block `BucketFile`, writes it to a temp file,
+and compares `ReadBucketFileMetadata`'s output (via a `RangedSource` wrapping the file) against
+the pre-existing disk-iterator code path's own decode of the same file.
+
+**Assertions:** decoded footer, block directory, and string table are identical between the two
+call paths; no regression in `NewDiskBucketFileIterator`'s own signature/behavior.
+
+## TEST-VI-16: `blockExcludedByValue` — ruling-14 scoped value-range pruning
+*Added: 2026-07-07*
+*Updated: 2026-07-07 — added the eq-branch comparator-disagreement case (see below).*
+
+**Scenario:** `blockExcludedByValue` (SPEC-VI-9) must prune correctly for equality predicates
+(any column type) and range/between predicates on non-numeric types, and must NEVER prune a
+range/between predicate on a numeric type — the deliberate capability boundary ruling 14
+establishes. Two DISTINCT regression tests are required to cover the comparator-choice
+question for numeric types, because the eq-predicate branch and the range/between branches
+reach the comparator differently (see the correction below).
+
+**Setup (table-driven, `blockexcluded_test.go`):**
+- `TestBlockExcludedByValue_Equality` — string/bytes equality predicate outside a block's
+  `[minValue, maxValue]` is excluded; inside is not.
+- `TestBlockExcludedByValue_EqualityNumeric` — equality prune also applies to numeric column
+  types (self-consistent regardless of byte-order semantics). Uses values kept below 256 so
+  LE byte order happens to match numeric order, keeping the test's own reasoning simple — this
+  test does NOT exercise the case where `compareCanonicalBytes` and `compareCanonical`
+  disagree; that is `TestBlockExcludedByValue_EqualityNumericDisagreement`'s job (see below).
+- `TestBlockExcludedByValue_EqualityNumericDisagreement` — **the required regression test for
+  the ONE branch where the `compareCanonicalBytes`-vs-`compareCanonical` choice is actually
+  live for a numeric column type: `eqPredicate` has no `isNumericColType` gate** (per ruling
+  14, equality is sound with either comparator applied consistently, but only if
+  `compareCanonicalBytes` — the comparator the write side actually used to build the directory
+  bounds — really is the one used). `minValue`/`maxValue` are laid out exactly as write-time
+  `compareCanonicalBytes` would order them for a block containing both `uint64(255)` and
+  `uint64(256)` (`canon(256)`'s bytes lexicographically precede `canon(255)`'s — the classic
+  disagreement case, NOTE-VI-011); an eq predicate for `256` (a value genuinely present in such
+  a block) must NOT be excluded. Added by a reviewer finding (task #138) after
+  `TestBlockExcludedByValue_NumericRangeNeverPruned`'s own doc comment was found to
+  incorrectly claim this disagreement case was already covered by it — a mutation test (eq
+  branch temporarily swapped to `compareCanonical`) confirmed the full suite passed without
+  this new test, proving the gap was real, not just theoretical. `TestBlockExcludedByValue_
+  EqualityNumeric`'s doc comment was corrected in the same pass to point at this test instead
+  of misattributing the coverage to `TestBlockExcludedByValue_NumericRangeNeverPruned`.
+- `TestBlockExcludedByValue_RangeNonNumeric` / `TestBlockExcludedByValue_BetweenNonNumeric` —
+  range/between predicates on string/bytes/UUID types prune correctly using
+  `compareCanonicalBytes`.
+- `TestBlockExcludedByValue_NumericRangeNeverPruned` — the required regression test for the
+  range/between branches: a numeric-typed (e.g. `uint64`) range/between predicate over a block
+  whose directory bounds would, under a naive lex-byte read, appear to exclude the predicate's
+  target value (the classic `uint64(255)` vs `uint64(256)` LE-byte-ordering disagreement,
+  NOTE-VI-011) must NOT be pruned — asserts `blockExcludedByValue` returns `false`
+  unconditionally for numeric range/between, proving no false-negative prune occurs. **Note:**
+  this test proves the `isNumericColType` gate exists and short-circuits before either
+  comparator is ever called for a numeric range/between predicate — it does NOT, by itself,
+  prove anything about comparator correctness on the eq-predicate branch (that is
+  `TestBlockExcludedByValue_EqualityNumericDisagreement`'s exclusive job, per the correction
+  above).
+- `TestBlockExcludedByValue_UnprunablePredicatesNeverExclude` — neq/regex/nil predicates always
+  return `false` (cannot decide, don't prune; fall through to `matchGroupsInBlock`'s per-group
+  TimeSec check + `pred.Match` — no bloom filter is consulted anywhere in this call chain,
+  NOTE-VI-082).
+
+**Assertions:** every table case matches SPEC-VI-9's scope table exactly; the numeric-range
+regression case in particular must never report `true` (excluded) regardless of directory bound
+values, since doing so would be a silent false-negative correctness bug, not merely a missed
+optimization; the eq-branch disagreement case must never report `true` (excluded) for a value
+genuinely present in the block, confirmed to fail (catching the regression) under a mutation
+test that swaps the eq branch's comparator to `compareCanonical`.
+
+## TEST-VI-17: `QueryBucketFileRanged` — partial-read parity with `QueryBucketFiles` and pruning behavior
+*Added: 2026-07-07*
+
+**Scenario:** `QueryBucketFileRanged` (SPEC-VI-10) must (a) prune at the file level using only a
+footer read, (b) prune at the block level using directory metadata without reading pruned
+blocks' bodies, (c) produce results identical to `QueryBucketFiles` for the same file/predicate/
+time-range, (d) treat a non-bucket-file as a skip rather than an error, (e) support nil
+(match-all) predicates, and (f) respect `ctx` cancellation at function entry (before any read),
+after the metadata read (before the per-block loop), and once per directory entry within the
+per-block loop.
+
+**Setup (`bucketquery_ranged_test.go`), using a `countingRangedSource` (or equivalent) fake that
+records exact `(off, len)` `ReadAt` ranges, not just call counts:**
+- `TestQueryBucketFileRanged_TimeExcludedFile_FooterOnly` — a file whose footer time range
+  doesn't overlap the query window issues exactly one `ReadAt` (the footer) and returns
+  `(nil, nil)`.
+- `TestQueryBucketFileRanged_ValueExcludedByAllBlocks_FooterAndDirOnly` — every block excluded
+  by `blockExcludedByValue` issues footer + directory reads only, zero block-body reads.
+- `TestQueryBucketFileRanged_MatchesQueryBucketFiles_MultiBlock` — a multi-block file queried
+  both ways (whole-file `QueryBucketFiles` vs. ranged `QueryBucketFileRanged`) produces
+  byte-identical `[]LookupResult` sets.
+- `TestQueryBucketFileRanged_NotABucketFile_SkippedNotError` — bad-magic/too-short input returns
+  `(nil, nil)`, not an error (NOTE-VI-083's `ErrNotBucketFile` wrapping enables this).
+- `TestQueryBucketFileRanged_TooShortToHoldFooter_SkippedNotError` — data shorter than a fixed
+  footer is classified the same way as a bad-magic footer (both routes through
+  `ErrNotBucketFile`).
+- `TestQueryBucketFileRanged_NilPredicate_MatchAll` — a nil predicate matches every group
+  (mirrors `QueryBucketFiles`' own nil-predicate contract).
+- `TestQueryBucketFileRanged_ContextCancelledStopsEarly` — a `ctx` canceled before the call is
+  checked at function entry, before the footer read: it returns a wrapped `ctx.Err()` and issues
+  zero `ReadAt` calls, not just an early-but-nonzero-cost cancellation.
+
+**Assertions:** each test's named behavior holds exactly; existing `QueryBucketFiles` tests
+remain green, unmodified in their own assertions, confirming the `matchGroupsInBlock` extraction
+(NOTE-VI-081) introduced no behavior change to the pre-existing whole-file path.
+
+## TEST-VI-18: `QueryBucketFileRanged` file-level prune matches `QueryBucketFiles` at the SPEC-VI-4 minute-flooring edge
+*Added: 2026-07-07*
+
+**Scenario:** required B-4 review sign-off regression proving `QueryBucketFileRanged`'s new
+file-level footer prune (which `QueryBucketFiles` has no equivalent of — it never checks
+file-level bounds, only per-block) applies SPEC-VI-4's no-internal-flooring, caller-trusts
+contract identically to `QueryBucketFiles`, rather than silently diverging with some
+ranged-path-only flooring rule.
+
+**Setup:** `TestQueryBucketFileRanged_MinuteFlooringParity_FileLevel`
+(`bucketquery_ranged_test.go`) builds a single-block fixture with a write-side-floored
+`TimeSec=960` (representing a true event time anywhere in `[960,1019]`), then queries both
+`QueryBucketFiles` and `QueryBucketFileRanged` with (a) a raw, un-floored `minTS=995` — strictly
+between the floored `TimeSec` and the next minute boundary, the exact edge a caller who fails
+to floor could trip — and (b) a correctly-floored `minTS=960`.
+
+**Assertions:** for both `minTS` values, `QueryBucketFileRanged`'s result equals
+`QueryBucketFiles`' result exactly (`require.Equal(t, whole, ranged, ...)`); case (a) excludes
+the entry in both paths (proving neither path silently includes it via some different flooring
+rule); case (b) includes the entry in both paths (proving the parity holds on the
+"should include" side too, not just the exclusion side).
+
+## TEST-VI-19: `QueryBucketFileRanged` per-block prune matches `QueryBucketFiles` at the SPEC-VI-4 minute-flooring edge
+*Added: 2026-07-07*
+
+**Scenario:** the per-block analog of TEST-VI-18 — isolates the dir-level time check
+(`d.MaxTimeSec < minTS || d.MinTimeSec > maxTS`) from the file-level check by using a 2-block
+fixture whose overall footer time range overlaps the query window (so the file-level prune
+never fires), proving the per-block prune independently applies the same
+no-internal-flooring, caller-trusts contract `QueryBucketFiles` already has per block.
+
+**Setup:** `TestQueryBucketFileRanged_MinuteFlooringParity_BlockLevel`
+(`bucketquery_ranged_test.go`) builds two blocks — one with `TimeSec=960` (floored; a raw
+`minTS=995` falls strictly after this), one with `TimeSec=1020` (a different, later minute
+boundary, not excluded by `minTS=995`) — and compares `QueryBucketFileRanged` against
+`QueryBucketFiles` at the same window-edge `minTS` values as TEST-VI-18.
+
+## TEST-VI-20: `readBucketFileTail` rejects overflowing footer offsets (NOTE-VI-046, ranged path parity)
+*Added: 2026-07-07*
+
+**Scenario:** the shared metadata helper (`readBucketFileTail`, SPEC-VI-8) must reject a corrupt
+footer whose `StringTableOff`/`BlockIndexOff` are individually validated against the file size
+*before* being summed with their paired length — the overflow-safe pattern `DecodeBucketFile`
+already established (`bucketfile.go:DecodeBucketFile`, NOTE-VI-046). A naive `off+len > size`
+check is insufficient: a huge `off` paired with a small `len` can wrap `uint64` and slip back
+below `size`, passing a sum-first check while `off` itself is nonsensical.
+
+**Setup:** `TestReadBucketFileTail_OverflowingFooterOffsetsRejected`
+(`bucketfile_metadata_test.go`) constructs a `BucketFooter` with `StringTableOff =
+math.MaxUint64-5, StringTableLen = 10` against a 100-byte `countingRangedSource` and calls
+`readBucketFileTail` directly.
+
+**Assertions:** the call returns a non-nil error; `src.reads` is empty — the bounds check runs
+before any `ReadAt` is issued, so a corrupt footer cannot even trigger a wasted string-table/
+block-index fetch, let alone a negative-offset `ReadAt` or an oversized allocation.
+
+## TEST-VI-21: block-directory `CompOff`/`CompLen` bounds check rejects corrupt entries on both the ranged and disk read paths (NOTE-VI-046)
+*Added: 2026-07-07*
+
+**Scenario:** `readBucketFileTail` validates every decoded `BlockDirEntry`'s `CompOff`/`CompLen`
+against the string-table offset (the same "region that can legally contain block bodies" bound
+`DecodeBucketFile` already checks via `end > strOff`, `bucketfile.go:DecodeBucketFile`) before
+returning the directory to either consumer — `bucketquery_ranged.go`'s `readAndDecodeBlockRanged`
+(ranged/S3 path) and `disk_iterator.go`'s `decodeBlockAt` (disk/compaction path) — so neither ever
+sees an unvalidated entry, closing a possible large-allocation DoS vector on a corrupted or
+truncated directory entry.
+
+**Setup, ranged path (`bucketquery_ranged_test.go`)**, using `blockDirEntryByteOffsets`
+(`bucketfile_metadata_test.go`) to locate and overwrite a directory entry's `CompOff`/`CompLen`
+bytes on an otherwise-valid encoded file:
+- `TestQueryBucketFileRanged_CorruptDirEntryCompLenRejected` — `CompLen` corrupted to
+  `math.MaxUint32`.
+- `TestQueryBucketFileRanged_CorruptDirEntryOffsetOverflowRejected` — `CompOff` corrupted to
+  `math.MaxUint64-5` with `CompLen = 10`, the overflow-wraps-below-bound case.
+
+**Setup, disk path (`disk_iterator_test.go`)**, the same two corruption shapes applied to a
+file passed to `NewDiskBucketFileIterator`:
+- `TestNewDiskBucketFileIterator_CorruptDirEntryCompLenRejected`
+- `TestNewDiskBucketFileIterator_CorruptDirEntryOffsetOverflowRejected`
+
+**Assertions:** every case returns a non-nil error (construction fails for the disk path;
+`QueryBucketFileRanged` returns an error for the ranged path) rather than panicking or attempting
+an oversized allocation; the ranged-path tests additionally assert, via `countingRangedSource`,
+that no `ReadAt` is ever issued for the bogus entry's original `CompOff` (CompLen case) or with
+the corrupted `CompLen` as its length (overflow case).
+
+**Assertions:** `QueryBucketFileRanged`'s per-block dir-level prune produces results identical
+to `QueryBucketFiles`' per-block check at every tested `minTS`, confirming the dir-level check
+is the algebraic negation of `BucketBlock.OverlapsTimeRange` applied to the same fields and
+comparators, with no additional or missing flooring logic introduced by the ranged path.

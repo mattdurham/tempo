@@ -220,14 +220,14 @@ func DefaultTypedConfig(hot, warm Cache) TypedConfig {
 
 // TwoTierTypedConfig returns a TypedConfig that splits caching across two remote caches:
 //   - meta: Footer, TOC, Bloom, Metadata, TraceIdx, Intrinsic — small, high-reuse entries
-//     that benefit from a shared cache with low eviction pressure (e.g. memcached-01).
+//     that benefit from a shared cache with low eviction pressure (e.g. a shared metadata cache instance).
 //   - page: Block — large column-page blobs cached separately to prevent small metadata
-//     entries from being evicted by large page data (e.g. memcached-blockpack-page-01).
+//     entries from being evicted by large page data (e.g. a dedicated page-cache instance).
 //
 // Example:
 //
-//	meta, _ := blockpack.OpenMemCache(blockpack.MemCacheConfig{Addresses: []string{"memcached-01:11211"}})
-//	page, _ := blockpack.OpenMemCache(blockpack.MemCacheConfig{Addresses: []string{"memcached-blockpack-page-01:11211"}})
+//	meta, _ := blockpack.OpenMemCache(blockpack.MemCacheConfig{Addresses: []string{"metadata-cache:11211"}})
+//	page, _ := blockpack.OpenMemCache(blockpack.MemCacheConfig{Addresses: []string{"page-cache:11211"}})
 //	tiered  := blockpack.NewTypedTieredCache(blockpack.TwoTierTypedConfig(meta, page))
 func TwoTierTypedConfig(meta, page Cache) TypedConfig {
 	return modules_tieredcache.TwoTierTypedConfig(meta, page)

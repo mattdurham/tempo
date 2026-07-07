@@ -30,7 +30,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 
 	"golang.org/x/sync/errgroup"
 
@@ -55,10 +54,10 @@ import (
 // errors.Is(err, ErrFileNotFound) from either Size or ReadAt.
 var ErrFileNotFound = errors.New("vibuilder: value-index file not found")
 
-// downloadConcurrency bounds how many value-index files downloadAll fetches in
+// downloadConcurrency bounds how many value-index files queryKeysRanged fetches in
 // parallel for one column's file set. The original 16-32 range was sized only
 // for S3/minio connection pressure, on the assumption this work was I/O-wait
-// bound. A live CPU profile on tempo-dev-test-03 after deploying that version
+// bound. A live CPU profile on the dev test cluster after deploying that version
 // showed otherwise: each downloaded file is immediately snappy-decoded and
 // merge-sorted in the same goroutine (valueindex.DecodeBucketFile,
 // executor.viSortDedup/viMatchSpans), so downloadConcurrency actually bounds
@@ -67,13 +66,13 @@ var ErrFileNotFound = errors.New("vibuilder: value-index file not found")
 // leafConcurrency) oversubscribed that by roughly 19x and caused queries to
 // time out on CPU contention even though each individual block's work was
 // fast in isolation. Lowered to roughly track available cores instead
-// (NOTE-VI, tempo-dev-test-03 TraceQL search timeout incident, CPU-bound
+// (NOTE-VI, dev-cluster TraceQL search timeout incident, CPU-bound
 // follow-up).
 const downloadConcurrency = 4
 
 // leafConcurrency bounds how many predicate leaf columns BuildSource downloads
 // in parallel. Kept smaller than downloadConcurrency because each leaf's own
-// downloadAll can itself fan out up to downloadConcurrency downloads — worst
+// queryKeysRanged can itself fan out up to downloadConcurrency downloads — worst
 // case simultaneous CPU-bound goroutines for one query is
 // leafConcurrency * downloadConcurrency. See downloadConcurrency's comment for
 // why this bounds CPU work, not just I/O.
@@ -367,10 +366,16 @@ func valueAsColType(v vm.Value) (modules_shared.ColumnType, any, bool) {
 	}
 }
 
-// lookupColumn discovers, downloads, and predicate-filters the value-index files
-// for one column, returning the matched spans as executor.VILookupResult. An empty
-// (non-nil-error) return means the column is indexed but had no matches — the
-// caller Adds it as covered-but-empty.
+// SPEC-VB-2: lookupColumn discovers and ranged-queries the value-index files for one column,
+// returning the matched spans as executor.VILookupResult. An empty (non-nil-error)
+// return means the column is indexed but had no matches — the caller Adds it as
+// covered-but-empty.
+//
+// Ranged read path (B-5, issue #488): rewired from whole-file downloadAll +
+// valueindex.QueryBucketFiles onto per-key valueindex.QueryBucketFileRanged, so a
+// column whose predicate/time-window prunes most of a value-index file's blocks
+// never pays for the pruned blocks' bytes over the network — only the footer,
+// directory, and surviving block bodies are fetched.
 func lookupColumn(
 	ctx context.Context,
 	disc FileDiscoverer,
@@ -389,18 +394,14 @@ func lookupColumn(
 	if err != nil {
 		return nil, 0, 0, fmt.Errorf("vibuilder: discover %s: %w", col, err)
 	}
-	files, bytesRead, err := downloadAll(store, keys)
-	if err != nil {
-		return nil, 0, 0, err
-	}
-	lrs, err := valueindex.QueryBucketFiles(pred, timeRange, files...)
+	lrs, filesRead, bytesRead, err := queryKeysRanged(ctx, store, keys, pred, timeRange)
 	if err != nil {
 		return nil, 0, 0, fmt.Errorf("vibuilder: query %s: %w", col, err)
 	}
-	return toVILookupResults(lrs), len(files), bytesRead, nil
+	return toVILookupResults(lrs), filesRead, bytesRead, nil
 }
 
-// lookupColumnAll discovers and downloads every value-index file for a column
+// SPEC-VB-2: lookupColumnAll discovers and ranged-queries every value-index file for a column
 // (across all of its candidate type buckets) and returns all entries — used by the
 // match-all path. It tries each plausible type bucket because a column name can
 // appear under more than one type prefix.
@@ -422,7 +423,7 @@ func lookupColumnAll(
 	slots := make([]bucketResult, len(buckets))
 	g, gctx := errgroup.WithContext(ctx)
 	// Bounded by leafConcurrency, not len(buckets) (7) — each bucket goroutine
-	// itself calls downloadAll, which fans out up to downloadConcurrency more
+	// itself calls queryKeysRanged, which fans out up to downloadConcurrency more
 	// CPU-bound work (decode+sort), so the effective worst case here is
 	// leafConcurrency * downloadConcurrency, matching BuildSource's leaf loop.
 	g.SetLimit(leafConcurrency)
@@ -436,20 +437,16 @@ func lookupColumnAll(
 			if len(keys) == 0 {
 				return nil
 			}
-			files, bytesRead, err := downloadAll(store, keys)
-			if err != nil {
-				return err
-			}
-			// A nil predicate matches every entry (Reader.Lookup treats nil as
-			// match-all), so the universe of indexed spans for this column is
-			// returned.
-			lrs, err := valueindex.QueryBucketFiles(nil, timeRange, files...)
+			// A nil predicate matches every entry (QueryBucketFileRanged treats nil as
+			// match-all, same as the underlying Predicate contract), so the universe of
+			// indexed spans for this column is returned.
+			lrs, filesRead, bytesRead, err := queryKeysRanged(gctx, store, keys, nil, timeRange)
 			if err != nil {
 				return fmt.Errorf("vibuilder: query-all %s: %w", col, err)
 			}
 			slots[i] = bucketResult{
 				results:    toVILookupResults(lrs),
-				filesRead:  len(files),
+				filesRead:  filesRead,
 				bytesRead:  bytesRead,
 				hasResults: len(lrs) > 0,
 			}
@@ -497,78 +494,121 @@ func allTypeBuckets() []modules_shared.ColumnType {
 	}
 }
 
-// downloadAll reads every key fully into memory via store. A per-file read error
-// aborts the whole build (the caller falls back to a full scan) rather than
-// silently dropping a file, which would produce a wrong (under-counted) result —
-// EXCEPT a not-found (ErrFileNotFound) file, which is skipped: the compactor's
-// write-then-delete cycle plus a stale listing cache can name a key that no longer
-// exists, and an absent file holds no postings, so dropping it cannot under-count
-// (NOTE-VI-041, issue #399 point 5). It also returns the total bytes downloaded so
-// the builder can record I/O stats (issue #465).
-func downloadAll(store FileStore, keys []string) ([][]byte, int64, error) {
+// SPEC-VB-1: storeRangedSource adapts vibuilder's FileStore (keyed by string) to
+// valueindex.RangedSource (no key parameter) for one specific key, so
+// QueryBucketFileRanged can be handed a plain RangedSource without valueindex ever
+// needing to know about vibuilder's FileStore shape (B-5, issue #488).
+//
+// Size is cached after its first successful call — a pointer receiver, not a plain
+// immutable value — because both QueryBucketFileRanged's own footer read and
+// queryKeysRanged's separate FilesRead/BytesRead stats bookkeeping (issue #465)
+// need the object's size, and an object-storage backend's Size is typically its own
+// network round trip (an S3 HEAD). Answering it twice per file would double that
+// specific cost, working against the very I/O reduction #488 exists to deliver.
+type storeRangedSource struct {
+	store FileStore
+	key   string
+	size  int64
+	sized bool
+}
+
+func (s *storeRangedSource) Size() (int64, error) {
+	if !s.sized {
+		sz, err := s.store.Size(s.key)
+		if err != nil {
+			return 0, err
+		}
+		s.size = sz
+		s.sized = true
+	}
+	return s.size, nil
+}
+
+func (s *storeRangedSource) ReadAt(p []byte, off int64) (int, error) {
+	return s.store.ReadAt(s.key, p, off)
+}
+
+// SPEC-VB-2: queryKeysRanged runs valueindex.QueryBucketFileRanged against every key in
+// parallel, bounded by downloadConcurrency (mirroring the pre-ranged-read
+// downloadAll's fan-out exactly), accumulating matched results and I/O stats.
+//
+// A per-key ErrFileNotFound (from either Size or ReadAt, surfaced through
+// QueryBucketFileRanged's wrapped error chain via errors.Is) is treated as an empty
+// miss and skipped: the compactor's write-then-delete cycle plus a stale listing
+// cache can name a key that no longer exists, and an absent file holds no postings,
+// so dropping it cannot under-count (NOTE-VI-041, issue #399 point 5). Any other
+// per-key error aborts the whole query so the caller falls back to a full scan.
+//
+// filesRead/bytesRead are observability counters (issue #465): bytesRead is each
+// surviving key's full object size (via storeRangedSource's cached Size), matching
+// the pre-ranged-read contract exactly — not the (smaller) number of bytes actually
+// transferred by QueryBucketFileRanged's ReadAt calls beneath. Reducing the latter
+// without changing what gets reported here is the whole point of the ranged read
+// path.
+func queryKeysRanged(
+	ctx context.Context,
+	store FileStore,
+	keys []string,
+	pred valueindex.Predicate,
+	timeRange *[2]uint64,
+) ([]valueindex.LookupResult, int, int64, error) {
 	if len(keys) == 0 {
-		return nil, 0, nil
+		return nil, 0, 0, nil
 	}
-	type dlSlot struct {
-		data []byte
-		keep bool // false for a skipped (404) key; zero-value default
+	type keySlot struct {
+		results []valueindex.LookupResult
+		size    int64
+		keep    bool // false for a skipped (404) key; zero-value default
 	}
-	slots := make([]dlSlot, len(keys))
-	g, gctx := errgroup.WithContext(context.Background())
+	slots := make([]keySlot, len(keys))
+	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(downloadConcurrency)
 	for i, key := range keys {
 		g.Go(func() error {
 			if gctx.Err() != nil {
-				// Another key already hit a real (non-404) error; do not start
-				// new work, but do not report a spurious error either — the
-				// goroutine that found the real error reports it.
+				// Another key already hit a real (non-404) error; do not start new
+				// work, but do not report a spurious error either — the goroutine
+				// that found the real error reports it.
 				return nil //nolint:nilerr // intentional: gctx.Err() belongs to a sibling goroutine's failure, not this one's
 			}
-			data, err := readWhole(store, key)
+			src := &storeRangedSource{store: store, key: key}
+			results, err := valueindex.QueryBucketFileRanged(gctx, src, pred, timeRange)
 			if err != nil {
 				if errors.Is(err, ErrFileNotFound) {
 					// Retention/compaction deleted this file out from under a
 					// stale listing — treat as an empty miss and skip it.
 					return nil
 				}
-				return fmt.Errorf("vibuilder: download %s: %w", key, err)
+				return fmt.Errorf("vibuilder: query %s: %w", key, err)
 			}
-			slots[i] = dlSlot{data: data, keep: true}
+			// Cached by src's own Size() call above (via QueryBucketFileRanged's
+			// footer read) — this does not issue a second network round trip.
+			size, serr := src.Size()
+			if serr != nil {
+				if errors.Is(serr, ErrFileNotFound) {
+					return nil
+				}
+				return fmt.Errorf("vibuilder: size %s: %w", key, serr)
+			}
+			slots[i] = keySlot{results: results, size: size, keep: true}
 			return nil
 		})
 	}
 	if err := g.Wait(); err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
-	files := make([][]byte, 0, len(keys))
-	var totalBytes int64
+	var out []valueindex.LookupResult
+	var filesRead int
+	var bytesRead int64
 	for _, s := range slots {
 		if !s.keep {
 			continue
 		}
-		files = append(files, s.data)
-		totalBytes += int64(len(s.data))
+		filesRead++
+		bytesRead += s.size
+		out = append(out, s.results...)
 	}
-	return files, totalBytes, nil
-}
-
-// readWhole reads the entire object at key into a single buffer. A not-found error
-// from either Size or ReadAt is returned verbatim so downloadAll can recognize it
-// via errors.Is(err, ErrFileNotFound) and skip the file.
-func readWhole(store FileStore, key string) ([]byte, error) {
-	size, err := store.Size(key)
-	if err != nil {
-		return nil, err
-	}
-	if size <= 0 {
-		return nil, nil
-	}
-	buf := make([]byte, size)
-	n, err := store.ReadAt(key, buf, 0)
-	if err != nil && err != io.EOF {
-		return nil, err
-	}
-	return buf[:n], nil
+	return out, filesRead, bytesRead, nil
 }
 
 // toVILookupResults maps valueindex.LookupResult to executor.VILookupResult,

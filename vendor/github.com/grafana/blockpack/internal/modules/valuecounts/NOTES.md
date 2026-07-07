@@ -531,3 +531,36 @@ A-17), `internal/modules/valuecounts/selfdescribing.go` (`DecodeLegacyVCNTFile` 
 A-Tempo-1/#111), `cube_vcnt_fetch_test.go:vcntObj()` (task A-17/#121, forward-compatible fix
 ahead of `A-Tempo-3`'s revendor). See `SPECS.md` SPEC-VC-4 (decode contract) and SPEC-VC-5
 (EncodeVCNTFile contract).
+
+---
+
+## NOTE-VC-016 — SelectivityPerMinute: the per-minute sibling of SelectivityInRange (issue #487)
+
+Date: 2026-07-07
+
+`SelectivityPerMinute(data, dir, column, value, minTS, maxTS)` is the C1 blockpack-side primitive
+for #487's time-slice job sharding: instead of collapsing `[minTS, maxTS]` into one scalar
+(`SelectivityInRange`, NOTE-VC-013), it buckets the same value-scoped sum by `Record.TimeStart`
+and returns `[]MinuteCount`, ascending by `Minute`. Every VCNT record already carries a
+single-minute `TimeStart == TimeEnd` (tempo `vcntwriter.go`'s `minuteBucket` floor), so bucketing
+by `TimeStart` is exactly "one bucket per live minute," with no independent floor/alignment logic
+of its own — this function trusts the write path's existing minute alignment rather than
+re-deriving it.
+
+### Why the caller needs per-minute signal, not the scalar
+
+Time-slice construction (C3, `queryplan.BuildTimeSlices`) needs to see WHICH minutes in the
+window carry live matches for the lead leaf so it can size slices adaptively — dense minutes get
+narrower slices, sparse/empty minutes get wider ones. `SelectivityInRange`'s single scalar throws
+away exactly the signal this needs; `SelectivityPerMinute` is a parallel, not a replacement,
+primitive for that reason.
+
+### Same liveness rule as the rest of the package
+
+Minutes whose net summed `Count` is `<= 0` are dropped entirely (NOTE-VC-001) — never returned as
+`Count: 0`. This mirrors `sumLiveValues`' behavior but is intentionally NOT built on top of it
+(that function is value-agnostic; this one filters to a single `(column, value)` pair in the same
+single pass as the minute-bucket sum, avoiding a full per-value map for a query that only wants
+one value).
+
+Back-refs: `SelectivityPerMinute`, `MinuteCount` in perminute.go. Issue #487, task C1.

@@ -97,48 +97,38 @@ func NewDiskBucketFileIterator(ctx context.Context, path string, checker RefChec
 	return it, nil
 }
 
+// osFileSource adapts a *os.File to RangedSource so readBucketFileMetadata can delegate to the
+// shared, store-agnostic ReadBucketFileMetadata (bucketfile_metadata.go, B-2/#488). *os.File
+// already implements io.ReaderAt, so ReadAt delegates directly; Size is backed by Stat.
+type osFileSource struct {
+	f *os.File
+}
+
+func (s osFileSource) Size() (int64, error) {
+	fi, err := s.f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	return fi.Size(), nil
+}
+
+func (s osFileSource) ReadAt(p []byte, off int64) (int, error) {
+	return s.f.ReadAt(p, off)
+}
+
 // readBucketFileMetadata reads and decodes f's footer, string table, and block directory —
 // the eager, bounded metadata NewDiskBucketFileIterator needs before any block can be
 // addressed. f's header magic must already have been validated by the caller.
+//
+// This is a thin *os.File-adapter wrapper around the shared ReadBucketFileMetadata
+// (bucketfile_metadata.go, B-2/#488): the footer it additionally decodes is discarded here
+// since NewDiskBucketFileIterator's compaction callers have never needed file-level time
+// bounds — only the ranged query path (B-4) does — and this wrapper's (dir, table, error)
+// return shape and NewDiskBucketFileIterator's behavior are both unchanged by this refactor.
 func readBucketFileMetadata(f *os.File) ([]BlockDirEntry, *StringTable, error) {
-	fi, err := f.Stat()
+	_, dir, table, err := ReadBucketFileMetadata(osFileSource{f: f})
 	if err != nil {
-		return nil, nil, fmt.Errorf("stat: %w", err)
-	}
-	size := fi.Size()
-	if size < int64(bucketFooterSize) {
-		return nil, nil, fmt.Errorf("file too short (%d bytes)", size)
-	}
-
-	footerBuf := make([]byte, bucketFooterSize)
-	if _, rerr := f.ReadAt(footerBuf, size-int64(bucketFooterSize)); rerr != nil {
-		return nil, nil, fmt.Errorf("read footer: %w", rerr)
-	}
-	footer, err := DecodeBucketFooter(footerBuf)
-	if err != nil {
-		return nil, nil, fmt.Errorf("decode footer: %w", err)
-	}
-	if footer.StringTableOff+footer.StringTableLen > uint64(size) ||
-		footer.BlockIndexOff+footer.BlockIndexLen > uint64(size) {
-		return nil, nil, fmt.Errorf("footer offsets out of bounds")
-	}
-
-	strBuf := make([]byte, footer.StringTableLen)
-	if _, rerr := f.ReadAt(strBuf, int64(footer.StringTableOff)); rerr != nil { //nolint:gosec // bounds-checked above
-		return nil, nil, fmt.Errorf("read string table: %w", rerr)
-	}
-	table, _, err := DecodeStringTable(strBuf)
-	if err != nil {
-		return nil, nil, fmt.Errorf("decode string table: %w", err)
-	}
-
-	dirBuf := make([]byte, footer.BlockIndexLen)
-	if _, rerr := f.ReadAt(dirBuf, int64(footer.BlockIndexOff)); rerr != nil { //nolint:gosec // bounds-checked above
-		return nil, nil, fmt.Errorf("read block index: %w", rerr)
-	}
-	dir, err := decodeBlockIndex(dirBuf)
-	if err != nil {
-		return nil, nil, fmt.Errorf("decode block index: %w", err)
+		return nil, nil, err
 	}
 	return dir, table, nil
 }
@@ -148,8 +138,11 @@ func readBucketFileMetadata(f *os.File) ([]BlockDirEntry, *StringTable, error) {
 // dropped by filtering — an empty-but-not-erroneous result, distinct from a decode error.
 func (it *diskBucketFileIterator) decodeBlockAt(ctx context.Context, i int) (*BucketBlock, error) {
 	d := it.dir[i]
+	// d.CompOff/CompLen were already bounds-checked against the string-table offset by
+	// readBucketFileTail (bucketfile_metadata.go, via readBucketFileMetadata) when it.dir was
+	// decoded — this function never sees an unvalidated entry (NOTE-VI-046).
 	raw := make([]byte, d.CompLen)
-	if _, err := it.f.ReadAt(raw, int64(d.CompOff)); err != nil { //nolint:gosec // CompOff/CompLen are file-derived
+	if _, err := it.f.ReadAt(raw, int64(d.CompOff)); err != nil { //nolint:gosec // bounds-checked by readBucketFileTail
 		return nil, fmt.Errorf("block %d: read compressed bytes: %w", i, err)
 	}
 	decompressed, err := snappy.Decode(nil, raw)

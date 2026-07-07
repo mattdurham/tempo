@@ -1,6 +1,6 @@
 # TraceQL Query Reference
 
-**Environment:** dev-us-east-0 / tempo-dev-test-03  
+**Environment:** dev-us-east-0 / the blockpack test cluster  
 **Tenant:** `X-Scope-OrgID: 11638`  
 **Generated:** 2026-04-12 (updated 2026-04-14 with r60/r62 results; updated 2026-04-15 with disk cache + parquet comparison)  
 **Time range queried:** last 3 hours (search), last 6 hours (metrics, r62+disk)  
@@ -12,8 +12,8 @@ API endpoint: `http://<query-frontend>:3100/tempo/api/`
 
 | Cell | Org ID | Format | Endpoint |
 |------|--------|--------|----------|
-| tempo-dev-test-03 (dev-us-east-0) | `11638` | blockpack (vblockpack) | tempo-dev-test-03-dev-us-east-0.grafana-dev.net |
-| tempo-dev-02 (dev-us-east-0) | `6121` | parquet | tempo-dev-02-dev-us-east-0.grafana-dev.net |
+| the blockpack test cluster (dev-us-east-0) | `11638` | blockpack (vblockpack) | <blockpack test cluster endpoint> |
+| the parquet comparison cluster (dev-us-east-0) | `6121` | parquet | <parquet comparison cluster endpoint> |
 
 Source: `deployment_tools/ksonnet/environments/jaeger/mirror.libsonnet` (`TEMPO_MIRROR_USERNAME` / `TEMPO_MIRROR2_USERNAME`)
 
@@ -288,7 +288,7 @@ Most complex metrics query: two OR groups joined with AND across span attribute,
 
 **Deployed:** 2026-04-14  
 **Image:** `mrdgrafana/tempo:blockpack-f335840e9-r60`  
-**Environment:** tempo-dev-test-03 (24h time range, 147–149 blocks, ~7.9 GB block data)
+**Environment:** the blockpack test cluster (24h time range, 147–149 blocks, ~7.9 GB block data)
 
 ### Optimizations
 
@@ -355,7 +355,7 @@ cuts query time by ~46% relative to M11 warm.
 
 **Deployed:** 2026-04-14  
 **Image:** `mrdgrafana/tempo:blockpack-8742c344e-r62`  
-**Environment:** tempo-dev-test-03 (24h range, `GOMEMLIMIT=13GiB`, pod limit 18Gi)
+**Environment:** the blockpack test cluster (24h range, `GOMEMLIMIT=13GiB`, pod limit 18Gi)
 
 ### Optimizations
 
@@ -395,7 +395,7 @@ Pods now stable at 13–13.5 Gi under sustained load (18 Gi limit, no OOMKill).
 **Deployed:** 2026-04-15  
 **Image:** `mrdgrafana/tempo:blockpack-89035c852-r62` (same code, disk cache config added)  
 **Disk cache:** `file_cache_path: /var/tempo/blockpack-cache`, `file_cache_max_bytes: 8589934592` (8 GiB, 80% of 10 Gi emptyDir)  
-**Environment:** tempo-dev-test-03, 3 querier replicas, each with independent 8 GiB disk cache
+**Environment:** the blockpack test cluster, 3 querier replicas, each with independent 8 GiB disk cache
 
 ### Disk Cache Metrics (single pod, after warm-up)
 
@@ -432,8 +432,8 @@ Pods now stable at 13–13.5 Gi under sustained load (18 Gi limit, no OOMKill).
 ## Blockpack vs Parquet Comparison (2026-04-15)
 
 **Method:** Same queries, same 6h window (step=6m), different cells.  
-**blockpack:** tempo-dev-test-03, org `11638`, 113 blocks  
-**parquet:** tempo-dev-02, org `6121`, 14 blocks  
+**blockpack:** the blockpack test cluster, org `11638`, 113 blocks  
+**parquet:** the parquet comparison cluster, org `6121`, 14 blocks  
 
 Org IDs sourced from `deployment_tools/ksonnet/environments/jaeger/mirror.libsonnet`.
 

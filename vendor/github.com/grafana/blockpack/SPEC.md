@@ -592,7 +592,7 @@ the authoritative contract that supersedes it follows.*
 
 **This is a breaking change to an exported root-package API function**, authorized explicitly
 by the user (not a unilateral agent decision) as part of fixing a production incident: a live
-heap profile on tempo-dev-test-03 showed `GetTraceByID`'s unconditional full-file block scan
+heap profile on the dev test cluster showed `GetTraceByID`'s unconditional full-file block scan
 driving a 64Gi-limited querier to 40.5GB/95% heap during a single in-flight `/api/traces/{id}`
 request. Full history in `.bob/state/brainstorm.md` and `.bob/state/plan.md`.
 

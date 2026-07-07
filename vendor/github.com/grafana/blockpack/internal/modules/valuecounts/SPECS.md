@@ -16,7 +16,7 @@ module's SPECS.md numbers from 1, per the established convention in
 independent per-file counters). IDs are assigned in ascending order and never reused or
 renumbered; superseded entries are marked `[SUPERSEDED by SPEC-VC-N]` rather than deleted.
 
-Next free ID: **SPEC-VC-6**.
+Next free ID: **SPEC-VC-7**.
 
 ---
 
@@ -209,3 +209,24 @@ is now the sole root-package VCNT encoder. See `NOTES.md` NOTE-VC-015.
 Back-refs: `vcnt.go:EncodeVCNTFile`, `internal/modules/valuecounts/selfdescribing.go:EncodeVCNTFile`
 (SPEC-VC-2). Test: `vcnt_test.go:TestEncodeVCNTFile_RoundTrip`. Consumer: tempo-mrd's
 `vcntwriter.go` (out of this repo's scope).
+
+## SPEC-VC-6: SelectivityPerMinute — per-minute selectivity contract
+*Added: 2026-07-07*
+
+**Contract:** `SelectivityPerMinute(data []byte, dir []ChunkDirEntry, column string, value
+[]byte, minTS, maxTS uint64) ([]MinuteCount, error)` decodes `[minTS, maxTS]` via
+`DecodeTimeRange`, sums `Record.Count` for the exact `(column, value)` pair grouped by
+`Record.TimeStart`, and returns one `MinuteCount{Minute, Count}` per distinct live minute,
+sorted ascending by `Minute`. `Minute` is a unix-second, 60-aligned bucket boundary inherited
+from the write path (tempo `vcntwriter.go`'s `minuteBucket`) — this function does not re-derive
+or re-validate minute alignment, it trusts `Record.TimeStart` is already floored.
+
+**Liveness rule:** a minute whose net summed `Count` is `<= 0` is dropped from the result, never
+returned as `Count: 0` (same rule as `SelectivityInRange`/`ValuesInRange`, NOTE-VC-001). Records
+for a different column or a different value in the same window contribute nothing.
+
+**No files opened:** like every other function in this file, it operates only on the
+already-decoded VCNT section (`data`/`dir`) and opens no blockpack data files.
+
+Back-refs: `perminute.go:SelectivityPerMinute`, `MinuteCount`. Test: `perminute_test.go`. Issue
+#487, task C1. See `NOTES.md` NOTE-VC-016.

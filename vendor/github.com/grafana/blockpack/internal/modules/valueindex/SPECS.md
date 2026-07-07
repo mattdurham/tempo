@@ -14,7 +14,7 @@ across the whole value-index pipeline's NOTES.md files by established convention
 assigned in ascending order and never reused or renumbered; superseded entries are marked
 `[SUPERSEDED by SPEC-VI-N]` rather than deleted.
 
-Next free ID: **SPEC-VI-7**.
+Next free ID: **SPEC-VI-11**.
 
 ---
 
@@ -161,6 +161,28 @@ needs no equivalent widening because flooring only ever reduces `TimeSec` relati
 event second, so `TimeSec <= true_event_sec <= upperBound` is preserved regardless of the
 upper bound's own alignment.
 
+**Where the flooring responsibility sits (binding — applies to every consumer, including
+`QueryBucketFileRanged`, SPEC-VI-10):** this package's own query functions
+(`LookupValue`, `QueryBucketFiles`, and `QueryBucketFileRanged`) perform **no internal
+flooring** — confirmed by direct read, no flooring call exists anywhere in `bucketquery.go`,
+`bucketquery_ranged.go`, `predicate.go`, or `bucketfile.go`. They are pure raw-value
+comparators by design and contract. The flooring responsibility sits entirely with the
+**external caller**, ultimately tempo-mrd's `nanoWindowToSec` (see the cross-repo dependency
+note below) — this package trusts that any `minSec`/`minTS` it receives has already been
+floored to the same 60-second alignment as write-side `TimeSec`. `QueryBucketFileRanged`
+deliberately places this responsibility identically to `QueryBucketFiles`, not differently:
+both its file-level prune (`footer.OverlapsTimeRange`) and its per-block prune (the algebraic
+negation of `BucketBlock.OverlapsTimeRange` applied to a `BlockDirEntry`'s `MinTimeSec`/
+`MaxTimeSec`) compare the caller's raw, unfloored-by-this-package bound directly against
+write-side-floored stored values — the same comparator, the same fields, the same lack of
+internal flooring `QueryBucketFiles` already has. The file-level check is a non-lossy superset
+short-circuit over the per-block checks (if the file's own aggregate range doesn't overlap,
+no block's narrower range can either), not a new semantic requiring separate reasoning.
+Pinned by `TESTS.md` TEST-VI-18 (file-level) and TEST-VI-19 (block-level), both of which prove
+`QueryBucketFileRanged` matches `QueryBucketFiles` exactly at the window edge where a caller's
+failure to floor would matter, rather than silently diverging by applying some
+ranged-path-only flooring rule.
+
 **Cross-repo dependency (external, informational — not enforced by this repo's tests):**
 tempo-mrd's index-driven TraceQL search path
 (`tempodb/encoding/vblockpack/value_index_query.go:nanoWindowToSec`) converts a query's
@@ -173,10 +195,12 @@ fallback (the index path reports "coverage found" and answers the query incomple
 a hard correctness coupling between the two repos, not an independent optimization — the two
 sides must not disagree on granularity, and a deploy that ships this repo's truncation without
 tempo-mrd's matching widening (or with a version-skew gap between them) reintroduces the
-false-negative bug.
+false-negative bug. `QueryBucketFileRanged` (SPEC-VI-10) inherits this same cross-repo coupling
+unchanged, since it performs no flooring of its own either.
 
 Back-refs: `valueindex_extract.go:buildSpanStartSecByRef` (this repo — the write-side
-truncation) and, as an external cross-repo back-ref, tempo-mrd's
+truncation), `bucketquery_ranged.go`'s two `SPEC-VI-4`-tagged comparison sites (file-level and
+block-level prune) and, as an external cross-repo back-ref, tempo-mrd's
 `tempodb/encoding/vblockpack/value_index_query.go:nanoWindowToSec` (the read-side bound that
 must match). See `NOTES.md` NOTE-VI-051 for the design rationale and cardinality motivation.
 
@@ -263,3 +287,216 @@ change (the merge still decodes every input into memory before re-encoding into 
 Back-refs: `internal/modules/valueindex/traceindex.go:MergeTraceGroups`,
 `internal/modules/valueindexcompactor/traceindex_dispatch.go:mergeTraceLevel` (the sole
 caller). See `NOTES.md` NOTE-VI-038 (Addendum, 2026-07-04) and NOTE-VI-064.
+
+---
+
+## SPEC-VI-7: `RangedSource` — minimal partial-read surface for a v2 BucketGroup file
+*Added: 2026-07-07*
+
+**Contract:** `RangedSource` is the minimal read surface a v2 `BucketGroup` file needs for
+partial (ranged) decoding:
+
+```go
+type RangedSource interface {
+	Size() (int64, error)
+	ReadAt(p []byte, off int64) (int, error)
+}
+```
+
+`Size` returns the total byte length of the underlying file/object. `ReadAt` fills `p` from the
+source starting at `off`, following `io.ReaderAt` semantics — a short read returns a non-nil
+error; EOF is `io.EOF`. Implementations are expected to surface a not-found condition (the
+object no longer exists) in a form recognizable via `errors.Is` by the specific sentinel their
+call site expects (e.g. `vibuilder.ErrFileNotFound`) — `RangedSource` itself defines no such
+sentinel, since "not found" is a property of the concrete backend (local disk vs. object
+storage), not of this interface.
+
+**Known implementations:** a local `*os.File` (`disk_iterator.go`'s compaction path) and a
+per-key object-storage adapter (`vibuilder.storeRangedSource`, issue #488 B-5) — both satisfy
+this interface without either needing to know about the other's backend.
+
+**Consequence:** any new backend wanting to use `ReadBucketFileMetadata` (SPEC-VI-8) or
+`QueryBucketFileRanged` (SPEC-VI-10) needs only implement these two methods — no dependency on
+`os.File`, `FileStore`, or any other concrete storage type.
+
+Back-ref: `internal/modules/valueindex/bucketfile_metadata.go:RangedSource`.
+
+---
+
+## SPEC-VI-8: `ReadBucketFileMetadata` — shared eager metadata decode for `RangedSource`
+*Added: 2026-07-07*
+
+**Contract:** `ReadBucketFileMetadata(src RangedSource) (BucketFooter, []BlockDirEntry,
+*StringTable, error)` reads and decodes `src`'s footer, string table, and block directory — the
+full eager, bounded metadata a ranged reader needs before any block can be addressed or the
+file pruned by time range. **Precondition:** `src`'s header magic must already have been
+validated by the caller — this function only reads the tail of the file (footer, string table,
+block index), never the header, and does not itself detect "this isn't a BucketGroup file at
+all" via the header.
+
+**Footer-level not-a-bucket-file detection:** a footer that is too short (`size <
+bucketFooterSize`) or fails magic validation is reported via an error satisfying
+`errors.Is(err, ErrNotBucketFile)` — the same sentinel `DecodeBucketFooter` uses (both branches,
+per the hardening documented in `NOTES.md` NOTE-VI-083) — letting a caller that has only a
+`RangedSource` (no prior whole-file decode) classify skip-vs-abort with one check, mirroring
+`QueryBucketFiles`' existing whole-file classification (`bucketquery.go:QueryBucketFiles`'s
+`ErrNotBucketFile`-skip branch).
+
+**Two-phase decomposition:** internally split into `readBucketFileFooter` (footer only, plus
+the source's total size) and `readBucketFileTail` (string table + block directory, given an
+already-decoded footer and size) so a caller that must inspect the footer before deciding
+whether to fetch the rest of the metadata at all (`QueryBucketFileRanged`'s file-level time
+prune, SPEC-VI-10) does not pay for a redundant footer read — only `ReadBucketFileMetadata`'s
+own combined call re-derives the footer, and does so exactly once.
+
+**Bounds validation (binding, NOTE-VI-046):** `readBucketFileTail` validates every untrusted
+offset/length it decodes using the same overflow-safe, per-term-before-sum pattern
+`DecodeBucketFile` already established (`bucketfile.go:DecodeBucketFile`) — never a naive
+`off+len > bound` sum-first check, which a corrupt huge `off` paired with a small `len` can wrap
+past. Two bounds are checked:
+1. The footer's `StringTableOff`/`StringTableLen` and `BlockIndexOff`/`BlockIndexLen`, each
+   individually against `size`, before their sums are checked against `size`.
+2. Every decoded `BlockDirEntry`'s `CompOff`/`CompLen`, each individually against
+   `StringTableOff` (the offset at which the string table begins — block bodies always live in
+   `[headerLen, StringTableOff)` by construction, the same "region that can legally contain
+   block bodies" bound `DecodeBucketFile` checks via `end > strOff`), before their sum is
+   checked against `StringTableOff`.
+Both checks fail closed with a descriptive error, never a panic or an unbounded allocation. This
+matters more here than in `DecodeBucketFile`: this helper is reachable from
+`QueryBucketFileRanged` on object-storage bucket files fetched over the network
+(`bucketquery_ranged.go:QueryBucketFileRanged`), not only from `disk_iterator.go`'s trusted local
+compaction temp files — a corrupted or truncated directory entry (bit-rot, a partial write,
+storage-layer inconsistency) must never drive a `make([]byte, CompLen)` allocation sized directly
+from untrusted wire bytes. Because the check runs once here, both consumers
+(`bucketquery_ranged.go`'s `readAndDecodeBlockRanged` and `disk_iterator.go`'s `decodeBlockAt`)
+receive only already-validated directory entries and need no bounds check of their own. Pinned by
+`TESTS.md` TEST-VI-20 (footer) and TEST-VI-21 (block directory).
+
+**Shared consumers:** `disk_iterator.go`'s `readBucketFileMetadata` (the local-`*os.File`,
+already-header-validated compaction path) is now a thin adapter over this function, preserving
+its own signature/behavior unchanged; `vibuilder`'s ranged query path (issue #488, B-5) is the
+other consumer, via `QueryBucketFileRanged`. Both consume one binary-format parser instead of
+two independently-maintained copies of the same offset arithmetic.
+
+Back-ref: `internal/modules/valueindex/bucketfile_metadata.go:ReadBucketFileMetadata,readBucketFileFooter,readBucketFileTail`,
+`internal/modules/valueindex/disk_iterator.go:readBucketFileMetadata` (the adapter).
+
+---
+
+## SPEC-VI-9: `blockExcludedByValue` — value-range prune, ruling-14 numeric-range capability boundary
+*Added: 2026-07-07*
+
+**Contract:** `blockExcludedByValue(pred Predicate, minValue, maxValue []byte) bool` reports
+whether every value in `[minValue, maxValue]` (a `BlockDirEntry`'s per-block value range) is
+excluded by `pred`, letting a ranged reader (`QueryBucketFileRanged`, SPEC-VI-10) skip a block's
+body `ReadAt` entirely, using only information already present in the block directory without
+reading or decoding the block body at all — no bloom filter is consulted anywhere in the
+`matchGroupsInBlock` call chain either read path uses (see `NOTES.md` NOTE-VI-082).
+
+**Comparator requirement (binding):** the containment check MUST use `compareCanonicalBytes`
+(plain lexicographic, with length-prefix tiebreak) — never the numeric-decode-aware
+`compareCanonical`. `BlockDirEntry.MinValue`/`MaxValue` are themselves computed at write time
+using `compareCanonicalBytes` (`bucketfile.go:ComputeBlockMeta`); checking containment with a
+different comparator than the one that built the bounds risks a **false-negative prune** —
+silently dropping a block that actually contains a match, a correctness regression, not a style
+choice.
+
+**Scope — this is a genuine, deliberate capability boundary, not a bug:**
+
+| Predicate kind | Column type | Value-range prune applied? |
+|---|---|---|
+| Equality | any | Yes — self-consistency holds regardless of whether byte order carries numeric meaning |
+| Range / Between | non-numeric (string, bytes, UUID, RangeString, RangeBytes) | Yes — `compareCanonical` and `compareCanonicalBytes` already agree for these types |
+| Range / Between | numeric (uint64, int64, float64, and their Range* variants) | **No** — falls through to `matchGroupsInBlock`'s per-group TimeSec check + `pred.Match` only, exactly matching pre-#488 behavior (no bloom filter is consulted anywhere in this call chain — NOTE-VI-082) |
+| neq / regex / nil predicate | any | No — returns `false` ("cannot decide, don't prune"); falls through to `matchGroupsInBlock`'s per-group TimeSec check + `pred.Match` (no bloom filter is consulted anywhere in this call chain — NOTE-VI-082) |
+
+**Why numeric range/between gets no prune:** persisted `MinValue`/`MaxValue` are lex-byte
+extremes of little-endian-encoded numbers, which carry no numeric meaning (LE encoding is not
+lex-order-preserving — the classic `uint64(255)` vs `uint64(256)` byte-ordering disagreement,
+see `NOTES.md` NOTE-VI-011). Directory extremes therefore cannot soundly bound a numeric range.
+**This is a real, currently-unclosed gap in the on-disk format** — not something papered over
+with an unsound comparator substitution. A future writer-side change to persist
+order-preserving numeric bounds in the block directory could close this gap but is explicitly
+out of scope for issue #488 (a format change, flagged as a candidate follow-up issue).
+
+**Consequence for callers:** a numeric-typed range/between query gets exactly the same
+block-level pruning today as it did before `QueryBucketFileRanged` existed (time-range pruning
+plus `matchGroupsInBlock`'s per-group TimeSec check + `pred.Match`; no bloom filter exists
+anywhere in this call chain — NOTE-VI-082) — `blockExcludedByValue` never makes numeric range
+queries *worse*, it simply does not make them *better* the way it does for equality and
+non-numeric range queries.
+
+Back-ref: `internal/modules/valueindex/predicate.go:blockExcludedByValue,isNumericColType`.
+See `NOTES.md` NOTE-VI-011 (the LE-byte-ordering root cause) and NOTE-VI-081 (this feature's
+overall design rationale).
+
+---
+
+## SPEC-VI-10: `QueryBucketFileRanged` — partial-read query contract, shared matching with `QueryBucketFiles`
+*Added: 2026-07-07*
+
+**Contract:** `QueryBucketFileRanged(ctx context.Context, src RangedSource, pred Predicate,
+timeRange *[2]uint64) ([]LookupResult, error)` performs a ranged, partial read of one v2
+`BucketGroup` file against `pred`/`timeRange`, issuing only the `ReadAt` calls needed to prune
+and decode surviving blocks:
+
+1. Footer `ReadAt` (via `ReadBucketFileMetadata`'s footer-only phase, SPEC-VI-8) — a
+   footer-magic mismatch (`errors.Is(err, ErrNotBucketFile)`) is treated as **"not a bucket
+   file"** and returns `(nil, nil)`, not an error — the per-file analog of `QueryBucketFiles`'
+   own `ErrNotBucketFile`-skip (`bucketquery.go:121`). Any other footer decode failure is a
+   genuine error on a real v2 file and is returned (caller falls back to a full scan, per
+   NOTE-VI-046's silent-under-count concern).
+2. **File-level time prune:** if the footer's own time range does not overlap
+   `[minTS, maxTS]`, return `(nil, nil)` — costs exactly one `ReadAt` (the footer) and nothing
+   more. **No internal flooring is applied to `minTS`/`maxTS` here** — this check
+   (`footer.OverlapsTimeRange`) compares the caller's raw bound directly against write-side-
+   floored stored values, identically to how `QueryBucketFiles`/`LookupValue` already do (per
+   SPEC-VI-4's binding "where the flooring responsibility sits" clause: the caller, ultimately
+   tempo-mrd's `nanoWindowToSec`, is responsible for flooring before this package is ever
+   reached). This is a non-lossy superset short-circuit over step 4's per-block check, not an
+   independent semantic requiring its own flooring reasoning. Pinned by `TESTS.md` TEST-VI-18.
+3. Block-directory `ReadAt` (via `ReadBucketFileMetadata`'s remaining phase) for the block
+   directory and string table.
+4. **Per-block prune**, for each directory entry: dir-level time-range check (`d.MaxTimeSec <
+   minTS || d.MinTimeSec > maxTS` — the algebraic negation of `BucketBlock.OverlapsTimeRange`,
+   applied to the same `MinTimeSec`/`MaxTimeSec` fields and comparators `QueryBucketFiles`
+   already uses per block, with the same no-internal-flooring, caller-trusts contract as step 2
+   above), then `blockExcludedByValue` (SPEC-VI-9) if `pred != nil`. Pinned by `TESTS.md`
+   TEST-VI-19.
+5. Block-body `ReadAt` — one per surviving block only, via `readAndDecodeBlockRanged`. The
+   entry's `CompOff`/`CompLen` were already bounds-checked against `StringTableOff` by step 3's
+   `readBucketFileTail` call (SPEC-VI-8's binding bounds-validation clause, NOTE-VI-046) — this
+   step never sees an unvalidated entry.
+6. **Group/predicate matching** delegated to `matchGroupsInBlock` — the exact same function
+   `QueryBucketFiles` calls for its own per-block matching (extracted from `QueryBucketFiles`'
+   inner loop specifically so the two read paths cannot silently diverge on group-level
+   matching semantics). `matchGroupsInBlock`'s own contract is exactly two checks per group:
+   `g.TimeSec` within `[minTS, maxTS]`, then `pred.Match(g.CanonicalValue)` if `pred != nil` —
+   **no bloom-filter check is part of this contract**. [Oracle-verified 2026-07-07 by direct
+   read of `QueryBucketFiles`, `matchGroupsInBlock`, and `QueryBucketFileRanged`: no call to
+   `BucketBlock.MayContainValue` exists in this call chain in either read path. An earlier
+   design description (`plan.md`/task-breakdown.md §B-4) referenced a "bloom check (post-read)"
+   step; this was a stale premise that never matched the actual `QueryBucketFiles`
+   implementation. `QueryBucketFileRanged` correctly does not add one either — see NOTES.md
+   NOTE-VI-082.]
+7. `ctx` is checked for cancellation at three points, each guarding the reads that follow it: once
+   at function entry (before the footer read), once after the metadata read (string table + block
+   directory) completes and before the per-block loop starts, and once per directory entry, at the
+   top of the per-block loop (before either prune check runs) — not just once per surviving entry.
+   A `ctx` already canceled on entry costs zero `ReadAt` calls. Pinned by `TESTS.md` TEST-VI-17's
+   `TestQueryBucketFileRanged_ContextCancelledStopsEarly` case.
+
+**Parity guarantee:** because both `QueryBucketFiles` and `QueryBucketFileRanged` call the
+identical `matchGroupsInBlock`, the two read paths are structurally incapable of diverging on
+which groups/spans a given block yields for a given predicate and time range — the only
+difference between them is which blocks get their bodies read at all (whole-file decode vs.
+directory-pruned partial read). This parity guarantee extends to the SPEC-VI-4 flooring
+question above: `TESTS.md` TEST-VI-18/19 assert `QueryBucketFileRanged` produces results
+byte-identical to `QueryBucketFiles` at the exact window edge where a caller's failure to floor
+would matter, proving the two paths agree rather than one silently applying a different
+flooring rule than the other.
+
+Back-refs: `internal/modules/valueindex/bucketquery_ranged.go:QueryBucketFileRanged,readAndDecodeBlockRanged`
+(its two `SPEC-VI-4`-tagged comparison sites are the file-level and per-block time-prune checks
+in steps 2 and 4 above), `internal/modules/valueindex/bucketquery.go:QueryBucketFiles,matchGroupsInBlock`
+(the shared helper). See `NOTES.md` NOTE-VI-081/082/083 and `SPECS.md` SPEC-VI-4.

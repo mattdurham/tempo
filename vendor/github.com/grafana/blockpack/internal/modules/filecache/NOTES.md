@@ -43,7 +43,7 @@ file into place. Writes are made visible via `os.Rename` only.
 
 **Why:** The FileCache is a cache, not primary storage — every entry is
 re-derivable from the source block. A synchronous per-entry `fsync()` serializes
-concurrent writers against the disk. Live diagnosis on tempo-dev-test-03 (issue #470)
+concurrent writers against the disk. Live diagnosis on the dev test cluster (issue #470)
 showed a single full-scan trace-by-id burst parked ~30% of all querier goroutines
 (229 of 775) blocked in `syscall.Fsync` via this exact path, hanging an interactive
 `GET /api/traces/{id}` for 90+ seconds. Removing fsync eliminates that serialization

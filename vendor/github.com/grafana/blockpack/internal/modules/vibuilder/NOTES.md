@@ -79,6 +79,17 @@ RecordFileIO), `api.go` (ValueIndexBuildStats alias).
 Tests: `builder_test.go:TestBuildSource_Stats*`,
 `metrics_trace_vi_test.go:TestSliceValueIndexSource_StatsAccumulate`.
 
+**Addendum (2026-07-07, B-5, issue #488) — `BytesRead`'s meaning survives the ranged-read
+rewire unchanged, but now measures something bigger than what actually crosses the wire.**
+`downloadAll` no longer exists (see NOTE-VI-041/049's own addenda below), but this note's core
+claim — `BytesRead` reflects "what did it cost to decide this column's coverage," accumulated
+per consulted file — is unchanged and re-pinned by `TestBuildSource_StatsRecordFileIO`. What
+changed underneath: `queryKeysRanged` (the `downloadAll` replacement) reports each surviving
+key's **full cached object size** (`storeRangedSource.Size()`), not the (typically much smaller)
+number of bytes `valueindex.QueryBucketFileRanged`'s `ReadAt` calls actually transferred. See
+`SPECS.md` SPEC-VB-2 for the full rationale and the recorded candidate follow-up (a separate
+ranged-wire-bytes stat, not attempted in #488).
+
 ## NOTE-VI-041: a not-found value-index file is a skipped miss, not a build failure (issue #399 point 5)
 
 *Added: 2026-06-30*
@@ -111,6 +122,19 @@ Tests: `builder_test.go:TestBuildSource_NotFoundFileIsSkippedNotFailed`,
 `TestBuildSource_NonNotFoundDownloadErrorStillFails`; tempo
 `value_index_query_test.go:TestMapNotFound`.
 
+**Addendum (2026-07-07, B-5, issue #488) — corrects stale back-ref, `downloadAll` deleted.**
+`downloadAll` (named throughout the entry above) was deleted in B-5's ranged-read rewire — it
+has zero remaining callers, confirmed via grep. The 404-skip classification this note documents
+is unchanged in substance but now lives in `queryKeysRanged`: a per-key `ErrFileNotFound`,
+surfaced through `valueindex.QueryBucketFileRanged`'s wrapped error chain (from either
+`storeRangedSource.Size` or `.ReadAt`) and recognized via the same `errors.Is` check, is skipped
+exactly as `downloadAll`'s was. **Current back-ref:** `builder.go:queryKeysRanged,
+storeRangedSource` (replaces `downloadAll` above); see `vibuilder/SPECS.md` SPEC-VB-2 for the
+up-to-date contract text. The `builder_test.go:TestBuildSource_*` tests listed above are
+untouched by this rewire (they exercise `BuildSource`'s own leaf-loop behavior, which did not
+change shape). `NOTE-VI-049`'s own addendum below covers the corresponding
+`TestDownloadAll_*`→`TestQueryKeysRanged_*` test-name mapping for the lower-level tests.
+
 ## NOTE-VI-049: Bounded-concurrency downloads — downloadAll, BuildSource leaves, lookupColumnAll buckets (tempo timeout incident, issue #465)
 
 *Added: 2026-07-02*
@@ -120,7 +144,7 @@ Tests: `builder_test.go:TestBuildSource_NotFoundFileIsSkippedNotFailed`,
 `lookupColumnAll`'s per-type-bucket loop) looped over columns/buckets on top of that — at
 files=465 this produced ~930 sequential S3 calls for one query. At typical S3/minio per-call
 latency this was confirmed as the root cause of 33s-2m38s TraceQL search timeouts on
-tempo-dev-test-03.
+the dev test cluster.
 
 **Fix — bounded concurrency at three call sites**, all via `golang.org/x/sync/errgroup` with
 `SetLimit`, mirroring the existing errgroup+SetLimit+pre-sized-slice pattern already used at
@@ -230,11 +254,36 @@ real-empty-vs-404-skip distinction above), `TestLookupColumnAll_PreservesFirstTy
 under `-race` and `make precommit` (gocyclo <20 for all three rewritten functions) as part of
 task #48's verification pass.
 
+**Addendum (2026-07-07, B-5, issue #488) — corrects stale back-refs; regression-test coverage
+was PORTED, not dropped.** `downloadAll` and `readWhole` (named throughout the entry above) were
+deleted in B-5's ranged-read rewire — `queryKeysRanged` (calling
+`valueindex.QueryBucketFileRanged` per key through a `storeRangedSource` adapter, `vibuilder/SPECS.md`
+SPEC-VB-2) is the current mechanism this note's bounded-concurrency design describes.
+`downloadConcurrency`/`leafConcurrency` and their numeric values (4/2, per NOTE-VI-050 below) are
+completely unchanged by the rewire — only what each unit of bounded-concurrent work *does* per
+key changed (a `ReadAt`-pruned partial fetch instead of a whole-file download).
+
+The four `TestDownloadAll_*` regression tests this note's Tests: list names above were **ported
+to their `queryKeysRanged` equivalents, not dropped** — coverage is preserved:
+
+| Old (deleted) | New (current) |
+|---|---|
+| `TestDownloadAll_BoundedConcurrencyScaling` | `TestQueryKeysRanged_BoundedConcurrencyScaling` |
+| `TestDownloadAll_PreservesNotFoundSkipSemantics` | `TestQueryKeysRanged_PreservesNotFoundSkipSemantics` |
+| `TestDownloadAll_NonNotFoundErrorAbortsAndReturnsError` | `TestQueryKeysRanged_NonNotFoundErrorAbortsAndReturnsError` |
+| `TestDownloadAll_LegitimatelyEmptyFileIsKeptDistinctFromSkippedFile` | `TestQueryKeysRanged_LegitimatelyEmptyFileIsKeptDistinctFromSkippedFile` |
+
+`TestLookupColumnAll_PreservesFirstTypeOrdering` and the `TestBuildSource_*` tests this note also
+names are untouched by B-5 — they exercise `lookupColumnAll`'s own bucket-loop ordering and
+`BuildSource`'s leaf-loop behavior, neither of which changed shape, only what they call
+internally. **Current back-ref:** `builder.go:queryKeysRanged,storeRangedSource,
+downloadConcurrency,leafConcurrency` (replaces the `downloadAll`/`readWhole` mentions above).
+
 ## NOTE-VI-050: downloadConcurrency/leafConcurrency lowered from 24/4 to 4/2 — the bound is CPU-bound, not just connection-count-bound (follow-up to NOTE-VI-049)
 
 *Added: 2026-07-02*
 
-**What changed.** After NOTE-VI-049 shipped and was deployed to tempo-dev-test-03, TraceQL
+**What changed.** After NOTE-VI-049 shipped and was deployed to the dev test cluster, TraceQL
 search queries stopped timing out on the serial-download bottleneck but continued to time out
 on `context deadline exceeded`. A live CPU profile of the querier during a retest (Pyroscope,
 `process_cpu`, 20-minute window covering the retest) showed **56% of all sampled CPU time
@@ -251,7 +300,7 @@ connection pressure*, on the implicit assumption that `downloadAll`'s per-key wo
 bound end to end. It isn't: `readWhole`'s two round trips are I/O-wait, but the caller
 immediately decodes and sorts the returned bytes in the *same* goroutine before returning —
 real, non-trivial CPU work. The querier runs under a **5-core CPU limit**
-(`tempo-dev-test-03`'s `querier` Deployment). The original bound's worst case
+(the dev test cluster's `querier` Deployment). The original bound's worst case
 (`leafConcurrency * downloadConcurrency` = 96 concurrent goroutines, most doing CPU work, not
 waiting on network) oversubscribed 5 cores by roughly 19x. Individual per-block query-stats
 logs showed sub-millisecond `total`/`plan_dur` even while the outer HTTP request timed out at
@@ -281,7 +330,77 @@ do. That is a larger change (touches `downloadAll`'s and `lookupColumn`'s contro
 just constants) and was deliberately deferred in favor of this smaller, immediately-deployable
 constant change. Flagged for a future NOTE-VI entry if pursued.
 
+**Addendum (2026-07-07, B-5, issue #488):** this note's constants (`downloadConcurrency=4`,
+`leafConcurrency=2`) and their rationale are unaffected by the ranged-read rewire — see
+NOTE-VI-049's own B-5 addendum above for the corresponding `downloadAll`→`queryKeysRanged`
+back-ref correction, which applies equally to this note's `readWhole`/`downloadAll` mentions.
+
 Back-ref: `internal/modules/vibuilder/builder.go:downloadConcurrency,leafConcurrency,lookupColumnAll`.
 No new tests required (see above); existing suite re-verified with
 `go test -race ./internal/modules/vibuilder/... ./internal/modules/executor/...` after the
 constant change.
+
+## NOTE-VI-084: `lookupColumn`/`lookupColumnAll` rewired onto `QueryBucketFileRanged`; `storeRangedSource` adapter (issue #488, B-5)
+
+*Added: 2026-07-07*
+
+**What changed.** Both `lookupColumn` (single-column path) and `lookupColumnAll` (match-all path
+— rewired alongside `lookupColumn` per a scope correction: the original issue text named only
+`lookupColumn`, but `lookupColumnAll` also called `downloadAll` internally in its per-bucket
+goroutine, and leaving it on the old whole-file path would have reintroduced exactly the I/O cost
+#488 exists to remove, just for a different caller) no longer call `downloadAll` +
+`valueindex.QueryBucketFiles` against fully-downloaded file bytes. Both now call a new shared
+helper, `queryKeysRanged`, which runs `valueindex.QueryBucketFileRanged` per key through a new
+`storeRangedSource{store, key}` adapter — a per-key wrapper satisfying `valueindex.RangedSource`
+(`valueindex/SPECS.md` SPEC-VI-7) over vibuilder's existing `FileStore`. `downloadAll` and
+`readWhole` are now fully orphaned (zero remaining callers, confirmed via grep) and have been
+deleted, along with their dedicated tests (ported to `TestQueryKeysRanged_*` — see NOTE-VI-049's
+addendum for the full mapping).
+
+**Why a new adapter type instead of widening `FileStore` itself.** `valueindex.RangedSource` is
+keyless (`Size()`/`ReadAt(p, off)`) because a single `BucketGroup` file's read operations don't
+need to know which key they're reading — the file has already been identified by the time
+`QueryBucketFileRanged` is called. `vibuilder.FileStore` is keyed (`Size(key)`/`ReadAt(key, p,
+off)`) because it addresses a whole store, not one file. `storeRangedSource` bridges the two by
+binding a single `(store, key)` pair at construction, so `valueindex` never needs to know
+`vibuilder.FileStore` exists — preserving the same import-direction discipline NOTE-VI-036
+established for why `vibuilder` exists as its own package in the first place (the one place
+depending on `executor`, `valueindex`, and `vm` together, so neither of the other two needs to
+depend on the third).
+
+**Size-caching is load-bearing, not an optimization nicety.** `storeRangedSource.Size()` caches
+its first successful result (`valueindex/SPECS.md` SPEC-VB-1) because both
+`QueryBucketFileRanged`'s own footer-locating read and `queryKeysRanged`'s separate
+`bytesRead` observability bookkeeping (NOTE-VI-039) call `Size()` on the same adapter instance;
+without caching, an object-storage backend's `Size` (typically its own network round trip, e.g.
+an S3 `HEAD`) would be paid twice per file, silently eating into the exact I/O savings this
+rewire is meant to produce.
+
+**What is unchanged, deliberately.** The 404-skip-not-abort classification (NOTE-VI-041), the
+bounded-concurrency model and its constants (`downloadConcurrency=4`, `leafConcurrency=2`,
+NOTE-VI-049/050 — `queryKeysRanged`'s fan-out bound and `lookupColumnAll`'s per-bucket loop bound
+are numerically identical to `downloadAll`'s and its callers' before this rewire, just wrapping a
+different unit of per-key work), and the coverage contract (NOTE-VI-036, unaffected since it
+depends only on whether a predicate was buildable and what the query call returned, not on which
+I/O path produced that return value). **`bytesRead`'s meaning is also deliberately unchanged
+(SPEC-VB-2, NOTE-VI-039's own addendum) — it remains "total object size of every consulted
+file," not "bytes actually transferred," so existing observability consumers (tempo's
+`blockpackBlock.tryIndexFetch` span stamping, NOTE-VI-039) see no behavior change in what gets
+reported. This will surprise anyone trying to measure #488's I/O-reduction win by watching this
+counter — it will not move, even though the real wire-byte reduction is real and significant. The
+actual reduction shows up only in store-side transfer metrics (e.g. S3/minio request/byte
+counters), not in this application-level stat. A separate ranged-wire-bytes stat is a recorded
+candidate follow-up, not attempted in #488 — see the issue's closing comment.**
+
+**Verification.** `TestLookupColumn_ParityWithRangedPath` (`vibuilder/TESTS.md` TEST-VB-1) pins
+`lookupColumn`'s exact output against a golden value recorded before this rewire (task B-1) and
+re-passes unmodified after it (task B-6) — the strongest available evidence that this is a pure
+I/O-path change, not a behavior change. Two new I/O-counting regression tests
+(`vibuilder/TESTS.md` TEST-VB-2/3) assert the exact `ReadAt` ranges issued for a time-excluded
+and a value-excluded-by-all-blocks file, respectively, proving the I/O reduction is real and not
+just theoretically implied by calling a differently-named function.
+
+Back-ref: `internal/modules/vibuilder/builder.go:lookupColumn,lookupColumnAll,queryKeysRanged,storeRangedSource`.
+See `SPECS.md` SPEC-VB-1/2, `valueindex/NOTES.md` NOTE-VI-081 (the corresponding `valueindex`-side
+design rationale for the ranged-read path this rewire consumes) and NOTE-VI-084's own forward
+reference from there.

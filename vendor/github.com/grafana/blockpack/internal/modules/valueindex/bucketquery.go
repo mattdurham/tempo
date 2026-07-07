@@ -29,14 +29,19 @@ type BucketFooter struct {
 
 // DecodeBucketFooter parses the fixed-size footer at the tail of data. The caller may pass
 // only the last bucketFooterSize bytes of the file (e.g. from a ranged S3 GET) — file
-// pruning by time range needs nothing else.
+// pruning by time range needs nothing else. A magic mismatch is reported as ErrNotBucketFile
+// (data is too short or not a v2 file at all) — the same sentinel DecodeBucketFile uses for its
+// own header/footer magic checks — so a ranged reader that only ever sees the footer (e.g.
+// QueryBucketFileRanged, B-4/#488) can use this as its sole "not a bucket file, skip" signal
+// (NOTE-VI-083: both branches below were widened to wrap ErrNotBucketFile as part of B-4; no
+// existing caller checked the previous plain-error shape).
 func DecodeBucketFooter(data []byte) (BucketFooter, error) {
 	if len(data) < bucketFooterSize {
-		return BucketFooter{}, fmt.Errorf("valueindex: footer too short (%d bytes)", len(data))
+		return BucketFooter{}, fmt.Errorf("valueindex: footer too short (%d bytes): %w", len(data), ErrNotBucketFile)
 	}
 	f := data[len(data)-bucketFooterSize:]
 	if binary.LittleEndian.Uint32(f[:4]) != BucketFileMagic {
-		return BucketFooter{}, fmt.Errorf("valueindex: bad footer magic")
+		return BucketFooter{}, fmt.Errorf("valueindex: bad footer magic: %w", ErrNotBucketFile)
 	}
 	return BucketFooter{
 		BlockIndexOff:  binary.LittleEndian.Uint64(f[4:12]),
@@ -136,32 +141,42 @@ func QueryBucketFiles(pred Predicate, timeRange *[2]uint64, files ...[]byte) ([]
 			if !b.OverlapsTimeRange(minTS, maxTS) {
 				continue
 			}
-			for gi := range b.Groups {
-				g := &b.Groups[gi]
-				if g.TimeSec < minTS || g.TimeSec > maxTS {
-					continue
-				}
-				if pred != nil && !pred.Match(g.CanonicalValue) {
-					continue
-				}
-				for ri := range g.Refs {
-					r := &g.Refs[ri]
-					src := f.StringTable.Lookup(r.SourceID)
-					for si := range r.Spans {
-						s := &r.Spans[si]
-						for _, idx := range s.SpanIndexes {
-							out = append(out, LookupResult{
-								SourceRef: src,
-								TimeSec:   g.TimeSec,
-								BlockRef:  r.Ref,
-								TraceID:   s.TraceID,
-								RowIdx:    idx,
-							})
-						}
-					}
+			out = append(out, matchGroupsInBlock(b, f.StringTable, pred, minTS, maxTS)...)
+		}
+	}
+	return out, nil
+}
+
+// NOTE-VI-081: matchGroupsInBlock scans b's groups for those matching pred within the closed
+// time range [minTS, maxTS], flattening every SpanRef span index into a LookupResult. Extracted
+// from QueryBucketFiles' inner loop and shared with QueryBucketFileRanged (bucketquery_ranged.go,
+// B-4/#488) so the two read paths cannot silently diverge on group-level matching semantics.
+func matchGroupsInBlock(b *BucketBlock, table *StringTable, pred Predicate, minTS, maxTS uint64) []LookupResult {
+	var out []LookupResult
+	for gi := range b.Groups {
+		g := &b.Groups[gi]
+		if g.TimeSec < minTS || g.TimeSec > maxTS {
+			continue
+		}
+		if pred != nil && !pred.Match(g.CanonicalValue) {
+			continue
+		}
+		for ri := range g.Refs {
+			r := &g.Refs[ri]
+			src := table.Lookup(r.SourceID)
+			for si := range r.Spans {
+				s := &r.Spans[si]
+				for _, idx := range s.SpanIndexes {
+					out = append(out, LookupResult{
+						SourceRef: src,
+						TimeSec:   g.TimeSec,
+						BlockRef:  r.Ref,
+						TraceID:   s.TraceID,
+						RowIdx:    idx,
+					})
 				}
 			}
 		}
 	}
-	return out, nil
+	return out
 }
