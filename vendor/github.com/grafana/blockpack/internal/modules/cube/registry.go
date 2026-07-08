@@ -177,6 +177,66 @@ func (r *Registry) Remove(ctx context.Context, cubeID string) error {
 	return fmt.Errorf("cube registry: remove %q: exceeded %d retries on conflict", cubeID, maxRetries)
 }
 
+// UpdateWatermarks records that cubeID's data is completely covered at the given resolution
+// level across [minMinute, maxMinute], using the same conditional-PUT retry discipline as
+// Add/Remove (E-12a). Expands the existing watermark's range (min of mins, max of maxes) rather
+// than replacing it outright — callers are expected to supply monotonically-extending, adjacent
+// windows (the compaction ladder processes fully-elapsed boundaries in order, E-12b), so a simple
+// min/max expansion is sufficient; gap detection within a level is the router's (E-6b) concern at
+// query time, not this write-time bookkeeping.
+func (r *Registry) UpdateWatermarks(ctx context.Context, cubeID string, level, minMinute, maxMinute uint32) error {
+	const maxRetries = 5
+	backoff := 50 * time.Millisecond
+
+	for attempt := range maxRetries {
+		cubes, etag, err := r.Load(ctx)
+		if err != nil {
+			return err
+		}
+		idx := -1
+		for i, c := range cubes {
+			if c.CubeID == cubeID {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			return fmt.Errorf("cube registry: update watermarks: cube %q not found", cubeID)
+		}
+
+		newWm := ResolutionWatermark{MinMinute: minMinute, MaxMinute: maxMinute}
+		if existing, ok := cubes[idx].Watermarks[level]; ok {
+			if existing.MinMinute < newWm.MinMinute {
+				newWm.MinMinute = existing.MinMinute
+			}
+			if existing.MaxMinute > newWm.MaxMinute {
+				newWm.MaxMinute = existing.MaxMinute
+			}
+		}
+		if cubes[idx].Watermarks == nil {
+			cubes[idx].Watermarks = make(map[uint32]ResolutionWatermark, 1)
+		}
+		cubes[idx].Watermarks[level] = newWm
+
+		data, err := json.Marshal(cubeIndex{Version: indexVersion, Cubes: cubes})
+		if err != nil {
+			return fmt.Errorf("cube registry: encode: %w", err)
+		}
+		if err := r.store.ConditionalPut(ctx, r.indexPath(), data, etag); err != nil {
+			if errors.Is(err, ErrConflict) {
+				if attempt < maxRetries-1 {
+					time.Sleep(backoff)
+					backoff *= 2
+				}
+				continue
+			}
+			return fmt.Errorf("cube registry: put: %w", err)
+		}
+		return nil
+	}
+	return fmt.Errorf("cube registry: update watermarks %q: exceeded %d retries on conflict", cubeID, maxRetries)
+}
+
 // ErrLimitReached is returned when the per-tenant cube limit would be exceeded.
 type ErrLimitReached struct {
 	Limit int

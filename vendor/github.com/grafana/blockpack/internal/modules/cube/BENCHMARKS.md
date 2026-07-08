@@ -258,3 +258,18 @@ func TestReaderMemoryFootprint(t *testing.T) {
 | BENCH-CUBE-004 | >500k cells/sec range | Dominant query pattern |
 | BENCH-CUBE-005 | O(log n) comparisons | Verify binary search correctness |
 | BENCH-CUBE-006 | <10 MB RSS | Bounded memory per Reader |
+
+**Addendum (2026-07-08, issue #491, E-3):** BENCH-CUBE-001 through BENCH-CUBE-006 above all
+benchmark the plain, unchanged 12-byte `Cell` path (`EncodeCell`/`DecodeCell`/`GetCell`/
+`GetCellsInRange`) — wire-format v2's `NumAggAttrs==0` case is byte-identical to what these
+benchmarks already measure, so none of the existing targets are stale. Note also that `GetCell`/
+`GetCellsInRange` themselves are confirmed dead code in production as of E-3's Reader
+generalization (the live read path uses `GetCellsRange`/`Rollup`/`CubeRollup`) — these benchmarks
+remain useful as micro-benchmarks of the underlying codec, just not as a measurement of a
+production-hot path. **Not yet benchmarked:** the `AggCell` path
+(`EncodeAggCell`/`DecodeAggCell`/`Writer.AddAggCell`/`Reader.GetAggCellsInRange`), whose per-cell
+byte cost scales as `12 + numAggAttrs*540` — e.g. 5 aggAttrs is 2712 bytes/cell, ~226x the base
+cell size. Throughput, memory footprint, and snappy-compression-ratio characteristics at realistic
+`numAggAttrs` counts (1-10) are unmeasured as of this phase. This is a genuine gap, not a claim
+that existing targets need revision — flagging for a future benchmark task once real aggAttr data
+volumes are exercised end-to-end in production.

@@ -11,6 +11,7 @@ package blockpack
 import (
 	"path"
 
+	"github.com/grafana/blockpack/internal/modules/queryplan"
 	"github.com/grafana/blockpack/internal/modules/valuecounts"
 	"github.com/grafana/blockpack/internal/modules/valueindex"
 )
@@ -133,6 +134,50 @@ func VCNTBuildSectionFromObjects(objects [][]byte) (data []byte, dir []VCNTChunk
 	merged := valuecounts.Compact(all)
 	data, dir = valuecounts.EncodeRecords(merged, 0)
 	return data, dir, skipped
+}
+
+// Selectivity is the value-index selectivity verdict for a compiled query
+// program: whether the query's lead predicate matches a small fraction of its
+// column's population (Selective — index pruning helps), most of it
+// (LowSelectivity — pruning skips almost nothing, e.g. `kind=server`), or
+// carries no VCNT signal at all (UnknownSelectivity). Re-exported from the
+// internal queryplan package so tempo can classify a query's selectivity on the
+// live index query path without importing internals (issue #481 part 2, driving
+// the eventual pointed-recent-block-first strategy choice — NOTE-QP-002/003).
+type Selectivity = queryplan.Selectivity
+
+const (
+	// SelectivityUnknown means no VCNT cost signal covered the plan's lead leaf, so
+	// selectivity cannot be determined. The caller keeps its default strategy.
+	SelectivityUnknown = queryplan.UnknownSelectivity
+	// SelectivitySelective means the lead leaf matches a small enough fraction of
+	// its column's population that index pruning is expected to skip meaningful
+	// work — build the index source over the window as usual.
+	SelectivitySelective = queryplan.Selective
+	// SelectivityLow means the lead leaf matches most of its column's population, so
+	// index pruning skips almost nothing (the kind=server case in #481). A
+	// limit-bounded caller should prefer pointed, recent-block-first execution.
+	SelectivityLow = queryplan.LowSelectivity
+)
+
+// ClassifyProgramVCNT classifies the selectivity of a compiled query program from
+// an already-decoded VCNT section (data + dir) over the query window [minTS, maxTS]
+// (unix seconds). It composes the plan, VCNT cost oracle, and column-total oracle
+// with the SAME window threaded through both, so the selectivity fraction's
+// numerator (a leaf's live count) and denominator (its column's population) are
+// always measured over the same time slice (NOTE-QP-003). It performs no
+// object-storage I/O: data/dir are the caller's already-fetched VCNT section bytes.
+//
+// Returns SelectivityUnknown when the program has no plannable predicate, no leaf
+// carried a Known VCNT cost, or the lead leaf's column has no VCNT population
+// coverage — i.e. "no signal", on which the caller keeps its default strategy.
+func ClassifyProgramVCNT(
+	prog *Program,
+	data []byte,
+	dir []VCNTChunkDirEntry,
+	minTS, maxTS uint64,
+) Selectivity {
+	return queryplan.ClassifyProgramVCNT(prog, data, dir, minTS, maxTS)
 }
 
 // VIFileMeta holds the parsed metadata from a v2 value-index filename.

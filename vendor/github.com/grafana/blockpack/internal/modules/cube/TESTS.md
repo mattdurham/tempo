@@ -137,3 +137,113 @@
 - **TEST-CUBE-017** `TestAccumulatorResetNoDoubleCount` — flush resets; next minute does not carry over.
 - **TEST-CUBE-018** `TestAccumulatorFlushEmptyNoOp` — idle minute writes nothing.
 - **TEST-CUBE-019** `TestWriterEncodeMatchesFlush` — `Encode()` bytes equal the `Flush()` file.
+
+---
+
+## TEST-CUBE-020..060 — Registry/CardinalityGate/CreationTrigger/Backfill/Rollup/Router/Compactor suite (issues #444-#453, #480)
+
+Landed across the `f9c39e74` epic commit (2026-06-29) and the #480 filter-identity fix
+(2026-07-06); each ID below is a real, implemented, correctly-numbered test.
+
+| ID | Test | File | What it pins |
+|---|---|---|---|
+| TEST-CUBE-020 | `TestComputeCubeID_Stable` | definition_test.go | Same inputs always produce the same CubeID |
+| TEST-CUBE-021 | `TestComputeCubeID_DimOrderNormalized` | definition_test.go | Reversed dimension order gives the same ID |
+| TEST-CUBE-022 | `TestComputeCubeID_DifferentTenants` | definition_test.go | Different tenants produce different IDs |
+| TEST-CUBE-023 | `TestComputeCubeID_FilterOrderNormalized` | definition_test.go | Filter order doesn't affect the ID |
+| TEST-CUBE-024 | `TestRegistryEntry_JSONRoundTrip` | definition_test.go | RegistryEntry survives a JSON round-trip |
+| TEST-CUBE-025 | `TestIDFromBytes_RoundTrip` | definition_test.go | IDFromBytes round-trips a hex CubeID |
+| TEST-CUBE-026 | `TestCheckCardinality_EmptyDataPasses` | cardinality_test.go | nil/empty VCNT data → gate passes (no data = no restriction) |
+| TEST-CUBE-027 | `TestCheckCardinality_TooManyDistinctRejects` | cardinality_test.go | >1000 distinct values → rejected |
+| TEST-CUBE-028 | `TestCheckCardinality_UUIDRejects` | cardinality_test.go | UUID/high-entropy columns always rejected |
+| TEST-CUBE-029 | `TestCheckCardinality_CombinedLimitEnforced` | cardinality_test.go | Combined dim1×dim2 cell-count limit enforced |
+| TEST-CUBE-030 | `TestCheckCardinality_LowCardinalityPasses` | cardinality_test.go | Low-cardinality dimensions pass |
+| TEST-CUBE-031 | `TestRegistry_EmptyStoreReturnsEmptyIndex` | registry_test.go | Empty store → empty index, not an error |
+| TEST-CUBE-032 | `TestRegistry_AddLoadRoundTrip` | registry_test.go | Add then Load returns what was added |
+| TEST-CUBE-033 | `TestRegistry_AddIdempotent` | registry_test.go | Adding the same CubeID twice yields one entry |
+| TEST-CUBE-034 | `TestRegistry_ConcurrentAddSameID` | registry_test.go | Concurrent Add with the same CubeID produces exactly one entry |
+| TEST-CUBE-035 | `TestRegistry_RemoveIdempotent` | registry_test.go | Remove deletes the cube; removing an absent cube is a no-op |
+| TEST-CUBE-036 | `TestRegistry_PerTenantLimitEnforced` | registry_test.go | Per-tenant limit enforced before Add |
+| TEST-CUBE-037 | `TestRegistry_IsActive` | registry_test.go | IsActive returns correct results |
+| TEST-CUBE-038 | `TestRegistry_IndexJSONValid` | registry_test.go | index.json is valid JSON with a version field |
+| TEST-CUBE-039 | `TestCreationTrigger_FirstQueryCreates` | trigger_test.go | First query for a pattern triggers cube creation |
+| TEST-CUBE-040 | `TestCreationTrigger_SecondCallNoDuplicate` | trigger_test.go | Second call for the same pattern returns the existing entry, not a duplicate |
+| TEST-CUBE-041 | `TestCreationTrigger_CardinalityRejectionPropagates` | trigger_test.go | Cardinality-gate rejection propagates as an error |
+| TEST-CUBE-042 | `TestCreationTrigger_LimitBeforeCardinality` | trigger_test.go | Per-tenant limit checked before the cardinality gate |
+| TEST-CUBE-043 | `TestCreationTrigger_ConcurrentFirstQueries` | trigger_test.go | Concurrent first queries for the same pattern produce exactly one entry |
+| TEST-CUBE-044 | `TestBackfiller_SingleDimWritesFile` | backfill_test.go | Single-dimension backfill writes a cube file for a minute with data |
+| TEST-CUBE-045 | `TestBackfiller_EmptyMinuteWritesNothing` | backfill_test.go | Empty minute writes nothing (sparse cube) |
+| TEST-CUBE-046 | `TestBackfiller_WatermarkAdvances` | backfill_test.go | Watermark advances correctly; progress called for each minute |
+| TEST-CUBE-047 | `TestBackfiller_CtxCancellationStops` | backfill_test.go | Context cancellation stops the backfill loop |
+| TEST-CUBE-048 | `TestRollup_L0ToL1SumsHour` | rollup_test.go | L0→L1 rollup sums 60 minutes into 1 hourly bucket |
+| TEST-CUBE-049 | `TestRollup_DisjointDictMerge` | rollup_test.go | Dictionary merge handles disjoint value sets correctly |
+| TEST-CUBE-050 | `TestRollupToWriter_ProducesReadableFile` | rollup_test.go | RollupToWriter produces a readable cube file with correct counts |
+| TEST-CUBE-051 | `TestRollup_EmptyInputsReturnNil` | rollup_test.go | Empty inputs return nil, not an error |
+| TEST-CUBE-052 | `TestQueryRouter_ExactMatch` | router_test.go | Exact match routes to the cube |
+| TEST-CUBE-053 | `TestQueryRouter_NoMatch` | router_test.go | No cube match returns Found=false |
+| TEST-CUBE-054 | `TestQueryRouter_ResolutionSnapping` | router_test.go | Resolution snapping selects the correct rollup level |
+| TEST-CUBE-055 | `TestResolutionLevel` | router_test.go | ResolutionLevel standalone function, all three levels |
+| TEST-CUBE-056 | `TestPlanL0Merge_MeetsThreshold` | compactor_test.go | PlanL0Merge returns a plan when ≥ threshold files cover the same hour |
+| TEST-CUBE-057 | `TestPlanL0Merge_BelowThreshold` | compactor_test.go | PlanL0Merge returns nothing when below threshold |
+| TEST-CUBE-058 | `TestCompactor_ExecuteMergesAndDeletes` | compactor_test.go | Execute merges cells and deletes input files (pure L0 merge case) |
+| TEST-CUBE-059 | `TestCompactor_ShouldEvictAccuracy` | compactor_test.go | ShouldEvict returns true for old last-queried timestamps |
+| TEST-CUBE-060 | `TestRouter_FilterDifferentiatesCubes` | router_test.go | Two cubes with identical dims but different filters must not share a cube; filtered/unfiltered queries must not cross-route (issue #480; renumbered from an original 056 collision with TestPlanL0Merge_MeetsThreshold via task E-15) |
+
+---
+
+## TEST-CUBE-061..097 — aggAttrs / wire-format-v2 / router-watermark suite (issue #491)
+
+Every ID below was assigned by spec-oracle-e before or immediately after landing, per this
+phase's ID-routing convention (FOOTGUN 5, `.bob/state/spec-knowledge-phase-e.md`).
+
+| ID | Test | File | What it pins |
+|---|---|---|---|
+| TEST-CUBE-061 | `TestComputeCubeID_DifferentAggAttrs_ProducesDifferentIDs` | definition_test.go | Differing only in aggAttrs content produces different CubeIDs — the attribute SET joins identity (ruling 3) |
+| TEST-CUBE-062 | `TestComputeCubeID_AggAttrsOrderIndependent` | definition_test.go | aggAttrs order does not affect the CubeID |
+| TEST-CUBE-063 | `TestComputeCubeID_AlwaysIncludesFourthSegment` | definition_test.go | No code path produces the old 3-segment-only hash anymore (replaces the vetoed byte-identity test) |
+| TEST-CUBE-064 | `TestComputeDimsFiltersKey_IsThe3SegmentPrefixOfComputeCubeID` | definition_test.go | computeDimsFiltersKey is a stable, independently-testable value ComputeCubeID builds on |
+| TEST-CUBE-065 | `TestRegistryEntry_AggAttrs_RoundTripsThroughJSON` | definition_test.go | RegistryEntry.AggAttrs round-trips through JSON |
+| TEST-CUBE-066 | `TestComputeCubeID_EmptyAggAttrs_StillHashesFourthSegment` | definition_test.go | nil/empty aggAttrs is a LIVE production path (router.go/trigger.go pass nil pending E-6b/E-10) yet the vetoed len==0 shortcut was never silently reintroduced (fix per reviewer-e2 mutation finding #38) |
+| TEST-CUBE-067 | `TestValidateDefinition_RejectsMissingDuration` | accumulator_test.go | THE test pinning the third-round clamp: a Definition whose AggAttrs omits DurationColumn is rejected by NewAccumulator |
+| TEST-CUBE-068 | `TestValidateDefinition_AcceptsDurationPlusOtherAttrs` | accumulator_test.go | Positive case — AggAttrs containing duration plus a second attr is accepted |
+| TEST-CUBE-069 | `TestAccumulator_Add_SumMinMaxSampleCount_SingleAggAttr` | accumulator_test.go | Known non-power-of-two duration values accumulate exact Sum/Min/Max/SampleCount |
+| TEST-CUBE-070 | `TestAccumulator_Add_Buckets_MatchesLog2Bucketize` | accumulator_test.go | Buckets[] exactly matches Log2Bucketize's boundaries across several power-of-two buckets |
+| TEST-CUBE-071 | `TestAccumulator_Add_DurationBelow2ns_ExcludedFromBucketsNotFromCount` | accumulator_test.go | duration=1 (<2ns) still increments base Count/SampleCount/Sum but contributes nothing to Buckets[] (ruling 1) |
+| TEST-CUBE-072 | `TestAccumulator_Add_FloatTypedAttr_NeverPopulatesBuckets` | accumulator_test.go | A second, Float64-typed attribute accumulates Sum/Min/Max but its Buckets stays all-zero (ruling 1 scope boundary) |
+| TEST-CUBE-073 | `TestAccumulator_Encode_RoundTripsThroughRealWriter` | accumulator_test.go | Accumulator.Encode() → OpenReaderFromBytes → GetAggCellsInRange round-trips every AggAttrValues field exactly (real write-path proof) |
+| TEST-CUBE-074 | `TestCreationTrigger_TryCreate_RejectsDefinitionMissingDuration` | trigger_test.go | validateDefinition's second call site (TryCreate) rejects a Definition missing duration |
+| TEST-CUBE-075 | `TestCheckCardinality_RejectsOnByteCost_EvenWhenCellCountUnderLimit` | cardinality_test.go | Byte-cost check rejects a cube even when the plain cell-count check would pass |
+| TEST-CUBE-076 | `TestCheckCardinality_ErrorIsCardinalityError` | cardinality_test.go | Byte-cost rejection returns a *CardinalityError (errors.As-comparable) |
+| TEST-CUBE-077 | `TestCompactor_Execute_DeletesL0MergeInputsImmediately` | compactor_test.go | A pure L0-to-L0 merge (plan.Level==RollupL0) deletes its inputs immediately |
+| TEST-CUBE-078 | `TestCompactor_Execute_NoLongerDeletesL0InputsImmediately` | compactor_test.go | An L0→L1 rollup (plan.Level==RollupL1) does NOT delete its L0 inputs immediately |
+| TEST-CUBE-079 | `TestCompactor_Execute_StillDeletesL1InputsAfterL2Rollup` | compactor_test.go | An L1→L2 rollup (plan.Level==RollupL2) deletes its L1 inputs immediately — retention is L0-specific |
+| TEST-CUBE-080 | `TestCompactor_Execute_UpdatesWatermarkOnSuccess` | compactor_test.go | Execute updates RegistryEntry.Watermarks[plan.Level] on every successful rollup write |
+| TEST-CUBE-081 | `TestCompactor_EvictAgedL0_DeletesOnlyPastRetentionAndAlreadyRolledUp` | compactor_test.go | EvictAgedL0 deletes only when BOTH past L0RetentionMinutes AND covered by Watermarks[RollupL1] |
+| TEST-CUBE-082 | `TestCompactor_EvictAgedL0_NeverDeletesFileWithinRetentionWindow` | compactor_test.go | A file within the retention window is never evicted, regardless of watermark coverage |
+| TEST-CUBE-083 | `TestCompactor_EvictAgedL0_NeverDeletesFileNotYetRolledUp` | compactor_test.go | A file past retention but not yet covered by the L1 watermark is never evicted |
+| TEST-CUBE-084 | `TestRegistry_UpdateWatermarks_MergesExistingRange` | registry_test.go | UpdateWatermarks expands (min-of-mins, max-of-maxes) an existing range rather than replacing it |
+| TEST-CUBE-085 | `TestRegistry_UpdateWatermarks_CubeNotFoundReturnsError` | registry_test.go | UpdateWatermarks against an unregistered CubeID returns an error |
+| TEST-CUBE-086 | `TestRegistry_UpdateWatermarks_ConditionalPutRetryDiscipline` | registry_test.go | UpdateWatermarks uses the same 5-retry/50ms-doubling conditional-PUT discipline as Add/Remove |
+| TEST-CUBE-087 | `TestBackfill_RealWriteReadPath_JoinsByTraceAndSpanID_NotJustTrace` | backfill_test.go | Real-write-path proof (Writer.AddEntryV4→Flush→OpenReader→Reader.Lookup) that the (TraceID,SpanID) join correctly attributes per-span aggAttr values without cross-contaminating trace siblings (fix #46) |
+| TEST-CUBE-088 | `TestRoute_SupersetTieBreak_PrefersSmallestCoveringSet` | router_test.go | Route prefers the smallest AggAttrs superset that still covers neededAttr |
+| TEST-CUBE-089 | `TestRoute_SupersetTieBreak_OnlySupersetCoversNeededAttr` | router_test.go | Only a genuine superset (containing neededAttr) is eligible, not any dims+filters match |
+| TEST-CUBE-090 | `TestRoute_SupersetTieBreak_EqualSetsBreakByNewestCreatedAt` | router_test.go | Equal-size AggAttrs sets break ties by newest CreatedAt |
+| TEST-CUBE-091 | `TestRoute_NeededAttrEmpty_MatchesAnyCandidate` | router_test.go | neededAttr=="" matches any candidate regardless of its attribute set |
+| TEST-CUBE-092 | `TestRoute_ResolutionCompleteness_DeclinesWhenWatermarkDoesNotCoverFullWindow` | router_test.go | A partial watermark at the chosen resolution declines the whole query |
+| TEST-CUBE-093 | `TestRoute_ResolutionCompleteness_FullCoverageSucceeds` | router_test.go | Full watermark coverage at the chosen resolution succeeds |
+| TEST-CUBE-094 | `TestRoute_ResolutionCompleteness_NoWatermarkAtAllDeclines` | router_test.go | A missing watermark for the chosen resolution declines the whole query |
+| TEST-CUBE-095 | `TestValidateFileMatchesRegistry_MatchSucceeds` | router_test.go | ValidateFileMatchesRegistry succeeds when file NumAggAttrs matches the registry entry's AggAttrs count |
+| TEST-CUBE-096 | `TestValidateFileMatchesRegistry_MismatchReturnsTypedError` | router_test.go | A count mismatch returns a typed error, not a silent pass |
+| TEST-CUBE-097 | `TestValidateFileMatchesRegistry_ErrorIsAggAttrsMismatchError` | router_test.go | The returned error is an *AggAttrsMismatchError (errors.As-comparable) |
+
+## TEST-CUBE-098..102 — Phase E fix pass (issue #491, review.md/go-presubmit.md, 2026-07-08)
+
+| ID | Test | File | Scenario/Setup/Assertions |
+|----|------|------|---------------------------|
+| TEST-CUBE-098 | `TestCubeIngest_PublicAPI_LoadCubeDefinitions_CopiesAggAttrs` | cube_ingest_publicapi_test.go (root package) | Setup: real Registry (Add/Load) backed by an in-memory ObjectStore fake, a realistic RegistryEntry with AggAttrs populated. Assertion: LoadCubeDefinitions' resulting Definition.AggAttrs is copied from entry.AggAttrs with correct type-defaulting (DurationColumn→Int64, other→Float64), and NewCubeAccumulator succeeds on it. Mutation-verified: reverting the AggAttrs copy in CubeRegistryEntryToDefinition fails this test. |
+| TEST-CUBE-099 | `TestBackfill_ProcessMinute_AppliesRegisteredFilter` | backfill_test.go | Setup: a filtered RegistryEntry (duration > threshold), two VI-backed spans (one above, one below threshold). Assertion: only the above-threshold span is counted in the resulting cube file (Count, SampleCount, Sum). Mutation-verified: reverting the Filters wiring in processMinute's Definition literal, OR reverting the Int64 landmine fix, both independently fail this test. |
+| TEST-CUBE-100 | `TestPlanL0Merge_ExcludesHourStraddlingFile` | compactor_test.go | Setup: one previously-merged L0 file whose own span straddles an hour boundary, plus enough well-contained hour-0 files to hit the merge threshold. Assertion: the straddling file is never included in any plan; the well-contained hour still merges normally, with output fully contained in that hour. Mutation-verified: reverting to grouping purely by MinMinute/60 (no hourMin!=hourMax guard) fails this test. |
+| TEST-CUBE-101 | `TestColumnFilterToFilter` | definition_test.go | Table test covering every representable ColumnFilter.Value shape (numeric string, Go-duration string, direct float64/int, non-numeric string via EQ fallback to StringFilter) plus the unrepresentable case (GT on a non-numeric string, which must return nil). |
+| TEST-CUBE-102 | `TestColumnFilterToFilter_MissingColumnRejected` | definition_test.go | A span missing the filtered column is rejected by both the NumericFilter-backed and StringFilter-backed conversion paths — a missing column can never satisfy a filter. |
+
+**Next free ID: TEST-CUBE-103.**

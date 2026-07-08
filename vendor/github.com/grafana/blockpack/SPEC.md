@@ -1094,3 +1094,28 @@ func QueryNegatedStructuralFromIndex(
 **Result conversion and panic safety** are identical to `QueryStructuralFromIndex`'s (SPEC-ROOT-020) — same `NewSpanFieldsAdapterWithReader`/`.Clone()`/`ReleaseSpanFieldsAdapter` sequence, same top-level `recover()`-to-error wrapper.
 
 Back-ref: `structural.go:QueryNegatedStructuralFromIndex`. Tests: `structural_index_realvi_test.go:TestQueryNegatedStructuralFromIndex_RealWriteValueIndexL0_EndToEnd`. See NOTE-VI-095 (`internal/modules/executor/NOTES.md`) for the fix-pass context. Issue #489.
+
+## SPEC-ROOT-022: Cube module public re-export surface, completed (issue #491, E-9)
+
+**Invariant:** Root `cube_ingest.go` (`package blockpack`) exposes `internal/modules/cube`'s
+public surface as thin type aliases and wrapper functions, following the same pattern
+`SPEC-ROOT-020`/`SPEC-ROOT-021` established for the structural-query engine. This task completes
+the re-export for every symbol Phase E's cube work introduced:
+
+- `CubeAggCell` (= `cube.AggCell`, the sole flattened cell type, `internal/modules/cube/SPECS.md`
+  `SPEC-CUBE-001`) and `CubeAggAttrValues` (= `cube.AggAttrValues`, `SPEC-CUBE-021`).
+- `CubeBucketCount`, `CubeLog2Bucketize`, `CubeLog2QuantileFromBuckets` (E-2's Log2 histogram
+  bucketing, `SPEC-CUBE-019`).
+- `CubeResolutionWatermark` (= `cube.ResolutionWatermark`, `SPEC-CUBE-018`'s addendum),
+  `CubeAggAttrsMismatchError` (= `cube.AggAttrsMismatchError`), and
+  `CubeValidateFileMatchesRegistry` (wraps `cube.ValidateFileMatchesRegistry`,
+  `SPEC-CUBE-024`).
+
+`Route`'s new `neededAttr`/watermark-completeness signature (`SPEC-CUBE-023`) and
+`Reader.GetAggCell`/`GetAggCellsInRange`/`NumAggAttrs`/`Registry.UpdateWatermarks` needed NO new
+wrapper code — they are automatically reachable through the PRE-EXISTING `CubeQueryRouter`/
+`CubeReader`/`CubeRegistry` type aliases, since a Go type alias exposes every method the aliased
+type gains, including ones added after the alias itself was written.
+
+**Back-ref:** `cube_ingest.go` (full symbol list above); `cube_ingest_publicapi_test.go`
+(`package blockpack_test`, proving the surface is usable without any `internal/` import).

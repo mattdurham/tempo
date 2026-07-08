@@ -81,11 +81,13 @@ func CubeReadHeader(buf []byte) (minMinute, maxMinute, resolution uint32, err er
 }
 
 // CubeComputeID returns the deterministic hex cube ID for a
-// (tenant, dimensions, filters) combination. It is the routing key: two queries
-// sharing the same tenant+dims but differing in filters produce different IDs, so a
-// filtered cube is never reused for a query with a different filter (issue #480).
-func CubeComputeID(tenant string, dimensions []string, filters []CubeColumnFilter) string {
-	return cube.ComputeCubeID(tenant, dimensions, filters)
+// (tenant, dimensions, filters, aggAttrs) combination. It is the routing key: two queries
+// sharing the same tenant+dims but differing in filters or aggregate-attribute set produce
+// different IDs, so a filtered cube is never reused for a query with a different filter
+// (issue #480), and a cube tracking a different attribute set is never reused for a query
+// needing an attribute outside its set (issue #491, ruling 3).
+func CubeComputeID(tenant string, dimensions []string, filters []CubeColumnFilter, aggAttrs []string) string {
+	return cube.ComputeCubeID(tenant, dimensions, filters, aggAttrs)
 }
 
 // CubeIDFromHex parses a hex cube ID string into its [16]byte representation.
@@ -138,6 +140,22 @@ func NewCubeQueryRouter(entries []CubeRegistryEntry) *CubeQueryRouter {
 
 // CubeRoutingResult is the outcome of a CubeQueryRouter.Route call.
 type CubeRoutingResult = cube.RoutingResult
+
+// CubeResolutionWatermark is one resolution level's complete-coverage window
+// (RegistryEntry.Watermarks' map value type, #491 E-6b/E-12a).
+type CubeResolutionWatermark = cube.ResolutionWatermark
+
+// CubeAggAttrsMismatchError signals a cube FILE's on-disk NumAggAttrs disagreeing with its own
+// RegistryEntry's AggAttrs count — a registry-vs-file consistency violation (#491, APPENDIX 3).
+type CubeAggAttrsMismatchError = cube.AggAttrsMismatchError
+
+// CubeValidateFileMatchesRegistry is a pure comparison, no I/O: the caller (E-10, tempo-side)
+// already has both an opened file's decoded header (via CubeReader.NumAggAttrs — inherited
+// automatically via the CubeReader alias, no wrapper needed) and the RegistryEntry it's about to
+// route through in hand at the same time. Returns *CubeAggAttrsMismatchError on a count mismatch.
+func CubeValidateFileMatchesRegistry(fileNumAggAttrs uint8, entry CubeRegistryEntry) error {
+	return cube.ValidateFileMatchesRegistry(fileNumAggAttrs, entry)
+}
 
 // CubeCreationTrigger checks the cardinality gate and registers a new cube.
 type CubeCreationTrigger = cube.CreationTrigger
@@ -243,13 +261,38 @@ const (
 	CubeFilterOpEqual = cube.FilterOpEqual
 )
 
+// CubeAggAttrType gates whether Buckets[] is computed for a materialized aggregate attribute
+// (ruling 1, #491). Minimal slice of E-9's re-export surface, added early (by E-4) because
+// external callers (tempo) cannot construct a valid Definition.AggAttrs without it — the full
+// re-export surface (Route's neededAttr wiring, etc.) remains E-9's job.
+type CubeAggAttrType = cube.AggAttrType
+
+const (
+	// CubeAggAttrTypeInt64 includes Duration-typed attributes (nanoseconds as int64).
+	CubeAggAttrTypeInt64 = cube.AggAttrTypeInt64
+	// CubeAggAttrTypeFloat64 attributes get Sum/Min/Max/Avg only; Buckets stays all-zero.
+	CubeAggAttrTypeFloat64 = cube.AggAttrTypeFloat64
+)
+
+// CubeAggAttrDef describes one materialized aggregate attribute (column + type tag).
+type CubeAggAttrDef = cube.AggAttrDef
+
+// CubeDurationColumn is the canonical span-duration column name every v2 cube's
+// Definition.AggAttrs MUST include (ruling 3 + the third-round clamp) — matches
+// tempoSpanValues' own "span:duration" intrinsic key. Never re-derive or hardcode a second
+// spelling; always reference this constant.
+const CubeDurationColumn = cube.DurationColumn
+
 // CubeAccumulator is an in-memory per-minute span counter for one cube.
 type CubeAccumulator = cube.Accumulator
 
 // NewCubeAccumulator creates an in-memory accumulator for one cube and one minute
 // bucket. Call Add(span) per span; call FlushTo(store, tenant) at minute rotation.
-// Not safe for concurrent use.
-func NewCubeAccumulator(def CubeDefinition, minute uint32) *CubeAccumulator {
+// Not safe for concurrent use. Returns an error if def violates the mandatory-duration
+// invariant every v2 cube's AggAttrs must satisfy (E-4, #491) — mechanical signature update
+// to match cube.NewAccumulator's breaking change; full aggAttr wiring for this re-export
+// surface is E-9's job.
+func NewCubeAccumulator(def CubeDefinition, minute uint32) (*CubeAccumulator, error) {
 	return cube.NewAccumulator(def, minute)
 }
 
@@ -257,6 +300,79 @@ func NewCubeAccumulator(def CubeDefinition, minute uint32) *CubeAccumulator {
 // column satisfies (value op threshold).
 func NewCubeNumericFilter(column string, op CubeFilterOp, threshold int64) CubeFilter {
 	return cube.NumericFilter(column, op, threshold)
+}
+
+// NewCubeStringFilter builds a CubeFilter that keeps a span only when its string column equals
+// value exactly (#491 Phase E fix pass, review.md Issues 2/3 — the string-equality counterpart to
+// NewCubeNumericFilter, needed for filters on non-numeric columns).
+func NewCubeStringFilter(column, value string) CubeFilter {
+	return cube.StringFilter(column, value)
+}
+
+// CubeColumnFilterToFilter converts a RegistryEntry-persisted CubeColumnFilter into a runtime
+// CubeFilter predicate — the single source of truth shared by both real code paths that apply a
+// cube's baked-in filters to real span data (#491 Phase E fix pass, review.md Issues 2/3): tempo's
+// cubemanager.go passes this directly as LoadCubeDefinitions' filterFn parameter so forward
+// ingest actually enforces a filtered cube's predicate (previously always nil, so def.Filters was
+// always empty in production). Prefers a numeric threshold (NewCubeNumericFilter) when the
+// filter's value parses as one (covers duration and numeric-attribute filters); falls back to
+// string equality (NewCubeStringFilter) for a DefFilterOpEQ filter on a non-numeric value. Returns
+// nil for an unrepresentable combination (a GT/GTE/LT/LTE op on a non-numeric value) — the caller
+// (LoadCubeDefinitions) already skips a nil filter.
+func CubeColumnFilterToFilter(cf CubeColumnFilter) CubeFilter {
+	return cube.ColumnFilterToFilter(cf)
+}
+
+// CubeAggCell is the sole cell type post-APPENDIX-2 flatten (#491, E-3/E-9): base fields
+// (Minute/Count/Dim1ID/Dim2ID) plus zero or more per-aggAttr records, in RegistryEntry.AggAttrs
+// order. CubeReader.GetAggCell/GetAggCellsInRange (inherited automatically via the CubeReader
+// alias above — no wrapper function needed, per this codebase's deadcode-vs-test convention:
+// reachable via tests is sufficient) return values of this type.
+type CubeAggCell = cube.AggCell
+
+// CubeAggAttrValues is one materialized aggregate attribute's accumulated state within a
+// CubeAggCell.Aggs entry (SampleCount/Sum/Min/Max/Buckets).
+type CubeAggAttrValues = cube.AggAttrValues
+
+// CubeBucketCount is the fixed number of log2 histogram buckets in every
+// CubeAggAttrValues.Buckets array (#491, E-2).
+const CubeBucketCount = cube.BucketCount
+
+// CubeLog2Bucketize returns the ceiling power-of-two boundary for v, or -1 when v < 2 (the
+// sample is excluded from any histogram entirely) — a byte-for-byte port of tempo's own
+// pkg/traceql.Log2Bucketize (#491, E-2, ruling 1).
+func CubeLog2Bucketize(v uint64) float64 {
+	return cube.Log2Bucketize(v)
+}
+
+// CubeLog2QuantileFromBuckets ports tempo's Log2QuantileWithBucket exactly (#491, E-2, ruling 1):
+// walks buckets accumulating counts until ceil(p*total) samples are consumed, then interpolates
+// exponentially between the containing bucket's boundary and the prior bucket's.
+func CubeLog2QuantileFromBuckets(p float64, buckets [CubeBucketCount]uint64) (value float64, bucketIdx int) {
+	return cube.Log2QuantileFromBuckets(p, buckets)
+}
+
+// Canonical cube rollup-level values (#491 Phase E fix pass, review.md/go-presubmit.md — duplicated
+// rollup-level constants). Re-exported as plain uint32 (rather than the internal cube.RollupLevel
+// type) so tempo's existing uint32-typed local constants (cubeLevelL0/L1/L2 in
+// tempodb/encoding/vblockpack/cube_scheduler.go, compared/arithmetic'd against
+// CubeFileInfo.Level and other uint32 values throughout that package) can reference these directly
+// without a type-conversion ripple at every use site.
+const (
+	// CubeRollupL0 is the 1-minute-granularity rollup level.
+	CubeRollupL0 = uint32(cube.RollupL0)
+	// CubeRollupL1 is the 1-hour-granularity (60-minute) rollup level.
+	CubeRollupL1 = uint32(cube.RollupL1)
+	// CubeRollupL2 is the 1-day-granularity (1440-minute) rollup level.
+	CubeRollupL2 = uint32(cube.RollupL2)
+)
+
+// CubeBucketMax is BucketIndex's inverse: CubeBucketMax(k) is the upper boundary of dense bucket
+// slot k (2^k). Exported so tempo's response-mapping code (histogram_over_time's per-bucket label
+// formatting) can call the single source of truth instead of re-implementing the formula
+// (#491, E-11b polish item 1 — "no reimplemented bucket math on the tempo side").
+func CubeBucketMax(k int) float64 {
+	return cube.BucketMax(k)
 }
 
 // CubeRegistryEntryToDefinition converts a RegistryEntry to a Definition suitable
@@ -274,6 +390,13 @@ func CubeRegistryEntryToDefinition(
 	def := CubeDefinition{
 		ID:         id,
 		Resolution: entry.Resolution,
+		// AggAttrs must be copied from entry.AggAttrs (#491 Phase E fix pass, review.md Issue 1):
+		// NewCubeAccumulator's validateDefinition requires DurationColumn to be present in
+		// AggAttrs (E-4), and this is the ONLY conversion point between the S3-persisted
+		// RegistryEntry and the runtime Definition NewCubeAccumulator consumes on the real
+		// production forward-ingest path (tempo's cubemanager.go loadDefs). Leaving this unset
+		// silently fails validateDefinition for every real cube.
+		AggAttrs: cube.AggAttrDefsFor(entry.AggAttrs),
 	}
 	if len(entry.Dimensions) >= 1 {
 		def.Dim1Column = entry.Dimensions[0]

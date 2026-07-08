@@ -14,9 +14,11 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"math"
 	"path"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -151,18 +153,27 @@ func (cqp *cubeQueryPath) tryQueryFromCube(
 		return nil, false
 	}
 
+	// The materialized attribute (if any) this query's function needs — "" for count_over_time/
+	// rate, which match any candidate cube regardless of its AggAttrs set (E-10).
+	neededAttr, neededAttrType, neededAttrOK := extractAggAttr(req.Query)
+
 	router := blockpack.NewCubeQueryRouter(entries)
 	minMinute := uint32(req.Start / 60_000_000_000)
 	maxMinute := uint32(req.End / 60_000_000_000)
-	result, routeErr := router.Route(tenant, dims, filters, 1, minMinute, maxMinute)
+	// req.Step is the query's requested granularity — the hardcoded resolution=1 (always L0)
+	// this call used before E-10 ignored it entirely, serving every query at minute resolution
+	// regardless of what it actually asked for.
+	requestedResolution := requestedResolutionMinutes(req.Step)
+	result, routeErr := router.Route(tenant, dims, filters, neededAttr, requestedResolution, minMinute, maxMinute)
 	if routeErr != nil || !result.Found {
-		// Cube not found — attempt to create it on first query.
-		// Fire cube creation in a background goroutine so QueryRange is not blocked.
-		// req.Start/req.End are nanoseconds; VCNT records are keyed in unix seconds
+		// Cube not found (or found but resolution-incomplete, ruling 4(b) — the whole query
+		// still falls back, never a partial/mixed-resolution answer). Attempt cube creation on
+		// first query. Fire cube creation in a background goroutine so QueryRange is not
+		// blocked. req.Start/req.End are nanoseconds; VCNT records are keyed in unix seconds
 		// (minute-floored), so pass the query window in seconds for the cardinality gate.
 		minTS := req.Start / 1_000_000_000
 		maxTS := req.End / 1_000_000_000
-		go cqp.maybeCreateCube(context.Background(), tenant, dims, filters, minTS, maxTS)
+		go cqp.maybeCreateCube(context.Background(), tenant, dims, filters, neededAttr, neededAttrType, neededAttrOK, minTS, maxTS)
 		return nil, false
 	}
 
@@ -173,15 +184,26 @@ func (cqp *cubeQueryPath) tryQueryFromCube(
 		return nil, false
 	}
 
-	// Download and open readers.
+	// Download, open, and validate readers (APPENDIX 3: registry-vs-file consistency check).
 	inputs := make([]blockpack.CubeRollupInput, 0, len(keys))
 	for _, key := range keys {
 		data, getErr := cqp.getObject(ctx, key)
 		if getErr != nil {
-			continue
+			continue // routine download failure — not a registry/file drift, not logged as one
 		}
 		r, openErr := blockpack.OpenCubeReaderFromBytes(data)
 		if openErr != nil {
+			continue // routine decode failure — same posture as above
+		}
+		if ok, mismatchErr := classifyCubeFile(r, result.Entry); !ok {
+			// A registry/file drift (corruption, a buggy writer, or a stale registry entry) —
+			// excluded from CubeRollup's inputs with the SAME posture as the routine failures
+			// above, but logged DISTINCTLY so the drift is operationally discoverable, never
+			// silently indistinguishable "noise" (APPENDIX 3).
+			level.Warn(util_log.Logger).Log(
+				"msg", "vblockpack: cube: registry-vs-file aggAttrs mismatch, excluding file",
+				"tenant", tenant, "cube_id", result.Entry.CubeID, "key", key, "err", mismatchErr,
+			)
 			continue
 		}
 		inputs = append(inputs, blockpack.CubeNewRollupInput(r))
@@ -190,12 +212,26 @@ func (cqp *cubeQueryPath) tryQueryFromCube(
 		return nil, false
 	}
 
-	cells, rollupErr := blockpack.CubeRollup(inputs, 1, minMinute, maxMinute)
+	cells, rollupErr := rollupCubeInputs(inputs, result, minMinute, maxMinute)
 	if rollupErr != nil {
 		return nil, false
 	}
 
-	return buildCubeQueryResponse(cells, result.Entry.Dimensions, req), true
+	return buildCubeQueryResponse(cells, result.Entry.Dimensions, result.Entry.AggAttrs, req), true
+}
+
+// rollupCubeInputs merges opened cube readers using the ROUTED resolution level
+// (result.Resolution — Route's own decision, E-10) as CubeRollup's target level, never a
+// hardcoded value. Extracted into its own function (mirroring #44's filterValidCubeDefs
+// extraction pattern) so a test can construct a fake CubeRoutingResult and real cube readers (via
+// the production write path, Lesson 2) and assert CubeRollup was invoked with THAT resolution,
+// independently of tryQueryFromCube's S3/minio wiring which is otherwise untestable in isolation.
+func rollupCubeInputs(
+	inputs []blockpack.CubeRollupInput,
+	result blockpack.CubeRoutingResult,
+	minMinute, maxMinute uint32,
+) ([]blockpack.CubeMergedCell, error) {
+	return blockpack.CubeRollup(inputs, result.Resolution, minMinute, maxMinute)
 }
 
 // maybeCreateCube fires TryCreate for a (tenant, dims, filters) pattern that had no
@@ -204,6 +240,11 @@ func (cqp *cubeQueryPath) tryQueryFromCube(
 // The filters are part of the cube identity (#480): two queries with the same group-by
 // dims but different filters must create (and route to) distinct cubes.
 //
+// neededAttr/neededAttrType/neededAttrOK are extractAggAttr's result for the triggering query
+// (E-10) — when neededAttrOK, the newly-created cube's AggAttrs is {duration} ∪
+// {neededAttr}, so the very first query for a pattern needing e.g. sum_over_time(x) creates a
+// cube that can actually answer it, not a count-only cube requiring a second creation later.
+//
 // minTS/maxTS are the query window in unix seconds; they scope the VCNT read used by
 // the cardinality gate to the same window the query asked for.
 func (cqp *cubeQueryPath) maybeCreateCube(
@@ -211,6 +252,9 @@ func (cqp *cubeQueryPath) maybeCreateCube(
 	tenant string,
 	dims []string,
 	filters []blockpack.CubeColumnFilter,
+	neededAttr string,
+	neededAttrType blockpack.CubeAggAttrType,
+	neededAttrOK bool,
 	minTS, maxTS uint64,
 ) {
 	key := tenant + "|" + strings.Join(dims, ",") + "|" + filterDedupKey(filters)
@@ -233,7 +277,11 @@ func (cqp *cubeQueryPath) maybeCreateCube(
 	// dims/window, the section is empty and the gate passes by default — matching
 	// the prior best-effort behaviour rather than blocking cube creation.
 	vcntData, vcntDir := cqp.fetchVCNTSection(ctx, tenant, dims, minTS, maxTS)
-	result, err := trigger.TryCreate(ctx, tenant, dims, filters, vcntData, vcntDir, minTS, maxTS)
+	// Every v2 cube always materializes duration (ruling 3); the triggering query's own
+	// attribute (if any) joins the set so the cube this query creates can immediately answer
+	// it, per E-10.
+	aggAttrs := buildAggAttrs(neededAttr, neededAttrType, neededAttrOK)
+	result, err := trigger.TryCreate(ctx, tenant, dims, filters, aggAttrs, vcntData, vcntDir, minTS, maxTS)
 	if err != nil {
 		level.Warn(util_log.Logger).Log("msg", "vblockpack: cube TryCreate failed", "tenant", tenant, "dims", dims, "err", err)
 		return
@@ -248,6 +296,38 @@ func (cqp *cubeQueryPath) maybeCreateCube(
 		// Kick off historical backfill from the value index.
 		launchBackfill(result.Entry)
 	}
+}
+
+// requestedResolutionMinutes converts a query's Step (nanoseconds) into the router's requested
+// resolution unit (minutes) — E-10 replaces the previous hardcoded resolution=1 (always L0) with
+// the query's own actual requested granularity, so router.ResolutionLevel can select L1/L2 for
+// coarse-step queries instead of always serving minute resolution.
+func requestedResolutionMinutes(stepNanos uint64) uint32 {
+	return uint32(stepNanos / 60_000_000_000) //nolint:gosec // step fits uint32 for any realistic query window
+}
+
+// buildAggAttrs builds the AggAttrs set a newly-created cube materializes: duration
+// unconditionally (ruling 3), plus the triggering query's own needed attribute when
+// extractAggAttr found one and it isn't duration itself (avoiding a duplicate entry).
+func buildAggAttrs(neededAttr string, neededAttrType blockpack.CubeAggAttrType, neededAttrOK bool) []blockpack.CubeAggAttrDef {
+	aggAttrs := []blockpack.CubeAggAttrDef{{Column: blockpack.CubeDurationColumn, Type: blockpack.CubeAggAttrTypeInt64}}
+	if neededAttrOK && neededAttr != blockpack.CubeDurationColumn {
+		aggAttrs = append(aggAttrs, blockpack.CubeAggAttrDef{Column: neededAttr, Type: neededAttrType})
+	}
+	return aggAttrs
+}
+
+// classifyCubeFile validates an already-opened reader's declared NumAggAttrs against entry
+// (APPENDIX 3's registry-vs-file consistency check) — a pure comparison, no I/O. Returns
+// ok=false when they mismatch; the caller must exclude the file from CubeRollup's inputs but log
+// the mismatch DISTINCTLY from a routine download/decode failure (which never reaches this
+// function at all, being a categorically different code path), so a real registry/file drift is
+// operationally discoverable rather than indistinguishable "noise."
+func classifyCubeFile(r *blockpack.CubeReader, entry blockpack.CubeRegistryEntry) (ok bool, mismatchErr error) {
+	if err := blockpack.CubeValidateFileMatchesRegistry(r.NumAggAttrs(), entry); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // listObjects returns all object keys under prefix.
@@ -277,6 +357,137 @@ func (cqp *cubeQueryPath) getObject(ctx context.Context, key string) ([]byte, er
 
 // byDimGroupRe matches "by (\s*col1\s*,\s*col2\s*)" in a TraceQL metrics query.
 var byDimGroupRe = regexp.MustCompile(`\|\s*(?:rate|count_over_time|sum_over_time|min_over_time|max_over_time)\s*\([^)]*\)\s*by\s*\(([^)]+)\)`)
+
+// aggFuncArgRe matches "func_name(attr" for the metrics functions that take a materialized
+// aggregate attribute as their first argument (sum/min/max/avg/histogram/quantile_over_time).
+// Captures the attribute up to the first ',' or ')' — quantile_over_time's second argument (the
+// percentile) is deliberately excluded by this boundary.
+var aggFuncArgRe = regexp.MustCompile(
+	`\|\s*(?:sum_over_time|min_over_time|max_over_time|avg_over_time|histogram_over_time|quantile_over_time)\s*\(\s*([^,)]+)\s*[,)]`,
+)
+
+// extractAggAttr extracts the materialized aggregate attribute column from a TraceQL metrics
+// query, e.g. "sum_over_time(span:duration)" -> ("span:duration", CubeAggAttrTypeInt64, true).
+// Returns ("", _, false) for count_over_time/rate (#490: no specific attribute is needed — Route's
+// own neededAttr=="" convention matches any candidate) or when no recognized function is present.
+//
+// aggType is a query-text-only heuristic: the mandatory duration column is always Int64-typed
+// (matching ruling 1's own duration/int64 pairing); any OTHER extracted attribute defaults to
+// Float64 — a safe default since a Float64-typed attribute still gets full Sum/Min/Max/Avg
+// support and only loses Buckets[] population (ruling 1's own, upstream-imposed TypeFloat
+// decline), never an incorrect value. The query text alone cannot know a general attribute's
+// runtime type; guessing Int64 for a value that is actually a float would silently corrupt
+// Buckets[] with a bad cast, which is the worse failure mode of the two.
+func extractAggAttr(query string) (col string, aggType blockpack.CubeAggAttrType, ok bool) {
+	m := aggFuncArgRe.FindStringSubmatch(query)
+	if len(m) < 2 {
+		return "", blockpack.CubeAggAttrTypeFloat64, false
+	}
+	col = strings.TrimSpace(m[1])
+	if col == blockpack.CubeDurationColumn {
+		return col, blockpack.CubeAggAttrTypeInt64, true
+	}
+	return col, blockpack.CubeAggAttrTypeFloat64, true
+}
+
+// metricsFunctionRe captures which metrics function a TraceQL query uses.
+var metricsFunctionRe = regexp.MustCompile(
+	`\|\s*(rate|count_over_time|sum_over_time|min_over_time|max_over_time|avg_over_time|histogram_over_time|quantile_over_time)\s*\(`,
+)
+
+// extractMetricsFunction returns the metrics function name in query (e.g. "sum_over_time"), or
+// "" if none of the recognized functions is present.
+func extractMetricsFunction(query string) string {
+	m := metricsFunctionRe.FindStringSubmatch(query)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
+}
+
+// aggAttrIndex returns the index of col within aggAttrNames (RegistryEntry.AggAttrs — the SAME
+// ordering every CubeMergedCell.AggAttrs slice uses, E-5/E-9), or -1 if absent.
+func aggAttrIndex(aggAttrNames []string, col string) int {
+	for i, name := range aggAttrNames {
+		if name == col {
+			return i
+		}
+	}
+	return -1
+}
+
+// quantilePercentileRe captures quantile_over_time's second argument, the requested percentile
+// (e.g. "quantile_over_time(span:duration, .5)" -> "0.5"). extractAggAttr's own aggFuncArgRe
+// deliberately stops at the first ',' to capture only the attribute; this regex captures the
+// percentile that comes after it.
+var quantilePercentileRe = regexp.MustCompile(`\|\s*quantile_over_time\s*\([^,]+,\s*([0-9.]+)\s*\)`)
+
+// extractQuantilePercentile returns quantile_over_time's requested percentile p, or (0, false)
+// when the query is not quantile_over_time or the percentile cannot be parsed.
+func extractQuantilePercentile(query string) (float64, bool) {
+	m := quantilePercentileRe.FindStringSubmatch(query)
+	if len(m) < 2 {
+		return 0, false
+	}
+	p, err := strconv.ParseFloat(m[1], 64)
+	if err != nil {
+		return 0, false
+	}
+	return p, true
+}
+
+// cellValueForFunction extracts the scalar value buildCubeQueryResponse serves for one merged
+// cell, dispatched by the query's metrics function (E-11a/E-11b). sum/avg/min/max all short-
+// circuit to NaN when the target aggAttr's SampleCount==0 (no valid samples merged into this cell
+// at this resolution). sum's NaN short-circuit (task #50) matches pkg/traceql's own post-#47
+// sumOverTime(): a running sum that never observes a real value stays NaN-seeded forever
+// (TestSumOverTime_AllValuesMissing_StaysNaN) rather than reporting the additive identity 0 —
+// parity requires the cube path to answer identically to a query that falls back to the full
+// scan path on the same all-missing-attribute data (min/max/avg already followed this
+// convention; sum previously did not, predating #47). quantile_over_time short-circuits to NaN
+// the same way when Log2QuantileFromBuckets finds every bucket empty (bucketIdx==-1) — the
+// natural "decline" case for a Float64-typed aggAttr, which ruling 1 never populates Buckets[]
+// for, with no separate type-check needed (E-11b). count_over_time/rate are unaffected,
+// continuing to read c.Count directly — E-11a's own stated, unchanged baseline — which is also
+// what a targetIdx of -1 (no recognized attribute, or the function needs none) falls back to.
+// histogram_over_time is NOT dispatched here — its response shape fans out into multiple series
+// per cell (buildHistogramResponse) rather than one scalar.
+func cellValueForFunction(c blockpack.CubeMergedCell, function string, targetIdx int, quantileP float64) float64 {
+	if targetIdx < 0 || targetIdx >= len(c.AggAttrs) {
+		return float64(c.Count)
+	}
+	agg := c.AggAttrs[targetIdx]
+	switch function {
+	case "sum_over_time":
+		if agg.SampleCount == 0 {
+			return math.NaN()
+		}
+		return agg.Sum
+	case "min_over_time":
+		if agg.SampleCount == 0 {
+			return math.NaN()
+		}
+		return agg.Min
+	case "max_over_time":
+		if agg.SampleCount == 0 {
+			return math.NaN()
+		}
+		return agg.Max
+	case "avg_over_time":
+		if agg.SampleCount == 0 {
+			return math.NaN()
+		}
+		return agg.Sum / float64(agg.SampleCount)
+	case "quantile_over_time":
+		v, bucketIdx := blockpack.CubeLog2QuantileFromBuckets(quantileP, agg.Buckets)
+		if bucketIdx == -1 {
+			return math.NaN()
+		}
+		return v
+	default:
+		return float64(c.Count)
+	}
+}
 
 // extractGroupByDims parses dimension column names from a TraceQL metrics query's
 // "by (dim1, dim2)" clause. Returns nil when there is no group-by.
@@ -406,12 +617,58 @@ func filterDedupKey(filters []blockpack.CubeColumnFilter) string {
 	return b.String()
 }
 
+// dimLabels splits dims into its (dim1, dim2) label names — dim2 is "" when dims has fewer than
+// 2 elements, the shared convention buildCubeQueryResponse and buildHistogramResponse both use.
+func dimLabels(dims []string) (dim1Label, dim2Label string) {
+	if len(dims) >= 1 {
+		dim1Label = dims[0]
+	}
+	if len(dims) >= 2 {
+		dim2Label = dims[1]
+	}
+	return dim1Label, dim2Label
+}
+
+// dimLabelKVs builds the dim1/dim2 KeyValue label pair for one series — shared by
+// buildCubeQueryResponse (scalar functions) and buildHistogramResponse (histogram_over_time).
+func dimLabelKVs(dim1Label, dim2Label, d1, d2 string) []commonpbv1.KeyValue {
+	labels := []commonpbv1.KeyValue{
+		{Key: dim1Label, Value: &commonpbv1.AnyValue{Value: &commonpbv1.AnyValue_StringValue{StringValue: d1}}},
+	}
+	if dim2Label != "" {
+		labels = append(labels, commonpbv1.KeyValue{
+			Key:   dim2Label,
+			Value: &commonpbv1.AnyValue{Value: &commonpbv1.AnyValue_StringValue{StringValue: d2}},
+		})
+	}
+	return labels
+}
+
 // buildCubeQueryResponse builds a QueryRangeResponse from rolled-up cube cells.
 func buildCubeQueryResponse(
 	cells []blockpack.CubeMergedCell,
 	dims []string,
+	aggAttrNames []string,
 	req *tempopb.QueryRangeRequest,
 ) *tempopb.QueryRangeResponse {
+	// function/targetIdx select WHICH merged value each cell contributes (E-11a/E-11b) —
+	// count_over_time and rate are unaffected, continuing to read c.Count directly (targetIdx
+	// stays -1 for them, since extractAggAttr's ok is false).
+	function := extractMetricsFunction(req.Query)
+	targetIdx := -1
+	if neededAttr, _, ok := extractAggAttr(req.Query); ok {
+		targetIdx = aggAttrIndex(aggAttrNames, neededAttr)
+	}
+
+	// histogram_over_time's response shape fans out into multiple (dims, bucket) series per
+	// cell rather than one scalar per cell — a structurally different shape from every other
+	// function, so it gets its own builder (E-11b).
+	if function == "histogram_over_time" {
+		return buildHistogramResponse(cells, dims, targetIdx)
+	}
+
+	quantileP, _ := extractQuantilePercentile(req.Query)
+
 	// Group cells into series by (dim1, dim2) label pair.
 	type seriesKey struct{ d1, d2 string }
 	seriesMap := make(map[seriesKey][]tempopb.Sample)
@@ -421,30 +678,64 @@ func buildCubeQueryResponse(
 		ts := int64(c.Minute) * 60 * 1_000_000_000 //nolint:gosec // minute fits int64
 		seriesMap[k] = append(seriesMap[k], tempopb.Sample{
 			TimestampMs: ts / 1_000_000,
-			Value:       float64(c.Count),
+			Value:       cellValueForFunction(c, function, targetIdx, quantileP),
 		})
 	}
 
-	dim1Label := ""
-	dim2Label := ""
-	if len(dims) >= 1 {
-		dim1Label = dims[0]
-	}
-	if len(dims) >= 2 {
-		dim2Label = dims[1]
-	}
+	dim1Label, dim2Label := dimLabels(dims)
 
 	var series []*tempopb.TimeSeries
 	for k, samples := range seriesMap {
-		labels := []commonpbv1.KeyValue{
-			{Key: dim1Label, Value: &commonpbv1.AnyValue{Value: &commonpbv1.AnyValue_StringValue{StringValue: k.d1}}},
+		series = append(series, &tempopb.TimeSeries{
+			Labels:  dimLabelKVs(dim1Label, dim2Label, k.d1, k.d2),
+			Samples: samples,
+		})
+	}
+	return &tempopb.QueryRangeResponse{Series: series}
+}
+
+// buildHistogramResponse builds histogram_over_time's response shape: one series per (dims,
+// bucket boundary) tuple carrying the cubeBucketLabel TraceQL's own histogram/quantile
+// aggregators expect, with per-minute sample values equal to that bucket's merged count. A cell
+// whose target aggAttr is missing (targetIdx out of range) or whose Buckets[] is entirely empty
+// (e.g. a Float64-typed aggAttr, which ruling 1 never populates) contributes no series — the
+// histogram naturally declines rather than emitting a misleading all-zero series (E-11b). The
+// bucket label uses traceql.LabelBucket directly (E-11b polish item 2) rather than a hardcoded
+// duplicate string, so the two can never silently drift apart.
+func buildHistogramResponse(cells []blockpack.CubeMergedCell, dims []string, targetIdx int) *tempopb.QueryRangeResponse {
+	type seriesKey struct {
+		d1, d2 string
+		bucket float64
+	}
+	seriesMap := make(map[seriesKey][]tempopb.Sample)
+
+	for _, c := range cells {
+		if targetIdx < 0 || targetIdx >= len(c.AggAttrs) {
+			continue
 		}
-		if dim2Label != "" {
-			labels = append(labels, commonpbv1.KeyValue{
-				Key:   dim2Label,
-				Value: &commonpbv1.AnyValue{Value: &commonpbv1.AnyValue_StringValue{StringValue: k.d2}},
+		agg := c.AggAttrs[targetIdx]
+		ts := int64(c.Minute) * 60 * 1_000_000_000 //nolint:gosec // minute fits int64
+		for i, count := range agg.Buckets {
+			if count == 0 {
+				continue
+			}
+			k := seriesKey{d1: c.Dim1Val, d2: c.Dim2Val, bucket: blockpack.CubeBucketMax(i)}
+			seriesMap[k] = append(seriesMap[k], tempopb.Sample{
+				TimestampMs: ts / 1_000_000,
+				Value:       float64(count),
 			})
 		}
+	}
+
+	dim1Label, dim2Label := dimLabels(dims)
+
+	var series []*tempopb.TimeSeries
+	for k, samples := range seriesMap {
+		labels := dimLabelKVs(dim1Label, dim2Label, k.d1, k.d2)
+		labels = append(labels, commonpbv1.KeyValue{
+			Key:   traceql.LabelBucket,
+			Value: &commonpbv1.AnyValue{Value: &commonpbv1.AnyValue_DoubleValue{DoubleValue: k.bucket}},
+		})
 		series = append(series, &tempopb.TimeSeries{
 			Labels:  labels,
 			Samples: samples,

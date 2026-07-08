@@ -17,11 +17,22 @@ type CardinalityLimits struct {
 	MaxDistinctPerDim int
 	// MaxCombinedCells is the maximum distinct (dim1,dim2) pairs across the window (default 50000).
 	MaxCombinedCells int
+	// MaxCombinedCellBytes caps the estimated total wire-format bytes the resulting cube's
+	// combined cells would occupy (combinedCells * recordWidthFor(len(aggAttrs)), #491 E-7) —
+	// a cube with few cells but many large aggAttr records can still be rejected even when
+	// MaxCombinedCells alone would pass. Default derived from today's MaxCombinedCells*12-byte
+	// pure-count figure as a SIZING HEURISTIC only (not a compatibility mechanism — no file,
+	// hash, or wire byte from any prior format is preserved by this calculation).
+	MaxCombinedCellBytes int
 }
 
 // DefaultCardinalityLimits returns the ticket-specified default limits.
 func DefaultCardinalityLimits() CardinalityLimits {
-	return CardinalityLimits{MaxDistinctPerDim: 1000, MaxCombinedCells: 50_000}
+	return CardinalityLimits{
+		MaxDistinctPerDim:    1000,
+		MaxCombinedCells:     50_000,
+		MaxCombinedCellBytes: 50_000 * 12,
+	}
 }
 
 // CardinalityError is returned when the cardinality gate rejects a cube.
@@ -36,12 +47,17 @@ func (e *CardinalityError) Error() string { return e.Reason }
 // CheckCardinality evaluates the cardinality gate for a proposed cube over
 // [minTS, maxTS] using pre-loaded value count data. data and dir are a single
 // VCNT section already fetched by the caller (so this function has zero S3 I/O).
+// aggAttrs is the proposed cube's materialized attribute set (#491, E-7) — it feeds the
+// combined-byte-cost check below via recordWidthFor (chunk.go's single source of truth for
+// the record-width formula); it does not affect the per-dimension or combined-cell-count
+// checks, which are purely dimension-shaped.
 //
 // Returns nil when the gate passes. Returns *CardinalityError when rejected.
 func CheckCardinality(
 	data []byte,
 	dir []valuecounts.ChunkDirEntry,
 	dims []string,
+	aggAttrs []AggAttrDef,
 	limits CardinalityLimits,
 	minTS, maxTS uint64,
 ) error {
@@ -77,16 +93,38 @@ func CheckCardinality(
 		dimValues[i] = vals
 	}
 
-	// Combined (dim1 × dim2) cell count estimate (only when 2 dimensions).
-	if len(dims) == 2 && len(dimValues[0]) > 0 && len(dimValues[1]) > 0 {
-		combined := len(dimValues[0]) * len(dimValues[1])
-		if combined > limits.MaxCombinedCells {
+	// Combined cell count estimate: dim1 x dim2 for two dimensions, dim1 alone for one.
+	var combinedCells int
+	switch {
+	case len(dims) == 2 && len(dimValues[0]) > 0 && len(dimValues[1]) > 0:
+		combinedCells = len(dimValues[0]) * len(dimValues[1])
+	case len(dims) == 1 && len(dimValues[0]) > 0:
+		combinedCells = len(dimValues[0])
+	}
+
+	if len(dims) == 2 && combinedCells > limits.MaxCombinedCells {
+		return &CardinalityError{
+			Reason: fmt.Sprintf(
+				"combined cell estimate (%s × %s = %d) exceeds limit %d",
+				dims[0], dims[1], combinedCells, limits.MaxCombinedCells,
+			),
+			Suggestion: "use dimensions with fewer distinct values or add a filter",
+		}
+	}
+
+	// Combined byte-cost estimate: the SAME combinedCells figure above, but weighted by
+	// recordWidthFor(len(aggAttrs)) — a cube with few cells but many/wide aggAttr records can
+	// still be rejected even when the plain cell-count check above would pass (#491 E-7).
+	if combinedCells > 0 {
+		recordWidth := recordWidthFor(len(aggAttrs))
+		estimatedBytes := combinedCells * recordWidth
+		if estimatedBytes > limits.MaxCombinedCellBytes {
 			return &CardinalityError{
 				Reason: fmt.Sprintf(
-					"combined cell estimate (%s × %s = %d) exceeds limit %d",
-					dims[0], dims[1], combined, limits.MaxCombinedCells,
+					"estimated cube size (%d cells x %d bytes/cell = %d bytes) exceeds limit %d bytes",
+					combinedCells, recordWidth, estimatedBytes, limits.MaxCombinedCellBytes,
 				),
-				Suggestion: "use dimensions with fewer distinct values or add a filter",
+				Suggestion: "reduce the number of materialized aggAttrs, or use lower-cardinality dimensions",
 			}
 		}
 	}
@@ -117,5 +155,3 @@ func isHighEntropy(col string) bool {
 	}
 	return false
 }
-
-// isHexString reports whether s is a valid hex string (UUID-like entropy heuristic).

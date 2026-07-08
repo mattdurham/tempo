@@ -16,6 +16,14 @@ import (
 // decompression cost vs memory footprint.
 const ChunkSizeNominal = 2048 // cells per chunk
 
+// recordWidthFor is the SINGLE place the full cell-record-width arithmetic lives (ruling 5's
+// single-source-of-truth requirement, E-3): the base 12-byte record plus numAggAttrs 540-byte
+// AggAttrValues records. Called by AggCell's codecs (cell.go) and, once wired, the cardinality
+// gate's byte-cost formula (E-7) — never an independently-maintained copy of this formula.
+func recordWidthFor(numAggAttrs int) int {
+	return 12 + numAggAttrs*AggAttrRecordWidth
+}
+
 // ChunkDirEntry is one entry in the chunk directory.
 type ChunkDirEntry struct {
 	MinMinute uint32 // first cell's minute in this chunk
@@ -23,39 +31,53 @@ type ChunkDirEntry struct {
 	CompLen   uint32 // snappy-compressed length
 }
 
-// EncodeChunk serializes cells into a snappy-compressed chunk payload.
-// Cells MUST be sorted by (Minute, Dim1ID, Dim2ID).
-func EncodeChunk(cells []Cell) ([]byte, error) {
+// EncodeChunk serializes AggCells into a snappy-compressed chunk payload. Cells MUST be sorted by
+// (Minute, Dim1ID, Dim2ID). Every cell's len(Aggs) must equal numAggAttrs, which must match the
+// owning file's Header.NumAggAttrs; for the plain-count case (numAggAttrs==0, len(Aggs)==0) this
+// is byte-identical to the pre-#491 fixed-12-byte format (AggCell is the SOLE cell type — E-3
+// APPENDIX 2 — there is no separate plain-Cell-shaped codec to keep in sync with this one).
+func EncodeChunk(cells []AggCell, numAggAttrs int) ([]byte, error) {
 	if len(cells) == 0 {
 		return snappy.Encode(nil, []byte{}), nil
 	}
-	raw := make([]byte, 0, len(cells)*12)
+	width := recordWidthFor(numAggAttrs)
+	raw := make([]byte, 0, len(cells)*width)
 	for i := range cells {
-		raw = append(raw, EncodeCell(cells[i])...)
+		if len(cells[i].Aggs) != numAggAttrs {
+			return nil, fmt.Errorf(
+				"cube: cell %d has %d aggAttrs, want %d",
+				i,
+				len(cells[i].Aggs),
+				numAggAttrs,
+			)
+		}
+		raw = append(raw, EncodeAggCell(cells[i])...)
 	}
 	return snappy.Encode(nil, raw), nil
 }
 
-// DecodeChunk decompresses and parses a chunk payload into cells.
-func DecodeChunk(compressed []byte) ([]Cell, error) {
+// DecodeChunk decompresses and parses a chunk payload into full-fidelity AggCells (base fields +
+// every per-aggAttr record). numAggAttrs must match the owning file's Header.NumAggAttrs.
+func DecodeChunk(compressed []byte, numAggAttrs int) ([]AggCell, error) {
 	raw, err := snappy.Decode(nil, compressed)
 	if err != nil {
 		return nil, fmt.Errorf("cube: snappy decode: %w", err)
 	}
-	if len(raw)%12 != 0 {
-		return nil, fmt.Errorf("cube: chunk size not multiple of 12 (%d bytes)", len(raw))
+	width := recordWidthFor(numAggAttrs)
+	if len(raw)%width != 0 {
+		return nil, fmt.Errorf("cube: chunk size not multiple of %d (%d bytes)", width, len(raw))
 	}
-	count := len(raw) / 12
+	count := len(raw) / width
 	if count > 65536 {
 		return nil, fmt.Errorf("cube: chunk cell count %d exceeds limit 65536", count)
 	}
-	cells := make([]Cell, count)
+	cells := make([]AggCell, count)
 	for i := 0; i < count; i++ {
-		c, err := DecodeCell(raw[i*12 : (i+1)*12])
+		ac, err := DecodeAggCell(raw[i*width:(i+1)*width], numAggAttrs)
 		if err != nil {
-			return nil, fmt.Errorf("cube: cell %d: %w", i, err)
+			return nil, fmt.Errorf("cube: aggCell %d: %w", i, err)
 		}
-		cells[i] = c
+		cells[i] = ac
 	}
 	return cells, nil
 }
@@ -102,9 +124,9 @@ func DecodeChunkDirectory(buf []byte) ([]ChunkDirEntry, error) {
 	return dir, nil
 }
 
-// SplitCellsIntoChunks splits sorted cells into chunks of up to chunkSize cells each.
-// Returns chunk payloads and directory entries.
-func SplitCellsIntoChunks(cells []Cell, chunkSize int) ([][]byte, []ChunkDirEntry, error) {
+// SplitCellsIntoChunks splits sorted AggCells into chunks of up to chunkSize cells each.
+// Returns chunk payloads and directory entries. See EncodeChunk for numAggAttrs semantics.
+func SplitCellsIntoChunks(cells []AggCell, chunkSize int, numAggAttrs int) ([][]byte, []ChunkDirEntry, error) {
 	if chunkSize <= 0 {
 		chunkSize = ChunkSizeNominal
 	}
@@ -122,7 +144,7 @@ func SplitCellsIntoChunks(cells []Cell, chunkSize int) ([][]byte, []ChunkDirEntr
 			end = len(cells)
 		}
 		chunk := cells[start:end]
-		compressed, err := EncodeChunk(chunk)
+		compressed, err := EncodeChunk(chunk, numAggAttrs)
 		if err != nil {
 			return nil, nil, fmt.Errorf("cube: encode chunk %d: %w", len(dir), err)
 		}

@@ -1,6 +1,6 @@
 package cube
 
-// NOTE: SPEC-CUBE-015 — Backfiller populates historical cube files by reading the value
+// NOTE: SPEC-CUBE-026 — Backfiller populates historical cube files by reading the value
 // index (no data-block reads) and aggregating per-(dim1,dim2) counts per minute. It processes
 // newest→oldest so recent data becomes available first. Progress is tracked by a watermark
 // stored alongside the RegistryEntry; the querier uses cube files for minutes ≥ watermark
@@ -9,6 +9,7 @@ package cube
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/grafana/blockpack/internal/modules/valueindex"
@@ -120,22 +121,134 @@ func (b *Backfiller) Run(
 	return nil
 }
 
+// viEntryKey identifies one span for cross-column VI joins: dim2 and aggAttr entries are looked
+// up as separate VI queries from dim1 and joined back to it by (traceID, spanID).
+func viEntryKey(traceID [16]byte, spanID [8]byte) [24]byte {
+	var key [24]byte
+	copy(key[:16], traceID[:])
+	copy(key[16:], spanID[:])
+	return key
+}
+
+// AggAttrDefsFor converts a registry's AggAttrs column names to AggAttrDefs. DurationColumn is
+// always Int64-typed (nanoseconds); every other column defaults to Float64-typed, since a bare
+// column name carries no type information — a conservative choice that still gets Sum/Min/Max/Avg
+// correctly, just without Buckets[]/histogram support for that attribute (ruling 1 already scopes
+// bucketing to Int64/Duration-typed attrs only, so this is not a capability regression versus what
+// a Float64-typed attr would get anyway).
+//
+// Exported (#491 Phase E fix pass, review.md Issue 1) so cube_ingest.go's
+// CubeRegistryEntryToDefinition can reuse the SAME type-defaulting convention backfill uses,
+// instead of maintaining a second, independently-drifting copy of this rule.
+func AggAttrDefsFor(columns []string) []AggAttrDef {
+	defs := make([]AggAttrDef, len(columns))
+	for i, col := range columns {
+		typ := AggAttrTypeFloat64
+		if col == DurationColumn {
+			typ = AggAttrTypeInt64
+		}
+		defs[i] = AggAttrDef{Column: col, Type: typ}
+	}
+	return defs
+}
+
+// lookupAggAttrValues fetches VI entries for every aggAttr column not already covered by the
+// cube's own dimensions, returning column → (traceID,spanID) → value-string, ready to join
+// against whichever dimension entries drive the per-span loop in processMinute.
+func (b *Backfiller) lookupAggAttrValues(
+	ctx context.Context,
+	minute uint32,
+	minSec, maxSec uint64,
+) (map[string]map[[24]byte]string, error) {
+	dimSet := make(map[string]bool, len(b.entry.Dimensions))
+	for _, d := range b.entry.Dimensions {
+		dimSet[d] = true
+	}
+	out := make(map[string]map[[24]byte]string, len(b.entry.AggAttrs))
+	for _, col := range b.entry.AggAttrs {
+		if dimSet[col] {
+			continue // already covered by a dimension lookup, no separate fetch needed
+		}
+		entries, err := b.src.LookupColumn(ctx, b.tenant, col, minSec, maxSec)
+		if err != nil {
+			return nil, fmt.Errorf("cube backfill: lookup aggAttr %q minute %d: %w", col, minute, err)
+		}
+		m := make(map[[24]byte]string, len(entries))
+		for _, e := range entries {
+			m[viEntryKey(e.TraceID, e.SpanID)] = e.SourceRef
+		}
+		out[col] = m
+	}
+	return out, nil
+}
+
+// buildSpanVals assembles one span's full column→value map: the dimension values already
+// resolved by the caller, plus every aggAttr column's value (if the span has one) joined by key.
+func buildSpanVals(
+	dim1Col, dim2Col, d1val, d2val string,
+	key [24]byte,
+	aggAttrValues map[string]map[[24]byte]string,
+) map[string]string {
+	vals := map[string]string{dim1Col: d1val, dim2Col: d2val}
+	for col, byKey := range aggAttrValues {
+		if v, ok := byKey[key]; ok {
+			vals[col] = v
+		}
+	}
+	return vals
+}
+
 // processMinute builds one cube file for the given minute from value index data.
 func (b *Backfiller) processMinute(ctx context.Context, minute uint32) error {
+	// b.entry.Dimensions[0] is indexed unconditionally below. This is safe in practice because
+	// every real RegistryEntry is constructed via CreationTrigger.TryCreate (which only ever
+	// reaches here via cubequerypath.go's extractGroupByDims, itself guarded against an empty
+	// dims slice) — but Backfiller/NewBackfiller take a bare RegistryEntry with no validation of
+	// their own, so a hand-constructed or future non-cubequerypath caller with empty Dimensions
+	// would otherwise panic here instead of failing with a typed error (#491 Phase E fix pass,
+	// go-presubmit.md LOW finding).
+	if len(b.entry.Dimensions) == 0 {
+		return &DefinitionError{
+			Reason:     fmt.Sprintf("cube backfill: RegistryEntry %q has no Dimensions", b.entry.CubeID),
+			Suggestion: "a RegistryEntry must have at least one Dimensions entry before it can be backfilled",
+		}
+	}
+
 	minSec := uint64(minute) * 60
 	maxSec := minSec + 59
 
-	// Build an accumulator for this minute (uses the existing ingest layer).
+	// Build an accumulator for this minute (uses the existing ingest layer). AggAttrs come
+	// directly from the registry entry — a real RegistryEntry is only ever created via
+	// CreationTrigger.TryCreate, which already enforces (via validateDefinition, E-4) that
+	// duration is present, so this is not re-derived defensively here.
 	dim2Col := "_"
 	if len(b.entry.Dimensions) > 1 {
 		dim2Col = b.entry.Dimensions[1]
 	}
-	acc := NewAccumulator(Definition{
+	// Filters must be converted from the registry entry's baked-in predicate (#491 Phase E fix
+	// pass, review.md Issue 3) — ColumnFilterToFilter is the SAME single-source-of-truth
+	// conversion tempo's cubemanager.go passes as LoadCubeDefinitions' filterFn for forward
+	// ingest, so backfill and forward ingest can never independently drift on filter semantics.
+	// Before this fix, b.entry.Filters was read nowhere in this file, so historical backfill of a
+	// filtered cube silently counted every span matching the cube's dimensions, ignoring the
+	// filter entirely.
+	filters := make([]Filter, 0, len(b.entry.Filters))
+	for _, cf := range b.entry.Filters {
+		if f := ColumnFilterToFilter(cf); f != nil {
+			filters = append(filters, f)
+		}
+	}
+	acc, err := NewAccumulator(Definition{
 		Dim1Column: b.entry.Dimensions[0],
 		Dim2Column: dim2Col,
+		Filters:    filters,
+		AggAttrs:   AggAttrDefsFor(b.entry.AggAttrs),
 		ID:         func() [16]byte { id, _ := IDFromBytes(b.entry.CubeID); return id }(),
 		Resolution: b.entry.Resolution,
 	}, minute)
+	if err != nil {
+		return fmt.Errorf("cube backfill: new accumulator: %w", err)
+	}
 
 	// Read dim1 entries from the value index.
 	dim1Entries, err := b.src.LookupColumn(ctx, b.tenant, b.entry.Dimensions[0], minSec, maxSec)
@@ -147,6 +260,11 @@ func (b *Backfiller) processMinute(ctx context.Context, minute uint32) error {
 		return nil // no data for this minute — write nothing (sparse cube)
 	}
 
+	aggAttrValues, err := b.lookupAggAttrValues(ctx, minute, minSec, maxSec)
+	if err != nil {
+		return err
+	}
+
 	// If there is only one dimension, use a fixed sentinel for dim2.
 	dim2 := "_"
 	if len(b.entry.Dimensions) > 1 {
@@ -154,28 +272,26 @@ func (b *Backfiller) processMinute(ctx context.Context, minute uint32) error {
 		// dim1 entries, then scan dim2 entries to find matching spans and record (dim1,dim2) pairs.
 		spanDim1 := make(map[[24]byte]string, len(dim1Entries))
 		for _, e := range dim1Entries {
-			var key [24]byte
-			copy(key[:16], e.TraceID[:])
-			copy(key[16:], e.SpanID[:])
-			spanDim1[key] = e.SourceRef // SourceRef stores the column value in VINX
+			spanDim1[viEntryKey(e.TraceID, e.SpanID)] = e.SourceRef // SourceRef stores the column value in VINX
 		}
 		dim2Entries, dim2Err := b.src.LookupColumn(ctx, b.tenant, b.entry.Dimensions[1], minSec, maxSec)
 		if dim2Err != nil {
 			return fmt.Errorf("cube backfill: lookup dim2 %q minute %d: %w", b.entry.Dimensions[1], minute, dim2Err)
 		}
 		for _, e2 := range dim2Entries {
-			var key [24]byte
-			copy(key[:16], e2.TraceID[:])
-			copy(key[16:], e2.SpanID[:])
+			key := viEntryKey(e2.TraceID, e2.SpanID)
 			d1val, ok := spanDim1[key]
 			if !ok {
 				continue
 			}
 			d2val := e2.SourceRef
-			// Apply cube filters (best-effort: only numeric int64 filters on span values
-			// embedded in SourceRef are supported at backfill time; other filters are skipped).
+			// Cube filters (registered via b.entry.Filters, converted to acc.def.Filters above
+			// via ColumnFilterToFilter) are applied here through the accumulator's normal Add
+			// path, exactly like forward ingest — Add rejects any span failing a filter before
+			// counting it. A filter whose value ColumnFilterToFilter could not parse is skipped
+			// (not enforced), per that function's documented fallback.
 			sv := valueIndexSpanValues{
-				vals: map[string]string{b.entry.Dimensions[0]: d1val, b.entry.Dimensions[1]: d2val},
+				vals: buildSpanVals(b.entry.Dimensions[0], b.entry.Dimensions[1], d1val, d2val, key, aggAttrValues),
 			}
 			if _, addErr := acc.Add(sv); addErr != nil {
 				return fmt.Errorf("cube backfill: add cell: %w", addErr)
@@ -184,8 +300,11 @@ func (b *Backfiller) processMinute(ctx context.Context, minute uint32) error {
 	} else {
 		// Single dimension: each dim1 entry increments the (dim1, "_") cell.
 		for _, e := range dim1Entries {
+			key := viEntryKey(e.TraceID, e.SpanID)
 			d1val := e.SourceRef
-			sv := valueIndexSpanValues{vals: map[string]string{b.entry.Dimensions[0]: d1val, dim2Col: dim2}}
+			sv := valueIndexSpanValues{
+				vals: buildSpanVals(b.entry.Dimensions[0], dim2Col, d1val, dim2, key, aggAttrValues),
+			}
 			if _, addErr := acc.Add(sv); addErr != nil {
 				return fmt.Errorf("cube backfill: add cell: %w", addErr)
 			}
@@ -205,10 +324,10 @@ func (b *Backfiller) processMinute(ctx context.Context, minute uint32) error {
 	return nil
 }
 
-// valueIndexSpanValues wraps pre-resolved (dim1col→val, dim2col→val) pairs as SpanValues
-// for the Accumulator. The accumulator calls String(colName) using the actual column names.
+// valueIndexSpanValues wraps pre-resolved (column→val) pairs as SpanValues for the Accumulator.
+// The accumulator calls String(colName)/Float64(colName) using the actual column names.
 type valueIndexSpanValues struct {
-	vals map[string]string // column name → resolved value
+	vals map[string]string // column name → resolved VI SourceRef string
 }
 
 func (v valueIndexSpanValues) String(col string) (string, bool) {
@@ -216,4 +335,39 @@ func (v valueIndexSpanValues) String(col string) (string, bool) {
 	return s, ok
 }
 
-func (v valueIndexSpanValues) Int64(_ string) (int64, bool) { return 0, false }
+// Int64 parses the VI's string-typed SourceRef as an integer (#491 Phase E fix pass, review.md
+// Issue 3 compounding note) — mirrors Float64's own parse-and-tolerate-absence convention below.
+// Before this fix, Int64 unconditionally returned (0, false), so ANY NumericFilter-based
+// predicate (which reads exclusively via Int64, accumulator.go) rejected every span once #3a
+// wired Filters into backfill's Definition — turning a filtered backfill into an
+// empty-but-not-obviously-wrong result instead of a correct one.
+func (v valueIndexSpanValues) Int64(col string) (int64, bool) {
+	s, ok := v.vals[col]
+	if !ok {
+		return 0, false
+	}
+	i, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return i, true
+}
+
+// Float64 parses the VI's string-typed SourceRef as a float (E-8, #491) — this is how
+// numeric aggAttr values (duration, and any other numeric span attribute) reach the
+// accumulator during backfill. A parse failure (missing column, or a non-numeric SourceRef)
+// returns (0, false), matching SpanValues' documented "absent" convention rather than an error —
+// backfill has no way to distinguish "not present" from "present but malformed" once the value
+// has already been stored as an opaque VI string, and the accumulator already treats
+// Float64-not-ok as "no sample" for that attribute (E-4), which is the correct behavior here too.
+func (v valueIndexSpanValues) Float64(col string) (float64, bool) {
+	s, ok := v.vals[col]
+	if !ok {
+		return 0, false
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, false
+	}
+	return f, true
+}

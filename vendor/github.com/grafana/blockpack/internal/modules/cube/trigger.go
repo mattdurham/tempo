@@ -47,14 +47,18 @@ func NewCreationTrigger(registry *Registry, cfg TriggerConfig) *CreationTrigger 
 	return &CreationTrigger{registry: registry, cfg: cfg}
 }
 
-// TryCreate attempts to register a cube for (tenant, dims, filters) on the first
+// TryCreate attempts to register a cube for (tenant, dims, filters, aggAttrs) on the first
 // query for that pattern. It:
+//  0. Validates aggAttrs includes duration (validateDefinition, E-4's single enforcement
+//     point — this is call site #2, delegating rather than duplicating the check).
 //  1. Checks the per-tenant cube limit.
-//  2. Runs the cardinality gate using the supplied VCNT data+dir and time window.
-//  3. If both pass, adds the cube to the registry via conditional-PUT (idempotent).
+//  2. Runs the cardinality gate (including aggAttrs' byte-cost, E-7) using the supplied VCNT
+//     data+dir and time window.
+//  3. If all pass, adds the cube to the registry via conditional-PUT (idempotent).
 //
 // Returns (result, nil) on success — result.Created distinguishes a fresh registration
 // from a pre-existing entry found after a 412 conflict.
+// Returns (zero, *DefinitionError) when aggAttrs omits duration.
 // Returns (zero, *CardinalityError) when the gate rejects the pattern.
 // Returns (zero, *ErrLimitReached) when the per-tenant limit is exhausted.
 // Returns (zero, err) on storage errors.
@@ -66,10 +70,23 @@ func (t *CreationTrigger) TryCreate(
 	tenant string,
 	dims []string,
 	filters []ColumnFilter,
+	aggAttrs []AggAttrDef,
 	vcntData []byte,
 	vcntDir []valuecounts.ChunkDirEntry,
 	minTS, maxTS uint64,
 ) (TriggerResult, error) {
+	// Step 0: aggAttrs must include duration — checked before anything else (registry I/O,
+	// ID computation) since it is a pure structural precondition, independent of registry
+	// state (ruling 3 / third-round clamp).
+	if err := validateDefinition(Definition{AggAttrs: aggAttrs}); err != nil {
+		return TriggerResult{}, err
+	}
+
+	aggAttrNames := make([]string, len(aggAttrs))
+	for i, a := range aggAttrs {
+		aggAttrNames[i] = a.Column
+	}
+
 	// Step 1: check the per-tenant active-cube count before the cardinality gate to
 	// avoid paying the VCNT I/O cost when the slot is already exhausted.
 	cubes, _, err := t.registry.Load(ctx)
@@ -77,7 +94,7 @@ func (t *CreationTrigger) TryCreate(
 		return TriggerResult{}, fmt.Errorf("cube trigger: load index: %w", err)
 	}
 	// Check whether this exact pattern is already registered.
-	cubeID := ComputeCubeID(tenant, dims, filters)
+	cubeID := ComputeCubeID(tenant, dims, filters, aggAttrNames)
 	for _, c := range cubes {
 		if c.CubeID == cubeID {
 			return TriggerResult{Entry: c}, nil // already exists
@@ -88,8 +105,8 @@ func (t *CreationTrigger) TryCreate(
 		return TriggerResult{}, &ErrLimitReached{Limit: t.registry.maxCubes}
 	}
 
-	// Step 2: cardinality gate.
-	if err := CheckCardinality(vcntData, vcntDir, dims, t.cfg.CardinalityLimits, minTS, maxTS); err != nil {
+	// Step 2: cardinality gate (including aggAttrs' byte-cost, E-7).
+	if err := CheckCardinality(vcntData, vcntDir, dims, aggAttrs, t.cfg.CardinalityLimits, minTS, maxTS); err != nil {
 		return TriggerResult{}, err
 	}
 
@@ -103,6 +120,7 @@ func (t *CreationTrigger) TryCreate(
 		Tenant:     tenant,
 		Dimensions: dims,
 		Filters:    filters,
+		AggAttrs:   aggAttrNames,
 		Resolution: 1,                         // L0
 		CreatedAt:  uint32(time.Now().Unix()), //nolint:gosec // unix timestamp fits uint32 until 2106
 	}

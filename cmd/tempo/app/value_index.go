@@ -27,9 +27,9 @@ import (
 
 	blockpack "github.com/grafana/blockpack"
 	"github.com/grafana/blockpack/blockevents"
+	vcntcompactor "github.com/grafana/blockpack/valuecountscompactor"
 	viccompactor "github.com/grafana/blockpack/valueindexcompactor"
 	vicconsumer "github.com/grafana/blockpack/valueindexconsumer"
-	vcntcompactor "github.com/grafana/blockpack/valuecountscompactor"
 	vblockpack "github.com/grafana/tempo/tempodb/encoding/vblockpack"
 )
 
@@ -215,12 +215,16 @@ func (t *App) initValueIndexCompactor() (services.Service, error) {
 					}
 				}()
 			}
-			// Cube compactor loop — runs inside the same service.
+			// Cube scheduler loop — runs inside the same service. Implements the full
+			// L0-merge / boundary-gated L0->L1 hourly / L1->L2 daily rollup ladder plus L0
+			// eviction as a single driver (#491, E-12b — replaces the former
+			// CubeCompactorService, whose L1-rollup step had no boundary-completeness gate).
 			if bp.CubeCompactorEnabled && len(bp.CubeTenants) > 0 {
-				cubeSvc := vblockpack.NewCubeCompactorService(
-					s3Client, bucket, bp.CubeTenants, bp.CubeCompactorInterval,
+				cubeScheduler := vblockpack.ConfigureCubeScheduler(
+					s3Client, bucket, bp.CubeTenants,
+					vblockpack.CubeSchedulerConfig{TickInterval: bp.CubeCompactorInterval},
 				)
-				go cubeSvc.Run(ctx)
+				go cubeScheduler.Run(ctx)
 			}
 			// VCNT (value-counts) compactor loop — bundled the same way as cube above,
 			// no dedicated StatefulSet. See blockpack valuecountscompactor NOTE-VC-005/009

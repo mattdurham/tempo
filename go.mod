@@ -472,4 +472,9 @@ replace (
 replace github.com/hashicorp/memberlist => github.com/grafana/memberlist v0.3.1-0.20260410132335-4887d8e8d493
 
 // Local blockpack — use `go mod vendor` to sync changes from ../blockpack
+// DEV-ONLY (Phase E, #491): temporarily retargeted to the read-path-modernization worktree so
+// tempo-side tasks (E-4's unskip, E-10/E-11a/E-11b/E-12b) can build against the real, in-progress
+// cube API. This must be flipped back to ../blockpack (and re-vendored against the primary
+// checkout) before Phase E's work is committed — see E-14's gate description. Never commit this
+// line pointing at a worktree.
 replace github.com/grafana/blockpack => ../blockpack

@@ -1,185 +1,26 @@
 package vblockpack
 
-// cube_compactor.go — periodic cube compaction service.
-//
-// Runs inside the value-index-compactor target alongside the VI index compactor.
-// Every CubeCompactorInterval it merges many 1-minute L0 cube files into:
-//   - merged L0 files spanning a full hour (PlanCubeL0Merge)
-//   - L1 rollup files at 60-minute granularity (PlanCubeL1Rollup)
+// cube_compactor.go — cubeFileStore: the blockpack.CubeFileStore implementation over minio,
+// shared by cube_scheduler.go (the only cube compaction driver — see that file's doc comment for
+// history: this file used to also own a periodic CubeCompactorService, which had a real,
+// currently-live correctness bug — its L1-rollup loop had no boundary-completeness gate, so it
+// rolled up any hour with >=2 L0 files regardless of whether the hour had finished, permanently
+// undercounting that hour's L1 data. It was deleted in favor of cube_scheduler.go's single,
+// boundary-gated ladder implementation rather than patched in place, to avoid two independent
+// cube-compaction drivers racing over the same files).
 
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"io"
 	"path"
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
-	"github.com/go-kit/log/level"
 	blockpack "github.com/grafana/blockpack"
-	util_log "github.com/grafana/tempo/pkg/util/log"
 	minio "github.com/minio/minio-go/v7"
 )
-
-// CubeCompactorService drives periodic cube compaction for a set of tenants.
-type CubeCompactorService struct {
-	client          *minio.Client
-	bucket          string
-	tenants         []string
-	compactInterval time.Duration
-}
-
-// NewCubeCompactorService creates a CubeCompactorService.
-func NewCubeCompactorService(client *minio.Client, bucket string, tenants []string, interval time.Duration) *CubeCompactorService {
-	if interval <= 0 {
-		interval = 5 * time.Minute
-	}
-	level.Info(util_log.Logger).Log("msg", "vblockpack: cube compactor configured",
-		"tenants", strings.Join(tenants, ","), "interval", interval)
-	return &CubeCompactorService{
-		client:          client,
-		bucket:          bucket,
-		tenants:         tenants,
-		compactInterval: interval,
-	}
-}
-
-// Run drives the compaction loop until ctx is done.
-func (svc *CubeCompactorService) Run(ctx context.Context) {
-	ticker := time.NewTicker(svc.compactInterval)
-	defer ticker.Stop()
-	svc.runOnce(ctx)
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			svc.runOnce(ctx)
-		}
-	}
-}
-
-func (svc *CubeCompactorService) runOnce(ctx context.Context) {
-	level.Debug(util_log.Logger).Log("msg", "vblockpack: cube compaction pass starting")
-	for _, tenant := range svc.tenants {
-		if err := svc.compactTenant(ctx, tenant); err != nil {
-			level.Warn(util_log.Logger).Log("msg", "vblockpack: cube compaction error",
-				"tenant", tenant, "err", err)
-		}
-	}
-}
-
-func (svc *CubeCompactorService) compactTenant(ctx context.Context, tenant string) error {
-	level.Info(util_log.Logger).Log("msg", "vblockpack: cube compaction tenant pass", "tenant", tenant)
-	os := &minioObjectStore{client: svc.client, bucket: svc.bucket}
-	reg := blockpack.NewCubeRegistry(os, tenant)
-	entries, _, err := reg.Load(ctx)
-	if err != nil {
-		return fmt.Errorf("load registry: %w", err)
-	}
-	if len(entries) == 0 {
-		return nil
-	}
-
-	store := &cubeFileStore{client: svc.client, bucket: svc.bucket}
-	compactor := blockpack.NewCubeCompactor(store, reg, blockpack.CubeCompactorConfig{
-		L0MergeThreshold: 10,
-		L1MergeThreshold: 24,
-	})
-
-	for _, entry := range entries {
-		if err := svc.compactCube(ctx, tenant, entry, store, compactor); err != nil {
-			level.Warn(util_log.Logger).Log("msg", "vblockpack: cube compaction error",
-				"tenant", tenant, "cube_id", entry.CubeID, "err", err)
-		}
-	}
-	return nil
-}
-
-func (svc *CubeCompactorService) compactCube(
-	ctx context.Context,
-	tenant string,
-	entry blockpack.CubeRegistryEntry,
-	store blockpack.CubeFileStore,
-	compactor *blockpack.CubeCompactor,
-) error {
-	files, err := store.List(ctx, tenant, entry.CubeID)
-	if err != nil {
-		return fmt.Errorf("list: %w", err)
-	}
-	level.Info(util_log.Logger).Log("msg", "vblockpack: cube compaction files listed",
-		"tenant", tenant, "cube_id", entry.CubeID, "files", len(files))
-	if len(files) == 0 {
-		return nil
-	}
-
-	id, idErr := blockpack.CubeIDFromHex(entry.CubeID)
-	if idErr != nil {
-		return fmt.Errorf("parse id: %w", idErr)
-	}
-
-	// Use the padded 32-char cube ID for S3 paths — accumulator writes use this form.
-	paddedCubeID := entry.CubeID
-	if len(entry.CubeID) == 16 {
-		paddedCubeID = entry.CubeID + strings.Repeat("0", 16)
-	}
-
-	// L0 merge: group files by hour, merge when ≥10 cover the same hour.
-	l0Plans := blockpack.PlanCubeL0Merge(files, 10, tenant, paddedCubeID)
-	merged := 0
-	for _, plan := range l0Plans {
-		if exErr := compactor.Execute(ctx, id, plan); exErr != nil {
-			level.Warn(util_log.Logger).Log("msg", "vblockpack: L0 merge failed",
-				"cube_id", entry.CubeID, "err", exErr)
-			continue
-		}
-		merged += len(plan.InputKeys)
-	}
-
-	// Re-list after merges for L1 rollup.
-	if len(l0Plans) > 0 {
-		if files, err = store.List(ctx, tenant, entry.CubeID); err != nil {
-			return nil
-		}
-	}
-
-	// L1 rollup: for each hour that has L0 files, roll up to one L1 file.
-	hours := make(map[uint32]bool)
-	for _, f := range files {
-		if f.Level == 1 {
-			hours[f.MinMinute/60] = true
-		}
-	}
-	rolledUp := 0
-	for h := range hours {
-		keys, ok := blockpack.PlanCubeL1Rollup(files, h*60, tenant, paddedCubeID)
-		if !ok || len(keys) < 2 {
-			continue
-		}
-		outKey := fmt.Sprintf("%s/cubes/%s/L1-%d-%d-%s.cube",
-			tenant, paddedCubeID, h*60, h*60+59, blockpack.VCNTNewID())
-		plan := blockpack.CubeCompactionPlan{
-			InputKeys: keys, OutputKey: outKey,
-			Level: 60, MinMinute: h * 60, MaxMinute: h*60 + 59,
-		}
-		if exErr := compactor.Execute(ctx, id, plan); exErr != nil {
-			level.Warn(util_log.Logger).Log("msg", "vblockpack: L1 rollup failed",
-				"cube_id", entry.CubeID, "err", exErr)
-			continue
-		}
-		rolledUp++
-	}
-
-	if merged > 0 || rolledUp > 0 {
-		level.Info(util_log.Logger).Log("msg", "vblockpack: cube compaction done",
-			"tenant", tenant, "cube_id", entry.CubeID,
-			"l0_merged", merged, "l1_rollups", rolledUp)
-	}
-	return nil
-}
 
 // cubeFileStore implements blockpack.CubeFileStore over minio.
 type cubeFileStore struct {
@@ -190,8 +31,36 @@ type cubeFileStore struct {
 // cubeFileRe matches any .cube file (with or without embedded time range).
 var cubeFileRe = regexp.MustCompile(`\.cube$`)
 
-// cubeTimedFileRe parses merged files: L<level>-<minM>-<maxM>-<xid>.cube
+// cubeTimedFileRe parses merged files: L<tier>-<minM>-<maxM>-<xid>.cube, where <tier> is the
+// human-readable filename prefix 0/1/2 (L0/L1/L2) — NOT the same numbering as
+// blockpack.CubeFileInfo.Level, whose documented contract is "output resolution (1, 60, or
+// 1440)" (the same values RollupL0/RollupL1/RollupL2, PlanCubeL0Merge, PlanCubeL1Rollup, and
+// Compactor.EvictAgedL0 all compare against). cubeTierToLevel translates between the two; do not
+// use the regex's captured tier digit as Level directly (see cubeTierToLevel's doc for the bug
+// this fixed: a re-listed L1 rollup file's tier digit "1" collided with RollupL0's value 1,
+// causing it to be misclassified as an evictable L0 file).
 var cubeTimedFileRe = regexp.MustCompile(`^L(\d+)-(\d+)-(\d+)-[^/]+\.cube$`)
+
+// cubeTierToLevel maps a merged filename's tier prefix (0/1/2, from "L0"/"L1"/"L2") to the actual
+// blockpack.CubeFileInfo.Level value (1/60/1440) every other cube compaction function compares
+// against. Before this mapping existed, List() assigned the raw tier digit straight to Level,
+// so a re-listed L1 rollup file ("L1-...cube" -> tier 1) collided with RollupL0's value (also 1)
+// and was misclassified as an L0 file — passing EvictAgedL0's L0 guard and, once past retention
+// and covered by the very L1 watermark it had just established, getting deleted outright (real
+// data loss, not cosmetic). Returns (0, false) for an unrecognized tier so the caller can skip
+// the file rather than tag it with a garbage Level.
+func cubeTierToLevel(tier uint64) (uint32, bool) {
+	switch tier {
+	case 0:
+		return cubeLevelL0, true
+	case 1:
+		return cubeLevelL1, true
+	case 2:
+		return cubeLevelL2, true
+	default:
+		return 0, false
+	}
+}
 
 func (s *cubeFileStore) List(ctx context.Context, tenant, cubeID string) ([]blockpack.CubeFileInfo, error) {
 	// Registry stores 16-hex-char IDs (8 bytes); S3 dirs use 32-hex-char (16 bytes, zero-padded).
@@ -212,12 +81,16 @@ func (s *cubeFileStore) List(ctx context.Context, tenant, cubeID string) ([]bloc
 		base := path.Base(obj.Key)
 		// Try to parse time range from filename (merged files).
 		if m := cubeTimedFileRe.FindStringSubmatch(base); m != nil {
-			lv, _ := strconv.ParseUint(m[1], 10, 32)
+			tier, _ := strconv.ParseUint(m[1], 10, 32)
+			level, ok := cubeTierToLevel(tier)
+			if !ok {
+				continue // unrecognized tier prefix — skip rather than tag with a garbage Level
+			}
 			minM, _ := strconv.ParseUint(m[2], 10, 32)
 			maxM, _ := strconv.ParseUint(m[3], 10, 32)
 			files = append(files, blockpack.CubeFileInfo{
 				Key:       obj.Key,
-				Level:     uint32(lv),   //nolint:gosec
+				Level:     level,
 				MinMinute: uint32(minM), //nolint:gosec
 				MaxMinute: uint32(maxM), //nolint:gosec
 			})

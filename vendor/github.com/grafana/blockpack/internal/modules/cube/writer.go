@@ -8,12 +8,18 @@ import (
 	"sort"
 )
 
-// Writer accumulates cells and flushes to a cube file.
+// Writer accumulates AggCells and flushes to a cube file. AggCell is the sole cell type (E-3
+// APPENDIX 2) — AddCell and AddAggCell are two convenience constructor METHODS over that one
+// type (this does not reintroduce type coexistence, only the type duality was vetoed), sharing
+// one internal buffer. Every cell added to a given Writer must carry the same aggAttr count —
+// per ruling 3's amendment, a cube's attribute set is fixed for its whole life.
 type Writer struct {
-	dict       *Dictionary
-	cells      []Cell
-	cubeID     [16]byte
-	resolution uint32
+	dict           *Dictionary
+	cells          []AggCell
+	cubeID         [16]byte
+	numAggAttrs    int
+	resolution     uint32
+	numAggAttrsSet bool // whether numAggAttrs has been established by the first Add call yet
 }
 
 // NewWriter creates a new Writer.
@@ -21,13 +27,37 @@ func NewWriter(cubeID [16]byte, resolution uint32) *Writer {
 	return &Writer{
 		cubeID:     cubeID,
 		resolution: resolution,
-		cells:      []Cell{},
+		cells:      []AggCell{},
 		dict:       NewDictionary(),
 	}
 }
 
-// AddCell increments the count for (minute, dim1, dim2).
+// AddCell increments the count for (minute, dim1, dim2). This is the plain-count entry point,
+// unchanged in behavior since before #491 — it stays the only path a numAggAttrs==0 caller ever
+// needs.
 func (w *Writer) AddCell(minute uint32, dim1, dim2 string, count uint32) error {
+	return w.addCell(minute, dim1, dim2, count, nil)
+}
+
+// AddAggCell adds one cell with its full per-aggAttr values (Sum/Min/Max/Buckets per attribute),
+// in RegistryEntry.AggAttrs order. Every call on a given Writer must pass the same len(aggs) —
+// per ruling 3's amendment, a cube's attribute set is fixed for its whole life.
+func (w *Writer) AddAggCell(minute uint32, dim1, dim2 string, count uint32, aggs []AggAttrValues) error {
+	return w.addCell(minute, dim1, dim2, count, aggs)
+}
+
+// addCell is the shared implementation behind AddCell/AddAggCell.
+func (w *Writer) addCell(minute uint32, dim1, dim2 string, count uint32, aggs []AggAttrValues) error {
+	if !w.numAggAttrsSet {
+		w.numAggAttrs = len(aggs)
+		w.numAggAttrsSet = true
+	} else if len(aggs) != w.numAggAttrs {
+		return fmt.Errorf(
+			"cube: cell aggAttr count changed mid-writer (got %d, want %d) — a cube's attribute set is fixed for its whole life",
+			len(aggs),
+			w.numAggAttrs,
+		)
+	}
 	dim1ID, err := w.dict.InternDim1(dim1)
 	if err != nil {
 		return fmt.Errorf("cube: intern dim1: %w", err)
@@ -36,17 +66,18 @@ func (w *Writer) AddCell(minute uint32, dim1, dim2 string, count uint32) error {
 	if err != nil {
 		return fmt.Errorf("cube: intern dim2: %w", err)
 	}
-	w.cells = append(w.cells, Cell{
+	w.cells = append(w.cells, AggCell{
 		Minute: minute,
 		Dim1ID: dim1ID,
 		Dim2ID: dim2ID,
 		Count:  count,
+		Aggs:   aggs,
 	})
 	return nil
 }
 
-// AddCellRaw appends a pre-constructed Cell (for testing).
-func (w *Writer) AddCellRaw(c Cell) {
+// AddCellRaw appends a pre-constructed AggCell (for testing).
+func (w *Writer) AddCellRaw(c AggCell) {
 	w.cells = append(w.cells, c)
 }
 
@@ -72,23 +103,24 @@ func (w *Writer) Encode() ([]byte, error) {
 
 	// Sort cells by (Minute, Dim1ID, Dim2ID)
 	sort.Slice(w.cells, func(i, j int) bool {
-		return CompareCell(w.cells[i], w.cells[j]) < 0
+		return CompareAggCell(w.cells[i], w.cells[j]) < 0
 	})
 
 	// Split cells into chunks
-	chunks, dir, err := SplitCellsIntoChunks(w.cells, ChunkSizeNominal)
+	chunks, dir, err := SplitCellsIntoChunks(w.cells, ChunkSizeNominal, w.numAggAttrs)
 	if err != nil {
 		return nil, fmt.Errorf("cube: split cells: %w", err)
 	}
 
 	// Build file sections
 	header := Header{
-		Magic:      MagicCube,
-		Version:    VersionCube,
-		CubeID:     w.cubeID,
-		MinMinute:  w.cells[0].Minute,
-		MaxMinute:  w.cells[len(w.cells)-1].Minute,
-		Resolution: w.resolution,
+		Magic:       MagicCube,
+		Version:     VersionCube,
+		NumAggAttrs: uint8(w.numAggAttrs), //nolint:gosec // G115: numAggAttrs is a small, bounded attribute-set size
+		CubeID:      w.cubeID,
+		MinMinute:   w.cells[0].Minute,
+		MaxMinute:   w.cells[len(w.cells)-1].Minute,
+		Resolution:  w.resolution,
 	}
 	headerBytes := EncodeHeader(header)
 	dictBytes := EncodeDictionary(w.dict)

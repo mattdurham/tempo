@@ -27,6 +27,15 @@ const (
 	internalLabelBucket        = "__bucket"
 	internalLabelQueryFragment = "__query_fragment"
 	maxExemplarsPerBucket      = 2
+)
+
+// LabelBucket exports internalLabelBucket for external packages that need the exact wire-level
+// label key histogram_over_time/quantile_over_time attach a per-sample bucket boundary under
+// (e.g. tempodb/encoding/vblockpack's cube-backed metrics fast path, #491 E-11b polish item 2) —
+// eliminates a hardcoded duplicate of this string outside the traceql package.
+const LabelBucket = internalLabelBucket
+
+const (
 	// maxExemplars is a safety cap applied at the engine entry points to bound memory
 	// usage regardless of what the caller requests.
 	maxExemplars uint32 = 100000
