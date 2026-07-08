@@ -14,7 +14,11 @@ import "slices"
 // LookupResult is one matching span from a value-index query.
 // It carries enough information to fetch the specific span from a blockpack file
 // without scanning unrelated spans: BlockRef gives the page address, RowIdx gives
-// the row within the block, and SpanID identifies the span for dedup.
+// the row within the block. SpanID is included in the dedup key below, but per
+// NOTE-VI-094 it is unconditionally zero on the live BucketGroup write/query path (every
+// version, not just v1-v3), so it does not actually distinguish distinct spans within the same
+// trace on that path -- (BlockRef.PageNum, BlockRef.LenPages) is what does the real dedup work
+// there today.
 type LookupResult struct {
 	SourceRef string
 	TimeSec   uint64
@@ -22,7 +26,8 @@ type LookupResult struct {
 	BlockID   uint32   // v1: block index within SourceRef
 	RowIdx    uint16   // zero for v1-v3 files
 	TraceID   [16]byte
-	SpanID    [8]byte // zero for v1-v3 files
+	SpanID    [8]byte // NOTE-VI-094: zero for EVERY version on the BucketGroup write path (the
+	// on-disk SpanRef type has no SpanID field at all by design), not merely "v1-v3 files".
 }
 
 // QueryFiles evaluates pred against each file in files and returns all matching

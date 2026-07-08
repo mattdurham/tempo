@@ -475,7 +475,7 @@ func TestBackendRequests(t *testing.T) {
 			pipelineRequest := pipeline.NewHTTPRequest(r)
 
 			searchJobResponse := &combiner.SearchJobResponse{}
-			s.backendRequests(ctx, "test", pipelineRequest, searchReq, searchJobResponse, nil, reqCh, cancelCause)
+			s.backendRequests(ctx, "test", pipelineRequest, searchReq, searchJobResponse, nil, false, reqCh, cancelCause)
 			require.Equal(t, tc.expectedJobs, searchJobResponse.TotalJobs)
 			require.Equal(t, tc.expectedBlocks, searchJobResponse.TotalBlocks)
 			require.Equal(t, tc.expectedBlockBytes, searchJobResponse.TotalBytes)
@@ -526,7 +526,7 @@ func TestSearchSharder_TimeSlicedDispatch_UsesQueryPlanSlicesNotBlockPaging(t *t
 	pipelineRequest := pipeline.NewHTTPRequest(r)
 	searchJobResponse := &combiner.SearchJobResponse{}
 
-	go s.backendRequests(ctx, "test", pipelineRequest, searchReq, searchJobResponse, plan, reqCh, cancelCause)
+	go s.backendRequests(ctx, "test", pipelineRequest, searchReq, searchJobResponse, plan, false, reqCh, cancelCause)
 
 	var gotReqs []*tempopb.SearchBlockRequest
 	for pr := range reqCh {
@@ -580,7 +580,7 @@ func TestSearchSharder_BlockShardedDispatch_UnchangedWhenStrategyIsBlockSharded(
 		pipelineRequest := pipeline.NewHTTPRequest(r)
 		searchJobResponse := &combiner.SearchJobResponse{}
 
-		go newSharder().backendRequests(ctx, "test", pipelineRequest, searchReq, searchJobResponse, plan, reqCh, cancelCause)
+		go newSharder().backendRequests(ctx, "test", pipelineRequest, searchReq, searchJobResponse, plan, false, reqCh, cancelCause)
 
 		var uris []string
 		for pr := range reqCh {
@@ -643,7 +643,7 @@ func runTimeSlicedBackendRequests(t *testing.T, s *asyncSearchSharder, r *http.R
 	ctx, cancelCause := context.WithCancelCause(context.Background())
 	resp := &combiner.SearchJobResponse{}
 
-	go s.backendRequests(ctx, "test", pipeline.NewHTTPRequest(r), searchReq, resp, plan, reqCh, cancelCause)
+	go s.backendRequests(ctx, "test", pipeline.NewHTTPRequest(r), searchReq, resp, plan, false, reqCh, cancelCause)
 
 	var order [][2]uint32
 	for pr := range reqCh {
@@ -859,7 +859,7 @@ func TestSearchSharder_TimeSlicedDispatch_SkipsNonOverlappingBlockSlicePairs(t *
 	pipelineRequest := pipeline.NewHTTPRequest(r)
 	resp := &combiner.SearchJobResponse{}
 
-	go s.backendRequests(ctx, "test", pipelineRequest, searchReq, resp, plan, reqCh, cancelCause)
+	go s.backendRequests(ctx, "test", pipelineRequest, searchReq, resp, plan, false, reqCh, cancelCause)
 
 	var gotReqs []*tempopb.SearchBlockRequest
 	for pr := range reqCh {
@@ -941,7 +941,7 @@ func TestSearchSharder_TimeSlicedDispatch_CacheKeyUsesWholeQueryWindowNotSliceWi
 	pipelineRequest := pipeline.NewHTTPRequest(r)
 	resp := &combiner.SearchJobResponse{}
 
-	go s.backendRequests(ctx, "test", pipelineRequest, searchReq, resp, plan, reqCh, cancelCause)
+	go s.backendRequests(ctx, "test", pipelineRequest, searchReq, resp, plan, false, reqCh, cancelCause)
 
 	var gotKeys []string
 	for pr := range reqCh {

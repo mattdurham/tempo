@@ -3757,3 +3757,55 @@ scan-fallback behavior when `IndexOnly=false`.
 **Spec invariants tested:** SPEC-VIS-2.
 
 Back-ref: `tracemetricoptions_test.go`. Issue #487.
+
+---
+
+## EX-36: D4/D6 structural index-path engines require a real-write-path e2e round trip (cross-references TEST-VI-22)
+
+**Scenario:** `ExecuteStructuralFromIndex` (D4) and `ExecuteNegatedStructuralFromIndex` (D6) must each have at least one test that goes through the REAL value-index write path (`WriteValueIndexL0`), not a hand-constructed `VILookupResult`/`ResolvedSpan` fixture — per the mandatory policy established in `valueindex/TESTS.md` TEST-VI-22, following task #12's discovery that D4's original SpanID-keyed join silently produced authoritative-empty results against every real attribute-predicate structural query, undetected by the entire hand-fixture-based D1-D7 suite.
+
+**Setup:** `CreateBlock` → write spans with real span/resource attributes → `WriteValueIndexL0` for both legs of a 2-node structural query → run `ExecuteStructuralFromIndex` (positive operator) and separately `ExecuteNegatedStructuralFromIndex` (negated operator) against the real VI output.
+
+**Assertion:** each engine returns the expected non-empty match set for at least one ORDINARY attribute-column predicate on each leg (not only `span:id`/`trace:id` sentinel columns) — this is the acceptance pin task #12 mandates, and the regression guard against ever reintroducing a SpanID-keyed join by accident. Confirmed satisfied by `structural_index_realvi_test.go` and `structural_index_negated_realvi_test.go`.
+
+Back-ref: `internal/modules/executor/structural_index.go`, `structural_index_negated.go`. See TEST-VI-22 (`internal/modules/valueindex/TESTS.md`) for the general policy this specializes, NOTE-VI-094 (`internal/modules/valueindex/NOTES.md`) for the underlying invariant. Issue #489, task #12.
+
+## EX-37: `MaterializeTraceGroupMultiFile`'s `errgroup.Go` closures recover panics (Phase D holistic review fix pass, 2026-07-08, NOTE-VI-095)
+
+**Scenario:** a panic inside the caller-supplied `readerFor` callback (`StructuralReaderProvider`) must surface as a returned error from `MaterializeTraceGroupMultiFile`, never crash the process — per SPEC-ROOT-001, mirroring the established `internal/modules/valueindexcompactor/service.go` panic-isolation pattern.
+
+**Setup:** a `readerFor` closure that unconditionally `panic("boom: ...")`s, passed to `MaterializeTraceGroupMultiFile` with a single-SourceRef `TraceGroup`, run under `go test -race`.
+
+**Assertion:** the call returns a non-nil error containing both the sourceRef and "panic" (not a crashed test binary); `resolved` is nil. A sibling test (`_ReaderForReturnsNilReader_ReturnsTypedCoverageGapError`) asserts the same outcome for a well-behaved-by-convention-but-not-type-enforced `readerFor` returning `(nil, nil)`.
+
+Back-ref: `internal/modules/executor/structural_multifile.go:MaterializeTraceGroupMultiFile`, `internal/modules/executor/structural_multifile_test.go:TestMaterializeTraceGroupMultiFile_ReaderForPanics_ReturnsErrorNotCrash, _ReaderForReturnsNilReader_ReturnsTypedCoverageGapError`. See NOTE-VI-095 item 1. Issue #489.
+
+## EX-38: nil-source guards inside `ExecuteStructuralFromIndex`/`ExecuteNegatedStructuralFromIndex` never panic on a match-all leg (Phase D holistic review fix pass, 2026-07-08, NOTE-VI-095)
+
+**Scenario:** a nil REQUIRED `ValueIndexSource` (D4's `leftSource`, D6's `rightSource`) combined with that same leg compiling to a match-all filter (`{ }`) must decline (`ok=false, err=nil`), never panic — `viMatchSpans` calls a nil-interface method unconditionally in the match-all case with no nil-check of its own (NOTE-VI-087), so the guard must live inside the executor function itself, not only in a caller.
+
+**Setup:** `ExecuteStructuralFromIndex(ctx, q, nil /* leftSource */, nil, nil, nil, "", "", nil, 0, 0, false, Options{})` with `q` parsed from `{ } >> { resource.service.name = "svc-child" }`; symmetrically `ExecuteNegatedStructuralFromIndex(ctx, q, nil /* rightSource */, nil, "", "", nil, 0, 0, false, Options{})` with `q` parsed from `{ resource.service.name = "svc-root" } !>> { }`.
+
+**Assertion:** both calls, wrapped in `require.NotPanics`, return `(nil, false, nil)`.
+
+Back-ref: `internal/modules/executor/structural_index.go:ExecuteStructuralFromIndex`, `structural_index_negated.go:ExecuteNegatedStructuralFromIndex`, `structural_index_test.go:TestExecuteStructuralFromIndex_NilLeftSourceWithMatchAllLeftLeg_DeclinesNoPanic`, `structural_index_negated_test.go:TestExecuteNegatedStructuralFromIndex_NilRightSourceWithMatchAllRightLeg_DeclinesNoPanic`. See NOTE-VI-095 item 3. Issue #489.
+
+## EX-39: per-reader `ReadBlocks` coalescing in `materializeConfirmedSpanBlocks` and `verifyCandidateSpans` (Phase D holistic review fix pass, 2026-07-08, NOTE-VI-095)
+
+**Scenario:** several candidate/confirmed spans addressed to DISTINCT blocks of the SAME reader must be fetched via ONE coalesced `ReadBlocks` call for that reader, never one `ReadBlocks([]int{blockIdx})` call per distinct block — the object-storage I/O invariant (`io_ops`) this repo enforces everywhere else block reads happen.
+
+**Setup:** a counting `ReaderProvider` (`verifyTestProvider`, `reads` field) backing a single-file `*modules_reader.Reader` with 4 spans in 4 adjacent blocks; `writeVerifyTestSpansCounted` builds the fixture. `verifyCandidateSpans` and `materializeConfirmedSpanBlocks` are each called directly (white-box, package `executor`) with all 4 `ResolvedSpan`s at once. A second variant repeats this across TWO distinct readers to confirm the batching is per-reader, not globally collapsed.
+
+**Assertion:** `provider.reads == 1` per reader after the call (not 4) — proving the blocks were coalesced into a single I/O operation, not fetched one at a time.
+
+Back-ref: `internal/modules/executor/structural_index.go:materializeConfirmedSpanBlocks`, `structural_verify.go:verifyCandidateSpans, evaluateProgramAgainstBlock`, `structural_verify_internal_test.go:TestVerifyCandidateSpans_MultiBlockSameReader_CoalescesIntoOneReadBlocksCall`, `structural_index_io_internal_test.go:TestMaterializeConfirmedSpanBlocks_MultiBlockSameReader_CoalescesIntoOneReadBlocksCall, _TwoReaders_OneReadBlocksCallPerReader`. See NOTE-VI-095 item 4. Issue #489.
+
+## EX-40: `QueryNegatedStructuralFromIndex` (root D6 wrapper) real-write-path end-to-end, non-vacuous negated answer (Phase D holistic review fix pass, 2026-07-08, NOTE-VI-095)
+
+**Scenario:** the new root-package `QueryNegatedStructuralFromIndex` wrapper must be reachable and correct end to end through the production write path, and the answer must be genuinely non-vacuous (both an included and an excluded right-match candidate in the same trace) — not merely an empty result that a broken/unreachable engine could also produce.
+
+**Setup:** one real trace (`WriteValueIndexL0`) with two `svc-leaf` spans: `leafXID` is a descendant of an `svc-root` span (`aID`); `leafYID` is a descendant of a non-`svc-root` span (`bID`). Query: `{ resource.service.name = "svc-root" } !>> { resource.service.name = "svc-leaf" }`. Per `applyStructuralOp`'s node1-is-output convention, `!>>`'s output side is the RIGHT (tested) operand: a right-match survives only when it has NO ancestor matching the left filter.
+
+**Assertion:** `QueryNegatedStructuralFromIndex` returns exactly one match, `leafYID` (no `svc-root` ancestor) — `leafXID` (has one, via `aID`) is correctly excluded. A second assertion in the same test confirms the `rightSource == nil` decline convention (`ok=false, err=nil`).
+
+Back-ref: root `structural.go:QueryNegatedStructuralFromIndex`, `structural_index_realvi_test.go:TestQueryNegatedStructuralFromIndex_RealWriteValueIndexL0_EndToEnd, writeRealVINegatedTrace`. See NOTE-VI-095 item 2, TEST-VI-22/EX-36 (the real-write-path test-class policy this satisfies for D6 at the ROOT layer specifically). Issue #489.

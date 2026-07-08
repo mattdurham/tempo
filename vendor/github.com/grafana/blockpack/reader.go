@@ -5,7 +5,6 @@ package blockpack
 // These are the core I/O primitives that storage backends and integrations build on.
 
 import (
-	"bytes"
 	"context"
 	"encoding/hex"
 	"fmt"
@@ -15,6 +14,7 @@ import (
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
 	modules_chaincache "github.com/grafana/blockpack/internal/modules/chaincache"
+	modules_executor "github.com/grafana/blockpack/internal/modules/executor"
 	modules_filecache "github.com/grafana/blockpack/internal/modules/filecache"
 	modules_memcache "github.com/grafana/blockpack/internal/modules/memcache"
 	modules_rw "github.com/grafana/blockpack/internal/modules/rw"
@@ -525,6 +525,13 @@ func getTraceByIDViaIndex(
 //
 // Returns (group, true, nil) on a hit, (zero, false, nil) when no candidate holds the
 // trace (an authoritative miss), or (zero, false, err) on any fetch/decode failure.
+//
+// NOTE-VI-091 (plan-d.md D4, team-lead ruling 2026-07-07): the actual merge/lookup algorithm now
+// lives in modules_executor.FindTraceGroupInCandidates — this function is a thin delegate,
+// mirroring materializeTraceGroup's own NOTE-VI-088/089 delegation to
+// modules_executor.ResolveTraceGroupSourceRef. ExecuteStructuralFromIndex's many-candidate-trace
+// discovery shares this SAME primitive, so GetTraceByID and structural queries never maintain two
+// independently-drifting copies of the same authoritative-index merge semantics.
 func findTraceGroupInCandidates(
 	ctx context.Context,
 	lister LookupStore,
@@ -532,55 +539,11 @@ func findTraceGroupInCandidates(
 	traceID [16]byte,
 	queryMinSec, queryMaxSec uint64,
 ) (valueindex.TraceGroup, bool, error) {
-	var merged valueindex.TraceGroup
-	found := false
-	seenSpan := make(map[[8]byte]struct{})
-
-	// mergeGroup folds a matching group's spans into merged, deduplicating by
-	// SpanID (first wins) and keeping the minimum TimeSec — the live-merge
-	// semantics shared with valueindex.MergeTraceGroups and
-	// LookupTraceGroupPartial.
-	mergeGroup := func(g *valueindex.TraceGroup) {
-		if !found {
-			merged.TraceID = g.TraceID
-			merged.TimeSec = g.TimeSec
-			found = true
-		} else if g.TimeSec < merged.TimeSec {
-			merged.TimeSec = g.TimeSec
-		}
-		for i := range g.Spans {
-			s := g.Spans[i]
-			if _, dup := seenSpan[s.SpanID]; dup {
-				continue
-			}
-			seenSpan[s.SpanID] = struct{}{}
-			merged.Spans = append(merged.Spans, s)
-		}
+	group, found, err := modules_executor.FindTraceGroupInCandidates(ctx, lister, keys, traceID, queryMinSec, queryMaxSec)
+	if err != nil {
+		return valueindex.TraceGroup{}, false, fmt.Errorf("GetTraceByID: %w", err)
 	}
-
-	for _, key := range keys {
-		// v2 batched files (issue #476) resolve with targeted partial reads
-		// (footer + block directory + only the surviving block), so an oversized
-		// index file never forces a whole-object download + full decode. A
-		// candidate whose footer magic doesn't match v2 (e.g. a pre-#476 legacy
-		// v1 flat-blob file) is a hard error — v1 read support was removed once
-		// the v2 rollover window closed (NOTE-VI-047 -> retired).
-		g, ok, lerr := valueindex.LookupTraceGroupPartial(
-			ctx, lister, key, traceID, queryMinSec, queryMaxSec,
-		)
-		if lerr != nil {
-			return valueindex.TraceGroup{}, false, fmt.Errorf(
-				"GetTraceByID: partial lookup index candidate %q: %w", key, lerr,
-			)
-		}
-		if ok {
-			mergeGroup(&g)
-		}
-	}
-	if !found {
-		return valueindex.TraceGroup{}, false, nil
-	}
-	return merged, true, nil
+	return group, found, nil
 }
 
 // materializeTraceGroup resolves every SpanEntry in group to an exact block+row in r and
@@ -603,96 +566,40 @@ func findTraceGroupInCandidates(
 // — only the latter is genuine skew. If no span survives the filter, that is an
 // authoritative "not found in THIS block" ((nil, nil)), not an error: some sibling block owns
 // the trace and will resolve it. An empty sourceRef disables the filter (v1 back-compat).
+//
+// NOTE-VI-088 (plan-d.md D3/D3B, team-lead ruling 2026-07-07): the actual resolve/skew-detection
+// algorithm now lives in modules_executor.ResolveTraceGroupSourceRef — this function is a thin
+// delegate that converts each ResolvedTraceRow to its own public SpanMatch via buildSpanMatch
+// (SpanFieldsProvider/Clone/pooling are a public-API-facing concern that stays in root, not
+// internal-module resolve logic). Structural queries' multi-file materialization
+// (modules_executor.MaterializeTraceGroupMultiFile) shares the SAME resolve primitive, so skew
+// semantics never drift between GetTraceByID's single-file path and the structural multi-file
+// path.
 func materializeTraceGroup(
 	r *Reader,
 	group valueindex.TraceGroup,
 	traceID [16]byte,
 	sourceRef string,
 ) ([]SpanMatch, error) {
-	rowsByBlock := make(map[int][]int, len(group.Spans))
-	blockOrder := make([]int, 0, len(group.Spans))
-	seen := make(map[[2]int]struct{}, len(group.Spans))
-	for _, span := range group.Spans {
-		// Drop spans owned by a sibling block: they are addressed against a
-		// different file's page geometry, so resolving them against r would be a
-		// spurious skew error. The sibling's own GetTraceByID call handles them.
-		if sourceRef != "" && span.SourceRef != sourceRef {
-			continue
-		}
-		blockIdx, ok := r.BlockIndexForPage(span.BlockRef.PageNum)
-		if !ok {
-			return nil, fmt.Errorf(
-				"GetTraceByID: index/data skew: index-named page %d does not resolve in file",
-				span.BlockRef.PageNum,
-			)
-		}
-		key := [2]int{blockIdx, int(span.RowIdx)}
-		if _, dup := seen[key]; dup {
-			continue
-		}
-		seen[key] = struct{}{}
-		if _, exists := rowsByBlock[blockIdx]; !exists {
-			blockOrder = append(blockOrder, blockIdx)
-		}
-		rowsByBlock[blockIdx] = append(rowsByBlock[blockIdx], int(span.RowIdx))
+	rows, err := modules_executor.ResolveTraceGroupSourceRef(r, group, traceID, sourceRef)
+	if err != nil {
+		return nil, fmt.Errorf("GetTraceByID: %w", err)
 	}
-	if len(blockOrder) == 0 {
-		if sourceRef != "" {
-			// Every span in the group belonged to a sibling block (filtered out
-			// above). This block simply does not hold the trace -- an authoritative
-			// "not found in THIS block," not skew. The sibling block whose SourceRef
-			// matches resolves the trace in its own parallel GetTraceByID call
-			// (NOTE-VI-076, issue #479).
-			return nil, nil
-		}
-		return nil, fmt.Errorf("GetTraceByID: index/data skew: trace group resolved to zero blocks")
-	}
-
-	rawBlocks, readErr := r.ReadBlocks(blockOrder)
-	if readErr != nil {
-		return nil, fmt.Errorf("GetTraceByID: read index-named blocks: %w", readErr)
+	if rows == nil {
+		// Every span in the group belonged to a sibling block/file (filtered out inside
+		// ResolveTraceGroupSourceRef). This block simply does not hold the trace -- an
+		// authoritative "not found in THIS block," not skew. The sibling block whose
+		// SourceRef matches resolves the trace in its own parallel GetTraceByID call
+		// (NOTE-VI-076, issue #479).
+		return nil, nil
 	}
 
 	traceIDStr := hex.EncodeToString(traceID[:])
-	results := make([]SpanMatch, 0, len(group.Spans))
-	for _, blockIdx := range blockOrder {
-		raw, ok := rawBlocks[blockIdx]
-		if !ok {
-			return nil, fmt.Errorf(
-				"GetTraceByID: index/data skew: block %d missing from read result", blockIdx,
-			)
-		}
-		bwb, parseErr := r.ParseBlockFromBytes(raw, modules_reader.WantAll(), r.BlockMeta(blockIdx))
-		if parseErr != nil {
-			return nil, fmt.Errorf("GetTraceByID: parse block %d: %w", blockIdx, parseErr)
-		}
-		traceIDCol := bwb.Block.GetColumn(modules_shared.TraceIDColumnName)
-		for _, rowIdx := range rowsByBlock[blockIdx] {
-			if !rowMatchesTraceID(traceIDCol, rowIdx, traceID) {
-				return nil, fmt.Errorf(
-					"GetTraceByID: index/data skew: block %d row %d trace:id does not match index entry",
-					blockIdx,
-					rowIdx,
-				)
-			}
-			results = append(results, buildSpanMatch(bwb.Block, rowIdx, traceIDStr))
-		}
+	results := make([]SpanMatch, 0, len(rows))
+	for _, row := range rows {
+		results = append(results, buildSpanMatch(row.Block, row.RowIdx, traceIDStr))
 	}
 	return results, nil
-}
-
-// rowMatchesTraceID reports whether col's value at rowIdx equals traceID. Used as the
-// defensive re-verify step after direct index-addressed row access: an index entry is a
-// hint, so the row it names is re-checked against the actual data before being trusted.
-func rowMatchesTraceID(col *modules_reader.Column, rowIdx int, traceID [16]byte) bool {
-	if col == nil {
-		return false
-	}
-	v, ok := col.BytesValue(rowIdx)
-	if !ok {
-		return false
-	}
-	return bytes.Equal(v, traceID[:])
 }
 
 // buildSpanMatch materializes the SpanMatch for the span at (block, rowIdx). block must

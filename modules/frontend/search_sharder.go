@@ -155,13 +155,24 @@ func (s asyncSearchSharder) RoundTrip(pipelineRequest pipeline.Request) (pipelin
 	// all") and would discard any plan built here unused — building one anyway would pay for
 	// CheckIndexCoverage/fetchVCNTSection for a query that can never reach backendRequests' block
 	// dispatch at all.
+	// planIsStructural (issue #489, plan-d.md DT1 Correction log): buildQueryPlan always returns
+	// nil for a structural query (blockpack.CompileTraceQL only accepts filter expressions), so
+	// buildStructuralQueryPlan is tried as a fallback when the filter-shaped attempt declines.
+	// backendRequests dispatches these two plan kinds with DIFFERENT fanout models (see
+	// structural_sharder.go's own package doc comment for why) — planIsStructural is the single
+	// signal that tells it which one it's holding.
 	var plan *blockpack.QueryPlan
+	var planIsStructural bool
 	if searchReq.Start != 0 && searchReq.End != 0 {
 		plan = buildQueryPlan(ctx, s.rawR, tenantID, s.indexPrefix, searchReq.Query, uint64(searchReq.Start), uint64(searchReq.End), s.cfg.ConcurrentRequests)
+		if plan == nil {
+			plan = buildStructuralQueryPlan(ctx, s.rawR, tenantID, s.indexPrefix, searchReq.Query, uint64(searchReq.Start), uint64(searchReq.End), s.cfg.ConcurrentRequests)
+			planIsStructural = plan != nil
+		}
 	}
 
 	// pass subCtx in requests so we can cancel and exit early
-	s.backendRequests(ctx, tenantID, pipelineRequest, searchReq, jobMetrics, plan, reqCh, func(err error) {
+	s.backendRequests(ctx, tenantID, pipelineRequest, searchReq, jobMetrics, plan, planIsStructural, reqCh, func(err error) {
 		// todo: actually find a way to return this error to the user
 		s.logger.Log("msg", "search: failed to build backend requests", "err", err)
 	})
@@ -182,7 +193,15 @@ func (s asyncSearchSharder) RoundTrip(pipelineRequest pipeline.Request) (pipelin
 // IndexOnly=true) instead of today's backendJobsFunc/buildBackendRequests (one job per
 // (block, page-range) pair) — backendJobsFunc/buildBackendRequests themselves are untouched,
 // so a nil or DispatchBlockSharded plan is byte-identical to today (parity-first discipline).
-func (s *asyncSearchSharder) backendRequests(ctx context.Context, tenantID string, parent pipeline.Request, searchReq *tempopb.SearchRequest, resp *combiner.SearchJobResponse, plan *blockpack.QueryPlan, reqCh chan<- pipeline.Request, errFn func(error)) {
+//
+// planIsStructural (issue #489, plan-d.md DT1 Correction log, 2026-07-08 ruling) further narrows
+// the DispatchTimeSliced branch: a structural query's plan uses
+// structuralTimeSlicedJobsFunc/buildStructuralTimeSlicedBackendRequests (ONE job per SLICE, no
+// per-block fanout) instead of timeSlicedJobsFunc/buildTimeSlicedBackendRequests — see
+// structural_sharder.go's own package doc comment for why the (block, slice) model is unsound for
+// this job type specifically. planIsStructural is only ever true when plan is also non-nil (RoundTrip
+// only sets it alongside a successfully-built structural plan).
+func (s *asyncSearchSharder) backendRequests(ctx context.Context, tenantID string, parent pipeline.Request, searchReq *tempopb.SearchRequest, resp *combiner.SearchJobResponse, plan *blockpack.QueryPlan, planIsStructural bool, reqCh chan<- pipeline.Request, errFn func(error)) {
 	// request without start or end, search only in ingester
 	if searchReq.Start == 0 || searchReq.End == 0 {
 		close(reqCh)
@@ -209,6 +228,27 @@ func (s *asyncSearchSharder) backendRequests(ctx context.Context, tenantID strin
 	firstShardIdx := len(resp.Shards)
 
 	if plan != nil && plan.Strategy == blockpack.DispatchTimeSliced {
+		if planIsStructural {
+			// One job per SLICE, never one job per (block, slice) pair — see
+			// structuralTimeSlicedJobsFunc's own doc comment for why the (block, slice) model is
+			// unsound for a structural query's index-driven path.
+			blockIter := structuralTimeSlicedJobsFunc(blocks, plan.Slices, s.cfg.MostRecentShards, blockOverlapsSlice)
+			blockIter(func(jobs int, sz uint64, completedThroughTime uint32) {
+				resp.TotalJobs += jobs
+				resp.TotalBytes += sz
+
+				resp.Shards = append(resp.Shards, shardtracker.Shard{
+					TotalJobs:               uint32(jobs),
+					CompletedThroughSeconds: completedThroughTime,
+				})
+			}, nil)
+
+			go func() {
+				buildStructuralTimeSlicedBackendRequests(ctx, tenantID, parent, searchReq, firstShardIdx, blockIter, reqCh, errFn)
+			}()
+			return
+		}
+
 		// blockOverlapsSlice (team-lead's layer-(a) completion): a (block, slice) pair with no
 		// time overlap dispatches no job at all, in both this count and buildTimeSlicedBackendRequests'
 		// own dispatch loop — see timeSlicedJobsFunc's doc comment for why this needs no

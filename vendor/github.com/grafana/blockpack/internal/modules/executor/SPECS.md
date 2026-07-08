@@ -710,6 +710,139 @@ Back-ref: `internal/modules/executor/stream_structural.go:applyStructuralOp`
 
 ---
 
+### 11.5 Index-Driven Structural Query Engine (issue #489, plan-d.md D2-D6)
+
+A second dispatch strategy alongside the scan-based `ExecuteStructural` (§11.1-11.4): for 2-node
+chains only, candidate discovery is driven by the value index and whole-trace resolution by
+TraceGroup materialization, with no full-block scan. Chains that don't flatten to exactly 2 nodes
+(`compileStructuralPair`'s decline, NOTE-VI-087) always fall back to `ExecuteStructural`, which
+retains full N-ary chain support (SPEC-STRUCT-8) unchanged.
+
+## SPEC-STRUCT-9: `ExecuteStructuralFromIndex` — 2-node positive-operator index-driven structural queries
+*Added: 2026-07-08*
+
+**Contract:**
+```go
+func ExecuteStructuralFromIndex(
+    ctx context.Context,
+    q *traceqlparser.StructuralQuery,
+    leftSource, rightSource ValueIndexSource,
+    isSelective StructuralSelectivityClassifier,
+    traceGroupStore valueindex.LookupStore,
+    tenant, indexPrefix string,
+    readerFor StructuralReaderProvider,
+    minTS, maxTS uint64,
+    indexOnly bool,
+    opts Options,
+) (*StructuralResult, bool, error)
+```
+
+Answers a 2-node structural query using value-index-driven candidate discovery
+(`FindTraceGroupInCandidates`, SPEC-VIS-5) plus TraceGroup materialization
+(`MaterializeTraceGroupMultiFile`, SPEC-VIS-3), with no full-block scan. Positive operators only
+(`>>`, `>`, `~`, `<<`, `<`) — negated operators decline (routed to SPEC-STRUCT-10 instead).
+
+`ok=false, err=nil` (routine decline, caller falls back to `ExecuteStructural`):
+- `q` does not flatten to exactly a 2-node chain (`compileStructuralPair`'s own decline, NOTE-VI-087).
+- `op` is a negated operator — this function is never responsible for negated operators.
+- `leftSource` has no VI coverage for `[minTS, maxTS)`, and `indexOnly` is false.
+- the trace-by-id index has zero candidate files for the window, and `indexOnly` is false.
+
+`ok=false, err!=nil`:
+- index/data inconsistency (skew) surfaces exactly as `MaterializeTraceGroupMultiFile`/`GetTraceByID` already do (SPEC-VIS-3/4/5) — never silently masked.
+- `ErrStructuralIndexCoverageGap` (SPEC-STRUCT-11) when `indexOnly` is true and either coverage gap above occurs, or when any candidate's assembled TraceGroup is `Partial`.
+
+**Invariant: bit-role occupancy never swaps, regardless of which side seeds discovery.**
+`nodeMatch` bit0 is ALWAYS the walk-anchor (L)'s real VI-match bit; bit1 is ALWAYS R's bit
+(provisional-match-all pre-D3B-confirmation, then real post-confirmation). This role assignment
+is fixed by `resolvedSpansToStructuralRecs` unconditionally, independent of `chooseCandidateTraceIDs`'
+seed choice (NOTE-VI-092) — seeding discovery from R's exact matches (when R is Selective and L
+is not) changes WHICH traces are even considered, never WHICH bit represents which side. This is
+the property validator-d2's adversarial check confirmed holds for all three structural-operator
+edge cases (including `~`'s self-exclusion case): the provisional-R-then-confirm walk is
+algebraically identical regardless of seed choice specifically because bit-role occupancy is
+invariant.
+
+**Join-key correctness (task #12):** all internal joins between value-index matches and
+`TraceGroup`/`ResolvedSpan` data key on `(SourceRef, BlockPage, RowIdx)`, never `SpanID` — see
+NOTE-VI-092 for why `VILookupResult.SpanID` is not a valid join key for this purpose.
+
+Design rationale (walk-anchor/discovery-seed split, selectivity injection, intersection prefilter): see NOTE-VI-092.
+
+Back-ref: `internal/modules/executor/structural_index.go:ExecuteStructuralFromIndex`. Tests: `structural_index_test.go`, `structural_index_golden_test.go`, `structural_index_seed_test.go`, `structural_index_realvi_test.go`. Issue #489.
+
+---
+
+## SPEC-STRUCT-10: `ExecuteNegatedStructuralFromIndex` — 2-node negated-operator index-driven structural queries
+*Added: 2026-07-08*
+
+**Contract:**
+```go
+func ExecuteNegatedStructuralFromIndex(
+    ctx context.Context,
+    q *traceqlparser.StructuralQuery,
+    rightSource ValueIndexSource,
+    traceGroupStore valueindex.LookupStore,
+    tenant, indexPrefix string,
+    readerFor StructuralReaderProvider,
+    minTS, maxTS uint64,
+    indexOnly bool,
+    opts Options,
+) (*StructuralResult, bool, error)
+```
+
+Answers a 2-node NEGATED structural query (`!>>`, `!>`, `!~`) using the value index for RIGHT-side
+candidate discovery only (no `leftSource` parameter exists — the negated side is never
+VI-resolvable, see NOTE-VI-093) plus TraceGroup materialization. Mirrors SPEC-STRUCT-9's
+decline/error contract with the operator polarity reversed:
+
+`ok=false, err=nil`:
+- `q` does not flatten to exactly a 2-node chain.
+- `op` is a positive operator — routed to SPEC-STRUCT-9 instead.
+- `rightSource` has no VI coverage for the window, and `indexOnly` is false.
+- the trace-by-id index has zero candidate files for the window, and `indexOnly` is false.
+
+`ok=false, err!=nil`: same shape as SPEC-STRUCT-9 — index/data skew, or `ErrStructuralIndexCoverageGap` (SPEC-STRUCT-11) under `indexOnly` or a `Partial` TraceGroup.
+
+**Invariant: the negated side is structurally unresolvable via VI, enforced by the function's own
+signature, not by a runtime convention a caller could violate.** `ExecuteNegatedStructuralFromIndex`
+has NO `leftSource` parameter at all — contrast `ExecuteStructuralFromIndex` (SPEC-STRUCT-9), which
+takes both `leftSource` and `rightSource`. There is no way for any caller, by mistake or otherwise,
+to wire a left-side `ValueIndexSource` into this function; candidate-trace discovery is driven
+EXCLUSIVELY by `rightSource`. This is a compile-time-enforced invariant, not a
+documented-but-checkable-at-runtime one — the strongest form the codebase can express for "this
+side is never VI-resolvable" (NOTE-VI-093).
+
+**Cost model is NOT interchangeable with SPEC-STRUCT-9's** — see NOTE-VI-093: confirmation of the negated side is unconditional (whole tree, every candidate), not selectivity-gated, so cost is proportional to trace size rather than to VI selectivity. Callers must not assume a shared per-candidate cost model between this function and `ExecuteStructuralFromIndex`.
+
+**Join-key correctness (task #12, D6 audit confirmed):** the right-side VI match join keys on
+`(SourceRef, BlockPage, RowIdx)`, never `SpanID` — see NOTE-VI-093. The left side's D3B-confirmed
+match set is safely keyed by SpanID (both operands are real per-row data, not raw VI results).
+
+Back-ref: `internal/modules/executor/structural_index_negated.go:ExecuteNegatedStructuralFromIndex`. Tests: `structural_index_negated_test.go`, `structural_index_negated_realvi_test.go`. Issue #489.
+
+---
+
+## SPEC-STRUCT-11: `ErrStructuralIndexCoverageGap` — shared coverage-gap/Partial-tree contract for both index-driven structural engines
+*Added: 2026-07-08*
+
+**Contract:** `ErrStructuralIndexCoverageGap` (`errors.Is`-comparable sentinel, `internal/modules/executor/structural_errors.go`) is returned by both `ExecuteStructuralFromIndex` (SPEC-STRUCT-9) and `ExecuteNegatedStructuralFromIndex` (SPEC-STRUCT-10) in exactly two situations:
+1. `indexOnly` is true and either the search VI (candidate discovery) or the trace-by-id VI/TraceGroup index has no coverage for the query window — mirrors #487's `IndexOnly`/`ErrSliceIndexCoverageGap` pattern (SPEC-VIS-2) and `ErrValueIndexNoCoverage`'s precedent: a time-sliced structural job has no safe scan fallback across slice boundaries, so it must fail loudly rather than silently narrow.
+2. ANY candidate trace's assembled TraceGroup (`valueindex.AssembleTrace`) is `Partial` — regardless of `indexOnly`. Ruling (team-lead, 2026-07-07): this is treated as a coverage gap for STRUCTURAL evaluation specifically, unlike `GetTraceByID`'s plain, non-structural `Partial` handling (an orphan span, `SpanEntry.IsRoot`/`ParentSpanID` semantics, `valueindex/NOTES.md`), which is NOT itself an error condition there. A partial tree can produce false NEGATIVES for `ExecuteStructuralFromIndex`'s positive operators and false POSITIVES for `ExecuteNegatedStructuralFromIndex`'s negated operators (NOTE-VI-093) — both directions make labeling a narrower-than-true answer "authoritatively successful" unsafe, so both engines fail the whole candidate-trace evaluation rather than silently returning a partial match set.
+
+Back-ref: `internal/modules/executor/structural_errors.go:ErrStructuralIndexCoverageGap`. Issue #489.
+
+---
+
+## SPEC-STRUCT-12: `StructuralSelectivityClassifier` — injected selectivity classifier (import-cycle workaround)
+*Added: 2026-07-08*
+
+**Contract:** `type StructuralSelectivityClassifier func(prog *vm.Program) bool` (`internal/modules/executor/structural_index.go`) reports whether `prog` classifies as `queryplan.Selective` over the caller's already-decoded VCNT section and query window. `ExecuteStructuralFromIndex` (SPEC-STRUCT-9) accepts this as an injected dependency rather than importing `internal/modules/queryplan` directly, because `queryplan` → `vibuilder` → `executor` is a real Go import cycle (verified by build attempt). Root's own caller wraps `queryplan.ClassifyProgramVCNT(prog, vcntData, vcntDir, minTS, maxTS) == queryplan.Selective` to construct the classifier it passes in. A `nil` classifier (or a `nil` `rightSource`) is treated as "not Selective" for both sides — `ExecuteStructuralFromIndex` always falls back to L as the discovery seed in that case (NOTE-VI-092).
+
+Back-ref: `internal/modules/executor/structural_index.go:StructuralSelectivityClassifier`. Issue #489.
+
+---
+
 ## 12. Pipeline Aggregate Queries (streamPipelineQuery)
 
 Invoked when `QueryTraceQL` receives a `*traceqlparser.MetricsQuery` (e.g.
@@ -1127,3 +1260,40 @@ NOTE-VI-086, NOTE-VI-035/047/078 (the search-path equivalent this mirrors in out
 mechanism). Tests: `tracemetricoptions_test.go` (`TestExecuteMetricsTraceQL_IndexOnly_NoValueIndexReturnsTypedError`,
 `_IndexOnly_GroupByDeclineReturnsTypedError`, `_IndexOnlyFalse_GroupByDeclineFallsBackToScan`,
 `_IndexOnly_LegacyTimeSecZeroDeclineReturnsTypedError`). Issue #487.
+
+---
+
+## SPEC-VIS-3: `MaterializeTraceGroupMultiFile` / `StructuralReaderProvider` / `ResolvedSpan` / `ErrStructuralMultiFileCoverageGap` — multi-file trace materialization for structural queries
+*Added: 2026-07-08 (issue #489, plan-d.md §D3, relocated root→executor per D3B checkpoint ruling)*
+
+**Contract:** `MaterializeTraceGroupMultiFile(ctx, readerFor StructuralReaderProvider, group valueindex.TraceGroup, traceID [16]byte, maxConcurrentReaderOpens int) ([]ResolvedSpan, error)` (`internal/modules/executor/structural_multifile.go`) resolves EVERY distinct `SourceRef` present in a `TraceGroup` against its own reader, with bounded concurrency (`errgroup.SetLimit`, default 8 when `maxConcurrentReaderOpens <= 0`). Returns `[]ResolvedSpan{Reader, SourceRef, Span, BlockIdx, RowIdx}` in first-seen `SourceRef` order (deterministic regardless of goroutine completion order).
+
+Either of two failure classes fails the WHOLE call via `errgroup.Wait()` (never a partial per-file result):
+- `ErrStructuralMultiFileCoverageGap` (`errors.Is`-comparable): `readerFor` could not open some `SourceRef` at all.
+- `ResolveTraceGroupSourceRef`'s (SPEC-VIS-4) own index/data skew error, wrapped with sourceRef context.
+
+Additive only — never changes `GetTraceByID`'s single-file `materializeTraceGroup` behavior (NOTE-VI-076, unchanged).
+
+Back-ref: `internal/modules/executor/structural_multifile.go:MaterializeTraceGroupMultiFile, StructuralReaderProvider, ResolvedSpan, ErrStructuralMultiFileCoverageGap`. Tests: `structural_multifile_test.go`. See NOTE-VI-088 for full design rationale. Issue #489.
+
+---
+
+## SPEC-VIS-4: `ResolveTraceGroupSourceRef` — single shared resolve/skew-detection primitive for single-file and multi-file trace-by-id resolution
+*Added: 2026-07-08 (issue #489, plan-d.md D3B checkpoint ruling)*
+
+**Contract:** `ResolveTraceGroupSourceRef(reader *modules_reader.Reader, group valueindex.TraceGroup, traceID [16]byte, sourceRef string) ([]ResolvedTraceRow, error)` (`internal/modules/executor/structural_traceresolve.go`) filters `group.Spans` to `sourceRef` (empty disables the filter, NOTE-VI-076 v1 back-compat), resolves each surviving span's `BlockRef`, reads/parses the needed blocks, and defensively re-verifies each resolved row's own `trace:id` column against `traceID`. Every failure mode (an index-named page that doesn't resolve, a read/parse failure, or a `trace:id` mismatch) is index/data skew and returns an error — never a silent drop. Zero surviving spans after a non-empty `sourceRef` filter is an authoritative "not found in THIS file" (`(nil, nil)`), not skew.
+
+This is the literal single shared implementation for both `GetTraceByID`'s single-file path (root `materializeTraceGroup` is now a thin delegate over it) and `MaterializeTraceGroupMultiFile`'s (SPEC-VIS-3) multi-file path — extracted verbatim from the original inline algorithm in root's `materializeTraceGroup` so the two callers can never disagree on what counts as "resolved" vs. "skew." All 19 pre-existing `GetTraceByID` tests pass unchanged, confirming behavioral parity with the pre-extraction implementation.
+
+Back-ref: `internal/modules/executor/structural_traceresolve.go:ResolveTraceGroupSourceRef, ResolvedTraceRow`, root `reader.go:materializeTraceGroup` (thin delegate). Tests: `gettracebyid_index_test.go` (19, unchanged), `structural_multifile_test.go` (6). See NOTE-VI-089 for full design rationale. Issue #489.
+
+---
+
+## SPEC-VIS-5: `FindTraceGroupInCandidates` — shared candidate-TraceGroup merge/lookup primitive for GetTraceByID and index-driven structural discovery
+*Added: 2026-07-08 (issue #489, plan-d.md §D4, team-lead ruling 2026-07-07)*
+
+**Contract:** `FindTraceGroupInCandidates(ctx, lister valueindex.LookupStore, keys []string, traceID [16]byte, queryMinSec, queryMaxSec uint64) (valueindex.TraceGroup, bool, error)` (`internal/modules/executor/structural_tracegroup.go`) fetches and decodes every candidate trace-by-id index file in `keys`, merging every matching group found for `traceID` across all of them (SpanID-deduplicated, first occurrence wins; `TimeSec` is the minimum across matches). Candidates are never short-circuited on first match — disjoint-span L0 files for the same TraceID are a legitimate pre-compaction state. A fetch/decode failure on any candidate is index/data inconsistency and returns an ERROR (NOTE-VI-071's authoritative-index contract), never silently skipped.
+
+Shared, canonical implementation for both `GetTraceByID`'s single-trace lookup (root `findTraceGroupInCandidates` is a thin delegate) and `ExecuteStructuralFromIndex`'s (SPEC-STRUCT-9) many-candidate-trace discovery loop.
+
+Back-ref: `internal/modules/executor/structural_tracegroup.go:FindTraceGroupInCandidates`, root `reader.go:findTraceGroupInCandidates` (thin delegate). See NOTE-VI-091 for full design rationale. Issue #489.

@@ -796,6 +796,45 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 			indexAnswered = true
 		}
 	}
+	// Structural index-driven path (blockpack issue #489, plan-d.md DT1): an orthogonal sibling
+	// to the filter-program branch above — never nested inside it, so #481's eventual removal of
+	// the filter path's own scan fallback does not need to also touch this one. Tried only when
+	// compilation as a plain filter program failed (compiledProgram == nil, the same signal that
+	// already routes structural/pipeline queries to the string-based path below), which makes
+	// this branch mutually exclusive with the one above. See value_index_structural_query.go's
+	// own package doc comment for why tryStructuralIndexFetch additionally gates on
+	// opts.IndexOnly today: ExecuteStructuralFromIndex has no per-block ownership restriction the
+	// way the filter path's sourceRef parameter provides, so attempting it under the default
+	// block-sharded dispatch would return the query's full answer from every block overlapping
+	// the window instead of a partition of it (checkpoint raised with team-lead, not yet
+	// resolved) — this keeps the branch reachable only through a genuine #487 slice job.
+	if compiledProgram == nil {
+		sm, sok, sistats, sidxErr := b.tryStructuralIndexFetch(ctx, query, queryOpts, opts.IndexOnly)
+		if sistats.FilesRead > 0 || sistats.Used {
+			span.SetAttributes(
+				attribute.Bool("structural_index.used", sistats.Used),
+				attribute.Int("structural_index.files_read", sistats.FilesRead),
+				attribute.Int64("structural_index.bytes_read", sistats.BytesRead),
+				attribute.Int("structural_index.hits", sistats.Hits),
+			)
+		}
+		if sidxErr != nil {
+			if errors.Is(sidxErr, blockpack.ErrStructuralIndexCoverageGap) {
+				// #487 time-slice job (opts.IndexOnly): the index routinely declined, but a full
+				// scan is not a safe fallback for a narrowed-window slice job — fail the query
+				// rather than double-count/over-fetch across overlapping slices.
+				slog.Error("vblockpack Fetch: structural index-only slice job hit a coverage gap", "query", query, "err", sidxErr)
+				return traceql.FetchSpansResponse{}, fmt.Errorf("vblockpack Fetch: %w", sidxErr)
+			}
+			// Authoritative-index inconsistency: fail the query, do not scan.
+			slog.Error("vblockpack Fetch: structural value index/data inconsistency", "query", query, "err", sidxErr)
+			return traceql.FetchSpansResponse{}, fmt.Errorf("vblockpack Fetch: structural value index inconsistency: %w", sidxErr)
+		}
+		if sok {
+			matches = sm
+			indexAnswered = true
+		}
+	}
 	switch {
 	case indexAnswered:
 		// already populated from the index path

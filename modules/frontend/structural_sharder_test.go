@@ -1,0 +1,141 @@
+package frontend
+
+// structural_sharder_test.go — pins the #489 (plan-d.md DT1 Correction log) dispatch contract:
+// a structural query's DispatchTimeSliced plan emits ONE job per SLICE, never one job per
+// (block, slice) pair — the opposite of TestSearchSharder_TimeSlicedDispatch_UsesQueryPlanSlicesNotBlockPaging's
+// own filter-path assertion, which this file's tests deliberately mirror in shape to make the
+// contrast explicit.
+
+import (
+	"context"
+	"net/http/httptest"
+	"sort"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/grafana/blockpack"
+	"github.com/grafana/tempo/modules/frontend/combiner"
+	"github.com/grafana/tempo/modules/frontend/pipeline"
+	"github.com/grafana/tempo/pkg/api"
+	"github.com/grafana/tempo/pkg/tempopb"
+	"github.com/grafana/tempo/tempodb/backend"
+	"github.com/stretchr/testify/require"
+)
+
+// TestSearchSharder_StructuralTimeSlicedDispatch_OneJobPerSliceNotPerBlock is this file's
+// PRIMARY correctness pin: TWO blocks both overlap BOTH slices below. A structural plan must
+// still dispatch exactly ONE job per slice (2 total), never one job per (block, slice) pair (4
+// total) — the (block, slice) model the filter path uses would have both blocks' jobs each
+// independently return the query's full answer for that slice window, a real duplication (see
+// structural_sharder.go's package doc comment). Mutation-verification: this test was confirmed to
+// FAIL (4 jobs, not 2) against structuralTimeSlicedJobsFunc's own predecessor draft, which reused
+// timeSlicedJobsFunc directly instead of firstOverlappingBlock's single-carrier selection, before
+// being left in its correct, passing state.
+func TestSearchSharder_StructuralTimeSlicedDispatch_OneJobPerSliceNotPerBlock(t *testing.T) {
+	bmA := backend.NewBlockMeta("test", uuid.New(), "wdwad")
+	bmA.StartTime = time.Unix(100, 0)
+	bmA.EndTime = time.Unix(200, 0)
+	bmA.Size_ = defaultTargetBytesPerRequest
+	bmA.TotalRecords = 1
+
+	bmB := backend.NewBlockMeta("test", uuid.New(), "wdwad")
+	bmB.StartTime = time.Unix(100, 0)
+	bmB.EndTime = time.Unix(200, 0)
+	bmB.Size_ = defaultTargetBytesPerRequest
+	bmB.TotalRecords = 1
+
+	s := &asyncSearchSharder{
+		cfg:    SearchSharderConfig{MostRecentShards: defaultMostRecentShards},
+		reader: &mockReader{metas: []*backend.BlockMeta{bmA, bmB}},
+	}
+
+	r := httptest.NewRequest("GET", "/?tags=foo%3Dbar&limit=50&start=100&end=200", nil)
+	searchReq, err := api.ParseSearchRequest(r)
+	require.NoError(t, err)
+
+	plan := &blockpack.QueryPlan{
+		Strategy: blockpack.DispatchTimeSliced,
+		Slices: []blockpack.TimeSlice{
+			{Start: 150, End: 200},
+			{Start: 100, End: 150},
+		},
+	}
+
+	reqCh := make(chan pipeline.Request)
+	ctx, cancelCause := context.WithCancelCause(context.Background())
+	pipelineRequest := pipeline.NewHTTPRequest(r)
+	searchJobResponse := &combiner.SearchJobResponse{}
+
+	go s.backendRequests(ctx, "test", pipelineRequest, searchReq, searchJobResponse, plan, true, reqCh, cancelCause)
+
+	var gotReqs []*tempopb.SearchBlockRequest
+	for pr := range reqCh {
+		parsed, err := api.ParseSearchBlockRequest(pr.HTTPRequest())
+		require.NoError(t, err)
+		gotReqs = append(gotReqs, parsed)
+	}
+	require.NoError(t, ctx.Err())
+
+	require.Equal(t, 2, searchJobResponse.TotalJobs, "one job per SLICE, not one per (block, slice) pair")
+	require.Len(t, gotReqs, 2)
+
+	sort.Slice(gotReqs, func(i, j int) bool { return gotReqs[i].SearchReq.Start < gotReqs[j].SearchReq.Start })
+
+	require.Equal(t, uint32(100), gotReqs[0].SearchReq.Start)
+	require.Equal(t, uint32(150), gotReqs[0].SearchReq.End)
+	require.True(t, gotReqs[0].IndexOnly, "a structural time-sliced job must set IndexOnly=true")
+
+	require.Equal(t, uint32(150), gotReqs[1].SearchReq.Start)
+	require.Equal(t, uint32(200), gotReqs[1].SearchReq.End)
+	require.True(t, gotReqs[1].IndexOnly, "a structural time-sliced job must set IndexOnly=true")
+}
+
+// TestSearchSharder_StructuralTimeSlicedDispatch_SkipsSliceWithNoOverlappingBlocks mirrors
+// TestSearchSharder_TimeSlicedDispatch_SkipsNonOverlappingBlockSlicePairs's own filter-path
+// assertion for the structural one-job-per-slice model: a slice with ZERO overlapping blocks
+// dispatches no job at all (nothing exists yet to search).
+func TestSearchSharder_StructuralTimeSlicedDispatch_SkipsSliceWithNoOverlappingBlocks(t *testing.T) {
+	bm := backend.NewBlockMeta("test", uuid.New(), "wdwad")
+	bm.StartTime = time.Unix(100, 0)
+	bm.EndTime = time.Unix(150, 0) // only overlaps the first slice below
+	bm.Size_ = defaultTargetBytesPerRequest
+	bm.TotalRecords = 1
+
+	s := &asyncSearchSharder{
+		cfg:    SearchSharderConfig{MostRecentShards: defaultMostRecentShards},
+		reader: &mockReader{metas: []*backend.BlockMeta{bm}},
+	}
+
+	r := httptest.NewRequest("GET", "/?tags=foo%3Dbar&limit=50&start=100&end=250", nil)
+	searchReq, err := api.ParseSearchRequest(r)
+	require.NoError(t, err)
+
+	plan := &blockpack.QueryPlan{
+		Strategy: blockpack.DispatchTimeSliced,
+		Slices: []blockpack.TimeSlice{
+			{Start: 100, End: 150}, // overlaps bm
+			{Start: 200, End: 250}, // does NOT overlap bm
+		},
+	}
+
+	reqCh := make(chan pipeline.Request)
+	ctx, cancelCause := context.WithCancelCause(context.Background())
+	pipelineRequest := pipeline.NewHTTPRequest(r)
+	searchJobResponse := &combiner.SearchJobResponse{}
+
+	go s.backendRequests(ctx, "test", pipelineRequest, searchReq, searchJobResponse, plan, true, reqCh, cancelCause)
+
+	var gotReqs []*tempopb.SearchBlockRequest
+	for pr := range reqCh {
+		parsed, err := api.ParseSearchBlockRequest(pr.HTTPRequest())
+		require.NoError(t, err)
+		gotReqs = append(gotReqs, parsed)
+	}
+	require.NoError(t, ctx.Err())
+
+	require.Equal(t, 1, searchJobResponse.TotalJobs, "the non-overlapping slice must dispatch no job")
+	require.Len(t, gotReqs, 1)
+	require.Equal(t, uint32(100), gotReqs[0].SearchReq.Start)
+	require.Equal(t, uint32(150), gotReqs[0].SearchReq.End)
+}

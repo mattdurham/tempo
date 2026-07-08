@@ -1020,3 +1020,77 @@ after the batch (cache hit), record a ToC hit. For column-level: `len(keepCols)`
 misses; the rest of `wantColumns` are warm hits.
 
 Back-ref: `internal/modules/blockio/reader/columnar_read.go:readBlockColumnarWithCache`.
+
+---
+
+## SPEC-ROOT-020: QueryStructuralFromIndex / CompileStructuralLegs — Root Public API for Index-Driven Structural Queries
+*Added: 2026-07-08 (issue #489, plan-d.md D5/D5b)*
+
+**What this is.** `QueryStructuralFromIndex` (`structural.go`) is the root-package public entry point for the index-driven structural-query path, mirroring `QueryTraceQLFromIndex`'s existing shape and doc-comment conventions (`api.go`): a thin wrapper with no heavy lifting of its own — `modules_executor.ExecuteStructuralFromIndex` (SPEC-STRUCT-9) does the actual work. Lives in its own new file (`structural.go`) rather than `vcnt.go`/`api.go` per the Rulings log (plan-d.md, ruling 2), deliberately independent of the concurrent #481 session's uncommitted `vcnt.go` re-exports.
+
+**Signature and parameter contract:**
+```go
+func QueryStructuralFromIndex(
+    ctx context.Context,
+    traceqlQuery string,
+    leftSource, rightSource ValueIndexSource,
+    vcntData []byte, vcntDir []VCNTChunkDirEntry,
+    traceGroupStore LookupStore,
+    tenant, indexPrefix string,
+    readerFor StructuralReaderProvider,
+    minTS, maxTS uint64,
+    indexOnly bool,
+    opts QueryOptions,
+) (results []SpanMatch, ok bool, err error)
+```
+- `leftSource` is REQUIRED (never nil): L is unconditionally the structural walk's anchor (SPEC-STRUCT-9/NOTE-VI-092) — a nil `leftSource` is a routine decline (`ok=false, err=nil`), identical in spirit to `QueryTraceQLFromIndex`'s own "no index coverage supplied" decline.
+- `rightSource` MAY be nil (e.g. a match-all right leg, or a caller declining to pre-resolve it) — it is consulted ONLY for the optional cost-based intersection prefilter (plan-d.md D4 step 4), which is automatically and silently disabled whenever `rightSource` or `vcntData` is nil, never attempted with a possibly-nil dereference. This nil-guard independently avoids the same `rightSource.AllResults()` panic risk that task #10 fixed one layer down inside `ExecuteStructuralFromIndex` itself — belt-and-suspenders, not a coincidence.
+- `vcntData`/`vcntDir` is one decoded VCNT section scoring BOTH legs over the SAME window (mirrors `queryplan.ClassifyProgramVCNT`'s single-window composition); nil/empty always skips the cost-based intersection prefilter — the query still executes correctly, just without that optimization.
+- `traceGroupStore` and `tenant` are REQUIRED (NOTE-VI-073) — there is no scan fallback for a caller that omits them; this mirrors `GetTraceByID`'s own authoritative-index contract (SPEC-ROOT-018).
+- `readerFor` (`StructuralReaderProvider`) resolves each candidate trace's `SpanEntry.SourceRef` to an open `*Reader` for Option A's multi-file materialization (SPEC-VIS-3) — the caller owns reader caching/pooling, exactly as `MaterializeTraceGroupMultiFile`'s own contract states.
+- `indexOnly` mirrors issue #487's `IndexOnly`/`ErrSliceIndexCoverageGap` pattern (SPEC-VIS-2): when true, a coverage gap that would otherwise be a routine decline instead returns `ErrStructuralIndexCoverageGap` — a time-sliced structural job has no safe scan fallback across slice boundaries.
+
+**Scope (v1): 2-node structural queries only.** A chain flattening to other than exactly 2 filter nodes, or a negated operator (`!>>`, `!>`, `!~` — routed to `modules_executor.ExecuteNegatedStructuralFromIndex`, SPEC-STRUCT-10, not this function), is a routine decline (`ok=false, err=nil`); the caller falls back to `QueryTraceQL` (the scan path), which already handles the general case and is not removed by this function's existence.
+
+**`CompileStructuralLegs(traceqlQuery string) (leftProg, rightProg *Program, op StructuralOp, ok bool, err error)`** is the root-level public re-export of `modules_executor.CompileStructuralLegs` (itself a zero-logic passthrough to `compileStructuralPair`, NOTE-VI-087) — exposed (D5b, task #11) so an external caller (tempo's DT1 dispatch) can classify a structural query's operator and build BOTH `ValueIndexSource`s (left AND right) BEFORE calling `QueryStructuralFromIndex`. Without this, a permanently-nil `rightSource` would silently disable D4's intersection prefilter and the entire discovery-seed cost mechanism (D4-SEED ruling) on the actual production dispatch path — `CompileStructuralLegs` exists specifically so the caller has the operator/leg information needed to decide whether building a right-side VI source is worth the cost, before ever calling `QueryStructuralFromIndex`.
+
+**Public re-exports (D5b, task #11), all zero-cost type aliases / passthroughs, not adapters:**
+- `ErrStructuralIndexCoverageGap` = `modules_executor.ErrStructuralIndexCoverageGap` (mirrors the `ErrValueIndexFileNotFound` re-export convention, `valueindex_query.go`) — without this, callers cannot `errors.Is()` against the typed coverage-gap error this path returns.
+- `StructuralOp` = `traceqlparser.StructuralOp` (type alias), plus the 8 operator constants (`OpDescendant`, `OpChild`, `OpSibling`, `OpAncestor`, `OpParent`, `OpNotSibling`, `OpNotDescendant`, `OpNotChild`) — re-exported so a caller can classify a `StructuralOp` (e.g. deciding whether a query is negated, to route to D4 vs D6) without importing `internal/traceqlparser` directly.
+- `StructuralReaderProvider` = `modules_executor.StructuralReaderProvider` — verified a genuinely zero-cost alias, not an adapter: `Reader` is itself a plain alias for `modules_reader.Reader` (`reader.go:44`), so root callers pass their own `*blockpack.Reader`-returning functions here unchanged.
+- `StructuralSelectivityClassifier` = `modules_executor.StructuralSelectivityClassifier` — exported only so advanced callers/tests can construct their own classifier; `QueryStructuralFromIndex` builds one internally over `queryplan.ClassifyProgramVCNT` in the normal case.
+
+**Result conversion.** Each `SpanMatch.Fields` returned is materialized (via `NewSpanFieldsAdapterWithReader` + `.Clone()`, then the adapter released — NOTE-ALLOC-4) and safe to retain after return, the same conversion pattern `QueryTraceQLFromIndex` and `QueryTraceQL`'s own structural case use. This depends on D4's `SpanMatch.Block` fix (`materializeConfirmedSpanBlocks`) always producing a real, non-nil parsed `Block`.
+
+**Panic safety.** `QueryStructuralFromIndex` wraps its body in a `recover()` that converts any panic into a returned error (`internal error in QueryStructuralFromIndex: %v`) — SPEC-ROOT-001 compliant, matching `QueryTraceQL`'s own existing top-level recover convention.
+
+Back-ref: `structural.go:QueryStructuralFromIndex, CompileStructuralLegs, ErrStructuralIndexCoverageGap, StructuralOp, StructuralReaderProvider, StructuralSelectivityClassifier`. Tests: `structural_test.go`, `search_trace_vi_realvi_test.go`. Issue #489.
+
+## SPEC-ROOT-021: QueryNegatedStructuralFromIndex — Root Public API for Index-Driven NEGATED Structural Queries
+*Added: 2026-07-08 (issue #489, Phase D holistic review fix pass — closes the SPEC-ROOT-020 gap where D6 was described as routed-to but had no actual root entry point)*
+
+**What this is.** `QueryNegatedStructuralFromIndex` (`structural.go`) is the root-package public entry point for the index-driven NEGATED structural-query path (`!>>`, `!>`, `!~`), mirroring `QueryStructuralFromIndex`'s (SPEC-ROOT-020) shape, decline conventions, and panic-safety wrapper exactly — `modules_executor.ExecuteNegatedStructuralFromIndex` (SPEC-STRUCT-10) does the actual work. Before this function existed, D6's engine was reachable only from tests inside `internal/modules/executor` (Go's `internal/` visibility rule made it a permanent dead end for any external caller), despite SPEC-ROOT-020's own text describing routing to it as though a root entry point already existed.
+
+**Signature and parameter contract:**
+```go
+func QueryNegatedStructuralFromIndex(
+    ctx context.Context,
+    traceqlQuery string,
+    rightSource ValueIndexSource,
+    traceGroupStore LookupStore,
+    tenant, indexPrefix string,
+    readerFor StructuralReaderProvider,
+    minTS, maxTS uint64,
+    indexOnly bool,
+    opts QueryOptions,
+) (results []SpanMatch, ok bool, err error)
+```
+- `rightSource` is REQUIRED (never nil): unlike SPEC-ROOT-020's `leftSource`/`rightSource` split, D6 has no optional side — `rightSource` is the ONLY VI-resolved operand (NOTE-VI-093); a nil `rightSource` is a routine decline (`ok=false, err=nil`), mirroring `QueryStructuralFromIndex`'s own `leftSource == nil` decline.
+- There is no `vcntData`/`vcntDir`/selectivity-classifier parameter: D6 has no cost-based intersection-prefilter equivalent to D4's step 4 (NOTE-VI-093's own cost-model note — D6's per-candidate cost is proportional to trace size, not to VI selectivity).
+- `traceGroupStore`/`tenant`/`indexPrefix`/`readerFor`/`minTS`/`maxTS`/`indexOnly`/`opts` carry the identical contract SPEC-ROOT-020 documents for `QueryStructuralFromIndex` — not repeated here.
+
+**Scope (v1): 2-node NEGATED structural queries only.** A chain flattening to other than exactly 2 filter nodes, or a positive operator (routed to `QueryStructuralFromIndex`, SPEC-ROOT-020, instead), is a routine decline (`ok=false, err=nil`).
+
+**Result conversion and panic safety** are identical to `QueryStructuralFromIndex`'s (SPEC-ROOT-020) — same `NewSpanFieldsAdapterWithReader`/`.Clone()`/`ReleaseSpanFieldsAdapter` sequence, same top-level `recover()`-to-error wrapper.
+
+Back-ref: `structural.go:QueryNegatedStructuralFromIndex`. Tests: `structural_index_realvi_test.go:TestQueryNegatedStructuralFromIndex_RealWriteValueIndexL0_EndToEnd`. See NOTE-VI-095 (`internal/modules/executor/NOTES.md`) for the fix-pass context. Issue #489.

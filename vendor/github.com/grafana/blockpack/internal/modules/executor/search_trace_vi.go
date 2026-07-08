@@ -18,6 +18,7 @@ import (
 	"fmt"
 
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
+	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/grafana/blockpack/internal/vm"
 )
 
@@ -133,7 +134,14 @@ func QueryTraceQLFromIndex(
 		rowsByBlock[blockIdx] = append(rowsByBlock[blockIdx], m.RowIdx)
 	}
 
-	want := modules_reader.WantOnly(wantCols)
+	// task #13 (FIX-459-SPANID): span:id must always be decoded, regardless of the caller's own
+	// wantCols, so each match's real span identity can be resolved from its own row below.
+	// VILookupResult.SpanID is unconditionally zero for every value-index entry in production —
+	// the BucketGroup wire format WriteValueIndexL0 writes has no SpanID field at all
+	// (internal/modules/valueindex/writer.go's assembleBucket, NOTE-VI-045/094) — so it can never
+	// be trusted as a match's identity; only the real row (already fetched for field
+	// materialization) reliably carries it.
+	want := modules_reader.WantOnly(withSpanIDColumn(wantCols))
 
 	// Coalesced multi-block fetch: adjacent blocks merge into as few round-trips as
 	// possible (Reader.ReadBlocks). Then parse each block once with the restricted
@@ -165,17 +173,52 @@ func QueryTraceQLFromIndex(
 		if parseErr != nil {
 			return nil, false, fmt.Errorf("QueryTraceQLFromIndex: parse block %d: %w", blockIdx, parseErr)
 		}
+		spanIDCol := bwb.Block.GetColumn(modules_shared.SpanIDColumnName)
 		for _, rowIdx := range rowsByBlock[blockIdx] {
 			m := identity[spanKey{blockIdx: blockIdx, rowIdx: rowIdx}]
+			spanID, spanIDOK := resolveRowSpanID(spanIDCol, int(rowIdx))
+			if !spanIDOK {
+				return nil, false, fmt.Errorf(
+					"QueryTraceQLFromIndex: block %d row %d missing span:id (index/data inconsistency)",
+					blockIdx, rowIdx,
+				)
+			}
 			out = append(out, SpanMatch{
 				Block:    bwb.Block,
 				BlockIdx: blockIdx,
 				RowIdx:   int(rowIdx),
 				TraceID:  m.TraceID,
-				SpanID:   append([]byte(nil), m.SpanID[:]...),
+				SpanID:   spanID,
 			})
 		}
 	}
 
 	return out, true, nil
+}
+
+// withSpanIDColumn returns a copy of wantCols with modules_shared.SpanIDColumnName added, never
+// mutating the caller's own map (wantCols may be reused elsewhere by the caller).
+func withSpanIDColumn(wantCols map[string]struct{}) map[string]struct{} {
+	out := make(map[string]struct{}, len(wantCols)+1)
+	for c := range wantCols {
+		out[c] = struct{}{}
+	}
+	out[modules_shared.SpanIDColumnName] = struct{}{}
+	return out
+}
+
+// resolveRowSpanID reads the real span:id value for rowIdx from an already-decoded span:id
+// column. Returns (nil, false) when the column is absent or the row's value cannot be read --
+// both are index/data inconsistency at the caller (a real block always carries span:id), never a
+// silent zero-value fallback (task #13, mirrors the structural path's own "never trust a
+// stale/absent identity, surface the error" discipline).
+func resolveRowSpanID(col *modules_reader.Column, rowIdx int) ([]byte, bool) {
+	if col == nil {
+		return nil, false
+	}
+	v, ok := col.BytesValue(rowIdx)
+	if !ok || len(v) != 8 {
+		return nil, false
+	}
+	return append([]byte(nil), v...), true
 }

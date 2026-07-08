@@ -1023,8 +1023,15 @@ func ExecuteTraceMetricsFromVI(
 // or (nil, false) when any leaf is unindexed (caller falls back to a block scan).
 //
 // Match-all queries ({}) have no leaf conditions; they enumerate every indexed span
-// via source.AllResults.
+// via source.AllResults. A nil prog is ALSO match-all — compileStructuralPair's own
+// nil-filter-leg convention (plan-d.md D2, issue #489) compiles a match-all structural leg
+// directly to a nil *vm.Program (skipping vm.CompileTraceQLFilter entirely, rather than
+// producing a Program with empty Predicates), so this must be checked before dereferencing prog,
+// not folded into the len(preds.Nodes)==0 case below.
 func viMatchSpans(source ValueIndexSource, prog *vm.Program) ([]VILookupResult, bool) {
+	if prog == nil {
+		return source.AllResults()
+	}
 	preds := prog.Predicates
 	if preds == nil || (len(preds.Nodes) == 0 && len(preds.Columns) == 0) {
 		// Match-all: count every indexed span.

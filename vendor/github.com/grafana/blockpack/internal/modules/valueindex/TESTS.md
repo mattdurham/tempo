@@ -10,7 +10,7 @@ Entries in this file use the module-local, sequential prefix `TEST-VI-N` (file-s
 SPEC-ROOT-009 — distinct from the `NOTE-VI-N` numbering in `NOTES.md`). IDs are assigned in
 ascending order and never reused or renumbered.
 
-Next free ID: **TEST-VI-22**.
+Next free ID: **TEST-VI-23**.
 
 ---
 
@@ -576,3 +576,19 @@ the corrupted `CompLen` as its length (overflow case).
 to `QueryBucketFiles`' per-block check at every tested `minTS`, confirming the dir-level check
 is the algebraic negation of `BucketBlock.OverlapsTimeRange` applied to the same fields and
 comparators, with no additional or missing flooring logic introduced by the ranged path.
+
+---
+
+## TEST-VI-22: Mandatory real-write-path end-to-end round trip for any new VI-consuming index-path feature (issue #489, task #12 post-mortem)
+
+**Policy, not a single test case.** Any new feature that consumes `valueindex.LookupResult`/`VILookupResult` for candidate discovery, joining, or identity purposes MUST ship with at least one end-to-end test that exercises the REAL write path — `Writer.AddEntryV2`/`AddEntryV4` (or the higher-level `WriteValueIndexL0`) producing the actual index bytes a query then reads back — not a hand-constructed `LookupResult`/`VILookupResult` fixture literal.
+
+**Why this is now mandatory, not a nice-to-have.** Issue #489's entire D1-D7 test suite (dozens of tests, "9/9 gates passing") missed a CRITICAL silent-wrong-answer defect (task #12: `ExecuteStructuralFromIndex`'s L-match join keyed on `SpanID`, always zero for attribute entries against the real write path, NOTE-VI-094) because every fixture in that suite hand-constructed its `LookupResult`/`VILookupResult` values directly, and every hand-constructed fixture happened to set `SpanID` to a real value — an assumption the real write path never actually satisfies for attribute columns. The defect was caught only by coder-d3's first test that went through the genuine `WriteValueIndexL0` → search-VI → engine round trip. A fixture-only test suite structurally cannot catch a write-path-vs-fixture mismatch of this shape, no matter how many fixture-based scenarios it adds.
+
+**Scope:** applies to any future feature (not just #489's structural queries) built on top of a `ValueIndexSource`/`LookupResult`/`VILookupResult`-consuming discovery or join mechanism — count/rate metrics, search, structural, or any not-yet-designed VI-driven engine.
+
+**Setup:** `CreateBlock` (or equivalent) → write real spans → `WriteValueIndexL0` (the real write path, not a hand-built `LookupResult`) → run the actual VI query function that produces `LookupResult`/`VILookupResult` values → feed those real results into the feature under test.
+
+**Assertion:** the feature under test produces the expected non-empty match set from realistically-written data — specifically exercising at least one ORDINARY attribute-column predicate (not only the `span:id`/`trace:id` sentinel columns), since those are the columns where `SpanID` is unpopulated and any accidental SpanID-keyed join would silently fail.
+
+See EX-36 (`internal/modules/executor/TESTS.md`) for D4/D6's own instance of this new test class. Issue #489, task #12.
