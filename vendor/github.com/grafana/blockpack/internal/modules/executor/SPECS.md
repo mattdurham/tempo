@@ -950,9 +950,14 @@ practical consequence this has for negated multi-node chains specifically (R15-A
 
 Back-ref: `internal/modules/executor/options.go:Options`,
 `internal/modules/executor/structuralresult.go:StructuralResult`,
-`internal/modules/executor/stream_structural.go:fetchStructuralBlocksBounded`. Tests:
+`internal/modules/executor/stream_structural.go:fetchStructuralBlocksBounded,ExecuteStructural`. Tests:
 `stream_structural_test.go` (bounded-path suite, chronology/newest-first regression coverage).
 Issue #481.
+
+`BudgetStopped`/`BlocksRead` are now also attached as `blockpack.structural.budget_stopped`/
+`blockpack.structural.blocks_read` attributes on the `blockpack.query` span (guarded by
+`IsRecording()`) — visibility only, no semantic change to this rule's own contract above
+(NOTE-480, issue #493).
 
 ---
 
@@ -993,10 +998,14 @@ rather than duplicating or amending it. See `NOTE-VI-098` for the fuller design-
 including why the ruling table that originally scoped this phase's work briefly (and incorrectly)
 treated "3+-node negated" as a distinct bucket needing its own execution path.
 
-Back-ref: `internal/modules/executor/stream_structural.go:resolveStructuralParentIndices`,
+Back-ref: `internal/modules/executor/stream_structural.go:resolveStructuralParentIndices,ExecuteStructural`,
 `internal/modules/executor/structuralresult.go:StructuralResult.IncompleteTraceCount`. Tests:
 `stream_structural_test.go` (incompleteness-exclusion suite, negated-operator false-positive
 regression coverage). Issue #481.
+
+`IncompleteTraceCount` is now also attached as `blockpack.structural.incomplete_trace_count`
+on the `blockpack.query` span (guarded by `IsRecording()`) — visibility only, no semantic
+change to this rule's own contract above (NOTE-480, issue #493).
 
 ## 12. Pipeline Aggregate Queries (streamPipelineQuery)
 
@@ -1314,9 +1323,15 @@ pre-filter fast paths (search and metrics) that resolve the query before reachin
 `planBlocks → scanBlocks` site. A successfully two-phase-pruned query (NOTE-464, issue #383)
 MUST NOT be invisible in a distributed trace.
 
+`queryplanner.PlanOptions.EnableExplain` MUST be gated on `querySpan.IsRecording()` — checked
+once per `Collect`/`ExecuteStructural` call and threaded down explicitly (never re-derived from
+context, never polled per block/structural node) — so `plan.Explain` string-building only
+happens when the span will actually record it (NOTE-478, issue #493).
+
 Back-ref: `internal/modules/executor/stream.go:Collect,scanBlocks,emitFastPathPlannerSpan`,
 `internal/modules/executor/metrics_trace.go:ExecuteTraceMetrics`,
-`internal/modules/executor/otel_spans.go:emitPlannerSpan,startBlockSpan`.
+`internal/modules/executor/otel_spans.go:emitPlannerSpan,startBlockSpan`,
+`internal/modules/executor/stream_structural.go:collectAllStructuralSpans,ExecuteStructural`.
 
 ---
 
@@ -1355,6 +1370,38 @@ via per-fetch child spans.
 
 Back-ref: `internal/modules/executor/otel_spans.go:attachCacheStats`,
 `internal/modules/blockio/reader/cache_stats.go`.
+
+---
+
+## SPEC-OBS-006: StructuralFunnelStats Contract — Structural Index-Driven Funnel
+
+*Added: 2026-07-09 (issue #493, Task 6)*
+
+`StructuralFunnelStats` (`structural_funnel_stats.go`) carries per-stage candidate counts for
+the index-driven structural funnel (`ExecuteStructuralFromIndex`/
+`ExecuteNegatedStructuralFromIndex`, `structural_index.go`/`structural_index_negated.go`).
+Threaded ALONGSIDE `*StructuralResult`, never added to it — `StructuralResult` stays scoped to
+`SPEC-STRUCT-13`/`14`'s orthogonal `RecentFirstBudget` concern.
+
+**Fields:** `LeadMatches`, `LeadTraces`, `CandidateTraces`, `TraceGroupHits`, `TraceGroupMisses`,
+`TraceGroupPartial` (bool), `TreeWalkSurvivors`, `VerifiedSurvivors`.
+
+**Contract:** `nil` means "span not recording, skip all counting work" — mirrors
+`PlannerSpanStats`' nil-means-skip convention (`otel_spans.go`). Every increment site in both
+engines is guarded by `stats != nil`. Emitted as span attributes on the existing
+`blockpack.query` span (`attachStructuralFunnelStats`), alongside `blockpack.query.engine`
+(values: `"scan"`, `"structural_scan"`, `"structural_index"` — set unconditionally at
+span-start on all three query engines, including on error-returning decline paths that never
+reach a stats-attach call).
+
+Back-ref: `internal/modules/executor/structural_funnel_stats.go:StructuralFunnelStats,
+attachStructuralFunnelStats`; call sites in
+`internal/modules/executor/structural_index.go:ExecuteStructuralFromIndex,
+evalOneStructuralCandidateTrace`,
+`internal/modules/executor/structural_index_negated.go:ExecuteNegatedStructuralFromIndex,
+evalOneNegatedStructuralCandidateTrace`. Also retrofits `blockpack.query.engine` onto
+`stream.go:Collect` ("scan") and `stream_structural.go:ExecuteStructural` ("structural_scan").
+See NOTE-479 for design rationale. Issue #493.
 
 ---
 

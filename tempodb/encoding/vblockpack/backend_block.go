@@ -356,6 +356,14 @@ func (b *blockpackBlock) QueryRange(ctx context.Context, req *tempopb.QueryRange
 			indexCovered = true
 		}
 	}
+	// issue #493: vi.covered is informative on every exit path (success or decline), including
+	// the ErrSliceIndexCoverageGap and cube.used early returns below — attach it here, once,
+	// right after indexCovered is finalized, rather than duplicating the attribute at every
+	// return site.
+	if span.IsRecording() {
+		span.SetAttributes(attribute.Bool("vi.covered", indexCovered))
+	}
+
 	if searchOpts.IndexOnly && !indexCovered {
 		// A #487 time-slice job whose index declined must fail rather than fall
 		// through to the cube path or the full-scan metrics path below — neither is
@@ -377,9 +385,24 @@ func (b *blockpackBlock) QueryRange(ctx context.Context, req *tempopb.QueryRange
 		}
 		cubeWarming = errors.Is(cubeErr, ErrCubeWarming)
 	}
+	// issue #493: cube.warming is informative either way (success or decline) and costs nothing
+	// extra — cubeWarming is already a local variable by this point.
+	if span.IsRecording() {
+		span.SetAttributes(attribute.Bool("cube.warming", cubeWarming))
+	}
 
 	result, err := blockpack.ExecuteMetricsTraceQL(ctx, r, req.Query, opts)
 	if err != nil {
+		// issue #493: promote the decline detail that would otherwise be discarded — the
+		// errors.Is routing chain below only distinguishes 3 of blockpack's 4 metrics decline
+		// sentinels (it doesn't need ErrMetricsValueIndexDisabled for routing purposes, since
+		// that sentinel is never remapped to ErrSliceIndexCoverageGap/ErrCubeWarming), but the
+		// trace-facing reason must not silently omit the most basic decline case (value index
+		// not configured at all for this querier). Set unconditionally, before the routing
+		// logic below, so it is present regardless of which branch fires.
+		if span.IsRecording() {
+			span.SetAttributes(attribute.String("metrics.decline_reason", declineReason(err)))
+		}
 		// blockpack's own IndexOnly-aware decline (opts.IndexOnly above) used to surface as the
 		// single blockpack.ErrValueIndexNoCoverage sentinel — issue #481 part 3 (F-4) replaced it
 		// with three distinct sentinels (ErrMetricsShapeNotAnswerable/ErrMetricsNoCoverage/
@@ -409,6 +432,28 @@ func (b *blockpackBlock) QueryRange(ctx context.Context, req *tempopb.QueryRange
 	}
 
 	return convertTraceMetricsResult(result, req), nil
+}
+
+// declineReason (issue #493) maps a metrics decline error to a short, stable string for the
+// vblockpack.backendBlock.QueryRange span's metrics.decline_reason attribute. Checks all 4 of
+// blockpack's metrics decline sentinels (decline_errors.go) — a superset of the 3 the
+// pre-existing errors.Is routing chain above distinguishes, since ErrMetricsValueIndexDisabled
+// is genuinely reachable from this call site (whenever indexCovered is false) even though the
+// routing chain never needs to remap it to ErrSliceIndexCoverageGap/ErrCubeWarming. Returns
+// "other" for any error this function doesn't recognize (e.g. context cancellation).
+func declineReason(err error) string {
+	switch {
+	case errors.Is(err, blockpack.ErrMetricsValueIndexDisabled):
+		return "value_index_disabled"
+	case errors.Is(err, blockpack.ErrMetricsShapeNotAnswerable):
+		return "shape_not_answerable"
+	case errors.Is(err, blockpack.ErrMetricsNoCoverage):
+		return "no_coverage"
+	case errors.Is(err, blockpack.ErrMetricsLegacyTimeSecZero):
+		return "legacy_time_sec_zero"
+	default:
+		return "other"
+	}
 }
 
 // convertTraceMetricsResult maps a blockpack TraceMetricsResult to a Tempo QueryRangeResponse.

@@ -109,6 +109,23 @@ func ClassifyProgramVCNT(
 	return queryplan.ClassifyProgramVCNT(prog, data, dir, minTS, maxTS)
 }
 
+// LeadDetail (SPEC-QP-7, NOTE-QP-011) carries a selectivity classification's lead-leaf cost
+// detail — the index side (estimated matching count) and the full-scan side (column total
+// population) that ClassifyProgramVCNT computes internally then discards — re-exported at root so
+// tempo's frontend (buildQueryPlanFromProgram, issue #493 Task 4b) can report WHY a query
+// qualified/declined without importing the internal queryplan package. See
+// queryplan.LeadDetail's own doc comment for the full field contract.
+type LeadDetail = queryplan.LeadDetail
+
+// ClassifyProgramVCNTWithDetail is ClassifyProgramVCNT plus the LeadDetail its classification
+// already computes internally — see queryplan.ClassifyProgramVCNTWithDetail's own doc comment
+// for the full contract (same default threshold, zero additional object-storage I/O).
+func ClassifyProgramVCNTWithDetail(
+	prog *Program, data []byte, dir []VCNTChunkDirEntry, minTS, maxTS uint64,
+) (Selectivity, LeadDetail) {
+	return queryplan.ClassifyProgramVCNTWithDetail(prog, data, dir, minTS, maxTS)
+}
+
 // BuildQueryPlan composes a cost-based leaf plan and, when qualified, minute-aligned
 // TimeSlices for prog's predicate over [minTS, maxTS] — the #487 time-slice job-sharding
 // entry point for tempo's frontend (issue #487, Section 1 C4/C5).

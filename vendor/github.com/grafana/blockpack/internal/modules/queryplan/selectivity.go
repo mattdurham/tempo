@@ -96,28 +96,60 @@ func Classify(g Group, total ColumnTotalFunc) Selectivity {
 // falls back to the default so a caller cannot accidentally classify everything (or
 // nothing) as low-selectivity.
 func ClassifyWithThreshold(g Group, total ColumnTotalFunc, fraction float64) Selectivity {
+	sel, _ := classifyDetailed(g, total, fraction)
+	return sel
+}
+
+// leadDetail (SPEC-QP-7, NOTE-QP-011) carries the lead leaf's own estimated matching count (the
+// index side) and its column's total live population over the window (the full-scan side)
+// alongside the verdict classifyDetailed already computes — both are already local variables
+// inside the classification logic below; this struct just keeps them instead of discarding them
+// (issue #493 Task 4b, R4: PRE-AUTHORIZED new blockpack public API — see LeadDetail, vcnt_cost.go,
+// for the exported counterpart this is composed into).
+type leadDetail struct {
+	leadColumn    string
+	leafCount     int64
+	colTotal      int64
+	hasLead       bool
+	colTotalKnown bool
+}
+
+// classifyDetailed (SPEC-QP-7, NOTE-QP-011) is ClassifyWithThreshold's implementation,
+// additionally returning the lead leaf detail its caller (ClassifyProgramVCNTWithDetail,
+// vcnt_cost.go) needs. ClassifyWithThreshold itself is a thin wrapper discarding the detail —
+// this split guarantees ClassifyWithThreshold's existing behavior is BYTE-IDENTICAL (parity-first,
+// zero risk to its existing callers) while making the detail available to the new sibling —
+// mirroring SPEC-QP-1's Group.Lead()/leadLeaf "wrapper can never diverge from its own
+// implementation" pattern.
+func classifyDetailed(g Group, total ColumnTotalFunc, fraction float64) (Selectivity, leadDetail) {
 	if total == nil {
-		return UnknownSelectivity
+		return UnknownSelectivity, leadDetail{}
 	}
 	if fraction <= 0 || fraction > 1 {
 		fraction = DefaultLowSelectivityFraction
 	}
 	lead, ok := leadLeaf(g)
 	if !ok {
-		return UnknownSelectivity
+		return UnknownSelectivity, leadDetail{}
+	}
+	detail := leadDetail{hasLead: true, leafCount: lead.Cost.Count}
+	if lead.Node != nil {
+		detail.leadColumn = lead.Node.Column
 	}
 	if lead.Cost.IsEmpty() {
 		// Net-zero live matches: maximally selective, prunes everything.
-		return Selective
+		return Selective, detail
 	}
 	colTotal, ok := total(lead.Node)
 	if !ok || colTotal <= 0 {
-		return UnknownSelectivity
+		return UnknownSelectivity, detail
 	}
+	detail.colTotal = colTotal
+	detail.colTotalKnown = true
 	if float64(lead.Cost.Count) >= fraction*float64(colTotal) {
-		return LowSelectivity
+		return LowSelectivity, detail
 	}
-	return Selective
+	return Selective, detail
 }
 
 // leadLeaf returns the most-selective leaf across the whole plan tree: the leaf with

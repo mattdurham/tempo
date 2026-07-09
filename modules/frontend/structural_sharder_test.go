@@ -20,6 +20,7 @@ import (
 	"github.com/grafana/tempo/pkg/api"
 	"github.com/grafana/tempo/pkg/tempopb"
 	"github.com/grafana/tempo/tempodb/backend"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -138,4 +139,72 @@ func TestSearchSharder_StructuralTimeSlicedDispatch_SkipsSliceWithNoOverlappingB
 	require.Len(t, gotReqs, 1)
 	require.Equal(t, uint32(100), gotReqs[0].SearchReq.Start)
 	require.Equal(t, uint32(150), gotReqs[0].SearchReq.End)
+}
+
+// TestSearchSharder_StructuralTimeSlicedDispatch_AttachesDispatchSpanInfo (go-presubmit/holistic
+// MEDIUM finding, issue #493) drives the REAL asyncSearchSharder.backendRequests entry point (R7)
+// down the structural (planIsStructural=true) branch with a tracer installed -- search_sharder.go's
+// structural call site (`attachDispatchSpanInfo(ctx, resp.TotalJobs, len(plan.Slices), ...)`) had
+// zero tracer-based test coverage before this: its own dedicated test file asserted only on job
+// counts/IndexOnly, never on a single dispatch.* attribute or span event, leaving this call site's
+// own independently-written totalCandidatePairs=len(plan.Slices) formula unguarded against exactly
+// the "silently clamps to a misleading 0" bug class reviewer-2 already caught once for the
+// backendJobsFunc call sites. Mirrors this file's own TestSearchSharder_StructuralTimeSlicedDispatch_
+// SkipsSliceWithNoOverlappingBlocks fixture shape (one non-overlapping slice) so
+// dispatch.jobs_skipped_overlap has a real, non-zero value to pin.
+func TestSearchSharder_StructuralTimeSlicedDispatch_AttachesDispatchSpanInfo(t *testing.T) {
+	rec := recordedSpansFrontend(t)
+
+	bm := backend.NewBlockMeta("test", uuid.New(), "wdwad")
+	bm.StartTime = time.Unix(100, 0)
+	bm.EndTime = time.Unix(150, 0) // only overlaps the first slice below
+	bm.Size_ = defaultTargetBytesPerRequest
+	bm.TotalRecords = 1
+
+	s := &asyncSearchSharder{
+		cfg:    SearchSharderConfig{MostRecentShards: defaultMostRecentShards},
+		reader: &mockReader{metas: []*backend.BlockMeta{bm}},
+	}
+
+	r := httptest.NewRequest("GET", "/?tags=foo%3Dbar&limit=50&start=100&end=250", nil)
+	searchReq, err := api.ParseSearchRequest(r)
+	require.NoError(t, err)
+
+	plan := &blockpack.QueryPlan{
+		Strategy: blockpack.DispatchTimeSliced,
+		Slices: []blockpack.TimeSlice{
+			{Start: 100, End: 150}, // overlaps bm -- 1 job dispatched
+			{Start: 200, End: 250}, // does NOT overlap bm -- 1 slice skipped
+		},
+	}
+
+	reqCh := make(chan pipeline.Request)
+	ctx, span := tracer.Start(context.Background(), "test.caller")
+	pipelineRequest := pipeline.NewHTTPRequest(r)
+	searchJobResponse := &combiner.SearchJobResponse{}
+
+	go s.backendRequests(ctx, "test", pipelineRequest, searchReq, searchJobResponse, plan, true, reqCh, func(error) {})
+
+	jobCount := 0
+	for range reqCh {
+		jobCount++
+	}
+	span.End()
+
+	require.Equal(t, 1, jobCount)
+	require.Equal(t, 1, searchJobResponse.TotalJobs)
+
+	got, ok := frontendSpanByName(rec.Ended(), "test.caller")
+	require.True(t, ok)
+	attrs := frontendAttrs(got)
+
+	jobsTotal, ok := attrs["dispatch.jobs_total"]
+	require.True(t, ok, "dispatch.jobs_total must be attached on the structural dispatch path")
+	assert.EqualValues(t, 1, jobsTotal.AsInt64())
+
+	jobsSkipped, ok := attrs["dispatch.jobs_skipped_overlap"]
+	require.True(t, ok, "the structural path DOES have an overlap-filter concept (one job per slice) -- unlike backendJobsFunc, dispatch.jobs_skipped_overlap must be present")
+	assert.EqualValues(t, 1, jobsSkipped.AsInt64(), "2 slices, 1 dispatched, 1 skipped (no overlapping block)")
+
+	require.LessOrEqual(t, len(got.Events()), maxAdvancementSpanEvents)
 }

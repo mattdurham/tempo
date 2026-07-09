@@ -9,6 +9,7 @@ package vblockpack
 
 import (
 	"context"
+	"errors"
 	"path"
 	"strings"
 	"time"
@@ -309,7 +310,7 @@ func RunCubeBackfill(ctx context.Context, entry blockpack.CubeRegistryEntry, s3c
 		}
 		return nil
 	})
-	if err != nil && err != ctx.Err() {
+	if err != nil && !errors.Is(err, ctx.Err()) {
 		level.Warn(util_log.Logger).Log("msg", "vblockpack: cube backfill error",
 			"tenant", entry.Tenant, "cube_id", entry.CubeID, "err", err)
 	}

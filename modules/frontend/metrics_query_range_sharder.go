@@ -300,6 +300,7 @@ func (s *queryRangeSharder) backendRequests(ctx context.Context, tenantID string
 			return start < end && step != 0
 		}
 		blockIter := timeSlicedJobsFunc(blocks, plan.Slices, maxShards, overlaps)
+		var advancementPoints []advancementPoint
 		blockIter(func(jobs int, sz uint64, completedThroughTime uint32) {
 			jobMetadata.TotalJobs += jobs
 			jobMetadata.TotalBytes += sz
@@ -308,7 +309,12 @@ func (s *queryRangeSharder) backendRequests(ctx context.Context, tenantID string
 				TotalJobs:               uint32(jobs),
 				CompletedThroughSeconds: completedThroughTime,
 			})
+			// issue #493 Task 5: see search_sharder.go's identical wrapping for the full
+			// rationale (thin closure around the counting-pass callback, no
+			// timeSlicedJobsFunc signature change).
+			advancementPoints = append(advancementPoints, advancementPoint{jobs: jobs, bytes: sz, completedThroughSeconds: completedThroughTime})
 		}, nil)
+		attachDispatchSpanInfo(ctx, jobMetadata.TotalJobs, len(blocks)*len(plan.Slices), advancementPoints)
 
 		go func() {
 			s.buildTimeSlicedMetricsBackendRequests(ctx, tenantID, parent, backendReq, firstShardIdx, blockIter, reqCh, getExemplarsForBlock)
@@ -321,6 +327,7 @@ func (s *queryRangeSharder) backendRequests(ctx context.Context, tenantID string
 	// metrics plan can never resolve to DispatchBoundedRecentFirst in the first place, so this
 	// fallthrough only ever sees DispatchBlockSharded or nil here.
 	blockIter := backendJobsFunc(blocks, targetBytesPerRequest, maxShards, uint32(time.Unix(0, int64(searchReq.End)).Unix()))
+	var advancementPoints []advancementPoint
 	blockIter(func(jobs int, sz uint64, completedThroughTime uint32) {
 		jobMetadata.TotalJobs += jobs
 		jobMetadata.TotalBytes += sz
@@ -329,7 +336,15 @@ func (s *queryRangeSharder) backendRequests(ctx context.Context, tenantID string
 			TotalJobs:               uint32(jobs),
 			CompletedThroughSeconds: completedThroughTime,
 		})
+		// issue #493 Task 5 (reviewer-2 finding): see search_sharder.go's identical fallback
+		// wrapping for the full rationale -- this is the most common dispatch model in
+		// production and needs the same observability as the DispatchTimeSliced branch above.
+		advancementPoints = append(advancementPoints, advancementPoint{jobs: jobs, bytes: sz, completedThroughSeconds: completedThroughTime})
 	}, nil)
+	// backendJobsFunc has no overlap-filtering concept -- see search_sharder.go's identical
+	// fallback wrapping (and attachDispatchSpanInfoNoOverlapFilter's own doc comment) for why
+	// dispatch.jobs_skipped_overlap is not emitted at all on this path.
+	attachDispatchSpanInfoNoOverlapFilter(ctx, jobMetadata.TotalJobs, advancementPoints)
 
 	go func() {
 		s.buildBackendRequests(ctx, tenantID, parent, backendReq, firstShardIdx, blockIter, reqCh, getExemplarsForBlock)

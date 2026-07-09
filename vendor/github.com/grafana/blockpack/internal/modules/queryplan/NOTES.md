@@ -698,3 +698,32 @@ SPEC-QP-6 (the full decision-table contract), `SPEC-QP-3`'s addendum (the third 
 value this note's decline-signaling design coexists with). Tests: `queryplan_test.go`
 (`TestSelectSearchStrategy_FiveRowCore`,
 `TestSelectSearchStrategy_NeverReturnsTimeSlicedOrFakeDeclineStrategy`). Issue #481.
+
+## NOTE-QP-011: `LeadDetail`'s R4 pre-authorization + parity-first refactor rationale (issue #493, Task 4b)
+
+*Added: 2026-07-09*
+
+**Why new public API was warranted.** The "both sides' costs" data (lead leaf's Known cost,
+its column's total) already existed as local variables inside `ClassifyWithThreshold`'s own
+classification logic (`lead.Cost.Count`, `colTotal`) — it was computed, compared, and discarded
+before returning, never surfaced to any caller. Tempo's frontend
+(`buildQueryPlanFromProgram`) needs exactly this detail to report WHY a query's plan qualified
+or declined, not just the 3-state `Selectivity` verdict — team-lead ruling R4 pre-authorized
+this as new blockpack public API for observability data, matching the project's "minimal
+necessary API growth" pattern.
+
+**Why `classifyDetailed` as a wrapped-by-`ClassifyWithThreshold` split, not a duplicate
+implementation.** Reimplementing the classification logic a second time (even if kept in sync
+by discipline) risks silent drift between the two — a bugfix or edge-case correction landed in
+one copy but not the other. Instead, `classifyDetailed` IS the implementation;
+`ClassifyWithThreshold` becomes `sel, _ := classifyDetailed(...); return sel`, a one-line
+wrapper that can never diverge from what `classifyDetailed` computes. This is the SAME
+parity-first pattern `SPEC-QP-1`'s `Group.Lead()`/`leadLeaf` pair already establishes in this
+package — precedent, not a new convention.
+
+**Regression guard.** All of `ClassifyWithThreshold`'s existing tests pass completely
+unmodified after the refactor (confirmed via `go test ./internal/modules/queryplan/... -run
+'Classify|Selectivity'`), proving the parity requirement holds in practice, not just by
+inspection.
+
+Back-ref: same files as `SPEC-QP-7`. Issue #493.

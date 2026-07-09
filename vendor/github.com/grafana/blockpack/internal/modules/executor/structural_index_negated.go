@@ -76,12 +76,20 @@ func ExecuteNegatedStructuralFromIndex(
 		// Positive operators are D4's responsibility, not this function's.
 		return nil, false, nil
 	}
+	// NOTE-479: blockpack.query span for the structural index-driven engine (R3, issue #493) --
+	// see ExecuteStructuralFromIndex's identical rationale (structural_index.go) for why this is
+	// opened here (after the chain-shape/operator-type declines above, which mean "wrong engine
+	// for this query", not a genuine attempt) rather than at the very top of the function.
+	ctx, querySpan, stats := startStructuralIndexQuerySpan(ctx)
+	defer querySpan.End()
+
 	if rightSource == nil {
 		// SPEC-ROOT-001: rightSource is D6's ONLY VI-resolved side and REQUIRED -- guarded here at
 		// the point of use, mirroring D4's leftSource guard (structural_index.go) and the same
 		// defect class task #10 fixed for D4's own rightSource at the wrapper layer. Without this,
 		// viMatchSpans calls a nil-interface method unconditionally on a match-all right leg
 		// (NOTE-VI-087), and this engine has no root wrapper today to catch it one layer up.
+		attachStructuralFunnelStats(querySpan, stats)
 		return nil, false, nil
 	}
 
@@ -90,6 +98,7 @@ func ExecuteNegatedStructuralFromIndex(
 	// leftSource parameter for any caller to wire one in, even by mistake.
 	rightResults, rightOK := viMatchSpans(rightSource, rightProg)
 	if !rightOK {
+		attachStructuralFunnelStats(querySpan, stats)
 		if indexOnly {
 			return nil, false, ErrStructuralIndexCoverageGap
 		}
@@ -98,7 +107,14 @@ func ExecuteNegatedStructuralFromIndex(
 	rightSpansByTrace := groupVILookupResultsByTrace(rightResults)
 	candidateTraceIDs := chooseDiscoverySeed(rightSpansByTrace)
 
+	if stats != nil {
+		stats.LeadMatches = len(rightResults)
+		stats.LeadTraces = len(rightSpansByTrace)
+		stats.CandidateTraces = len(candidateTraceIDs)
+	}
+
 	if len(candidateTraceIDs) == 0 {
+		attachStructuralFunnelStats(querySpan, stats)
 		return &StructuralResult{}, true, nil
 	}
 
@@ -122,7 +138,7 @@ func ExecuteNegatedStructuralFromIndex(
 		}
 		done, evalErr := evalOneNegatedStructuralCandidateTrace(
 			ctx, traceID, keys, traceGroupStore, readerFor, minTS, maxTS,
-			rightSpansByTrace[traceID], op, leftProg, opts, result,
+			rightSpansByTrace[traceID], op, leftProg, opts, result, stats,
 		)
 		if evalErr != nil {
 			return nil, false, evalErr
@@ -131,6 +147,7 @@ func ExecuteNegatedStructuralFromIndex(
 			break
 		}
 	}
+	attachStructuralFunnelStats(querySpan, stats)
 	return result, true, nil
 }
 
@@ -152,6 +169,7 @@ func evalOneNegatedStructuralCandidateTrace(
 	leftProg *vm.Program,
 	opts Options,
 	result *StructuralResult,
+	stats *StructuralFunnelStats,
 ) (bool, error) {
 	group, found, findErr := FindTraceGroupInCandidates(ctx, traceGroupStore, keys, traceID, minTS, maxTS)
 	if findErr != nil {
@@ -160,7 +178,13 @@ func evalOneNegatedStructuralCandidateTrace(
 	if !found {
 		// Legitimate VI/TraceGroup skew at the trace level — not an error, mirrors D4/
 		// GetTraceByID's own miss semantics.
+		if stats != nil {
+			stats.TraceGroupMisses++
+		}
 		return false, nil
+	}
+	if stats != nil {
+		stats.TraceGroupHits++
 	}
 
 	assembled := valueindex.AssembleTrace(group)
@@ -168,6 +192,12 @@ func evalOneNegatedStructuralCandidateTrace(
 		// Wrapped with the trace ID (MEDIUM finding, go-presubmit.md; mirrors D4's identical fix)
 		// so an operator debugging a production coverage-gap error can identify which trace
 		// triggered it -- %w preserves errors.Is compatibility (DT2's contract).
+		// NOTE-479: see structural_index.go's identical comment -- this can only ever fire on the
+		// FIRST partial candidate (the error unwinds the whole loop), so TraceGroupPartial is a
+		// bool, never a running count.
+		if stats != nil {
+			stats.TraceGroupPartial = true
+		}
 		return false, fmt.Errorf("trace %x: %w", traceID, ErrStructuralIndexCoverageGap)
 	}
 
@@ -186,6 +216,13 @@ func evalOneNegatedStructuralCandidateTrace(
 	if verifyErr != nil {
 		return false, fmt.Errorf("ExecuteNegatedStructuralFromIndex: %w", verifyErr)
 	}
+	// NOTE-479: unlike the positive engine, D3B confirmation here runs UNCONDITIONALLY on the
+	// whole resolved tree BEFORE the structural walk, not as a narrowing step after it (ruling 3)
+	// -- VerifiedSurvivors therefore reports how many spans confirmed the left/negated filter,
+	// not "spans surviving after the walk" (see StructuralFunnelStats' own doc comment).
+	if stats != nil {
+		stats.VerifiedSurvivors += len(confirmedLeft)
+	}
 	leftMatchSpanIDs := make(map[[8]byte]struct{}, len(confirmedLeft))
 	for _, sp := range confirmedLeft {
 		leftMatchSpanIDs[sp.Span.SpanID] = struct{}{}
@@ -201,6 +238,9 @@ func evalOneNegatedStructuralCandidateTrace(
 	candidateIdx := applyStructuralOp(recs, op, nil)
 	if len(candidateIdx) == 0 {
 		return false, nil
+	}
+	if stats != nil {
+		stats.TreeWalkSurvivors += len(candidateIdx)
 	}
 	candidates := make([]ResolvedSpan, 0, len(candidateIdx))
 	for _, idx := range candidateIdx {

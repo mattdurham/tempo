@@ -15,6 +15,10 @@ import (
 
 	"github.com/grafana/blockpack"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/backend/local"
@@ -61,16 +65,20 @@ func newLocalRawReadWriter(t *testing.T) (backend.RawReader, backend.RawWriter) 
 }
 
 func TestFetchVCNTSection_NilRawReaderReturnsNil(t *testing.T) {
-	data, dir := fetchVCNTSection(context.Background(), nil, "tenant-a", testIndexPrefix, []string{"resource.service.name"})
+	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), nil, "tenant-a", testIndexPrefix, []string{"resource.service.name"})
 	require.Nil(t, data)
 	require.Nil(t, dir)
+	require.Zero(t, filesCount)
+	require.Zero(t, bytesRead)
 }
 
 func TestFetchVCNTSection_NoDimsReturnsNil(t *testing.T) {
 	rawR, _ := newLocalRawReadWriter(t)
-	data, dir := fetchVCNTSection(context.Background(), rawR, "tenant-a", testIndexPrefix, nil)
+	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), rawR, "tenant-a", testIndexPrefix, nil)
 	require.Nil(t, data)
 	require.Nil(t, dir)
+	require.Zero(t, filesCount)
+	require.Zero(t, bytesRead)
 }
 
 // TEST-487-fetch-1: fetchVCNTSection finds and merges the .vcnt objects written under a
@@ -87,9 +95,13 @@ func TestFetchVCNTSection_MergesObjectsForRequestedDims(t *testing.T) {
 	writeVCNTObject(t, rawW, "span.http.method",
 		vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 9}))
 
-	data, dir := fetchVCNTSection(context.Background(), rawR, tenant, testIndexPrefix, []string{"resource.service.name"})
+	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), rawR, tenant, testIndexPrefix, []string{"resource.service.name"})
 	require.NotNil(t, data)
 	require.NotEmpty(t, dir)
+	// filesCount/bytesRead (issue #493 Task 4c): exactly the 2 resource.service.name objects
+	// written above must be counted -- the unrequested span.http.method object must not.
+	require.Equal(t, 2, filesCount)
+	require.Positive(t, bytesRead)
 
 	est, err := blockpack.VCNTSelectivityInRange(data, dir, "resource.service.name", []byte("api"), 0, 200)
 	require.NoError(t, err)
@@ -104,9 +116,11 @@ func TestFetchVCNTSection_MergesObjectsForRequestedDims(t *testing.T) {
 
 func TestFetchVCNTSection_MissingDimYieldsNoCoverageNotError(t *testing.T) {
 	rawR, _ := newLocalRawReadWriter(t)
-	data, dir := fetchVCNTSection(context.Background(), rawR, "tenant-a", testIndexPrefix, []string{"resource.service.name"})
+	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), rawR, "tenant-a", testIndexPrefix, []string{"resource.service.name"})
 	require.Nil(t, data)
 	require.Nil(t, dir)
+	require.Zero(t, filesCount)
+	require.Zero(t, bytesRead)
 }
 
 func TestBuildQueryPlan_NilRawReaderReturnsNilPlan(t *testing.T) {
@@ -258,4 +272,211 @@ func TestBuildQueryPlanFromProgram_UnknownSelectivity_WithoutLimit_StaysIndexOnl
 	require.NotNil(t, plan)
 	require.NotEqual(t, blockpack.DispatchBoundedRecentFirst, plan.Strategy,
 		"UnknownSelectivity with no limit must stay on the index-only path, never bounded")
+}
+
+// recordedSpansFrontend installs an in-process span recorder as the global tracer provider and
+// refreshes this package's own tracer var so recorded spans flow into it -- mirrors
+// vblockpack's recordedSpans (tempodb/encoding/vblockpack/observability_test.go) exactly, per
+// R7's "EXACT setupTestTracer pattern" requirement (this package's own tracer var, not a
+// hand-rolled provider it never reads from).
+func recordedSpansFrontend(t *testing.T) *tracetest.SpanRecorder {
+	t.Helper()
+	rec := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
+	otel.SetTracerProvider(tp)
+	tracer = tp.Tracer("modules/frontend")
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+	return rec
+}
+
+// frontendSpanByName returns the first recorded span with the given operation name.
+func frontendSpanByName(spans []sdktrace.ReadOnlySpan, name string) (sdktrace.ReadOnlySpan, bool) {
+	for _, s := range spans {
+		if s.Name() == name {
+			return s, true
+		}
+	}
+	return nil, false
+}
+
+// frontendAttrs converts a recorded span's attributes into a lookup map for assertions.
+func frontendAttrs(s sdktrace.ReadOnlySpan) map[string]attribute.Value {
+	m := make(map[string]attribute.Value, len(s.Attributes()))
+	for _, kv := range s.Attributes() {
+		m[string(kv.Key)] = kv.Value
+	}
+	return m
+}
+
+// TestBuildQueryPlanFromProgram_AttachesQualificationOutcome (issue #493 Task 4a) drives the
+// REAL buildQueryPlanFromProgram entry point (via buildQueryPlan/buildMetricsQueryPlan, R7) for
+// each of its 4 qualification outcomes, asserting plan.qualification_outcome on whatever span was
+// already active on ctx via trace.ContextWithSpan -- exactly the "attach to the EXISTING span"
+// contract sub-task 4a specifies (search_sharder.go/metrics_query_range_sharder.go already do
+// this same thing with their own real frontend.ShardSearch/frontend.QueryRangeSharder.* spans;
+// this test uses a plain span standing in for either, since the attribute's presence and value
+// don't depend on which caller's span it is).
+func TestBuildQueryPlanFromProgram_AttachesQualificationOutcome(t *testing.T) {
+	rec := recordedSpansFrontend(t)
+
+	runWithSpan := func(t *testing.T, fn func(ctx context.Context)) sdktrace.ReadOnlySpan {
+		t.Helper()
+		// Reset before each subtest -- frontendSpanByName returns the FIRST span matching a
+		// name, and every subtest below reuses "test.caller", so a stale recording from an
+		// earlier subtest would otherwise be picked up instead of this run's own span.
+		rec.Reset()
+		ctx, span := tracer.Start(context.Background(), "test.caller")
+		fn(ctx)
+		span.End()
+		s, ok := frontendSpanByName(rec.Ended(), "test.caller")
+		require.True(t, ok)
+		return s
+	}
+
+	t.Run("not_indexable", func(t *testing.T) {
+		// No value-index reader configured for this subtest -- CheckIndexCoverage declines.
+		rawR, rawW := newLocalRawReadWriter(t)
+		writeVCNTObject(t, rawW, "span.http.method", vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 9}))
+
+		span := runWithSpan(t, func(ctx context.Context) {
+			plan, err := buildQueryPlan(ctx, rawR, "tenant-a", testIndexPrefix, `{ span.http.method = "GET" }`, 0, 200, 1000, false)
+			require.NoError(t, err)
+			require.Nil(t, plan)
+		})
+		got, ok := frontendAttrs(span)["plan.qualification_outcome"]
+		require.True(t, ok)
+		require.Equal(t, "not_indexable", got.AsString())
+	})
+
+	t.Run("low_selectivity_no_limit_search", func(t *testing.T) {
+		restore := vblockpack.ConfigureValueIndexQueryForTest(emptyVIStore{}, testIndexPrefix)
+		defer restore()
+		rawR, rawW := newLocalRawReadWriter(t)
+		writeVCNTObject(t, rawW, "span.http.method", vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 900, "POST": 100}))
+
+		span := runWithSpan(t, func(ctx context.Context) {
+			plan, err := buildQueryPlan(ctx, rawR, "tenant-a", testIndexPrefix, `{ span.http.method = "GET" }`, 0, 200, 1000, false)
+			require.Error(t, err)
+			require.Nil(t, plan)
+		})
+		got, ok := frontendAttrs(span)["plan.qualification_outcome"]
+		require.True(t, ok)
+		require.Equal(t, "low_selectivity_no_limit_search", got.AsString())
+	})
+
+	t.Run("low_selectivity_metrics_no_partial_aggregate", func(t *testing.T) {
+		restore := vblockpack.ConfigureValueIndexQueryForTest(emptyVIStore{}, testIndexPrefix)
+		defer restore()
+		rawR, rawW := newLocalRawReadWriter(t)
+		writeVCNTObject(t, rawW, "span.http.method", vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 900, "POST": 100}))
+
+		span := runWithSpan(t, func(ctx context.Context) {
+			plan, err := buildMetricsQueryPlan(ctx, rawR, "tenant-a", testIndexPrefix, `{ span.http.method = "GET" } | rate()`, 0, 200, 1000)
+			require.Error(t, err)
+			require.Nil(t, plan)
+		})
+		got, ok := frontendAttrs(span)["plan.qualification_outcome"]
+		require.True(t, ok)
+		require.Equal(t, "low_selectivity_metrics_no_partial_aggregate", got.AsString())
+	})
+
+	t.Run("qualified", func(t *testing.T) {
+		restore := vblockpack.ConfigureValueIndexQueryForTest(emptyVIStore{}, testIndexPrefix)
+		defer restore()
+		rawR, rawW := newLocalRawReadWriter(t)
+		// "POST" is the minority value (100/1000) -- Selective, always falls through to a real
+		// qualified plan regardless of hasLimit.
+		writeVCNTObject(t, rawW, "span.http.method", vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 900, "POST": 100}))
+
+		var capturedPlan *blockpack.QueryPlan
+		span := runWithSpan(t, func(ctx context.Context) {
+			plan, err := buildQueryPlan(ctx, rawR, "tenant-a", testIndexPrefix, `{ span.http.method = "POST" }`, 0, 200, 1000, false)
+			require.NoError(t, err)
+			require.NotNil(t, plan)
+			capturedPlan = plan
+		})
+		attrs := frontendAttrs(span)
+		got, ok := attrs["plan.qualification_outcome"]
+		require.True(t, ok)
+		require.Equal(t, "qualified", got.AsString())
+		// This fixture's Selective, no-limit query resolves to DispatchTimeSliced -- pin the
+		// actual string value (not just presence) against dispatchStrategyString's real output
+		// for the plan this exact call returned, so a future change to the strategy-to-string
+		// mapping (or to what strategy this fixture qualifies for) is caught.
+		strategyAttr, ok := attrs["plan.strategy"]
+		require.True(t, ok, "plan.strategy must be attached on the qualified/success path")
+		require.Equal(t, blockpack.DispatchTimeSliced, capturedPlan.Strategy,
+			"test fixture assumption: a Selective, no-limit query qualifies for DispatchTimeSliced")
+		require.Equal(t, dispatchStrategyString(capturedPlan.Strategy), strategyAttr.AsString())
+		require.Equal(t, "time_sliced", strategyAttr.AsString())
+		_, ok = attrs["plan.slice_count"]
+		require.True(t, ok, "plan.slice_count must be attached on the qualified/success path")
+		_, ok = attrs["plan.slices_est_known_fraction"]
+		require.True(t, ok, "plan.slices_est_known_fraction must be attached on the qualified/success path")
+	})
+}
+
+// TestBuildQueryPlanFromProgram_AttachesLeadDetail (issue #493 Task 4b) proves the lead leaf's
+// both-sides cost detail is attached to the span exactly when known, driving the REAL
+// buildQueryPlan entry point (R7) against real VCNT bytes -- never a hand-built LeadDetail.
+func TestBuildQueryPlanFromProgram_AttachesLeadDetail(t *testing.T) {
+	rec := recordedSpansFrontend(t)
+	restore := vblockpack.ConfigureValueIndexQueryForTest(emptyVIStore{}, testIndexPrefix)
+	defer restore()
+
+	rawR, rawW := newLocalRawReadWriter(t)
+	// "GET" is 900 of the column's 1000 live spans over [0,200).
+	writeVCNTObject(t, rawW, "span.http.method", vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 900, "POST": 100}))
+
+	ctx, span := tracer.Start(context.Background(), "test.caller")
+	plan, err := buildQueryPlan(ctx, rawR, "tenant-a", testIndexPrefix, `{ span.http.method = "GET" }`, 0, 200, 1000, true)
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+	span.End()
+
+	s, ok := frontendSpanByName(rec.Ended(), "test.caller")
+	require.True(t, ok)
+	attrs := frontendAttrs(s)
+
+	col, ok := attrs["plan.lead_column"]
+	require.True(t, ok)
+	require.Equal(t, "span.http.method", col.AsString())
+	cost, ok := attrs["plan.lead_index_cost"]
+	require.True(t, ok)
+	require.Equal(t, int64(900), cost.AsInt64())
+	total, ok := attrs["plan.lead_column_total"]
+	require.True(t, ok)
+	require.Equal(t, int64(1000), total.AsInt64())
+}
+
+// TestFetchVCNTFetch_EmitsChildSpanWithFileStats (issue #493 Task 4c) drives the REAL
+// buildQueryPlanFromProgram entry point (via buildQueryPlan, R7) and asserts the
+// "frontend.vcntFetch" child span carries files.count/bytes.read matching the real objects
+// written -- the only genuinely new span in this whole plan.
+func TestFetchVCNTFetch_EmitsChildSpanWithFileStats(t *testing.T) {
+	rec := recordedSpansFrontend(t)
+	restore := vblockpack.ConfigureValueIndexQueryForTest(emptyVIStore{}, testIndexPrefix)
+	defer restore()
+
+	rawR, rawW := newLocalRawReadWriter(t)
+	// "POST" is the minority value (Selective) across both objects combined -- avoids the
+	// LowSelectivity plan-time decline path so this test can assert on a real, qualified plan.
+	writeVCNTObject(t, rawW, "span.http.method",
+		vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 5, "POST": 3}))
+	writeVCNTObject(t, rawW, "span.http.method",
+		vcntObj(t, "span.http.method", 120, map[string]int64{"GET": 2}))
+
+	plan, err := buildQueryPlan(context.Background(), rawR, "tenant-a", testIndexPrefix, `{ span.http.method = "POST" }`, 0, 200, 1000, false)
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+
+	s, ok := frontendSpanByName(rec.Ended(), "frontend.vcntFetch")
+	require.True(t, ok, "expected a frontend.vcntFetch child span")
+	attrs := frontendAttrs(s)
+	filesCount, ok := attrs["files.count"]
+	require.True(t, ok)
+	require.EqualValues(t, 2, filesCount.AsInt64())
+	bytesRead, ok := attrs["bytes.read"]
+	require.True(t, ok)
+	require.Positive(t, bytesRead.AsInt64())
 }

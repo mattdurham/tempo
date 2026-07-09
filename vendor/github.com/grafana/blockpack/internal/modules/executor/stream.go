@@ -260,6 +260,9 @@ func Collect(
 			attribute.Int("blockpack.query.limit", opts.Limit),
 			attribute.Int("blockpack.query.shard_start", opts.StartBlock),
 			attribute.Int("blockpack.query.shard_count", opts.BlockCount),
+			// NOTE-479 (R3): distinguishes this engine from the structural paths' own
+			// blockpack.query spans without needing a separate span name.
+			attribute.String("blockpack.query.engine", "scan"),
 		)
 	}
 
@@ -275,10 +278,14 @@ func Collect(
 	var qs QueryStats
 
 	// --- Plan step ---
+	// SPEC-OBS-002, NOTE-478 (issue #493, Task 1): EnableExplain is gated on
+	// querySpan.IsRecording(), checked once here (not polled per block/node), so
+	// plan.Explain is only ever built when the span will actually record it.
 	planStart := time.Now()
 	plan := planBlocks(r, program, opts.TimeRange, queryplanner.PlanOptions{
-		Direction: opts.Direction,
-		Limit:     opts.Limit,
+		Direction:     opts.Direction,
+		Limit:         opts.Limit,
+		EnableExplain: querySpan.IsRecording(),
 	})
 
 	// Sub-file sharding: if the caller specified a block range, filter the planner's

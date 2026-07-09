@@ -329,3 +329,48 @@ Back-ref: `internal/modules/queryplan/queryplan.go:SelectSearchStrategy,Dispatch
 Tests: `queryplan_test.go` (`TestSelectSearchStrategy_FiveRowCore`,
 `TestSelectSearchStrategy_NeverReturnsTimeSlicedOrFakeDeclineStrategy` — see `queryplan/TESTS.md`
 `TEST-QP-1`/`TEST-QP-2`). See `NOTES.md` NOTE-QP-010. Issue #481.
+
+---
+
+## SPEC-QP-7: `LeadDetail` / `ClassifyProgramVCNTWithDetail` — Both-Sides'-Costs Contract
+
+*Added: 2026-07-09 (issue #493, Task 4b, team-lead ruling R4)*
+
+`LeadDetail` (`vcnt_cost.go`) carries the "both sides' costs" a selectivity classification
+computes internally and discards: the lead leaf's own estimated matching count (`IndexCost`,
+the index/VI/VCNT side numerator) and its column's total live population over the window
+(`ColumnTotal`, the full-scan side denominator).
+
+**Fields:** `LeadColumn string`, `IndexCost int64`, `ColumnTotal int64`, `HasLead bool`,
+`IndexCostKnown bool`, `ColumnTotalKnown bool`.
+
+**Known-flag semantics:** `HasLead` is `false` when the plan had no lead leaf at all
+(`UnknownSelectivity`, no signal) — every other field is then zero-value. `IndexCostKnown`/
+`ColumnTotalKnown` are independently `false` whenever their respective oracle had no coverage
+for the lead leaf, mirroring `LeafCost`'s own Known/Unknown split (`NOTE-QP-001`).
+`IndexCostKnown` is always equal to `HasLead` in practice (`leadLeaf` only ever returns a
+Known-cost leaf) — kept as a distinct field for the same defensive symmetry `LeafCost` itself
+uses.
+
+**Parity guarantee:** `ClassifyWithThreshold(g, total, fraction)` is implemented as
+`sel, _ := classifyDetailed(g, total, fraction); return sel` — `classifyDetailed` IS
+`ClassifyWithThreshold`'s implementation, not a parallel reimplementation, so the two can never
+diverge. Mirrors `SPEC-QP-1`'s `Group.Lead()`/`leadLeaf` wrapper-can-never-diverge pattern.
+
+`ClassifyProgramVCNTWithDetail(prog, data, dir, minTS, maxTS) (Selectivity, LeadDetail)`
+composes `VCNTCostFunc` → `Plan` → `VCNTColumnTotalFunc` → `classifyDetailed`, same default
+threshold as `ClassifyProgramVCNT`, zero additional object-storage I/O (same decoded VCNT bytes
+the caller already has in hand).
+
+**Root re-export:** `blockpack.LeadDetail` (type alias), `blockpack.ClassifyProgramVCNTWithDetail`
+(thin wrapper), `timeslice.go` — same pattern as `ClassifyProgramVCNT`'s own root re-export.
+
+**Deadcode anchoring:** `cmd/deadcode/main.go` anchors both symbols permanently (tempo's
+frontend, a separate repo, is the only real caller — blockpack's own deadcode analysis has no
+cross-repo visibility, same situation as `ClassifyProgramVCNT`/`SelectSearchStrategy`'s existing
+anchors).
+
+Back-ref: `internal/modules/queryplan/vcnt_cost.go:LeadDetail,ClassifyProgramVCNTWithDetail`;
+`internal/modules/queryplan/selectivity.go:leadDetail,classifyDetailed`;
+`timeslice.go:LeadDetail,ClassifyProgramVCNTWithDetail`; `cmd/deadcode/main.go` (anchor). See
+`NOTES.md` `NOTE-QP-011`. Issue #493.

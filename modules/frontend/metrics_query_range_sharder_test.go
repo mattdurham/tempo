@@ -405,6 +405,159 @@ func TestMetricsQueryRangeSharder_BlockShardedDispatch_UnchangedWhenStrategyIsBl
 	require.Equal(t, nilJobs, blockShardedJobs)
 }
 
+// TestMetricsQueryRangeSharder_TimeSlicedDispatch_AttachesDispatchSpanInfo (go-presubmit/holistic
+// MEDIUM finding, issue #493) drives the REAL queryRangeSharder.backendRequests entry point (R7)
+// down its DispatchTimeSliced branch with a tracer installed -- this call site
+// (metrics_query_range_sharder.go:317) had zero tracer-based test coverage before this: existing
+// tests asserted only on dispatched job shape, never on a dispatch.* span attribute. Reuses
+// TestMetricsQueryRangeSharder_TimeSlicedDispatch_SkipsNonOverlappingBlockSlicePairs' own
+// disjoint-pairs fixture shape (2 blocks x 2 slices, only 2 of the 4 candidate pairs genuinely
+// overlap) so dispatch.jobs_skipped_overlap has a real, non-zero, hand-verifiable value to pin --
+// this sharder's own overlap predicate (a per-slice traceql.TrimToBlockOverlap closure) is
+// independently written from search_sharder.go's blockOverlapsSlice, so nothing before this
+// regression-tested that ITS formula/arithmetic holds at this specific call site either.
+func TestMetricsQueryRangeSharder_TimeSlicedDispatch_AttachesDispatchSpanInfo(t *testing.T) {
+	rec := recordedSpansFrontend(t)
+
+	blockA := backend.NewBlockMeta("test", uuid.New(), "wdwad")
+	blockA.StartTime = time.Unix(100, 0)
+	blockA.EndTime = time.Unix(150, 0)
+	blockA.Size_ = defaultTargetBytesPerRequest
+	blockA.TotalRecords = 1
+	blockA.ReplicationFactor = backend.MetricsGeneratorReplicationFactor
+
+	blockB := backend.NewBlockMeta("test", uuid.New(), "wdwad")
+	blockB.StartTime = time.Unix(500, 0)
+	blockB.EndTime = time.Unix(600, 0)
+	blockB.Size_ = defaultTargetBytesPerRequest
+	blockB.TotalRecords = 1
+	blockB.ReplicationFactor = backend.MetricsGeneratorReplicationFactor
+
+	s := &queryRangeSharder{
+		logger: log.NewNopLogger(),
+		cfg:    QueryRangeSharderConfig{StreamingShards: defaultMostRecentShards},
+		reader: &mockReader{metas: []*backend.BlockMeta{blockA, blockB}},
+	}
+
+	searchReq := tempopb.QueryRangeRequest{
+		Query: "{} | count_over_time()",
+		Start: uint64(100 * time.Second),
+		End:   uint64(600 * time.Second),
+		Step:  uint64(10 * time.Second),
+	}
+
+	// slice1 overlaps ONLY blockA; slice2 overlaps ONLY blockB -- 2 of the 4 (block, slice)
+	// candidate pairs are genuinely disjoint and must be skipped.
+	plan := &blockpack.QueryPlan{
+		Strategy: blockpack.DispatchTimeSliced,
+		Slices: []blockpack.TimeSlice{
+			{Start: 500, End: 600}, // slice2
+			{Start: 100, End: 150}, // slice1
+		},
+	}
+
+	reqCh := make(chan pipeline.Request)
+	ctx, span := tracer.Start(context.Background(), "test.caller")
+	pipelineRequest := pipeline.NewHTTPRequest(httptest.NewRequest("GET", "/", nil))
+	jobMetadata := &combiner.QueryRangeJobResponse{}
+	cutoff := time.Unix(1000, 0)
+
+	go s.backendRequests(ctx, "test", pipelineRequest, searchReq, cutoff, defaultTargetBytesPerRequest, plan, reqCh, jobMetadata)
+
+	jobCount := 0
+	for range reqCh {
+		jobCount++
+	}
+	span.End()
+
+	require.Equal(t, 2, jobCount)
+	require.Equal(t, 2, jobMetadata.TotalJobs)
+
+	got, ok := frontendSpanByName(rec.Ended(), "test.caller")
+	require.True(t, ok)
+	attrs := frontendAttrs(got)
+
+	jobsTotal, ok := attrs["dispatch.jobs_total"]
+	require.True(t, ok)
+	assert.EqualValues(t, 2, jobsTotal.AsInt64())
+
+	jobsSkipped, ok := attrs["dispatch.jobs_skipped_overlap"]
+	require.True(t, ok, "the metrics time-sliced path DOES have an overlap-filter concept -- dispatch.jobs_skipped_overlap must be present")
+	assert.EqualValues(t, 2, jobsSkipped.AsInt64(), "2 blocks x 2 slices = 4 candidates, 2 dispatched, 2 disjoint pairs skipped")
+
+	require.LessOrEqual(t, len(got.Events()), maxAdvancementSpanEvents)
+}
+
+// TestMetricsQueryRangeSharder_BlockShardedDispatch_AttachesDispatchSpanInfoWithEventCap
+// (go-presubmit/holistic MEDIUM finding, issue #493) drives the REAL
+// queryRangeSharder.backendRequests entry point (R7) down its backendJobsFunc FALLBACK branch
+// (metrics_query_range_sharder.go:347, nil plan) with a tracer installed AND a >20-shard fixture,
+// per the review's own explicit request ("including a >20-shard fixture to pin the event cap on
+// that sharder too" -- previously only pinned for the search sharder). Asserts dispatch.jobs_total
+// reflects the true job count, dispatch.jobs_skipped_overlap is absent (backendJobsFunc has no
+// overlap-filter concept -- see attachDispatchSpanInfoNoOverlapFilter's own doc comment), and the
+// 20-event cap holds even at this scale.
+func TestMetricsQueryRangeSharder_BlockShardedDispatch_AttachesDispatchSpanInfoWithEventCap(t *testing.T) {
+	rec := recordedSpansFrontend(t)
+
+	const n = 25
+	blocks := make([]*backend.BlockMeta, n)
+	for i := range n {
+		bm := backend.NewBlockMeta("test", uuid.New(), "wdwad")
+		bm.StartTime = time.Unix(int64(100+i*10), 0)
+		bm.EndTime = time.Unix(int64(105+i*10), 0)
+		bm.Size_ = 1024
+		bm.TotalRecords = 1
+		bm.ReplicationFactor = backend.MetricsGeneratorReplicationFactor
+		blocks[i] = bm
+	}
+
+	s := &queryRangeSharder{
+		logger: log.NewNopLogger(),
+		cfg:    QueryRangeSharderConfig{StreamingShards: n},
+		reader: &mockReader{metas: blocks},
+	}
+
+	searchReq := tempopb.QueryRangeRequest{
+		Query: "{} | count_over_time()",
+		Start: uint64(100 * time.Second),
+		End:   uint64(100000 * time.Second),
+		Step:  uint64(10 * time.Second),
+	}
+
+	reqCh := make(chan pipeline.Request)
+	ctx, span := tracer.Start(context.Background(), "test.caller")
+	pipelineRequest := pipeline.NewHTTPRequest(httptest.NewRequest("GET", "/", nil))
+	jobMetadata := &combiner.QueryRangeJobResponse{}
+	cutoff := time.Unix(1000000, 0) // well after every block so nothing is trimmed away
+
+	go s.backendRequests(ctx, "test", pipelineRequest, searchReq, cutoff, defaultTargetBytesPerRequest, nil, reqCh, jobMetadata)
+
+	jobCount := 0
+	for range reqCh {
+		jobCount++
+	}
+	span.End()
+
+	require.Equal(t, n, jobCount, "one job per block (each block is smaller than TargetBytesPerRequest)")
+	require.Equal(t, n, jobMetadata.TotalJobs)
+
+	got, ok := frontendSpanByName(rec.Ended(), "test.caller")
+	require.True(t, ok)
+
+	require.LessOrEqual(t, len(got.Events()), maxAdvancementSpanEvents,
+		"the backendJobsFunc fallback must respect the same 20-event cap at this scale")
+
+	attrs := frontendAttrs(got)
+	jobsTotal, ok := attrs["dispatch.jobs_total"]
+	require.True(t, ok)
+	assert.EqualValues(t, n, jobsTotal.AsInt64())
+
+	_, hasSkippedOverlap := attrs["dispatch.jobs_skipped_overlap"]
+	assert.False(t, hasSkippedOverlap,
+		"dispatch.jobs_skipped_overlap has no meaning for the backendJobsFunc dispatch model and must not be emitted")
+}
+
 func TestExemplarsForBlock(t *testing.T) {
 	s := &queryRangeSharder{}
 

@@ -7731,3 +7731,101 @@ actual bytes/blocks read, never the configured cap) I/O-cost tradeoff, never a c
 
 Back-refs: `internal/modules/executor/stream.go` (`SPEC-STREAM-13`'s formal contract),
 `internal/modules/executor/recentfirst.go:RecentFirstBudget`. Issue #481.
+
+## NOTE-479: StructuralFunnelStats design decisions — nil-means-skip, TraceGroupPartial as bool, VerifiedSurvivors' divergent semantics (issue #493, Task 6)
+
+*Added: 2026-07-09*
+
+**Nil-means-skip.** `stats *StructuralFunnelStats` is only allocated when
+`querySpan.IsRecording()`; every increment site in both `ExecuteStructuralFromIndex` and
+`ExecuteNegatedStructuralFromIndex` is `if stats != nil` guarded, so an unsampled query pays
+zero extra counting/allocation cost. Mirrors `PlannerSpanStats`' existing precedent
+(`otel_spans.go`, SPEC-OBS-005's own history of trimming dead fields) and the project's
+EnableExplain-regression lesson about never making observability unconditional in a
+performance-critical hot path.
+
+**`TraceGroupPartial` is a bool, not a counter.** The candidate loop in both engines returns an
+error and unwinds ENTIRELY the first time a candidate's assembled `TraceGroup` is `Partial`, so
+no later candidate is ever evaluated in that call — a running count could never exceed 1 in
+practice, so a bool is the honest type rather than an int that would misleadingly imply
+multiple occurrences are possible.
+
+**`VerifiedSurvivors` means different things between the two engines, by construction, not
+oversight.** For the positive engine (`ExecuteStructuralFromIndex`), D3B's
+`verifyCandidateSpans` runs AFTER the tree walk, narrowing walk survivors down to the final
+confirmed set — `VerifiedSurvivors` is that post-walk count. For the negated engine
+(`ExecuteNegatedStructuralFromIndex`), D3B confirmation runs UNCONDITIONALLY on the WHOLE
+resolved tree BEFORE the walk (ruling 3 — the negated/left side has no VI fast-path, so it must
+be confirmed against every span up front) — `VerifiedSurvivors` there reports how many spans
+confirmed the left/negated filter, not "survivors after the walk." Do not compare the two
+engines' `VerifiedSurvivors` values as if they measure the same funnel stage.
+
+**Separate struct from `StructuralResult`, not new fields on it.** `StructuralResult` is
+`SPEC-STRUCT-13`/`14`-tagged for the `RecentFirstBudget` concern; growing it for tracing would
+muddy that orthogonal contract. Mirrors `PlannerSpanStats`' own precedent of a sibling stats
+struct rather than result-type growth.
+
+**`blockpack.query.engine` retrofit.** The attribute is populated on all three query engines
+(`"scan"`, `"structural_scan"`, `"structural_index"`), not just the new `structural_index` one
+— set unconditionally right after span-start in each engine's entry point, so it survives every
+return path including early error declines.
+
+Back-ref: `internal/modules/executor/structural_funnel_stats.go:StructuralFunnelStats,
+attachStructuralFunnelStats`, `structural_index.go:ExecuteStructuralFromIndex,
+evalOneStructuralCandidateTrace`, `structural_index_negated.go:
+ExecuteNegatedStructuralFromIndex,evalOneNegatedStructuralCandidateTrace`,
+`stream.go:Collect`, `stream_structural.go:ExecuteStructural`. See SPEC-OBS-006 for the formal
+contract. Issue #493.
+
+## NOTE-478: EnableExplain must be gated on span recording, never unconditional (issue #493, Task 1)
+
+*Added: 2026-07-09*
+
+`queryplanner.PlanOptions.EnableExplain` was never set at either `planBlocks` call site
+(`stream.go:Collect`, `stream_structural.go:collectAllStructuralSpans`), so `plan.Explain` was
+always `""` regardless of span recording state, even though `SPEC-OBS-002` already establishes
+the `blockpack.planner` span's explain attribute. Fixed by gating `EnableExplain` on
+`querySpan.IsRecording()`, checked once per `Collect`/`ExecuteStructural` call and threaded
+down as an explicit `explainEnabled bool` parameter — never re-derived from context, never
+polled per structural node.
+
+**Why gated, not unconditional.** This mirrors the project's own EnableExplain-regression
+lesson: unconditional debug/explain string building (`strings.Builder`+`fmt.Sprintf`+slice
+appends) previously dominated an unrelated package's allocs/op (63% of queryplanner
+allocs/op) when run on every call regardless of sampling. Gating on `IsRecording()` keeps the
+explain-string cost paid only when a span will actually consume it.
+
+**Why checked once and threaded explicitly, not re-derived from context or polled.** Matches
+this package's existing style of threading booleans explicitly (e.g. `gated bool` in the same
+function family) rather than re-deriving span state from `ctx` repeatedly, and avoids redundant
+`IsRecording()` calls inside a hot per-node loop.
+
+Back-ref: `internal/modules/executor/stream.go:Collect`,
+`internal/modules/executor/stream_structural.go:collectAllStructuralSpans,ExecuteStructural`.
+See SPEC-OBS-002. Tests: `explain_gating_test.go`
+(`TestCollect_PlannerSpanExplainGatedByRecording`,
+`TestExecuteStructural_PlannerSpanExplainGatedByRecording`). Issue #493.
+
+## NOTE-480: Connecting #481-era budget/incompleteness hooks to the blockpack.query span (issue #493, Task 3)
+
+*Added: 2026-07-09*
+
+#493 connects the #481-era tracing-ready hooks (`BudgetStopped`/`BlocksRead`/
+`IncompleteTraceCount`) to the `blockpack.query` span; the fields themselves are unchanged,
+only their visibility is new. All three are already-computed scalars in local scope
+(`result`), zero extra allocation to attach.
+
+**Two test-correctness details found and fixed while landing this** (not just test hygiene —
+both reflect real, pre-existing behavior that a naive test would get wrong):
+
+- `ExecuteStructural` also emits one `blockpack.planner` span per structural node (pre-existing
+  NOTE-456 behavior) alongside the `blockpack.query` span — a test asserting exactly one
+  exported span for a multi-node structural query is wrong; it must filter by span name.
+- `BlocksRead` is NOT zero-value on the unbounded (no `RecentFirstBudget`) path —
+  `collectAllStructuralSpans`' unbounded branch sets it to `len(rawBlocks)`, a real non-zero
+  count. Only `BudgetStopped`/`IncompleteTraceCount` are genuinely zero-value there.
+
+Back-ref: `internal/modules/executor/stream_structural.go:ExecuteStructural`. See
+SPEC-STRUCT-13, SPEC-STRUCT-14. Tests: `stream_structural_budget_test.go`
+(`TestExecuteStructural_EmitsBudgetStatsOnQuerySpan`,
+`TestExecuteStructural_UnboundedPath_BudgetAttributesAreZeroValue`). Issue #493.

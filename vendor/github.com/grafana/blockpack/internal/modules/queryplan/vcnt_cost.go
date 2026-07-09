@@ -117,6 +117,62 @@ func ClassifyProgramVCNTWithThreshold(
 	return ClassifyWithThreshold(g, total, fraction)
 }
 
+// LeadDetail (SPEC-QP-7, NOTE-QP-011) carries the "both sides' costs" a selectivity
+// classification computes internally and then discards: the lead leaf's own estimated matching
+// count (the index side, the numerator) and its column's total live population over the window
+// (the full-scan side, the denominator) — issue #493 Task 4b, R4 (PRE-AUTHORIZED new blockpack
+// public API). Exposing this lets an external caller (tempo's frontend) report WHY a query
+// qualified or declined, not just the 3-state Selectivity verdict.
+//
+// HasLead is false when the plan had no lead leaf at all (UnknownSelectivity, no signal) —
+// every other field is then zero-value and must not be read. IndexCostKnown/ColumnTotalKnown are
+// independently false whenever their respective oracle had no coverage for the lead leaf,
+// mirroring LeafCost's own Known/Unknown split (NOTE-QP-001) — check the paired *Known flag
+// before trusting IndexCost/ColumnTotal, exactly like LeafCost.Known. IndexCostKnown is always
+// equal to HasLead in practice (leadLeaf, selectivity.go, only ever returns a leaf whose own cost
+// is Known) — it is still a distinct field, for the same defensive symmetry LeafCost itself uses,
+// rather than callers inferring it from HasLead.
+type LeadDetail struct {
+	// LeadColumn is the lead leaf's column name. Empty when HasLead is false.
+	LeadColumn string
+	// IndexCost is the lead leaf's estimated matching-span count (the VI/VCNT index side).
+	// Meaningful only when IndexCostKnown.
+	IndexCost int64
+	// ColumnTotal is the lead leaf's column's total live-span population over the window (the
+	// full-scan side). Meaningful only when ColumnTotalKnown.
+	ColumnTotal      int64
+	HasLead          bool
+	IndexCostKnown   bool
+	ColumnTotalKnown bool
+}
+
+// ClassifyProgramVCNTWithDetail is ClassifyProgramVCNT plus the LeadDetail its classification
+// already computes internally — same composition (cost oracle -> Plan -> column-total oracle ->
+// classify), same default threshold, zero additional object-storage I/O. See LeadDetail's own
+// doc comment for the field contract.
+func ClassifyProgramVCNTWithDetail(
+	prog *vm.Program,
+	data []byte,
+	dir []valuecounts.ChunkDirEntry,
+	minTS, maxTS uint64,
+) (Selectivity, LeadDetail) {
+	cost := VCNTCostFunc(data, dir, minTS, maxTS)
+	g, ok := Plan(prog, cost)
+	if !ok {
+		return UnknownSelectivity, LeadDetail{}
+	}
+	total := VCNTColumnTotalFunc(data, dir, minTS, maxTS)
+	sel, d := classifyDetailed(g, total, DefaultLowSelectivityFraction)
+	return sel, LeadDetail{
+		LeadColumn:       d.leadColumn,
+		IndexCost:        d.leafCount,
+		ColumnTotal:      d.colTotal,
+		HasLead:          d.hasLead,
+		IndexCostKnown:   d.hasLead,
+		ColumnTotalKnown: d.colTotalKnown,
+	}
+}
+
 // leafEqualityValue extracts a single-value equality (`column = value`) from a leaf
 // as a (columnType, concrete value) pair the VCNT oracle can canonically encode.
 // Returns ok=false for any non-equality or multi-value leaf — those carry no

@@ -141,18 +141,30 @@ func ExecuteStructuralFromIndex(
 		// Negated operators are D6's responsibility, not this function's.
 		return nil, false, nil
 	}
+	// NOTE-479: blockpack.query span for the structural index-driven engine (R3, issue #493) --
+	// reuses the existing "one query, one top-level span" name/convention rather than inventing a
+	// new one; blockpack.query.engine distinguishes this engine from the plain-scan/full-scan-
+	// structural paths. Opened here, not above the chain-shape/operator-type declines just above
+	// this point, since those mean "wrong engine for this query" (the caller picked the wrong
+	// function, not a coverage-driven decline of a genuine attempt) -- no span is emitted for
+	// those. Every decline from here on is a real attempt by this engine, so it gets one.
+	ctx, querySpan, stats := startStructuralIndexQuerySpan(ctx)
+	defer querySpan.End()
+
 	if leftSource == nil {
 		// SPEC-ROOT-001: leftSource is the walk anchor and REQUIRED -- guarded here at the point
 		// of use (not only by the root wrapper, structural.go's QueryStructuralFromIndex), since
 		// viMatchSpans calls a nil-interface method unconditionally on a match-all left leg
 		// (NOTE-VI-087) with no nil-check of its own. Mirrors the root wrapper's own "no index
 		// coverage supplied" decline convention.
+		attachStructuralFunnelStats(querySpan, stats)
 		return nil, false, nil
 	}
 
 	// Walk anchor: L is ALWAYS resolved exactly via VI (see package doc comment above).
 	leftResults, leftOK := viMatchSpans(leftSource, leftProg)
 	if !leftOK {
+		attachStructuralFunnelStats(querySpan, stats)
 		if indexOnly {
 			return nil, false, ErrStructuralIndexCoverageGap
 		}
@@ -162,7 +174,14 @@ func ExecuteStructuralFromIndex(
 
 	candidateTraceIDs := chooseCandidateTraceIDs(rightSource, rightProg, isSelective, leftProg, leftSpansByTrace)
 
+	if stats != nil {
+		stats.LeadMatches = len(leftResults)
+		stats.LeadTraces = len(leftSpansByTrace)
+		stats.CandidateTraces = len(candidateTraceIDs)
+	}
+
 	if len(candidateTraceIDs) == 0 {
+		attachStructuralFunnelStats(querySpan, stats)
 		return &StructuralResult{}, true, nil
 	}
 
@@ -186,7 +205,7 @@ func ExecuteStructuralFromIndex(
 		}
 		done, err := evalOneStructuralCandidateTrace(
 			ctx, traceID, keys, traceGroupStore, readerFor, minTS, maxTS,
-			leftSpansByTrace[traceID], op, rightProg, opts, result,
+			leftSpansByTrace[traceID], op, rightProg, opts, result, stats,
 		)
 		if err != nil {
 			return nil, false, err
@@ -195,6 +214,7 @@ func ExecuteStructuralFromIndex(
 			break
 		}
 	}
+	attachStructuralFunnelStats(querySpan, stats)
 	return result, true, nil
 }
 
@@ -215,6 +235,7 @@ func evalOneStructuralCandidateTrace(
 	rightProg *vm.Program,
 	opts Options,
 	result *StructuralResult,
+	stats *StructuralFunnelStats,
 ) (bool, error) {
 	group, found, findErr := FindTraceGroupInCandidates(ctx, traceGroupStore, keys, traceID, minTS, maxTS)
 	if findErr != nil {
@@ -224,7 +245,13 @@ func evalOneStructuralCandidateTrace(
 		// Legitimate VI/TraceGroup skew at the trace level (the search VI named a trace the
 		// trace-by-id index doesn't cover for this window) — not an error, mirrors
 		// GetTraceByID's own miss semantics.
+		if stats != nil {
+			stats.TraceGroupMisses++
+		}
 		return false, nil
+	}
+	if stats != nil {
+		stats.TraceGroupHits++
 	}
 
 	assembled := valueindex.AssembleTrace(group)
@@ -234,6 +261,12 @@ func evalOneStructuralCandidateTrace(
 		// (MEDIUM finding, go-presubmit.md) so an operator debugging a production coverage-gap
 		// error can identify which trace triggered it -- %w preserves errors.Is compatibility
 		// (DT2's contract), the sentinel identity is unchanged.
+		// NOTE-479: can only ever fire on the FIRST partial candidate in a given call -- this
+		// error unwinds the whole candidate loop (ExecuteStructuralFromIndex returns immediately),
+		// so TraceGroupPartial is a bool, never a running count (see StructuralFunnelStats' doc).
+		if stats != nil {
+			stats.TraceGroupPartial = true
+		}
 		return false, fmt.Errorf("trace %x: %w", traceID, ErrStructuralIndexCoverageGap)
 	}
 
@@ -256,6 +289,9 @@ func evalOneStructuralCandidateTrace(
 	if len(candidateIdx) == 0 {
 		return false, nil
 	}
+	if stats != nil {
+		stats.TreeWalkSurvivors += len(candidateIdx)
+	}
 	candidates := make([]ResolvedSpan, 0, len(candidateIdx))
 	for _, idx := range candidateIdx {
 		candidates = append(candidates, resolvedSpans[idx])
@@ -264,6 +300,9 @@ func evalOneStructuralCandidateTrace(
 	confirmed, verifyErr := verifyCandidateSpans(ctx, rightProg, candidates)
 	if verifyErr != nil {
 		return false, fmt.Errorf("ExecuteStructuralFromIndex: %w", verifyErr)
+	}
+	if stats != nil {
+		stats.VerifiedSurvivors += len(confirmed)
 	}
 
 	blockByKey, blockErr := materializeConfirmedSpanBlocks(confirmed)

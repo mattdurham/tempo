@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"sync"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/atomic"
 
 	"github.com/grafana/tempo/modules/frontend/combiner"
@@ -90,6 +92,19 @@ func consumeAndCombineResponses(ctx context.Context, consumers int, resps Respon
 		}()
 	}
 
+	// issue #493 Task 5, R2's ShouldQuit design question: the sharder's own frontend.ShardSearch/
+	// frontend.QueryRangeSharder.* span has ALREADY ENDED by the time ShouldQuit is ever checked
+	// below (RoundTrip returns and defers span.End() right after dispatching jobs; this function
+	// only starts consuming responses -- and therefore only starts checking ShouldQuit -- once
+	// that RoundTrip call has already returned). Per R2's own explicit fallback for exactly this
+	// situation: record "ShouldQuit fired at job N" as a best-effort SUMMARY ATTRIBUTE (never an
+	// event -- there is nothing here to attach a chronologically-ordered event stream to) on
+	// whatever span genuinely IS active at this point -- this function's own "httpCollector.
+	// RoundTrip" span, via ctx. See advancementPoint's doc comment (modules/frontend/
+	// dispatch_events.go) for the full cross-repo-shaped investigation this conclusion rests on.
+	span := trace.SpanFromContext(ctx)
+	jobsConsumed := 0
+
 	for {
 		if ctx.Err() != nil {
 			setErr(ctx.Err())
@@ -104,6 +119,7 @@ func consumeAndCombineResponses(ctx context.Context, consumers int, resps Respon
 
 		if resp != nil {
 			respChan <- resp
+			jobsConsumed++
 		}
 
 		if overallErr.Load() != nil {
@@ -111,6 +127,9 @@ func consumeAndCombineResponses(ctx context.Context, consumers int, resps Respon
 		}
 
 		if c.ShouldQuit() {
+			if span.IsRecording() {
+				span.SetAttributes(attribute.Int("dispatch.should_quit_at_job", jobsConsumed))
+			}
 			break
 		}
 

@@ -244,6 +244,7 @@ func (s *asyncSearchSharder) backendRequests(ctx context.Context, tenantID strin
 			// structuralTimeSlicedJobsFunc's own doc comment for why the (block, slice) model is
 			// unsound for a structural query's index-driven path.
 			blockIter := structuralTimeSlicedJobsFunc(blocks, plan.Slices, s.cfg.MostRecentShards, blockOverlapsSlice)
+			var advancementPoints []advancementPoint
 			blockIter(func(jobs int, sz uint64, completedThroughTime uint32) {
 				resp.TotalJobs += jobs
 				resp.TotalBytes += sz
@@ -252,7 +253,15 @@ func (s *asyncSearchSharder) backendRequests(ctx context.Context, tenantID strin
 					TotalJobs:               uint32(jobs),
 					CompletedThroughSeconds: completedThroughTime,
 				})
+				// issue #493 Task 5: buffered here (the counting pass, per-shard-boundary
+				// callback), never inside structuralTimeSlicedJobsFunc itself — a thin wrapping
+				// closure, per R2's own plan, so the function's shared shardIterFn signature
+				// (also used by timeSlicedJobsFunc/backendJobsFunc) needs no change.
+				advancementPoints = append(advancementPoints, advancementPoint{jobs: jobs, bytes: sz, completedThroughSeconds: completedThroughTime})
 			}, nil)
+			// One candidate per SLICE for the structural dispatch model (never per (block,
+			// slice) pair — see structuralTimeSlicedJobsFunc's own doc comment).
+			attachDispatchSpanInfo(ctx, resp.TotalJobs, len(plan.Slices), advancementPoints)
 
 			go func() {
 				buildStructuralTimeSlicedBackendRequests(ctx, tenantID, parent, searchReq, firstShardIdx, blockIter, reqCh, errFn)
@@ -265,6 +274,7 @@ func (s *asyncSearchSharder) backendRequests(ctx context.Context, tenantID strin
 		// own dispatch loop — see timeSlicedJobsFunc's doc comment for why this needs no
 		// TrimToBlockOverlap-style narrowing the way the metrics sharder's predicate does.
 		blockIter := timeSlicedJobsFunc(blocks, plan.Slices, s.cfg.MostRecentShards, blockOverlapsSlice)
+		var advancementPoints []advancementPoint
 		blockIter(func(jobs int, sz uint64, completedThroughTime uint32) {
 			resp.TotalJobs += jobs
 			resp.TotalBytes += sz
@@ -273,7 +283,10 @@ func (s *asyncSearchSharder) backendRequests(ctx context.Context, tenantID strin
 				TotalJobs:               uint32(jobs),
 				CompletedThroughSeconds: completedThroughTime,
 			})
+			advancementPoints = append(advancementPoints, advancementPoint{jobs: jobs, bytes: sz, completedThroughSeconds: completedThroughTime})
 		}, nil)
+		// One candidate per (block, slice) pair for the plain time-sliced dispatch model.
+		attachDispatchSpanInfo(ctx, resp.TotalJobs, len(blocks)*len(plan.Slices), advancementPoints)
 
 		go func() {
 			buildTimeSlicedBackendRequests(ctx, tenantID, parent, searchReq, firstShardIdx, blockIter, reqCh, errFn)
@@ -295,6 +308,7 @@ func (s *asyncSearchSharder) backendRequests(ctx context.Context, tenantID strin
 	// (tracked informally as Phase G) may want a tracing attribute or job count hint surfaced here
 	// for observability, but no wire field is required for correctness.
 	blockIter := backendJobsFunc(blocks, s.cfg.TargetBytesPerRequest, s.cfg.MostRecentShards, searchReq.End)
+	var advancementPoints []advancementPoint
 	blockIter(func(jobs int, sz uint64, completedThroughTime uint32) {
 		resp.TotalJobs += jobs
 		resp.TotalBytes += sz
@@ -303,7 +317,18 @@ func (s *asyncSearchSharder) backendRequests(ctx context.Context, tenantID strin
 			TotalJobs:               uint32(jobs),
 			CompletedThroughSeconds: completedThroughTime,
 		})
+		// issue #493 Task 5 (reviewer-2 finding): this fallback path -- DispatchBlockSharded,
+		// DispatchBoundedRecentFirst, and nil plan all land here -- is the MOST COMMON dispatch
+		// model in production (every ordinary, non-time-sliced query), so it needs the same
+		// observability as the two DispatchTimeSliced branches above, not just the new #487 path.
+		advancementPoints = append(advancementPoints, advancementPoint{jobs: jobs, bytes: sz, completedThroughSeconds: completedThroughTime})
 	}, nil)
+	// backendJobsFunc has no overlap-filtering concept and no fixed 1-job-per-block relationship
+	// (a block can page-split into many jobs) -- see attachDispatchSpanInfoNoOverlapFilter's own
+	// doc comment for why dispatch.jobs_skipped_overlap is not emitted at all on this path
+	// (reviewer-2 finding: reusing attachDispatchSpanInfo's subtraction formula here silently
+	// clamped to a misleading 0 whenever any block page-split, which is the common case, not rare).
+	attachDispatchSpanInfoNoOverlapFilter(ctx, resp.TotalJobs, advancementPoints)
 
 	go func() {
 		buildBackendRequests(ctx, tenantID, parent, searchReq, firstShardIdx, blockIter, reqCh, errFn)

@@ -472,12 +472,4 @@ replace (
 replace github.com/hashicorp/memberlist => github.com/grafana/memberlist v0.3.1-0.20260410132335-4887d8e8d493
 
 // Local blockpack — use `go mod vendor` to sync changes from ../blockpack
-// DEV-ONLY (Phase F, #481): retargeted to the read-path-modernization worktree so tempo-side
-// tasks (F-6/F-7/F-8/F-9/F-10) can build against the real, in-progress bounded-newest-first /
-// typed-decline-error API. Previously retargeted for Phase E (#491) with the same comment
-// pattern but the literal replace line had drifted back to ../blockpack (the primary checkout,
-// stale relative to this phase) — re-flipped here, verified by resolving both paths before
-// editing. This must be flipped back to ../blockpack (and re-vendored against the primary
-// checkout) before Phase F's work is committed — see F-13's gate description. Never commit this
-// line pointing at a worktree.
 replace github.com/grafana/blockpack => ../blockpack

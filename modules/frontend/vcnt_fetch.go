@@ -19,6 +19,9 @@ import (
 	"path"
 	"strings"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/grafana/blockpack"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding/vblockpack"
@@ -61,11 +64,17 @@ var ErrPlanTimeLowSelectivityNoLimit = errors.New(
 // listing (local's implementation filters to directories only; S3's uses a "/" delimiter,
 // returning CommonPrefixes only) — neither ever returns a leaf-level file at the queried
 // keypath. Find recursively walks and reports every actual file.
+//
+// filesCount/bytesRead (issue #493 Task 4c) report the number of .vcnt objects actually
+// downloaded and their total byte size — already-computed local state (len(objects) and each
+// object's len(data)), now returned so the caller can attach them to the "frontend.vcntFetch"
+// child span it wraps this call in, without this function needing any tracing awareness of its
+// own.
 func fetchVCNTSection(
 	ctx context.Context, rawR backend.RawReader, tenant, indexPrefix string, dims []string,
-) ([]byte, []blockpack.VCNTChunkDirEntry) {
+) (data []byte, dir []blockpack.VCNTChunkDirEntry, filesCount int, bytesRead int64) {
 	if rawR == nil || len(dims) == 0 {
-		return nil, nil
+		return nil, nil, 0, 0
 	}
 
 	var objects [][]byte
@@ -88,19 +97,21 @@ func fetchVCNTSection(
 			if err != nil {
 				continue
 			}
-			data, readErr := io.ReadAll(rc)
+			objData, readErr := io.ReadAll(rc)
 			_ = rc.Close()
-			if readErr != nil || len(data) == 0 {
+			if readErr != nil || len(objData) == 0 {
 				continue
 			}
-			objects = append(objects, data)
+			objects = append(objects, objData)
+			filesCount++
+			bytesRead += int64(len(objData))
 		}
 	}
 	if len(objects) == 0 {
-		return nil, nil
+		return nil, nil, filesCount, bytesRead
 	}
-	data, dir, _ := blockpack.VCNTBuildSectionFromObjects(objects)
-	return data, dir
+	data, dir, _ = blockpack.VCNTBuildSectionFromObjects(objects)
+	return data, dir, filesCount, bytesRead
 }
 
 // splitObjectKey splits a Find-reported full key (tenant/.../file) into the KeyPath (every
@@ -208,6 +219,14 @@ func buildQueryPlanFromProgram(
 	ctx context.Context, rawR backend.RawReader, tenant, indexPrefix string, prog *blockpack.Program,
 	minTS, maxTS uint64, concurrentRequests int, boundedEligible, hasLimit bool,
 ) (*blockpack.QueryPlan, error) {
+	// issue #493 Task 4a/4b: attach qualification/plan attributes to whatever span is already
+	// active on ctx — this function has no span of its own; ctx is the SAME ctx
+	// search_sharder.go/metrics_query_range_sharder.go already attached frontend.ShardSearch/
+	// frontend.QueryRangeSharder.* to before calling in, so trace.SpanFromContext(ctx) gets that
+	// span directly, with zero signature changes needed to thread a span parameter through 3 call
+	// sites (buildQueryPlan/buildStructuralQueryPlan/buildMetricsQueryPlan all tail-call here).
+	span := trace.SpanFromContext(ctx)
+
 	// (Issue 4/holistic-review fix E) Check resolvability BEFORE any VCNT fetch I/O.
 	// allLeavesResolvable is BuildQueryPlan's ONLY gate on Strategy (see its own doc comment):
 	// a query that fails this check always resolves to DispatchBlockSharded regardless of what
@@ -218,6 +237,9 @@ func buildQueryPlanFromProgram(
 	// separate discovery cache), so this ordering costs nothing extra for queries that DO
 	// qualify.
 	if !vblockpack.CheckIndexCoverage(ctx, tenant, prog, minTS, maxTS) {
+		if span.IsRecording() {
+			span.SetAttributes(attribute.String("plan.qualification_outcome", "not_indexable"))
+		}
 		return nil, nil
 	}
 
@@ -226,18 +248,50 @@ func buildQueryPlanFromProgram(
 		dims = append(dims, c)
 	}
 
-	data, dir := fetchVCNTSection(ctx, rawR, tenant, indexPrefix, dims)
+	// issue #493 Task 4c: the only genuinely new span in this whole phase (besides Task 6's
+	// reuse of blockpack.query) — a distinct I/O phase (S3 Find+Read fan-out) worth timing on
+	// its own, not routine attribute promotion onto an existing span.
+	vcntCtx, vcntSpan := tracer.Start(ctx, "frontend.vcntFetch")
+	data, dir, filesCount, bytesRead := fetchVCNTSection(vcntCtx, rawR, tenant, indexPrefix, dims)
+	if vcntSpan.IsRecording() {
+		vcntSpan.SetAttributes(
+			attribute.Int("files.count", filesCount),
+			attribute.Int64("bytes.read", bytesRead),
+		)
+	}
+	vcntSpan.End()
 
 	// F-6/R3/R6: classify selectivity over the SAME decoded section TimeSliceOracle below
 	// consumes — no extra I/O, a pure-function call over already-in-hand bytes.
-	sel := blockpack.ClassifyProgramVCNT(prog, data, dir, minTS, maxTS)
+	//
+	// issue #493 Task 4b: ClassifyProgramVCNTWithDetail additionally returns the lead leaf's
+	// both-sides cost detail (index-side count, full-scan-side column total) that the plain
+	// ClassifyProgramVCNT call used to discard — attached below (plan.lead_column/
+	// plan.lead_index_cost/plan.lead_column_total, only when known) so a trace viewer can see
+	// WHY a query classified the way it did, not just the 3-state verdict.
+	sel, leadDetail := blockpack.ClassifyProgramVCNTWithDetail(prog, data, dir, minTS, maxTS)
+	if span.IsRecording() && leadDetail.HasLead {
+		span.SetAttributes(attribute.String("plan.lead_column", leadDetail.LeadColumn))
+		if leadDetail.IndexCostKnown {
+			span.SetAttributes(attribute.Int64("plan.lead_index_cost", leadDetail.IndexCost))
+		}
+		if leadDetail.ColumnTotalKnown {
+			span.SetAttributes(attribute.Int64("plan.lead_column_total", leadDetail.ColumnTotal))
+		}
+	}
 
 	if boundedEligible {
 		strategy, planTimeDecline := blockpack.SelectSearchStrategy(sel, hasLimit)
 		if planTimeDecline {
+			if span.IsRecording() {
+				span.SetAttributes(attribute.String("plan.qualification_outcome", "low_selectivity_no_limit_search"))
+			}
 			return nil, fmt.Errorf("plan-time decline for tenant %s: %w", tenant, ErrPlanTimeLowSelectivityNoLimit)
 		}
 		if strategy == blockpack.DispatchBoundedRecentFirst {
+			if span.IsRecording() {
+				span.SetAttributes(attribute.String("plan.qualification_outcome", "qualified"))
+			}
 			// R9/R10 (Option B, ratified): QueryPlan carries ONLY the Strategy signal — no
 			// budget fields. The querier (backend_block.go) applies its own budget policy
 			// when it sees this Strategy value.
@@ -254,6 +308,9 @@ func buildQueryPlanFromProgram(
 		// corpus, and a truncated aggregate is a wrong answer, not a partial one (R2). Per R6,
 		// fail at plan time rather than dispatch N block jobs that would each independently
 		// decline identically once the block-level executor also observes low coverage/shape.
+		if span.IsRecording() {
+			span.SetAttributes(attribute.String("plan.qualification_outcome", "low_selectivity_metrics_no_partial_aggregate"))
+		}
 		return nil, fmt.Errorf("plan-time decline for tenant %s: %w", tenant, ErrPlanTimeLowSelectivityNoLimit)
 	}
 
@@ -262,5 +319,38 @@ func buildQueryPlanFromProgram(
 	plan := blockpack.BuildQueryPlan(
 		prog, cost, true, perMinuteForLead, minTS, maxTS, concurrentRequests, blockpack.DefaultK,
 	)
+	if span.IsRecording() {
+		knownFraction := 0.0
+		if len(plan.Slices) > 0 {
+			known := 0
+			for _, s := range plan.Slices {
+				if s.EstKnown {
+					known++
+				}
+			}
+			knownFraction = float64(known) / float64(len(plan.Slices))
+		}
+		span.SetAttributes(
+			attribute.String("plan.qualification_outcome", "qualified"),
+			attribute.String("plan.strategy", dispatchStrategyString(plan.Strategy)),
+			attribute.Int("plan.slice_count", len(plan.Slices)),
+			attribute.Float64("plan.slices_est_known_fraction", knownFraction),
+		)
+	}
 	return &plan, nil
+}
+
+// dispatchStrategyString renders a blockpack.DispatchStrategy for the plan.strategy span
+// attribute (issue #493 Task 4a) — blockpack.DispatchStrategy has no String method of its own
+// (a root-level export of one was not requested and would grow blockpack's public API beyond
+// what R4 pre-authorized for this phase), so this is a small local mapping instead.
+func dispatchStrategyString(s blockpack.DispatchStrategy) string {
+	switch s {
+	case blockpack.DispatchTimeSliced:
+		return "time_sliced"
+	case blockpack.DispatchBoundedRecentFirst:
+		return "bounded_recent_first"
+	default:
+		return "block_sharded"
+	}
 }

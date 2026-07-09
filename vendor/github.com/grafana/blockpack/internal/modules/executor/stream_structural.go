@@ -74,6 +74,9 @@ func ExecuteStructural(
 			attribute.Int("blockpack.query.limit", opts.Limit),
 			attribute.Int("blockpack.query.shard_start", opts.StartBlock),
 			attribute.Int("blockpack.query.shard_count", opts.BlockCount),
+			// NOTE-479 (R3): distinguishes this engine from the index-driven structural path's own
+			// blockpack.query span without needing a separate span name.
+			attribute.String("blockpack.query.engine", "structural_scan"),
 		)
 	}
 
@@ -101,9 +104,12 @@ func ExecuteStructural(
 		return nil, err
 	}
 
+	// SPEC-OBS-002, NOTE-478 (issue #493, Task 1): explainEnabled is querySpan.IsRecording(),
+	// checked once here and threaded down explicitly rather than polled per structural node.
 	traceSpans, parsedBlocks, budgetStopped, blocksRead, err := collectAllStructuralSpans(
 		ctx,
 		r,
+		querySpan.IsRecording(),
 		programs,
 		ops,
 		opts,
@@ -126,6 +132,17 @@ func ExecuteStructural(
 	}
 	if err := evalStructuralMatches(traceSpans, parsedBlocks, ops, opts, result); err != nil {
 		return nil, err
+	}
+	// SPEC-STRUCT-13, SPEC-STRUCT-14, NOTE-480 (issue #493, Task 3): connects the #481-era
+	// tracing-ready hooks (BudgetStopped/BlocksRead/IncompleteTraceCount) to the blockpack.query
+	// span; the fields themselves are unchanged, only their visibility is new. All three are
+	// already-computed scalars in local scope (result), zero extra allocation to attach.
+	if querySpan.IsRecording() {
+		querySpan.SetAttributes(
+			attribute.Bool("blockpack.structural.budget_stopped", result.BudgetStopped),
+			attribute.Int("blockpack.structural.blocks_read", result.BlocksRead),
+			attribute.Int("blockpack.structural.incomplete_trace_count", result.IncompleteTraceCount),
+		)
 	}
 	return result, nil
 }
@@ -174,9 +191,15 @@ func isNegationOp(op traceqlparser.StructuralOp) bool {
 // sharding) and accumulates per-trace span records. Returns a map keyed by [16]byte trace ID,
 // plus (issue #481 part 2, F-3) whether a RecentFirstBudget cap stopped block collection early
 // and how many blocks were actually fetched.
+//
+// SPEC-OBS-002, NOTE-478 (issue #493, Task 1): explainEnabled gates queryplanner.PlanOptions.
+// EnableExplain at both planBlocks call sites below — the caller checks querySpan.IsRecording()
+// once and threads the bool down explicitly rather than re-deriving it from ctx or polling it
+// per structural node.
 func collectAllStructuralSpans(
 	ctx context.Context,
 	r *modules_reader.Reader,
+	explainEnabled bool,
 	programs []*vm.Program,
 	ops []traceqlparser.StructuralOp,
 	opts Options,
@@ -207,9 +230,9 @@ func collectAllStructuralSpans(
 		gated := shouldRejectFileForProgram(ops, i)
 		if !gated {
 			// Negation LHS — absent LHS means all RHS spans qualify; use time-range-only plan.
-			p = planBlocks(r, nil, tr, queryplanner.PlanOptions{})
+			p = planBlocks(r, nil, tr, queryplanner.PlanOptions{EnableExplain: explainEnabled})
 		} else {
-			p = planBlocks(r, prog, tr, queryplanner.PlanOptions{})
+			p = planBlocks(r, prog, tr, queryplanner.PlanOptions{EnableExplain: explainEnabled})
 		}
 		// NOTE-456: emit per-node planner span for structural queries.
 		// NOTE-464 (issue #383): structural nodes always fetch block payloads for the
@@ -799,10 +822,7 @@ func computeStructuralPredBits(sets []vm.RowSet, spanCount int) []uint8 {
 		mask := uint8(1) << uint(i) //nolint:gosec // safe: i bounded by len(programs) <= 8
 		if am, ok := s.(*allMatchSet); ok {
 			// Every row in [0, am.n) matches — set the bit without allocating ToSlice().
-			n := am.n
-			if n > spanCount {
-				n = spanCount
-			}
+			n := min(am.n, spanCount)
 			for r := range n {
 				predBits[r] |= mask
 			}
