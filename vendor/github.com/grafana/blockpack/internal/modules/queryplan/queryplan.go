@@ -13,7 +13,15 @@ import (
 // a query. DispatchBlockSharded (the zero value) is today's existing per-block job path,
 // unchanged — the always-safe default. DispatchTimeSliced is the #487 opt-in narrowing, selected
 // whenever every leaf in the plan is resolvable by the index (the ONLY Strategy gate — lead-leaf
-// estimability governs slice width mode, not Strategy; see BuildQueryPlan).
+// estimability governs slice width mode, not Strategy; see BuildQueryPlan). DispatchBoundedRecentFirst
+// is the #481 part 2/3 bounded-newest-first strategy: selected by tempo's frontend
+// (buildQueryPlanFromProgram) when a search query's index coverage is low/unknown but a limit is
+// present, per R3's ruling — NEVER selected for metrics (a truncated aggregate is a wrong
+// answer, not a partial one). Unlike DispatchTimeSliced, blockpack's QueryPlan carries ONLY this
+// Strategy value for the bounded path — no budget fields (MaxBlocks/MaxBytes/MaxDuration): the
+// querier (tempo's backend_block.go) owns and applies its own budget policy when it sees this
+// signal, mirroring how IndexOnly/MostRecent are tempo-set booleans on blockpack's QueryOptions
+// rather than blockpack-computed values (plan-f.md Task 5's Option B, ratified).
 type DispatchStrategy int
 
 const (
@@ -21,7 +29,61 @@ const (
 	DispatchBlockSharded DispatchStrategy = iota
 	// DispatchTimeSliced is the #487 opt-in narrowing; see DispatchStrategy's doc comment.
 	DispatchTimeSliced
+	// DispatchBoundedRecentFirst is the #481 bounded-newest-first strategy; see
+	// DispatchStrategy's doc comment for the full contract, and SPEC-QP-6 (SelectSearchStrategy)
+	// for the full selection decision table.
+	DispatchBoundedRecentFirst
 )
+
+// SelectSearchStrategy implements R3's ruling table for choosing a search-query dispatch
+// strategy from a VCNT selectivity classification and whether the query carries a limit
+// (issue #481 parts 2/3, team-lead ruling R13). It is a PURE function — no I/O, no tempo
+// context — and is the single source of truth for this decision table so tempo's frontend
+// (buildQueryPlanFromProgram) consumes it directly instead of hand-rolling an
+// independently-maintained copy that could drift.
+//
+// SPEC-QP-6: the full decision-table contract lives here. NOTE-QP-010 records the design
+// rationale.
+//
+// Deliberately EXCLUDED from this function: boundedEligible (search-vs-metrics) and
+// resolvability (index-coverage). Both are tempo-context concerns the caller must gate on
+// FIRST — metrics callers never reach this function at all (R2: metrics is never
+// bounded-served), and an unresolvable plan is DispatchBlockSharded before selectivity is
+// even considered. This keeps the five-row core here untestable-drift-proof in one place.
+//
+// planTimeDecline=true means the query has NO safe answer at plan time (LowSelectivity with
+// no limit present: every per-block job would decline identically, so dispatching at all
+// wastes N block round-trips on a certain failure, per R6). When planTimeDecline is true, the
+// returned strategy value is MEANINGLESS and must NOT be dispatched — the caller (tempo) must
+// fail the query at plan time instead, mapping to the typed hard-error family. This is
+// deliberately NOT represented as a fake DispatchStrategy enum value (e.g. a
+// "DispatchDecline" constant) — decline is a distinct, non-dispatchable outcome, not a
+// dispatch strategy, so it is returned out-of-band via this second bool.
+//
+// The five-row core (Selective's outcome does not depend on hasLimit, collapsing what would
+// otherwise be six selectivity×limit combinations into five distinct outcomes):
+//
+//	Selective         + any limit -> DispatchBlockSharded  (index-only; hard-errors on decline downstream)
+//	LowSelectivity     + limit    -> DispatchBoundedRecentFirst
+//	LowSelectivity     + no limit -> planTimeDecline=true
+//	UnknownSelectivity + limit    -> DispatchBoundedRecentFirst
+//	UnknownSelectivity + no limit -> DispatchBlockSharded  (index-only; hard-errors on decline downstream)
+func SelectSearchStrategy(sel Selectivity, hasLimit bool) (strategy DispatchStrategy, planTimeDecline bool) {
+	switch sel {
+	case Selective:
+		return DispatchBlockSharded, false
+	case LowSelectivity:
+		if hasLimit {
+			return DispatchBoundedRecentFirst, false
+		}
+		return DispatchBlockSharded, true
+	default: // UnknownSelectivity
+		if hasLimit {
+			return DispatchBoundedRecentFirst, false
+		}
+		return DispatchBlockSharded, false
+	}
+}
 
 // QueryPlan is the top-level output blockpack hands tempo's frontend: the existing leaf-cost
 // Group tree (Root, unchanged from Plan()'s own output) plus, when qualified, a set of

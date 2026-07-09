@@ -7290,6 +7290,16 @@ Back-ref: `internal/modules/executor/search_trace_vi.go:QueryTraceQLFromIndex`,
 `api_test.go:TestQueryTraceQLFromIndex_Public*`. External: tempo
 `tempodb/encoding/vblockpack/value_index_query.go`, `backend_block.go`.
 
+**Superseded 2026-07-08 (issue #481 parts 2-4, Phase F):** superseded by `NOTE-VI-096` — the
+metrics half of this note's contract is no longer "IndexOnly forbids the fallback," it's
+"the fallback no longer exists"; the search half gains a bounded alternative
+(`RecentFirstBudget`/`SelectSearchStrategy`) to its remaining routine declines. This entry (the
+executor-package `NOTE-VI-047`, not to be confused with `valueindex/NOTES.md`'s own unrelated
+`NOTE-VI-047` on cross-block BucketFile ordering — the two packages independently number into the
+same shared counter and this collision predates Phase F's ID-collision-tracking discipline) is
+left otherwise UNCHANGED below, per this project's append-only convention — see `NOTE-VI-096` for
+the current contract.
+
 ## NOTE-VI-078 — Search-path index/data inconsistency now FAILS the query in tempo, not masked by a silent scan (issue #481)
 
 *Added: 2026-07-06*
@@ -7337,6 +7347,106 @@ Back-ref: tempo `tempodb/encoding/vblockpack/value_index_query.go:tryIndexFetch`
 SPEC: SPEC-ROOT-019 (root `SPEC.md`, Addendum 2026-07-06 / issue #481).
 Blockpack-side error production: `search_trace_vi.go:QueryTraceQLFromIndex` (unchanged),
 `search_trace_vi_test.go:TestQueryTraceQLFromIndex_InconsistentIndexIsError`.
+
+---
+
+## NOTE-VI-096 — Metrics decline is now unconditional and typed; search gains a bounded alternative to the unconditional scan (issue #481 parts 2-4, Phase F)
+
+*Added: 2026-07-08*
+
+**Supersedes the executor-package `NOTE-VI-047`** (search/metrics VI authoritative, issue #474) —
+that entry is left unchanged above per the append-only convention, with a one-line pointer added
+at its end. This entry also resolves that note's ID collision with `valueindex/NOTES.md`'s own,
+unrelated `NOTE-VI-047` (cross-block `BucketFile` ordering, issue-unrelated, 2026-07-02): going
+forward, "NOTE-VI-047" without a file qualifier should be treated as ambiguous historical debt —
+cite `NOTE-VI-096` for the executor-side content this note continues.
+
+**Metrics: the fallback did not just get "enforced," it was DELETED.** `ExecuteTraceMetrics` (the
+full-block-scan engine) is gone outright (`internal/modules/executor/metrics_trace.go`), along
+with `metrics_trace_intrinsic.go` and its whole dict-ID group-map fast path (`SPEC-ETM-13`/`14`,
+now tombstoned). `TraceMetricOptions.IndexOnly` no longer changes `ExecuteMetricsTraceQL`'s decline
+behavior at all — there is nothing left for it to gate. The single old sentinel
+`ErrValueIndexNoCoverage` is replaced outright (`errors.New` plain sentinels, not an enum+struct —
+mirrors `ErrStructuralIndexCoverageGap`'s style) by four: `ErrMetricsShapeNotAnswerable` (unsupported
+aggregate/group-by shape), `ErrMetricsNoCoverage` (a specific leaf/column lacks coverage — a
+per-query-SHAPE limitation), `ErrMetricsLegacyTimeSecZero` (the matched block predates per-span
+timestamps — a per-block-DATA limitation), and `ErrMetricsValueIndexDisabled` (team-lead ruling R8:
+no `ValueIndexSource` supplied for this call at all — a zeroth, operator-CONFIGURATION-level
+condition). **R8's category was nearly lost during implementation:** an early version of the fix
+conflated "no ValueIndexSource supplied" with `ErrMetricsNoCoverage`'s narrower "this one column
+isn't covered" scope — caught and fixed (task tracked separately) before landing, precisely because
+these are operationally different signals for an on-call operator (one means "value-index querying
+is disabled for this querier," the other means "this specific query touches an uncovered column").
+See `internal/modules/executor/SPECS.md` `SPEC-VIS-2` (revised) for the full mechanism contract.
+
+**Search: the three routine decline categories `NOTE-VI-047`/`078` documented are UNCHANGED by
+this note — they still fall back to a scan.** What's new is that the scan they fall back to CAN
+now be a BOUNDED one. `QueryOptions.RecentFirstBudget` (root `SPEC.md` `SPEC-ROOT-023`) activates a
+newest-first, capped-read execution strategy on the scan path itself
+(`QueryTraceQL`/`ExecuteStructural`), consumed via `queryplan.SelectSearchStrategy`
+(`internal/modules/queryplan/SPECS.md` `SPEC-QP-6`) — a pure decision-table function tempo's
+frontend calls with a VCNT selectivity classification and whether the query carries a `Limit`, to
+choose between an index-only strategy, this bounded scan, or a genuine plan-time decline
+(team-lead ruling R13). This is additive infrastructure, not a removal of any existing decline
+category — a caller that never sets `RecentFirstBudget` sees identical behavior to before this
+phase.
+
+**Why this scope split (metrics unconditional-typed-error, search additive-bounded-option) is
+correct and not an inconsistency.** Metrics has NO safe partial answer — a truncated aggregate is
+a WRONG answer, not a partial one (an under-counted `count_over_time()` looks exactly like a
+correct lower-traffic period). Search's partial answer (fewer matches than a full scan would find)
+is HONEST and useful — a caller with a `Limit` genuinely doesn't need every match, just the newest
+ones up to that limit. This asymmetry is why `RecentFirstBudget`'s own doc comment explicitly
+states the bounded-newest-first strategy that exists for search is never applied to metrics, and
+why metrics gets a hard-error family while search gets a bounded-execution family for what is
+otherwise the same underlying "index cannot answer this query SHAPE cheaply" problem.
+
+Back-refs: `internal/modules/executor/decline_errors.go` (all four sentinels),
+`internal/modules/executor/recentfirst.go:RecentFirstBudget`, `internal/modules/executor/stream.go`
+(`SPEC-STREAM-13`), `internal/modules/queryplan/queryplan.go:SelectSearchStrategy` (`SPEC-QP-6`),
+`queryoptions.go:RecentFirstBudget` (`SPEC-ROOT-023`). SPEC: `SPEC-VIS-2` (revised),
+`SPEC-ROOT-019` (Addendum 2026-07-08). Tests: F-4's real-write-path sentinel suite, `recentfirst_test.go`
+(root and executor package). Issue #481.
+
+---
+
+## NOTE-VI-097 — decline_errors.go's four-plain-sentinel design; why ErrMetricsValueIndexDisabled is a distinct category from ErrMetricsNoCoverage (issue #481 part 3, F-4)
+
+*Added: 2026-07-08*
+
+**Why four plain `errors.New` sentinels, not an enum + wrapper struct.** An earlier design draft
+for this decline family used a `DeclineReason` enum plus a single `ErrValueIndexDecline{Reason
+DeclineReason}` wrapper struct. This was changed before landing to four independent plain
+sentinels (`ErrMetricsShapeNotAnswerable`, `ErrMetricsNoCoverage`, `ErrMetricsLegacyTimeSecZero`,
+`ErrMetricsValueIndexDisabled`), mirroring `ErrStructuralIndexCoverageGap`'s existing style
+(`structural_errors.go`) rather than inventing a second decline-signaling convention in the same
+package family. A plain sentinel is `errors.Is`-comparable with zero indirection — a caller writes
+`errors.Is(err, executor.ErrMetricsNoCoverage)` directly; the enum+struct alternative would have
+required either `errors.As` plus a field comparison, or a bespoke `Is()` method on the wrapper
+struct, for no expressiveness gained (there is no scenario where a caller needs to hold a
+`DeclineReason` value independent of a concrete error, since every reason already has an
+independently-`errors.Is`-comparable sentinel of its own).
+
+**Why `ErrMetricsValueIndexDisabled` is a fourth, distinct category — not folded into
+`ErrMetricsNoCoverage` — team-lead ruling R8.** An early implementation pass conflated the two:
+`opts.ValueIndex == nil` (no `ValueIndexSource` supplied for this call at all) was mapped to the
+same `ErrMetricsNoCoverage` sentinel used for "a specific leaf/column in this query's predicate
+isn't covered by an otherwise-configured index." Caught and fixed before landing (tracked
+separately as its own fix task) because these are operationally different signals to an on-call
+operator debugging a production alert: `ErrMetricsValueIndexDisabled` means "value-index querying
+is not configured for this querier at all" — every metrics query fails this way, a
+config/deployment-level condition, actionable by checking `value_index_query.enabled`.
+`ErrMetricsNoCoverage` means "the value index IS configured and working, but THIS query touches an
+uncovered column" — only some queries fail this way, actionable by checking which predicate the
+failing query used. Collapsing the two into one sentinel would have made the more common, more
+alarming operational case (index querying entirely disabled) indistinguishable from the narrower,
+less alarming one (one query shape isn't covered) in any monitoring or alerting built on
+`errors.Is` checks.
+
+Back-refs: `internal/modules/executor/decline_errors.go` (all four sentinels),
+`internal/modules/executor/structural_errors.go:ErrStructuralIndexCoverageGap` (the plain-sentinel
+style this mirrors). See `SPECS.md` `SPEC-VIS-2` (revised) for the formal contract this note
+explains the rationale for. Issue #481.
 
 ---
 
@@ -7535,3 +7645,89 @@ Back-refs: `internal/modules/executor/structural_index_negated.go:ExecuteNegated
 **Verification.** `go build ./...`, `go vet ./...`, `gofumpt -l .` (clean), `golangci-lint run ./...` (0 issues), `gocyclo -over 20` on every touched file (none), `go test -race ./...` (all packages green), `make precommit` (9/9 green).
 
 Back-refs: `internal/modules/executor/structural_multifile.go:MaterializeTraceGroupMultiFile`, `structural_index.go:ExecuteStructuralFromIndex, evalOneStructuralCandidateTrace, materializeConfirmedSpanBlocks`, `structural_index_negated.go:ExecuteNegatedStructuralFromIndex, evalOneNegatedStructuralCandidateTrace`, `structural_verify.go:verifyCandidateSpans, evaluateProgramAgainstBlock`, `structural_traceresolve.go:rowMatchesTraceIDColumn`, root `structural.go:QueryNegatedStructuralFromIndex, QueryStructuralFromIndex`. Tests: `structural_multifile_test.go`, `structural_index_test.go`, `structural_index_negated_test.go`, `structural_verify_internal_test.go`, `structural_index_io_internal_test.go`, root `structural_index_realvi_test.go`. Issue #489.
+
+
+## NOTE-VI-098 — R15's incompleteness-exclusion rule, and R15-AMENDED's correction to the original Q1 ruling table (issue #481 part 2, F-3)
+
+*Added: 2026-07-08*
+
+**R15: why bounded structural resolution excludes an ambiguous trace WHOLESALE rather than
+partially evaluating it or reusing the unbounded path's orphan treatment.** Under
+`RecentFirstBudget`, `resolveStructuralParentIndices` skips the unbounded path's
+`expandStructuralBlocksForTraces` step (`SPEC-STRUCT-13`), so an unresolved-but-present parent
+reference is no longer a confirmed absence (an orphan, per the unbounded path's existing
+`parentIdx = -1` root-like treatment) — it is genuinely AMBIGUOUS, since the true ancestor may live
+in a block the bounded read never reached. The two candidate designs considered:
+
+1. **Reuse the unbounded path's orphan treatment (REJECTED).** Treating an unread ancestor as a
+   confirmed absence would silently convert "may exist, unread" into "confirmed does not exist" —
+   for a NEGATED operator (`!>>`, `!>`, `!~`), this flips into a FALSE POSITIVE: the query reports
+   a match that a full scan would have correctly excluded. A false positive is a materially worse
+   failure mode than a false negative — a user acting on a wrong "found" result is worse than one
+   acting on an honestly incomplete "not found among what we checked" result.
+2. **Exclude the whole trace, uniformly for both polarities (ADOPTED).** `IncompleteTraceCount`
+   tracks exactly this exclusion. Uniform treatment (no polarity-specific special-casing) was an
+   explicit R15 requirement: a positive operator's own honest degradation from a tight budget (it
+   may miss a true match whose ancestor lives in an unread block) is the SAME shape of tradeoff as
+   the negated case's risk, just pointing the opposite direction (false negative vs. false
+   positive) — one rule that always excludes ambiguous traces covers both correctly, rather than
+   two operator-specific rules that would need to be proven consistent with each other.
+
+**R15-AMENDED: correcting the Q1 ruling table's original "3+-node/negated" bucket.** Phase F's
+early brainstorm/plan work (per `brainstorm-f.md`'s Q1 decline-category table) initially treated
+"3+-node negated structural chains" as a distinct bucket needing its OWN bounded-execution
+treatment, parallel to "3+-node positive chains." This was WRONG, caught during F-3's
+implementation (coder-f2): `SPEC-STRUCT-8`'s pre-existing constraint 2 (negation operators
+disallowed in any multi-node chain, added long before this phase, unconditional and independent of
+budget mode) already makes a "3+-node negated chain" unreachable at ALL — `ExecuteStructural`
+hard-errors on it before any block I/O, budget-aware or not. There is no execution path this
+combination could ever reach for `SPEC-STRUCT-13`/`14`'s bounded mechanism to apply to. **No
+spec-text correction to `SPEC-STRUCT-8` itself was made or is needed** — that entry already,
+correctly, forecloses this case; it simply wasn't cross-referenced from the Phase F planning
+material until this note. The corrected scope: `SPEC-STRUCT-13`/`14`'s bounded path applies to
+"3+-node chains of any polarity that `SPEC-STRUCT-8` already permits" (i.e., positive-only, since
+negation is disallowed above 2 nodes regardless) plus 2-node negated chains that fall through from
+the index-driven engines (`SPEC-STRUCT-10`) for reasons unrelated to node count.
+
+Back-refs: `internal/modules/executor/stream_structural.go:resolveStructuralParentIndices`,
+`internal/modules/executor/structuralresult.go:StructuralResult.IncompleteTraceCount`,
+`internal/modules/executor/SPECS.md` `SPEC-STRUCT-8` (unchanged, cross-referenced),
+`SPEC-STRUCT-13`/`14` (this note's formal contract). Issue #481.
+
+## NOTE-VI-099 — RecentFirstBudget's block-collection mechanism: truncate-before-coalesce for an exact MaxBlocks bound; why the concurrent-prefetch overshoot under MaxBytes/MaxDuration is acceptable (issue #481 part 2, F-2, team-lead ruling R14/R14-AMENDED)
+
+*Added: 2026-07-08*
+
+**Why truncate `SelectedBlocks` before coalescing, rather than checking `MaxBlocks` during the
+fetch loop.** Coalescing groups multiple blocks into a single ~8 MB I/O call for efficiency — by
+the time a coalesced group is being processed, the blocks within it have already been read
+together as one unit; there is no clean way to "partially" honor a per-block cap once blocks are
+merged into a shared read. Truncating the already newest-first-reversed `SelectedBlocks` list to
+at most `MaxBlocks` entries BEFORE any coalescing decision is made sidesteps this entirely: the
+bound becomes exact and trivially provable (at most `MaxBlocks` block indices exist in the list
+coalescing ever sees), independent of however the coalescer happens to group them.
+
+**Why `MaxBytes`/`MaxDuration` cannot use the same trick, and why the resulting concurrent-prefetch
+overshoot is an accepted tradeoff, not a bug.** Unlike block COUNT, byte size and elapsed time are
+only knowable once I/O has actually happened (or is in flight) — there is no pre-coalesce truncation
+equivalent. The chosen design checks both once per coalesced GROUP, after that group's blocks
+finish processing, which is cheap and correct for a single-threaded pipeline. `blockGroupPipeline`,
+however, dispatches up to `defaultPipelineWorkers` (8) groups' I/O CONCURRENTLY via a pre-filled
+semaphore, without waiting for a per-group budget decision before issuing the NEXT group's I/O —
+so for a file with ≤8 total coalesced groups, every group's I/O may already be in flight before any
+`MaxBytes`/`MaxDuration` check can act on the first one. Two alternatives were weighed against the
+adopted design: (a) serializing group dispatch to make the check fully preemptive (rejected — this
+would regress the unbounded path's own concurrent-I/O throughput for every query, not just budgeted
+ones, to fix an edge case that only matters for small files where the wasted I/O is itself small);
+(b) accepting the bounded overshoot as `min(remaining groups, defaultPipelineWorkers)` groups' worth
+of wasted PREFETCH (adopted) — justified because the caps exist specifically to prevent the
+catastrophic unbounded-read class (multi-hundred-second/OOM queries against LARGE files with many
+groups), and a ≤8-group file is inherently small (≤~64 MB of coalesced reads) — the overshoot
+ceiling is structurally bounded exactly where it is cheapest to tolerate. Critically, **the RESULT
+SET is never affected by this overshoot**: `processGroup` runs strictly in ascending group order, so
+a group whose I/O was wastefully prefetched but never reached `processGroup` before a stop fired
+never contributes rows to the answer — the overshoot is a bounded, visible (via `QueryStats`'
+actual bytes/blocks read, never the configured cap) I/O-cost tradeoff, never a correctness one.
+
+Back-refs: `internal/modules/executor/stream.go` (`SPEC-STREAM-13`'s formal contract),
+`internal/modules/executor/recentfirst.go:RecentFirstBudget`. Issue #481.

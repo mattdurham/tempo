@@ -18,6 +18,7 @@ import "errors"
 //
 // Also returned when indexOnly is true and either the search VI or the trace-by-id index has no
 // coverage for the query window — a time-sliced structural job has no safe scan fallback across
-// slice boundaries (mirrors #487's IndexOnly / ErrSliceIndexCoverageGap pattern and
-// ErrValueIndexNoCoverage's precedent), so it must fail loudly rather than silently narrow.
+// slice boundaries (mirrors #487's IndexOnly / ErrSliceIndexCoverageGap pattern and the metrics
+// path's ErrMetricsNoCoverage precedent, issue #481 part 3), so it must fail loudly rather than
+// silently narrow.
 var ErrStructuralIndexCoverageGap = errors.New("executor: structural index coverage gap")

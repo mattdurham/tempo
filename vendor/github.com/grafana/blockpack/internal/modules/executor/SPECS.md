@@ -501,6 +501,61 @@ Back-ref: `internal/modules/executor/stream_prefn_test.go:TestForEachBlockInGrou
 
 ---
 
+## SPEC-STREAM-13: Bounded, Pointed Newest-First Block Collection (`RecentFirstBudget`)
+*Added: 2026-07-08 (issue #481 parts 2-3, F-2, team-lead ruling R14/R14-AMENDED)*
+
+**Contract:** when `CollectOptions.RecentFirstBudget != nil`, `Collect`'s block-selection/fetch
+path enforces three independent, optional caps — `MaxBlocks`, `MaxBytes`, `MaxDuration` (a zero
+field means no cap on that dimension) — stopping block collection at the FIRST one reached, on top
+of the existing `Direction=Backward`/`WantSort=false` newest-first read order this strategy
+requires (see `NOTE-VI-099` for why `WantSort` must be false: `RecentFirstBudget` never routes
+through `shouldUseTopKPath`'s globally-correct-but-exhaustive heap scan, which reads ALL selected
+blocks regardless of budget).
+
+**`MaxBlocks` is enforced EXACTLY, at plan time.** Before coalescing, `scanBlocks` truncates the
+already newest-first-reversed `SelectedBlocks` list to at most `MaxBlocks` entries
+(`stream.go`, ~line 321-329) — this is a hard, concurrency-independent bound: at most `MaxBlocks`
+blocks are ever fetched, regardless of coalescing group boundaries or pipeline concurrency.
+
+**`MaxBytes`/`MaxDuration` are checked once per coalesced I/O GROUP, not per block or per row**
+(`stream.go`, ~line 471-603): `bytesSoFar` accumulates cumulative bytes read across processed
+groups; `scanStart`/`time.Since` tracks elapsed wall-clock time. Both checks are cheap to compute
+unconditionally (a no-op when `RecentFirstBudget` is nil, the normal unbounded path).
+
+**R14-AMENDED — the concurrent-prefetch overshoot bound.** Because `blockGroupPipeline` dispatches
+up to `defaultPipelineWorkers` (8) groups' I/O CONCURRENTLY via a pre-filled semaphore — it does
+not wait for a per-group budget decision before issuing the next group's I/O — the actual I/O
+overshoot bound is `min(remaining groups, defaultPipelineWorkers)` groups' worth of wasted
+prefetch, not a flat "one group," for a file with ≤8 total groups every group may already be in
+flight before any check can act. **This is an accepted tradeoff, not a correctness gap**: the caps
+exist to prevent the catastrophic unbounded-read class (multi-hundred-second/OOM queries), and a
+≤8-group file is inherently small (≤~64 MB of coalesced reads). **The RESULT SET is unaffected by
+this overshoot and remains an exact, concurrency-independent bound** — results only ever reflect
+groups whose `processGroup` call completed before a stop fired (`processGroup` runs strictly in
+ascending group order), so a group whose I/O was wastefully prefetched but never reached
+`processGroup` never contributes rows to the answer. Callers must report ACTUAL bytes/blocks read
+from `QueryStats` (never the configured budget values), so any overshoot is visible to the user,
+never hidden behind the cap number.
+
+**Never routes through the top-K path.** `shouldUseTopKPath` gates purely on
+`WantSort`/`TimestampColumn`/`Limit` — `RecentFirstBudget`'s callers always set `WantSort=false`,
+so the gate is false regardless of `Limit`, pinned directly at the gate function
+(`recentfirst_test.go` in `internal/modules/executor`), independent of how any particular caller
+constructs `CollectOptions`.
+
+**Design rationale (why truncate-before-coalesce for an exact bound; why the concurrent-prefetch
+overshoot is acceptable):** `NOTE-VI-099`.
+
+Back-ref: `internal/modules/executor/stream.go` (`scanBlocks` truncation, `bytesSoFar`/`scanStart`
+setup, per-group budget check), `internal/modules/executor/recentfirst.go:RecentFirstBudget`
+(`SPEC-ROOT-023`'s executor-local mirror), `internal/modules/executor/collectoptions.go`. Tests:
+`recentfirst_test.go` (root, real-write-path suite: `MaxBlocks`/`MaxBytes`/`MaxDuration` stopping,
+newest-first ordering, never-routes-through-topK, including the `Limit>0`+`MaxBytes`/`MaxDuration`-only
+regression coverage added by issue #71's post-mortem), `internal/modules/executor/recentfirst_test.go`
+(`shouldUseTopKPath` gate pin). Issue #481.
+
+---
+
 ## SPEC-INTRINSIC-004: File-level bloom pre-check before intrinsic scan
 
 *Added: 2026-04-14*
@@ -525,9 +580,22 @@ Back-ref: `internal/modules/executor/stream.go:collectWithBloomCheck`
 
 ---
 
-## 7. ExecuteTraceMetrics
+## 7. ExecuteTraceMetrics `[SUPERSEDED — ExecuteTraceMetrics deleted outright, issue #481 Task F-4, 2026-07-08]`
 
-### 10.1 Signature
+**This entire section documents `ExecuteTraceMetrics`, the full-block-scan metrics engine, which
+was DELETED OUTRIGHT (not deprecated) as part of Phase F (issue #481 parts 3-4) — there is no
+scan path left to answer to this contract.** Kept below verbatim for history, per `SPEC-ROOT-009`'s
+"mark superseded, never delete" rule (each `SPEC-ETM-N` ID below remains valid and addressable,
+none are reused). The CURRENT metrics-answering contract (the VI-only `ExecuteTraceMetricsFromVI`,
+with an unconditional typed-error decline — no scan fallback of any kind) is `SPEC-VIS-2` (revised
+2026-07-08). §10.1 (Signature) and §10.3 (Supported Functions) below describe a function and a
+function-support table that no longer exist in any form — `ExecuteTraceMetricsFromVI` only ever
+answers `count_over_time()`/`rate()` without group-by (the VI-answerable subset), never the full
+SUM/AVG/MIN/MAX/HISTOGRAM/QUANTILE/STDDEV/group-by surface below. **§10.2 (Types) is the ONE
+subsection that SURVIVES unchanged** — `TraceMetricLabel`/`TraceTimeSeries`/`TraceMetricsResult`
+are still declared and used by `ExecuteTraceMetricsFromVI` and `api.go` today.
+
+### 10.1 Signature `[SUPERSEDED — no live function has this signature]`
 
 ```go
 func ExecuteTraceMetrics(
@@ -537,7 +605,7 @@ func ExecuteTraceMetrics(
 ) (*TraceMetricsResult, error)
 ```
 
-### 10.2 Types
+### 10.2 Types (SURVIVES — used unchanged by `ExecuteTraceMetricsFromVI`/`api.go`)
 
 ```go
 type TraceMetricLabel struct {
@@ -557,7 +625,7 @@ type TraceMetricsResult struct {
 }
 ```
 
-### 10.3 Supported Functions
+### 10.3 Supported Functions `[SUPERSEDED — see SPEC-VIS-2: only count_over_time()/rate() without group-by survive, via ExecuteTraceMetricsFromVI]`
 
 | `AggregateSpec.Function` | Description |
 |---|---|
@@ -571,7 +639,7 @@ type TraceMetricsResult struct {
 | `QUANTILE` | q-th percentile of field values per time bucket (nearest-rank method). `q` from `querySpec.Aggregate.Quantile` (0 ≤ q ≤ 1). NaN for empty buckets. Reuses `logComputeQuantile`. |
 | `STDDEV` | Sample standard deviation of field values per time bucket (Welford online algorithm). NaN when bucket count < 2 (sample stddev undefined). |
 
-### 10.4 Invariants
+### 10.4 Invariants `[SUPERSEDED — SPEC-ETM-1 through SPEC-ETM-14 (including the two standalone entries at the end of this file) all describe ExecuteTraceMetrics/metrics_trace_intrinsic.go behavior that no longer exists; kept below for history only, IDs never reused]`
 
 - **SPEC-ETM-1:** Labels are an ordered slice; the same label name will not appear twice.
 - **SPEC-ETM-2:** `Values[i]` is NaN when no data exists for bucket i (except COUNT/RATE which use 0).
@@ -843,6 +911,93 @@ Back-ref: `internal/modules/executor/structural_index.go:StructuralSelectivityCl
 
 ---
 
+## SPEC-STRUCT-13: Bounded, Pointed Newest-First Execution for the Structural Scan Engine (`Options.Direction`/`RecentFirstBudget`)
+*Added: 2026-07-08 (issue #481 parts 2-3, F-3)*
+
+**Contract:** `Options.Direction`/`Options.RecentFirstBudget` (`options.go`) activate a bounded,
+newest-first execution path for `ExecuteStructural`'s own 1e/1f decline categories — structural
+chains that flatten to other than exactly 2 nodes, any polarity, which never reach the
+index-driven engines (`SPEC-STRUCT-9`/`10`) and always ran the full scan engine before this phase.
+`RecentFirstBudget != nil` implies the caller has also set `Direction == queryplanner.Backward` —
+`ExecuteStructural` does not infer `Direction` from budget presence, mirroring
+`executor.CollectOptions`' explicit-field convention (`SPEC-STREAM-13`). When
+`RecentFirstBudget` is `nil`, both fields are ignored and `ExecuteStructural` behaves exactly as
+before this phase: the full predicate-selected block set, no early stop, no incomplete-trace
+exclusion.
+
+**Mechanism:** `fetchStructuralBlocksBounded` fetches the (already Direction-ordered)
+`selectedBlocks` ONE BLOCK AT A TIME — not the single coalesced batch call the unbounded path
+uses — stopping at the FIRST `RecentFirstBudget` cap reached: `MaxBlocks`/`MaxBytes` are checked
+BEFORE each fetch (zero-I/O, from `BlockMeta.Length`), `MaxDuration` is checked AFTER each fetch
+(the only way to bound actual wall-clock I/O time spent). Trading per-block-call coalescing
+efficiency for a genuine, checkable stop condition is the explicit, accepted tradeoff. Under
+`RecentFirstBudget`, the unbounded path's `expandStructuralBlocksForTraces` step (the unconditional
+full-file cross-block-trace-completion scan) is SKIPPED ENTIRELY — see `SPEC-STRUCT-14` for the
+correctness consequence this has for parent resolution.
+
+**Result reporting:** `StructuralResult.BudgetStopped`/`BlocksRead` (`structuralresult.go`) are
+populated ONLY when `Options.RecentFirstBudget` was set; both are zero-value for the unbounded
+path (unchanged behavior). `BudgetStopped` is `true` when a `MaxBlocks`/`MaxBytes`/`MaxDuration`
+cap stopped block collection before the full predicate-selected block set was read.
+
+**Relationship to `SPEC-STRUCT-8`:** this bounded path is orthogonal to `SPEC-STRUCT-8`'s own,
+pre-existing, independent constraints (max-8-node chains; negation operators disallowed in any
+multi-node chain, unconditionally, regardless of budget mode). A chain that would already hard-error
+under `SPEC-STRUCT-8` continues to hard-error identically whether or not `RecentFirstBudget` is
+set — the bounded path changes HOW blocks are read for chains `SPEC-STRUCT-8` already allows to
+execute, never WHETHER a given chain is allowed to execute at all. See `NOTE-VI-098` for the
+practical consequence this has for negated multi-node chains specifically (R15-AMENDED).
+
+Back-ref: `internal/modules/executor/options.go:Options`,
+`internal/modules/executor/structuralresult.go:StructuralResult`,
+`internal/modules/executor/stream_structural.go:fetchStructuralBlocksBounded`. Tests:
+`stream_structural_test.go` (bounded-path suite, chronology/newest-first regression coverage).
+Issue #481.
+
+---
+
+## SPEC-STRUCT-14: Incompleteness-Exclusion Contract for Bounded Structural Parent Resolution
+*Added: 2026-07-08 (issue #481 part 2, F-3, team-lead ruling R15)*
+
+**Contract:** `resolveStructuralParentIndices`'s `budgetMode` parameter (true whenever
+`Options.RecentFirstBudget != nil`) excludes a trace WHOLESALE — never partially evaluated — when
+any of its spans carries a non-empty parent reference (`ParentSpanId` was non-empty at write time)
+that fails to resolve within that trace's assembled span set. `StructuralResult.IncompleteTraceCount`
+is this rule's own observable output: the count of traces excluded this way, zero-value for the
+unbounded path.
+
+**Why wholesale exclusion, not partial evaluation or the unbounded path's orphan treatment.**
+Under the unbounded path (`budgetMode == false`), an unresolved-but-present parent reference is a
+genuine orphan: the caller already fetched every block in the file
+(`expandStructuralBlocksForTraces`), so "not found" means "does not exist," and the existing
+`parentIdx = -1` root-like treatment is correct and UNCHANGED by this rule. Under
+`RecentFirstBudget`, that expansion is SKIPPED (`SPEC-STRUCT-13`), so "not found" is genuinely
+AMBIGUOUS — the ancestor may exist in a block the bounded read never reached. R15 resolves that
+ambiguity conservatively: treat it as "may exist, unread," not "confirmed absent," because a
+wrongly-confirmed absence would flip a negated operator (`!>>`, `!>`, `!~`) into a FALSE POSITIVE —
+a materially different, and worse, failure mode than the honest partial answer (a false negative)
+that a positive operator's incompleteness already produces under a tight budget. Excluding the
+whole trace, uniformly for BOTH polarities (no operator-specific special-casing), is R15's explicit
+requirement: a positive-operator's honest degradation from omission is the same shape of tradeoff
+either way, so one uniform rule safely covers both directions.
+
+**R15-AMENDED — interaction with `SPEC-STRUCT-8`'s pre-existing negation/chain-length
+constraints.** Because `SPEC-STRUCT-8` already hard-errors any multi-node (>2) chain containing a
+negation operator — unconditionally, independent of this phase or of budget mode — a "3+-node
+negated chain" can never actually reach `resolveStructuralParentIndices` (or any structural
+execution path) at all. This narrows the practical scope of this entry's false-positive concern to
+2-node negated chains only (the only shape in which a negation operator and a multi-block,
+budget-truncated trace can co-occur). No spec-text change to `SPEC-STRUCT-8` itself was made or is
+needed — it already, correctly, forecloses the 3+-node-negated case; this entry cross-references it
+rather than duplicating or amending it. See `NOTE-VI-098` for the fuller design-decision history,
+including why the ruling table that originally scoped this phase's work briefly (and incorrectly)
+treated "3+-node negated" as a distinct bucket needing its own execution path.
+
+Back-ref: `internal/modules/executor/stream_structural.go:resolveStructuralParentIndices`,
+`internal/modules/executor/structuralresult.go:StructuralResult.IncompleteTraceCount`. Tests:
+`stream_structural_test.go` (incompleteness-exclusion suite, negated-operator false-positive
+regression coverage). Issue #481.
+
 ## 12. Pipeline Aggregate Queries (streamPipelineQuery)
 
 Invoked when `QueryTraceQL` receives a `*traceqlparser.MetricsQuery` (e.g.
@@ -914,9 +1069,16 @@ Back-ref: `api.go:streamPipelineQuery`, `api.go:computeSpansetAggregate`,
 
 ---
 
-## SPEC-ETM-13: Dict-ID Group Map Invariants
+## SPEC-ETM-13: Dict-ID Group Map Invariants `[SUPERSEDED — metrics_trace_intrinsic.go deleted outright, issue #481 Task F-4, 2026-07-08]`
 
 *Added: 2026-04-17*
+
+**Kept below verbatim for history; every back-ref function in this entry (`buildGroupIDMap`,
+`accumulateIntrinsicBuckets`, `intrinsicInt64ColToString`, `scanIntrinsicColDictIDs`,
+`scanIntrinsicColVals`) was deleted along with `metrics_trace_intrinsic.go` and no longer exists
+anywhere in the codebase (confirmed by repo-wide grep at tombstone time). No successor entry
+exists — the VI-only `ExecuteTraceMetricsFromVI` (`SPEC-VIS-2`) has no group-by dict-ID fast path
+of its own; it only ever answers `count_over_time()`/`rate()` without group-by.**
 
 - **SPEC-ETM-13.1:** When `len(agg.GroupBy) <= maxGroupByDimsFastPath (8)`, the intrinsic
   fast path uses `buildGroupIDMap` to construct a `map[uint32]groupIDKey` instead of
@@ -941,9 +1103,15 @@ Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:intrinsicInt64Co
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:scanIntrinsicColDictIDs`
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:scanIntrinsicColVals`
 
-## SPEC-ETM-14: N=0/N=1 No-Predicate Direct Accumulation
+## SPEC-ETM-14: N=0/N=1 No-Predicate Direct Accumulation `[SUPERSEDED — metrics_trace_intrinsic.go deleted outright, issue #481 Task F-4, 2026-07-08]`
 
 *Added: 2026-04-22*
+
+**Kept below verbatim for history; every back-ref function in this entry
+(`accumulateIntrinsicBucketsDirect`, `accumulateHistogramDirect`, `accumulateAggDirect`,
+`accumulateCountRateDirect`, `accumulateHistogramDirectN0`) was deleted along with
+`metrics_trace_intrinsic.go` and no longer exists anywhere in the codebase. No successor entry
+exists — see SPEC-ETM-13's tombstone note for why.**
 
 **N=1 no-predicate direct accumulation** — when a metrics query has exactly one group-by key,
 no span-level predicate filter, and the block is a dict-encoded intrinsic block, the executor
@@ -1229,37 +1397,64 @@ decline) — `ExecuteMetricsTraceQL` returns `blockpack.ErrValueIndexNoCoverage`
 (`errors.Is`-comparable) instead of falling through to `executor.ExecuteTraceMetrics` (the full
 scan).
 
-**Why blockpack owns this, unlike the search path.** The search path's analogous decline
-(`executor.QueryTraceQLFromIndex`, `NOTE-VI-035`/`047`/`078`) leaves the decline-to-scan
-decision to its CALLER (tempo's `tryIndexFetch`, which converts a routine decline into its own
+**Why blockpack owns this, unlike the search path.** ~~The search path's analogous decline
+(`executor.QueryTraceQLFromIndex`, `NOTE-VI-035`/`096`/`078`) leaves the decline-to-scan
+decision to its CALLER~~ **(superseded below — see Revised 2026-07-08)** ~~(tempo's `tryIndexFetch`, which converts a routine decline into its own
 `ErrSliceIndexCoverageGap`) — blockpack's search-path function just returns `(nil, false, nil)`
-and lets the caller decide. The metrics path is architecturally different:
-`ExecuteMetricsTraceQL` owns its VI-decline-to-scan fallback INTERNALLY (it calls
-`ExecuteTraceMetricsFromVI` itself, then falls through to `ExecuteTraceMetrics` itself) — there
-is no external caller decision point to hook into. `IndexOnly` exists to give an external caller
+and lets the caller decide.~~ The metrics path is architecturally different:
+`ExecuteMetricsTraceQL` owns its VI-decline-to-scan fallback INTERNALLY ~~(it calls
+`ExecuteTraceMetricsFromVI` itself, then falls through to `ExecuteTraceMetrics` itself)~~ — there
+is no external caller decision point to hook into. ~~`IndexOnly` exists to give an external caller
 (tempo's #487 time-slice job dispatch) a way to forbid that internal fallback from outside,
 mirroring the search path's OUTCOME (typed decline signal, no unsafe scan) via a different
-MECHANISM (a boolean flag) required by the different ownership shape.
+MECHANISM (a boolean flag) required by the different ownership shape.~~
 
-**Why a narrowed-window job cannot safely fall back to a full scan.** A `#487` per-slice job
-runs the same query over `[sliceStart, sliceEnd)` only. `ExecuteTraceMetrics`'s full block scan
-is un-windowed at the per-span level relative to the slice boundary — it would ignore
-`[sliceStart, sliceEnd)` and could double-count or over-fetch spans across multiple overlapping
-slice jobs dispatched for the same block. Only a typed, fail-fast decline (which the caller
-converts into a fallback to `DispatchBlockSharded` for the WHOLE query, not a per-slice scan)
-is safe.
+**Why a narrowed-window job cannot safely fall back to a full scan (historical rationale, still
+correct as a description of WHY a scan was unsafe — the scan itself no longer exists, see
+below).** A `#487` per-slice job runs the same query over `[sliceStart, sliceEnd)` only.
+`ExecuteTraceMetrics`'s full block scan was un-windowed at the per-span level relative to the
+slice boundary — it would have ignored `[sliceStart, sliceEnd)` and could have double-counted or
+over-fetched spans across multiple overlapping slice jobs dispatched for the same block. This is
+exactly why removing the scan outright (below), rather than merely gating it behind `IndexOnly`,
+is strictly safer, not a regression.
 
-**`ErrValueIndexNoCoverage`** (root `tracemetricoptions.go`) is the sentinel, `errors.Is`-
+~~**`ErrValueIndexNoCoverage`** (root `tracemetricoptions.go`) is the sentinel, `errors.Is`-
 comparable, distinct per its own doc comment from the search path's tempo-owned
 `ErrSliceIndexCoverageGap` (different repos, different ownership, same underlying design
-intent).
+intent).~~ **(superseded below.)**
 
-Back-ref: `api.go:ExecuteMetricsTraceQL`, `tracemetricoptions.go:TraceMetricOptions.IndexOnly,ErrValueIndexNoCoverage`,
+**Revised 2026-07-08 (issue #481 parts 3-4, Phase F) — the fallback this entry originally
+describes is GONE, not merely forbidden by a flag.** `ExecuteTraceMetrics` (the full-block-scan
+engine referenced throughout the original text above) was **deleted outright**
+(`internal/modules/executor/metrics_trace.go`) — there is no scan left for `IndexOnly` to forbid,
+so `IndexOnly` no longer changes `ExecuteMetricsTraceQL`'s decline behavior at all (it is retained
+on `TraceMetricOptions` only so tempo's callers can keep describing their own job's dispatch shape,
+per its own updated field doc comment). Every non-answer — the OUTER decline
+(`opts.ValueIndex == nil`) and every INNER decline `ExecuteTraceMetricsFromVI` can produce — is now
+the SAME unconditional, production-default typed-error contract, for every caller, always.
+
+**`ErrValueIndexNoCoverage` is replaced outright (no back-compat alias) by FOUR
+`errors.Is`-comparable sentinels** (`internal/modules/executor/decline_errors.go`), mirroring
+`ErrStructuralIndexCoverageGap`'s plain-sentinel style rather than an enum+struct: `ErrMetricsShapeNotAnswerable`
+(an aggregate/group-by shape the VI path cannot answer — SUM/AVG/MIN/MAX/HISTOGRAM/QUANTILE/STDDEV
+and any group-by, deterministic per query text), `ErrMetricsNoCoverage` (a specific leaf/column in
+the predicate has no VI coverage — a per-query-SHAPE limitation), `ErrMetricsLegacyTimeSecZero` (a
+matched span's block predates per-span timestamps — a per-block-DATA limitation, heterogeneous
+across blocks), and `ErrMetricsValueIndexDisabled` (team-lead ruling R8: no `ValueIndexSource` was
+supplied for this call at all — a zeroth, operator-CONFIGURATION-level condition, distinct from
+`ErrMetricsNoCoverage`'s narrower "this one column isn't covered" scope; an earlier version of this
+fix conflated the two, losing R8's distinct category, fixed before landing). Because the fallback
+scan this entry originally protected against is now categorically gone, "why blockpack owns this
+decision internally" is moot — there is no fallback left to own or forbid, only a typed error to
+return.
+
+Back-ref: `api.go:ExecuteMetricsTraceQL`, `tracemetricoptions.go:TraceMetricOptions.IndexOnly`,
+`internal/modules/executor/decline_errors.go` (all four sentinels),
 `internal/modules/executor/metrics_trace.go:ExecuteTraceMetricsFromVI`. See `NOTES.md`
-NOTE-VI-086, NOTE-VI-035/047/078 (the search-path equivalent this mirrors in outcome, not
-mechanism). Tests: `tracemetricoptions_test.go` (`TestExecuteMetricsTraceQL_IndexOnly_NoValueIndexReturnsTypedError`,
-`_IndexOnly_GroupByDeclineReturnsTypedError`, `_IndexOnlyFalse_GroupByDeclineFallsBackToScan`,
-`_IndexOnly_LegacyTimeSecZeroDeclineReturnsTypedError`). Issue #487.
+NOTE-VI-086, NOTE-VI-096 (the search-path equivalent this mirrors in outcome, not mechanism — ID
+corrected 2026-07-08, see NOTE-VI-096 for why the citation changed from NOTE-VI-047). Tests:
+`tracemetricoptions_test.go` (original `IndexOnly` suite, now exercising the unconditional
+contract), plus the F-4 real-write-path suite for the four sentinels. Issues #487, #481.
 
 ---
 

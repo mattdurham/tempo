@@ -192,7 +192,7 @@ func evalOneNegatedStructuralCandidateTrace(
 	}
 
 	recs := resolvedSpansToNegatedStructuralRecs(resolvedSpans, leftMatchSpanIDs, rightMatchAddrs)
-	resolved := resolveStructuralParentIndices([][]structuralSpanRec{recs}, nil)
+	resolved, _ := resolveStructuralParentIndices([][]structuralSpanRec{recs}, nil, false)
 	if len(resolved) == 0 {
 		return false, nil
 	}

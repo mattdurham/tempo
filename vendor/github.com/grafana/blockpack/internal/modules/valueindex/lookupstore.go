@@ -15,7 +15,7 @@ package valueindex
 //
 // This is a breaking interface change for external consumers (tempo's S3 adapter):
 // its minioVIStore already implements Size + ReadAt for the search/metrics path,
-// so it satisfies the widened LookupStore without new methods (NOTE-VI-047).
+// so it satisfies the widened LookupStore without new methods (NOTE-VI-079).
 
 import "context"
 

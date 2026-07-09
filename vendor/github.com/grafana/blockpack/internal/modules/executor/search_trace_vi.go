@@ -34,7 +34,7 @@ import (
 //     other SourceRef are skipped (a single Reader serves one data file)
 //   - wantCols: columns to decode when parsing matched blocks (result materialization)
 //
-// The value index is AUTHORITATIVE for the columns it covers (NOTE-VI-047, issue
+// The value index is AUTHORITATIVE for the columns it covers (NOTE-VI-096, issue
 // #474): when every leaf predicate resolves against the index, the returned spans
 // are the complete, correct answer for this file — there is no speculative
 // "the index answered but a full scan is cheaper" fallback, because a scan would
@@ -54,7 +54,7 @@ import (
 // matched span names a block/page that does not exist in the file. This is index
 // corruption, not a routine "no coverage" miss: surfacing it as an error (rather
 // than silently reproducing the answer via a scan) upholds the authoritative
-// contract and makes the inconsistency observable (NOTE-VI-047, issue #474).
+// contract and makes the inconsistency observable (NOTE-VI-096, issue #474).
 func QueryTraceQLFromIndex(
 	ctx context.Context,
 	source ValueIndexSource,
@@ -104,7 +104,7 @@ func QueryTraceQLFromIndex(
 	// NOTE-VI-045 (#429): the v2 BucketGroup index carries a page-addressed BlockRef
 	// (BlockPage), not a block index. Resolve each page to a block index via the reader;
 	// a page that names no block start means the index and data file are out of sync.
-	// The value index is authoritative (NOTE-VI-047, #474): an out-of-sync page is index
+	// The value index is authoritative (NOTE-VI-096, #474): an out-of-sync page is index
 	// corruption, so surface it as an error rather than silently masking it with a scan.
 	rowsByBlock := make(map[int][]uint16)
 	blockOrder := make([]int, 0, len(filtered))
@@ -161,7 +161,7 @@ func QueryTraceQLFromIndex(
 		raw, ok := rawBlocks[blockIdx]
 		if !ok {
 			// Reader returned no bytes for a block the index named ⇒ index/data
-			// inconsistency; surface it (NOTE-VI-047, #474) rather than masking it.
+			// inconsistency; surface it (NOTE-VI-096, #474) rather than masking it.
 			return nil, false, fmt.Errorf(
 				"QueryTraceQLFromIndex: value index names block %d absent from %s (index/data inconsistency)",
 				blockIdx,

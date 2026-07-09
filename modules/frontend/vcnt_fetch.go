@@ -13,6 +13,8 @@ package frontend
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"path"
 	"strings"
@@ -20,6 +22,24 @@ import (
 	"github.com/grafana/blockpack"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding/vblockpack"
+)
+
+// ErrPlanTimeLowSelectivityNoLimit (issue #481 parts 2/3, F-6, team-lead ruling R6) is returned
+// by buildQueryPlanFromProgram when a query is resolvable but has NO safe answer at plan time:
+// its VCNT-classified selectivity is low (would match most of the column's live values) and
+// either (a) it's a search query with no limit, or (b) it's a metrics query (never bounded-
+// served, R2) — in both cases every per-block job dispatched would decline identically, so per
+// R6 the frontend fails HERE, at plan time, rather than fanning out N certain-to-decline
+// queries. This is deliberately NOT one of blockpack's F-4 querier-side decline sentinels
+// (ErrMetricsShapeNotAnswerable et al.) — those fire from Fetch/QueryRange per-block, after
+// dispatch; this fires from RoundTrip BEFORE any block job is ever constructed, so it never
+// reaches the querier, the combiner, or F-10's declineErrorToHTTPResponse mapper. Callers
+// (search_sharder.go, metrics_query_range_sharder.go) convert this directly to
+// pipeline.NewBadRequest — a plan-time failure IS "failing in the frontend," no combiner
+// round-trip required.
+var ErrPlanTimeLowSelectivityNoLimit = errors.New(
+	"query has low value-index selectivity with no bounded answer available: " +
+		"a full per-block scan would be required to answer it correctly, which is not attempted",
 )
 
 // fetchVCNTSection lists and downloads the .vcnt files covering each of dims (candidate
@@ -118,16 +138,16 @@ func splitObjectKey(fullKey string) (backend.KeyPath, string) {
 // and is unreachable from this block-independent plan-time call site).
 func buildQueryPlan(
 	ctx context.Context, rawR backend.RawReader, tenant, indexPrefix, query string,
-	minTS, maxTS uint64, concurrentRequests int,
-) *blockpack.QueryPlan {
+	minTS, maxTS uint64, concurrentRequests int, hasLimit bool,
+) (*blockpack.QueryPlan, error) {
 	if rawR == nil || query == "" {
-		return nil
+		return nil, nil
 	}
 	prog, err := blockpack.CompileTraceQL(query, blockpack.QueryOptions{})
 	if err != nil || prog == nil {
-		return nil
+		return nil, nil
 	}
-	return buildQueryPlanFromProgram(ctx, rawR, tenant, indexPrefix, prog, minTS, maxTS, concurrentRequests)
+	return buildQueryPlanFromProgram(ctx, rawR, tenant, indexPrefix, prog, minTS, maxTS, concurrentRequests, true, hasLimit)
 }
 
 // buildMetricsQueryPlan is buildQueryPlan's metrics sibling (holistic-review Issue 2/B): a real
@@ -153,26 +173,41 @@ func buildQueryPlan(
 func buildMetricsQueryPlan(
 	ctx context.Context, rawR backend.RawReader, tenant, indexPrefix, query string,
 	minTS, maxTS uint64, concurrentRequests int,
-) *blockpack.QueryPlan {
+) (*blockpack.QueryPlan, error) {
 	if rawR == nil || query == "" {
-		return nil
+		return nil, nil
 	}
 	prog, viAnswerableShape, err := blockpack.CompileTraceQLMetricsFilter(query)
 	if err != nil || prog == nil || !viAnswerableShape {
-		return nil
+		return nil, nil
 	}
-	return buildQueryPlanFromProgram(ctx, rawR, tenant, indexPrefix, prog, minTS, maxTS, concurrentRequests)
+	// boundedEligible=false (R2: metrics is never bounded-served); hasLimit is irrelevant on
+	// this path and unused by buildQueryPlanFromProgram's boundedEligible=false branch.
+	return buildQueryPlanFromProgram(ctx, rawR, tenant, indexPrefix, prog, minTS, maxTS, concurrentRequests, false, false)
 }
 
-// buildQueryPlanFromProgram is the shared tail both buildQueryPlan and buildMetricsQueryPlan call
-// once they have a compiled *blockpack.Program that has already passed any caller-specific
-// qualification (buildMetricsQueryPlan's own viAnswerableShape check, in particular) — the
-// VCNT-fetch/qualification logic itself must stay identical for both call sites, so it lives in
-// exactly one place.
+// buildQueryPlanFromProgram is the shared tail buildQueryPlan/buildStructuralQueryPlan (search,
+// boundedEligible=true) and buildMetricsQueryPlan (metrics, boundedEligible=false) all call once
+// they have a compiled *blockpack.Program that has already passed any caller-specific
+// qualification (buildMetricsQueryPlan's own viAnswerableShape check, buildStructuralQueryPlan's
+// own left-leg compile, in particular) — the VCNT-fetch/qualification/selectivity logic itself
+// must stay identical across all three call sites, so it lives in exactly one place.
+//
+// R10 (issue #481 parts 2/3, F-6): the signature changed from a bare *blockpack.QueryPlan return
+// to (*blockpack.QueryPlan, error) — a non-nil error means the query has NO safe answer at plan
+// time (ErrPlanTimeLowSelectivityNoLimit; see its own doc comment) and the caller MUST fail the
+// request here (pipeline.NewBadRequest), never dispatch. A nil plan AND nil error (unchanged from
+// before this phase) means "no real plan could be built for other reasons" (no RawReaderProvider,
+// compile failure, unresolvable index coverage, nothing plannable) — treat exactly like
+// DispatchBlockSharded, byte-identical to today.
+//
+// hasLimit is meaningful ONLY when boundedEligible is true (search/structural); metrics callers
+// pass it as false and it is never read on the boundedEligible=false branch, since R2 already
+// forecloses metrics ever reaching DispatchBoundedRecentFirst regardless of a limit.
 func buildQueryPlanFromProgram(
 	ctx context.Context, rawR backend.RawReader, tenant, indexPrefix string, prog *blockpack.Program,
-	minTS, maxTS uint64, concurrentRequests int,
-) *blockpack.QueryPlan {
+	minTS, maxTS uint64, concurrentRequests int, boundedEligible, hasLimit bool,
+) (*blockpack.QueryPlan, error) {
 	// (Issue 4/holistic-review fix E) Check resolvability BEFORE any VCNT fetch I/O.
 	// allLeavesResolvable is BuildQueryPlan's ONLY gate on Strategy (see its own doc comment):
 	// a query that fails this check always resolves to DispatchBlockSharded regardless of what
@@ -183,7 +218,7 @@ func buildQueryPlanFromProgram(
 	// separate discovery cache), so this ordering costs nothing extra for queries that DO
 	// qualify.
 	if !vblockpack.CheckIndexCoverage(ctx, tenant, prog, minTS, maxTS) {
-		return nil
+		return nil, nil
 	}
 
 	dims := make([]string, 0, len(prog.WantColumns))
@@ -192,10 +227,40 @@ func buildQueryPlanFromProgram(
 	}
 
 	data, dir := fetchVCNTSection(ctx, rawR, tenant, indexPrefix, dims)
+
+	// F-6/R3/R6: classify selectivity over the SAME decoded section TimeSliceOracle below
+	// consumes — no extra I/O, a pure-function call over already-in-hand bytes.
+	sel := blockpack.ClassifyProgramVCNT(prog, data, dir, minTS, maxTS)
+
+	if boundedEligible {
+		strategy, planTimeDecline := blockpack.SelectSearchStrategy(sel, hasLimit)
+		if planTimeDecline {
+			return nil, fmt.Errorf("plan-time decline for tenant %s: %w", tenant, ErrPlanTimeLowSelectivityNoLimit)
+		}
+		if strategy == blockpack.DispatchBoundedRecentFirst {
+			// R9/R10 (Option B, ratified): QueryPlan carries ONLY the Strategy signal — no
+			// budget fields. The querier (backend_block.go) applies its own budget policy
+			// when it sees this Strategy value.
+			return &blockpack.QueryPlan{Strategy: blockpack.DispatchBoundedRecentFirst}, nil
+		}
+		// strategy == DispatchBlockSharded here means SelectSearchStrategy's Selective or
+		// UnknownSelectivity-without-limit row — fall through to the existing cost/
+		// perMinuteForLead/BuildQueryPlan flow below exactly as before this phase (it decides
+		// DispatchTimeSliced vs. DispatchBlockSharded on its own, unrelated, resolvability-only
+		// gate).
+	} else if sel == blockpack.LowSelectivity {
+		// Metrics (boundedEligible=false, R2): a resolvable-but-low-selectivity metrics query
+		// has no safe answer — SUM/AVG/HISTOGRAM/etc. need the aggregate over the FULL matching
+		// corpus, and a truncated aggregate is a wrong answer, not a partial one (R2). Per R6,
+		// fail at plan time rather than dispatch N block jobs that would each independently
+		// decline identically once the block-level executor also observes low coverage/shape.
+		return nil, fmt.Errorf("plan-time decline for tenant %s: %w", tenant, ErrPlanTimeLowSelectivityNoLimit)
+	}
+
 	cost, perMinuteForLead := blockpack.TimeSliceOracle(data, dir, minTS, maxTS)
 
 	plan := blockpack.BuildQueryPlan(
 		prog, cost, true, perMinuteForLead, minTS, maxTS, concurrentRequests, blockpack.DefaultK,
 	)
-	return &plan
+	return &plan, nil
 }

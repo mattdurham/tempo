@@ -257,6 +257,16 @@ func CheckIndexCoverage(ctx context.Context, tenant string, prog *blockpack.Prog
 	return ok
 }
 
+// boundedAuthorized (issue #481 part 3, F-7, R7, LOCAL-DERIVATION contract ruled by R17 —
+// supersedes an earlier plan-strategy-threaded design that never had a wire path from the
+// frontend's QueryPlan.Strategy to this per-block call, and would have required protobuf
+// generator surgery unavailable in this environment) is set true by the caller (Fetch, F-8)
+// exactly when a limit is present on this query and it is not a #487 slice job — the SAME
+// hasLimit predicate blockpack.SelectSearchStrategy already applies frontend-side (F-6),
+// re-evaluated locally rather than threaded over the wire, so there is only ever one
+// implementation of "does this query have a limit". A slice job (indexOnly) always passes
+// false regardless of limit — R11-AMENDED's absolute priority. See declineOutcomeBounded's
+// doc comment for the full outcome table.
 func (b *blockpackBlock) tryIndexFetch(
 	ctx context.Context,
 	r *blockpack.Reader,
@@ -264,10 +274,13 @@ func (b *blockpackBlock) tryIndexFetch(
 	query string,
 	opts blockpack.QueryOptions,
 	indexOnly bool,
+	boundedAuthorized bool,
 ) ([]blockpack.SpanMatch, bool, indexFetchStats, error) {
 	var stats indexFetchStats
 	vr := getValueIndexQueryReader()
 	if vr == nil {
+		// R8: the vr==nil zeroth category is UNCHANGED and untouched by boundedAuthorized —
+		// see declineOutcome's own doc comment.
 		return declineOutcome(indexOnly, stats)
 	}
 
@@ -282,17 +295,16 @@ func (b *blockpackBlock) tryIndexFetch(
 		// A build-time error is an object-store/discovery failure (List error,
 		// corrupt-file decode). This is not the authoritative "index named a block
 		// absent from the data file" inconsistency — the source has not yet
-		// produced any span match — so it remains a routine decline: log and let
-		// the caller fall back to a correct full scan (NOTE-VI-078, issue #481),
-		// unless indexOnly forbids the fallback (issue #487).
+		// produced any span match — so it remains a routine decline (F-7: hard error
+		// unless boundedAuthorized, or ErrSliceIndexCoverageGap under indexOnly).
 		level.Warn(util_log.Logger).Log("msg", "vblockpack: index fetch: build source error",
 			"block", b.meta.BlockID, "err", err)
-		return declineOutcome(indexOnly, stats)
+		return declineOutcomeBounded(indexOnly, boundedAuthorized, stats)
 	}
 	if !ok {
 		level.Info(util_log.Logger).Log("msg", "vblockpack: index fetch: no coverage",
 			"block", b.meta.BlockID, "tenant", b.meta.TenantID, "minSec", minSec, "maxSec", maxSec)
-		return declineOutcome(indexOnly, stats)
+		return declineOutcomeBounded(indexOnly, boundedAuthorized, stats)
 	}
 	level.Info(util_log.Logger).Log("msg", "vblockpack: index fetch: coverage found",
 		"block", b.meta.BlockID, "tenant", b.meta.TenantID, "files", src.Stats().FilesRead)
@@ -328,7 +340,7 @@ func (b *blockpackBlock) tryIndexFetch(
 		return nil, false, stats, err
 	}
 	if !indexOK {
-		return declineOutcome(indexOnly, stats)
+		return declineOutcomeBounded(indexOnly, boundedAuthorized, stats)
 	}
 	stats.Used = true
 	return matches, true, stats, nil
@@ -338,9 +350,45 @@ func (b *blockpackBlock) tryIndexFetch(
 // (nil, false, stats, nil) when indexOnly is false, or the #487 slice-mode
 // (nil, false, stats, ErrSliceIndexCoverageGap) when indexOnly is true — a slice
 // job must fail rather than let its caller fall through to an unsafe full scan.
+//
+// R8 (issue #481 part 3): this is the UNCHANGED, UNCONDITIONAL decline path reserved for the
+// vr == nil zeroth category ONLY (value_index_query.enabled=false — the index-driven path is
+// disabled entirely for this querier, mirroring trace-by-id's already-settled "no index
+// provided → scan is the only correct path, KEPT" category). It is deliberately NOT threaded
+// through declineOutcomeBounded's boundedAuthorized gate below — vr==nil is a config-level
+// absence of any index signal, never a per-query/per-block routine decline, so it is exempt from
+// R7's backstop by design (F-8 keeps calling this same path for vr==nil, unchanged).
 func declineOutcome(indexOnly bool, stats indexFetchStats) ([]blockpack.SpanMatch, bool, indexFetchStats, error) {
 	if indexOnly {
 		return nil, false, stats, ErrSliceIndexCoverageGap
+	}
+	return nil, false, stats, nil
+}
+
+// declineOutcomeBounded is tryIndexFetch's ROUTINE DECLINE outcome for every decline site EXCEPT
+// the vr==nil zeroth category (issue #481 part 3, F-7, team-lead rulings R7/R17): boundedAuthorized
+// is Fetch's LOCAL derivation (R17) from whether this query carries a limit — the frontend's
+// plan-time gate (buildQueryPlanFromProgram, R6) is authoritative for query-SHAPE-driven
+// rejection, but per-block declines a coarse, tenant-level VCNT classification couldn't predict
+// (a query classified Selective at plan time can still decline on an individual block) are this
+// function's concern, independent of the frontend's Strategy choice.
+//
+//   - indexOnly (unchanged, takes priority): ErrSliceIndexCoverageGap — a #487 slice job's
+//     narrowed window has no safe scan fallback either way, regardless of boundedAuthorized.
+//   - !indexOnly && boundedAuthorized (a limit is present on this query): (nil, false, stats,
+//     nil) — relayed unchanged so Fetch's caller (F-8) routes to the bounded path instead of a
+//     scan. Bounded-with-a-limit is an honest, budgeted answer by construction (R2), never a
+//     wrong one, regardless of what selectivity class the frontend assigned this query.
+//   - !indexOnly && !boundedAuthorized (no limit present): the search decline hard-errors
+//     DIRECTLY — never an implicit scan. Absent a limit, there is no safe way to bound the read,
+//     matching R6's framing that an unauthorized decline must never silently fall back to
+//     "silently scan," the #481 anti-pattern this phase eliminates.
+func declineOutcomeBounded(indexOnly, boundedAuthorized bool, stats indexFetchStats) ([]blockpack.SpanMatch, bool, indexFetchStats, error) {
+	if indexOnly {
+		return nil, false, stats, ErrSliceIndexCoverageGap
+	}
+	if !boundedAuthorized {
+		return nil, false, stats, ErrSearchNoCoverage
 	}
 	return nil, false, stats, nil
 }

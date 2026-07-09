@@ -779,6 +779,57 @@ longer exists.
 
 ---
 
+**Addendum 2026-07-08 (issue #481 parts 2-4, Phase F) — metrics decline is now unconditional and
+typed; search gains a bounded alternative to the unconditional scan fallback.**
+
+**Metrics: the fallback is GONE, not just enforced.** `ExecuteTraceMetrics` (the full-block-scan
+engine) was deleted outright — there is no scan left to fall back to, under `IndexOnly` or
+otherwise (that flag no longer changes `ExecuteMetricsTraceQL`'s decline behavior at all; every
+non-answer is now the same typed-error contract regardless of its value). The single old sentinel
+`ErrValueIndexNoCoverage` (scoped to the opt-in `IndexOnly` path only) is replaced outright by four
+`errors.Is`-comparable sentinels covering every decline category, including a new zeroth/
+config-level category surfaced during review (team-lead ruling R8): `ErrMetricsShapeNotAnswerable`
+(category 3, unsupported aggregate/group-by shape), `ErrMetricsNoCoverage` (category 1,
+per-query-shape: a specific leaf/column lacks coverage), `ErrMetricsLegacyTimeSecZero`
+(per-block-data: the matched span predates per-span timestamps), and
+`ErrMetricsValueIndexDisabled` (R8: no `ValueIndexSource` supplied at all for this call — an
+operator-configuration condition affecting every metrics query, distinct from a single
+uncovered column). See `internal/modules/executor/SPECS.md` `SPEC-VIS-2` (revised) for the full
+mechanism-level contract and `internal/modules/executor/decline_errors.go` for the sentinels
+themselves.
+
+**Search: a new bounded, pointed execution option exists alongside the unconditional scan —
+blockpack's own contract is additive, not yet a removal.** `QueryOptions.RecentFirstBudget`
+(`SPEC-ROOT-023`, new) activates a bounded, newest-first-block read strategy on the SCAN path
+(`QueryTraceQL`/`ExecuteStructural`) — reading stops at the first `MaxBlocks`/`MaxBytes`/
+`MaxDuration` cap reached, rather than reading every selected block unconditionally. This is
+consumed by `queryplan.SelectSearchStrategy` (`internal/modules/queryplan/SPECS.md` `SPEC-QP-6`),
+a pure decision-table function a caller uses to choose between an index-only strategy, this
+bounded scan, and a genuine plan-time decline, based on a VCNT selectivity classification and
+whether the query carries a limit (team-lead ruling R13). **This addendum does NOT retract the
+three routine-decline categories documented above for `QueryTraceQLFromIndex`/`ExecuteMetricsTraceQL`
+— they are unchanged by this phase.** What changed is that the CALLER (tempo's frontend) now has,
+for the search path specifically, a bounded alternative to reach for instead of an unconditional
+full scan when a full index-source build isn't worth it — the decision of *when* to use it is a
+tempo-side dispatch concern (`internal/modules/queryplan`'s `SelectSearchStrategy`/
+`ClassifyProgramVCNT`), not a change to what `QueryTraceQLFromIndex` itself declines on.
+
+**Tempo-side consumer wiring status (external, not tracked in this file per this project's
+standing rule that tempo-side files take no spec-ID citations here).** Issue #481's full directive
+— tempo's frontend strategy choice (`buildQueryPlanFromProgram` consuming `ClassifyProgramVCNT`/
+`SelectSearchStrategy`), the `Fetch`/`QueryRange` rewire that retires the old unconditional-scan
+fallback in favor of this bounded strategy plus typed hard-errors, and the accompanying test
+rewrites — is complete as of this addendum's writing (Phase F, tasks F-6 through F-10). Blockpack's
+own capability (`RecentFirstBudget`, `SelectSearchStrategy`, the typed metrics sentinels) and its
+tempo consumer are both stable; this file documents only the blockpack-side contract, as always.
+
+Back-refs (Phase F additions): `queryoptions.go:RecentFirstBudget` (`SPEC-ROOT-023`),
+`internal/modules/executor/decline_errors.go` (the four sentinels),
+`internal/modules/executor/stream.go` (`SPEC-STREAM-13`, the bounded-read mechanism),
+`internal/modules/queryplan/queryplan.go:SelectSearchStrategy` (`SPEC-QP-6`). Issue #481.
+
+---
+
 ## SPEC-FORMAT-001: All Metadata Sections Must Be ToC-Driven for Selective Decoding
 
 **Invariant:** Every metadata section that contains per-column data MUST be stored as an
@@ -1119,3 +1170,67 @@ type gains, including ones added after the alias itself was written.
 
 **Back-ref:** `cube_ingest.go` (full symbol list above); `cube_ingest_publicapi_test.go`
 (`package blockpack_test`, proving the surface is usable without any `internal/` import).
+
+
+## SPEC-ROOT-023: `RecentFirstBudget` — Bounded, Pointed Newest-First Execution Strategy
+*Added: 2026-07-08 (issue #481 parts 2-3, team-lead rulings R13/R14/R14-AMENDED)*
+
+**What this is.** `QueryOptions.RecentFirstBudget *RecentFirstBudget` (`queryoptions.go`)
+activates a bounded, pointed newest-first execution strategy on the scan path
+(`QueryTraceQL`/`ExecuteStructural`), as an alternative to reading every predicate-selected block
+unconditionally. It exists because removing the search path's routine-decline-to-full-scan
+fallback outright (issue #481's original directive) would turn common negation/low-selectivity
+queries into hard failures — a bounded, pointed scan is the safe middle ground between "answer
+authoritatively from the index" and "fail the query."
+
+**Contract:**
+```go
+type RecentFirstBudget struct {
+    MaxBlocks   int
+    MaxBytes    int64
+    MaxDuration time.Duration
+}
+```
+A zero field means "no cap on that dimension." At least one of `Limit`/`MaxBlocks`/`MaxBytes`/
+`MaxDuration` must be positive, or the bounded strategy has no way to ever stop —
+`validateQueryOptions` (`api.go`) rejects an all-zero budget as invalid input (`SPEC-ROOT-001`: a
+typed error, never a panic, on this adversarial input). `RecentFirstBudget` and `MostRecent` are
+mutually exclusive (`RecentFirstBudget` is a strategy-engine signal set by the caller's dispatch
+logic; `MostRecent` is a user-facing query hint) — `validateQueryOptions` rejects both being set
+together.
+
+**Execution semantics (mechanism detail in `internal/modules/executor/SPECS.md` `SPEC-STREAM-13`
+for the filter path, `SPEC-STRUCT-13`/`14` for the structural path):** blocks are read
+newest-first (`Direction=Backward`, `WantSort=false` — the bounded path deliberately never routes
+through the globally-correct-but-exhaustive top-K heap scan, which reads all selected blocks
+regardless of any budget). Reading stops at the FIRST cap reached: `Limit` matches found,
+`MaxBlocks` blocks read, `MaxBytes` bytes read, or `MaxDuration` elapsed. `MaxBlocks` is enforced
+EXACTLY (blocks are truncated to the newest `MaxBlocks` before coalescing); `MaxBytes`/
+`MaxDuration` are checked once per coalesced I/O group, not per block or per row, so a caller may
+observe a bounded overshoot proportional to group/pipeline-concurrency size, never proportional to
+file size — see `SPEC-STREAM-13` for the exact overshoot bound (R14-AMENDED).
+
+**No budget fields carry into `queryplan.QueryPlan`** — unlike `DispatchTimeSliced`, tempo's
+backend (not blockpack) owns and applies the actual budget policy once `SelectSearchStrategy`
+(`SPEC-QP-6`) signals `DispatchBoundedRecentFirst`; blockpack's own `QueryPlan` carries only the
+`Strategy` enum value for this path, mirroring how `IndexOnly`/`MostRecent` are tempo-set booleans
+on blockpack's `QueryOptions` rather than blockpack-computed values (plan-f.md Task 5's Option B,
+ratified).
+
+**Executor-package-local mirror.** `internal/modules/executor/recentfirst.go`'s own
+`RecentFirstBudget` struct is a field-for-field DUPLICATE of this type, not an import — `executor`
+is a lower-level package the root `blockpack` package imports, so it cannot reference the root
+type without an import cycle. `api.go`/`query_traceql.go` copy field-by-field across that
+boundary when building `CollectOptions`/`Options`, mirroring the existing pattern for
+`Limit`/`StartBlock`/etc. `SPEC-STRUCT-13`'s bounded structural path reuses this SAME executor-local
+type — no further duplication for the structural engine.
+
+**Real-write-path test coverage:** `recentfirst_test.go` (root) exercises `MaxBlocks`/`MaxBytes`/
+`MaxDuration` stopping conditions, newest-first block ordering, and the never-routes-through-topK
+guarantee, all via real multi-block files written through the standard write path (not fixtures).
+
+Back-refs: `queryoptions.go:RecentFirstBudget`, `api.go:validateQueryOptions`,
+`internal/modules/executor/recentfirst.go:RecentFirstBudget`, `internal/modules/executor/stream.go`
+(`SPEC-STREAM-13`), `internal/modules/executor/options.go`/`structuralresult.go`/
+`stream_structural.go` (`SPEC-STRUCT-13`/`14`). Tests: `recentfirst_test.go`,
+`internal/modules/executor/recentfirst_test.go`. Issue #481.

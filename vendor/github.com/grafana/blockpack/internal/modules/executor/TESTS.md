@@ -393,7 +393,14 @@ case-insensitive alternations).
 
 ---
 
-## ExecuteTraceMetrics Tests (metrics_trace_test.go)
+## ExecuteTraceMetrics Tests (metrics_trace_test.go) `[SUPERSEDED — metrics_trace_test.go deleted outright, issue #481 Task F-4, 2026-07-08]`
+
+**This whole section (EX-ETM-01 through EX-ETM-22, plus EX-ETM-GKM-01 through EX-ETM-GKM-05 below)
+tested `ExecuteTraceMetrics`, deleted outright along with this section's sole back-ref file,
+`metrics_trace_test.go`. Kept below verbatim for history, per `SPEC-ROOT-009`'s never-delete-an-ID
+rule. No successor test entries exist for the deleted scan-based function/group-key-map path — see
+`internal/modules/executor/SPECS.md` `SPEC-VIS-2` (revised) for the current, VI-only metrics
+contract and its own real-write-path test coverage (F-4's sentinel-error suite).**
 
 ### EX-ETM-01: TestTraceMetrics_Count
 
@@ -1381,7 +1388,17 @@ user attribute. Guards against path optimizations silently changing observable r
 
 ---
 
-## Intrinsic Fast-Path Tests (intrinsic_correctness_test.go, intrinsic_pruning_test.go, metrics_trace_intrinsic_test.go)
+## Intrinsic Fast-Path Tests (intrinsic_correctness_test.go, intrinsic_pruning_test.go, metrics_trace_intrinsic_test.go) `[SUPERSEDED — all three back-ref files deleted outright, issue #481 Task F-4, 2026-07-08]`
+
+**Every `EX-ETM-*` entry within this section (`EX-ETM-INTR-07`/`08`, `EX-ETM-GID-01` through `10`,
+`EX-ETM-N1-01` through `20`, `EX-ETM-SK-01`/`02` — confirmed by direct back-ref/file-existence
+check, zero survivors) tested the `metrics_trace_intrinsic.go` dict-ID group-map fast path, deleted
+outright along with all three of this section's back-ref files. Kept below verbatim for history.
+No successor test entries exist — see `SPEC-ETM-13`/`14`'s tombstone in `SPECS.md` for the
+corresponding spec-contract retirement. Non-`EX-ETM-*` entries physically interleaved in this same
+file region (`EX-BGP`, `EX-CK-*`, `EX-INT-*`, `EX-CP-*`, `EX-STRUCT-INT-*`) are UNRELATED features
+in surviving files and are NOT part of this retirement — do not mistake their physical proximity
+for shared fate.**
 
 These tests verify the SPEC-STREAM-9 intrinsic execution path (Cases A–D) and the
 SPEC-STREAM-10 invariants (nilIntrinsicScan, userAttrProgram, filterRowSetByIntrinsicNodes).

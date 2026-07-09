@@ -1009,6 +1009,16 @@ func TestFetch_SetsAttributeMatched(t *testing.T) {
 // Root cause: vendor/github.com/grafana/blockpack/spanmatch.go:271-273 skips nil-Fields spans.
 // Fix location: tempodb/encoding/vblockpack/backend_block.go:Fetch() — detect nil Fields,
 // issue a metadata re-query with "{}" + SelectColumns for the matched trace IDs.
+//
+// F-9 (issue #481 parts 2/3): common.SearchOptions now carries MaxTraces: 5 — a fixture-level
+// change forced by Phase F's decline-routing rewrite (F-8). This test's structural query has no
+// value-index reader configured at all, so it declines identically to
+// structural_dispatch_test.go's TestFetch_StructuralIndexOnlyFalse_DeclineRoutingUnaffectedByVIConfig;
+// without a limit that decline now hard-errors (ErrSearchNoCoverage) instead of falling back to a
+// scan. Adding the limit routes through F-3's bounded structural path instead — the SAME correct
+// answer this test's actual (unrelated) invariant, RootServiceName/DurationNanos population, needs
+// to observe. This is the ONLY change; the RootServiceName/DurationNanos assertions below are
+// untouched.
 func TestFetch_StructuralQueryPopulatesRootServiceName(t *testing.T) {
 	t.Cleanup(blockpack.ClearReaderCaches)
 
@@ -1070,7 +1080,7 @@ func TestFetch_StructuralQueryPopulatesRootServiceName(t *testing.T) {
 	fetchCtx := common.WithOriginalTraceQLQuery(ctx, structuralQuery, false)
 
 	req := traceql.FetchSpansRequest{}
-	resp, err := blk.Fetch(fetchCtx, req, common.SearchOptions{})
+	resp, err := blk.Fetch(fetchCtx, req, common.SearchOptions{MaxTraces: 5})
 	require.NoError(t, err)
 	defer resp.Results.Close()
 

@@ -1,8 +1,9 @@
 package executor
 
-// intrinsic_helpers.go — utilities extracted from metrics_trace_intrinsic.go after #433
-// (IntrinsicTOC removal). These helpers are still used by stream_structural.go,
-// metrics_trace.go, and predicates.go.
+// intrinsic_helpers.go — scratch-buffer pools extracted from metrics_trace_intrinsic.go after
+// #433 (IntrinsicTOC removal). Still used by stream_structural.go. normalizeIntrinsicFieldName
+// and pow2Floor (metrics_trace.go-only helpers) were deleted 2026-07-08 (issue #481 part 3)
+// along with ExecuteTraceMetrics, their only caller.
 
 import (
 	"sync"
@@ -29,37 +30,6 @@ func releaseCompactInt32(s []int32) {
 		return
 	}
 	compactInt32Pool.Put(s[:cap(s)]) //nolint:staticcheck // SA6002: slice is pointer-sized
-}
-
-// normalizeIntrinsicFieldName converts aliases like "duration" → "span:duration"
-// so callers can use shorthand names for well-known fields.
-func normalizeIntrinsicFieldName(field string) string {
-	switch field {
-	case "duration":
-		return colNameSpanDuration
-	case "name":
-		return colNameSpanName
-	case "status":
-		return colNameSpanStatus
-	case "kind":
-		return colNameSpanKind
-	case "start":
-		return colNameSpanStart
-	}
-	return field
-}
-
-// pow2Floor returns the largest power of two ≤ v, or v itself for non-positive values.
-func pow2Floor(v float64) float64 {
-	if v <= 0 {
-		return v
-	}
-	// Repeatedly halve until ≤ v; this is the branch-free version.
-	p := 1.0
-	for p*2 <= v {
-		p *= 2
-	}
-	return p
 }
 
 var (

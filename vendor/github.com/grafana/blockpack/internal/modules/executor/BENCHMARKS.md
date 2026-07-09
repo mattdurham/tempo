@@ -90,9 +90,11 @@ Back-ref: `internal/modules/executor/prealloc_bench_test.go:BenchmarkCollectStre
 
 ---
 
-## BENCH-EX-05: BenchmarkTraceAccumulateRow_AllocCount
+## BENCH-EX-05: BenchmarkTraceAccumulateRow_AllocCount `[SUPERSEDED — benchmark deleted, issue #481 Task F-4, 2026-07-08]`
 
 _Added: 2026-04-08_
+
+**F-4-caused, confirmed by diff review:** `prealloc_bench_test.go` (this benchmark's sole home) was deleted as part of `ExecuteTraceMetrics`'s outright removal. Kept below verbatim for history, per `SPEC-ROOT-009`'s never-delete-an-ID rule. No successor benchmark exists — the surviving `ExecuteTraceMetricsFromVI` has no scan-path row-accumulation hot loop of its own to benchmark this way.
 
 Measures per-call allocations in the `traceAccumulateRow` hot path by running
 `ExecuteTraceMetrics` with a 1-element GroupBy over 200 matching spans in a single block.
@@ -129,9 +131,11 @@ Back-ref: `internal/modules/executor/prealloc_bench_test.go:BenchmarkTraceAccumu
 
 ---
 
-## BENCH-EX-09: BenchmarkTraceAccumulateRow_HISTOGRAM_AllocCount
+## BENCH-EX-09: BenchmarkTraceAccumulateRow_HISTOGRAM_AllocCount `[SUPERSEDED — benchmark deleted, issue #481 Task F-4, 2026-07-08]`
 
 _Added: 2026-04-16. Renumbered from BENCH-EX-08 during PR combination — #229 already took BENCH-EX-08 for BenchmarkTraceMetrics_FilteredIntrinsic_AllocCount._
+
+**F-4-caused, same file as BENCH-EX-05** (`prealloc_bench_test.go`, deleted). Kept below verbatim for history.
 
 Measures per-call allocations in the HISTOGRAM path of `traceAccumulateRow`. Uses 200
 spans with `span:duration`, cycling `resource.env` across 3 values, 1s step buckets,
@@ -240,9 +244,11 @@ b.ReportMetric(float64(len(result.Matches)), "matches")
 
 ---
 
-## BENCH-EX-08: BenchmarkTraceMetrics_FilteredIntrinsic_AllocCount
+## BENCH-EX-08: BenchmarkTraceMetrics_FilteredIntrinsic_AllocCount `[SUPERSEDED — pre-existing orphan, PARTIALLY predates Phase F; fully orphaned by issue #481 Task F-4, 2026-07-08]`
 
 _Added: 2026-04-16_
+
+**Vintage-attributed, NOT a Phase F deletion:** one of this entry's two back-refs (`metrics_trace_intrinsic.go:mergeJoinFilteredRefsWithVals`) was ALREADY gone before Phase F started — that file predates this phase's own deletion of it, and the function itself was confirmed absent from the codebase entirely at tombstone time, independent of anything F-4 touched (likely #433's IntrinsicTOC removal, based on vintage — not independently verified against that issue's own history). Phase F's F-4 then deleted this entry's OTHER back-ref (`metrics_trace_intrinsic_test.go`, the actual benchmark function's home) as part of `ExecuteTraceMetrics`'s removal, making the entry fully (rather than partially) orphaned. Kept below verbatim for history; no successor benchmark exists.
 
 Measures per-iteration allocations in `executeTraceMetricsIntrinsic` on the filtered
 intrinsic path (predicate filter present, count/rate, no aggregate column), exercising the
@@ -276,9 +282,11 @@ Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:mergeJoinFiltere
 
 ---
 
-## BENCH-EX-10: BenchmarkIntrinsicCountRateGroupBy_AllocCount
+## BENCH-EX-10: BenchmarkIntrinsicCountRateGroupBy_AllocCount `[SUPERSEDED — pre-existing orphan, predates Phase F, 2026-07-08]`
 
 _Added: 2026-04-17_
+
+**Vintage-attributed, NOT a Phase F deletion:** `intrinsic_group_id_bench_test.go` (this benchmark's sole home) and the `buildGroupIDMap`/`streamCountRateGroupByID` functions it exercises were already gone before Phase F started — nothing in Phase F's diff touched this file (likely #433's IntrinsicTOC removal, based on vintage — not independently verified against that issue's own history). Kept below verbatim for history; no successor benchmark exists.
 
 Measures per-call allocations for `{ } | rate() by (resource.service.name)` on the
 dict-ID count/rate group-by fast path (`streamCountRateGroupByID`). Exercises
@@ -321,9 +329,11 @@ Back-ref: `internal/modules/executor/intrinsic_group_id_bench_test.go:BenchmarkI
 
 ---
 
-## BENCH-EX-11: BenchmarkIntrinsicHistogramGroupBy_AllocCount
+## BENCH-EX-11: BenchmarkIntrinsicHistogramGroupBy_AllocCount `[SUPERSEDED — pre-existing orphan, predates Phase F, 2026-07-08]`
 
 _Added: 2026-04-17_
+
+**Vintage-attributed, NOT a Phase F deletion** — same file (`intrinsic_group_id_bench_test.go`) and same pre-existing-debt classification as `BENCH-EX-10`. Kept below verbatim for history; no successor benchmark exists.
 
 Measures per-call allocations for `{ } | histogram_over_time(span:duration) by (resource.service.name)`
 on the dict-ID histogram group-by fast path (`streamHistogramGroupByID`). Exercises
@@ -503,9 +513,11 @@ Back-ref: `internal/modules/executor/intrinsic_bench_test.go:BenchmarkCollect_In
 
 ---
 
-## BENCH-EX-16: BenchmarkIntrinsicCountRateGroupBy_AllocCount (N=1 path)
+## BENCH-EX-16: BenchmarkIntrinsicCountRateGroupBy_AllocCount (N=1 path) `[SUPERSEDED — pre-existing orphan, predates Phase F, 2026-07-08]`
 
 _Added: 2026-04-22_
+
+**Vintage-attributed, NOT a Phase F deletion** — same file (`intrinsic_group_id_bench_test.go`) and same pre-existing-debt classification as `BENCH-EX-10`/`BENCH-EX-11`. Kept below verbatim for history; no successor benchmark exists.
 
 NOTE-082 annotation: BENCH-EX-10 now implicitly exercises the N=1 fast path
 (`streamCountRateGroupByIDSingle`) because the query groups by a single dimension
@@ -796,3 +808,32 @@ go test -run='^$' -bench=BenchmarkStructural_LazyRHSColumn -benchmem -benchtime=
 
 Back-ref: `internal/modules/executor/stream_structural_bench_test.go:BenchmarkStructural_LazyRHSColumn`,
 `internal/modules/executor/stream_structural.go:anySpanMatchesIntrinsicNodes`
+
+
+---
+
+## BENCH-EX-21: `benchmark/trace_metrics_bench_test.go` retired outright (issue #481 Task F-4, 2026-07-08)
+
+_Added: 2026-07-08_
+
+**The blockpack-vs-parquet metrics comparison benchmark retired along with #481's scan removal.**
+`benchmark/trace_metrics_bench_test.go`'s `TestTraceMetricsCorrectness` and
+`BenchmarkTraceMetricsComparison` (plus their solely-used helpers) were deleted outright, whole
+file, as part of `ExecuteTraceMetrics`'s removal — the code path this benchmark compared against
+parquet (`ExecuteTraceMetrics`, the full-block-scan engine) no longer exists, so there is nothing
+left for the comparison to measure.
+
+**Not a `SPEC-ROOT-009` four-file module benchmark** (`benchmark/` is a top-level comparison-harness
+workspace, not a spec-driven `internal/modules/*` package, per this project's own package map — no
+`BENCHMARKS.md` exists at `benchmark/` root, and none is being created for this retirement; a
+speculative new spec file with no other consumer would violate this project's no-speculative-files
+principle). This entry lands here, in `executor/BENCHMARKS.md`, as the closest owning module's
+record of the retirement, rather than inventing a new location.
+
+**Natural successor, out of scope for this phase, unfiled:** a future tempo-side cube-vs-parquet
+comparison (the cube module, issue #491, is the metrics-answering capability that has actually
+replaced the old scan-based comparison's subject matter) would be the natural spiritual successor
+to this benchmark, but no such comparison has been built or scoped as of this entry.
+
+Back-ref: (none — the file no longer exists; confirmed via repo-wide grep for
+`TestTraceMetricsCorrectness`/`BenchmarkTraceMetricsComparison`, zero hits). Issue #481.

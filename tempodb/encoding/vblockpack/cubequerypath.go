@@ -13,6 +13,7 @@ package vblockpack
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"math"
 	"path"
@@ -38,12 +39,29 @@ import (
 type cubeQueryPath struct {
 	client *minio.Client
 	bucket string
+	// store, when non-nil, is used in place of a minioObjectStore{client, bucket} wrapper —
+	// a test-only dependency-injection seam (F-10, issue #481 part 3) so tryQueryFromCube's
+	// cube-not-found/warming branch is testable through the REAL production entry point
+	// without a live S3/minio server. ConfigureCubeQueryPath (production) never sets this;
+	// ordinary production behavior is completely unchanged (objectStore() falls back to
+	// wrapping client/bucket exactly as before this field existed).
+	store blockpack.CubeObjectStore
 	// per-tenant registry cache (refreshed every 5m)
 	mu      sync.RWMutex
 	tenants map[string]*tenantCubeState
 	// createCooldown rate-limits cube creation to at most once per minute
 	// per (tenant+dims) key, preventing per-block fan-out storms.
 	createSeen map[string]time.Time
+}
+
+// objectStore returns cqp.store if injected (tests), otherwise the real minio-backed store —
+// the SINGLE construction point both loadEntries and maybeCreateCube use, so the two call
+// sites can never drift on which store a cqp instance actually talks to.
+func (cqp *cubeQueryPath) objectStore() blockpack.CubeObjectStore {
+	if cqp.store != nil {
+		return cqp.store
+	}
+	return &minioObjectStore{client: cqp.client, bucket: cqp.bucket}
 }
 
 type tenantCubeState struct {
@@ -105,7 +123,7 @@ func (cqp *cubeQueryPath) loadEntries(ctx context.Context, tenant string) ([]blo
 	}
 	cqp.mu.Unlock()
 
-	os := &minioObjectStore{client: cqp.client, bucket: cqp.bucket}
+	os := cqp.objectStore()
 	reg := blockpack.NewCubeRegistry(os, tenant)
 	entries, _, err := reg.Load(ctx)
 	if err != nil {
@@ -125,17 +143,33 @@ func (cqp *cubeQueryPath) invalidateCache(tenant string) {
 	cqp.mu.Unlock()
 }
 
-// tryQueryFromCube attempts to answer req from cube files. Returns (result, true)
-// when the cube path answered the query, (nil, false) to fall back to block scan.
+// ErrCubeWarming (issue #481 part 3, F-10, R1's self-healing story) is returned by
+// tryQueryFromCube ONLY for the specific "cube not found (or resolution-incomplete), cube
+// creation just fired" case — cubequerypath.go's `!result.Found` branch below, which triggers
+// maybeCreateCube. This is a tempo-side sentinel, not a shared enum value with blockpack's F-4
+// family (team-lead ruling: cubequerypath.go is tempo code, cube-side declines are tempo's own
+// taxonomy) — it distinguishes "this shape IS cube-answerable, just not backfilled yet, retry
+// shortly" from every OTHER false reason (no group-by dims, filter not cube-representable,
+// registry load failure, list/download/decode failure, rollup failure) — those remain a silent
+// (nil, false, nil) fallback to the VI/typed-error path below with no actionable "retry" signal,
+// since they are not self-healing in the same way (a repeat query would hit the identical
+// permanent condition, not a transient warming window). Joins F-10's declineErrorToHTTPResponse
+// mapper as a 4xx-class, actionable "retry shortly" case.
+var ErrCubeWarming = errors.New("vblockpack: cube not yet backfilled for this shape/window; creation triggered, retry shortly")
+
+// tryQueryFromCube attempts to answer req from cube files. Returns (result, true, nil) when the
+// cube path answered the query. Returns (nil, false, err) to fall back to block scan/VI — err is
+// ErrCubeWarming specifically when cube creation was just triggered (see its own doc comment),
+// nil for every other "cannot answer from cube" reason (not self-healing, no retry signal).
 func (cqp *cubeQueryPath) tryQueryFromCube(
 	ctx context.Context,
 	tenant string,
 	req *tempopb.QueryRangeRequest,
-) (*tempopb.QueryRangeResponse, bool) {
+) (*tempopb.QueryRangeResponse, bool, error) {
 	dims := extractGroupByDims(req.Query)
 	if len(dims) == 0 {
 		level.Debug(util_log.Logger).Log("msg", "vblockpack: cube: no group-by dims in query", "query", req.Query)
-		return nil, false // no group-by → cube not applicable
+		return nil, false, nil // no group-by → cube not applicable
 	}
 
 	// The query's {...} predicate is part of the cube identity (#480): a cube built for
@@ -144,13 +178,13 @@ func (cqp *cubeQueryPath) tryQueryFromCube(
 	filters, filtersOK := extractFilters(req.Query)
 	if !filtersOK {
 		level.Debug(util_log.Logger).Log("msg", "vblockpack: cube: filter not cube-representable; falling back", "query", req.Query)
-		return nil, false
+		return nil, false, nil
 	}
 	level.Debug(util_log.Logger).Log("msg", "vblockpack: cube: found dims", "dims", strings.Join(dims, ","), "filters", filterDedupKey(filters), "tenant", tenant)
 
 	entries, err := cqp.loadEntries(ctx, tenant)
 	if err != nil {
-		return nil, false
+		return nil, false, nil
 	}
 
 	// The materialized attribute (if any) this query's function needs — "" for count_over_time/
@@ -174,14 +208,14 @@ func (cqp *cubeQueryPath) tryQueryFromCube(
 		minTS := req.Start / 1_000_000_000
 		maxTS := req.End / 1_000_000_000
 		go cqp.maybeCreateCube(context.Background(), tenant, dims, filters, neededAttr, neededAttrType, neededAttrOK, minTS, maxTS)
-		return nil, false
+		return nil, false, ErrCubeWarming
 	}
 
 	// Cube found: list and download L0 files for the time window.
 	prefix := path.Join(tenant, "cubes", result.Entry.CubeID) + "/"
 	keys, listErr := cqp.listObjects(ctx, prefix)
 	if listErr != nil || len(keys) == 0 {
-		return nil, false
+		return nil, false, nil
 	}
 
 	// Download, open, and validate readers (APPENDIX 3: registry-vs-file consistency check).
@@ -209,15 +243,15 @@ func (cqp *cubeQueryPath) tryQueryFromCube(
 		inputs = append(inputs, blockpack.CubeNewRollupInput(r))
 	}
 	if len(inputs) == 0 {
-		return nil, false
+		return nil, false, nil
 	}
 
 	cells, rollupErr := rollupCubeInputs(inputs, result, minMinute, maxMinute)
 	if rollupErr != nil {
-		return nil, false
+		return nil, false, nil
 	}
 
-	return buildCubeQueryResponse(cells, result.Entry.Dimensions, result.Entry.AggAttrs, req), true
+	return buildCubeQueryResponse(cells, result.Entry.Dimensions, result.Entry.AggAttrs, req), true, nil
 }
 
 // rollupCubeInputs merges opened cube readers using the ROUTED resolution level
@@ -267,7 +301,7 @@ func (cqp *cubeQueryPath) maybeCreateCube(
 	cqp.createSeen[key] = time.Now()
 	cqp.mu.Unlock()
 
-	os := &minioObjectStore{client: cqp.client, bucket: cqp.bucket}
+	os := cqp.objectStore()
 	reg := blockpack.NewCubeRegistry(os, tenant)
 	trigger := blockpack.NewCubeCreationTrigger(reg, blockpack.CubeTriggerConfig{})
 	// Fetch real VCNT data for the proposed dimensions over the query window so the

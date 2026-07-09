@@ -20,7 +20,7 @@ ascending order and never reused or renumbered; superseded entries are marked `[
 SPEC-QP-N]` rather than deleted. `queryplan/NOTES.md`'s own entries use the separate `NOTE-QP-00N`
 counter (module-local to this package only, not shared with any other module).
 
-Next free ID: **SPEC-QP-6**.
+Next free ID: **SPEC-QP-7**.
 
 ---
 
@@ -193,6 +193,18 @@ See `NOTES.md` NOTE-QP-006. Tests: `queryplan_test.go` (including
 `TestBuildQueryPlan_InvertedTimeRangeFallsBackToBlockSharded`,
 `TestBuildQueryPlan_HugeWindowFallsBackToBlockShardedNoPanic`). Issue #487.
 
+**Addendum 2026-07-08 (issue #481 parts 2-3, F-5) — `DispatchStrategy` gains a third value,
+`DispatchBoundedRecentFirst`.** The "`DispatchStrategy` is an enum: `DispatchBlockSharded` (zero
+value) or `DispatchTimeSliced`" bullet above is now incomplete, not wrong — both of those values
+and their `BuildQueryPlan`-computed selection rule are UNCHANGED by this addendum.
+`DispatchBoundedRecentFirst` is a THIRD value, selected by a completely different function
+(`SelectSearchStrategy`, `SPEC-QP-6`) for a completely different caller context (tempo's
+search-query frontend, not `BuildQueryPlan`'s own #487 time-slice qualification) — `BuildQueryPlan`
+itself never returns `DispatchBoundedRecentFirst`, and `SelectSearchStrategy` never returns
+`DispatchTimeSliced`. The two dispatch-selection functions are siblings sharing one enum type, not
+one function with an expanded contract; see `SPEC-QP-6` for the full contract this value belongs
+to.
+
 ---
 
 ## SPEC-QP-4: `VCNTPerMinuteFunc` — per-minute-signal oracle construction, `VCNTCostFunc`'s sibling
@@ -259,3 +271,61 @@ Back-ref: `internal/modules/queryplan/indexable.go:AllLeavesIndexable,collectLea
 `indexable_test.go` (including `TestAllLeavesIndexable_MixedIndexableAndNegatedLeafIsNotIndexable`),
 root-level parity test `timeslice_test.go:TestAllLeavesIndexable_RootReexportMatchesQueryplanPackage`.
 Issue #487.
+
+
+---
+
+## SPEC-QP-6: `SelectSearchStrategy` — Search-Query Dispatch Strategy Decision Table
+*Added: 2026-07-08 (issue #481 parts 2-3, team-lead ruling R13)*
+
+**Contract:**
+```go
+func SelectSearchStrategy(sel Selectivity, hasLimit bool) (strategy DispatchStrategy, planTimeDecline bool)
+```
+A PURE function (no I/O, no tempo context) implementing R13's ruling table for choosing a
+search-query dispatch strategy from a VCNT selectivity classification and whether the query
+carries a limit. It is the single source of truth for this decision so tempo's frontend
+(`buildQueryPlanFromProgram`) consumes it directly instead of hand-rolling an
+independently-maintained copy that could drift.
+
+**The five-row core** (Selective's outcome does not depend on `hasLimit`, collapsing what would
+otherwise be six selectivity×limit combinations into five distinct outcomes):
+
+| `Selectivity` | `hasLimit` | `strategy` | `planTimeDecline` |
+|---|---|---|---|
+| `Selective` | any | `DispatchBlockSharded` | `false` |
+| `LowSelectivity` | `true` | `DispatchBoundedRecentFirst` | `false` |
+| `LowSelectivity` | `false` | `DispatchBlockSharded` | `true` |
+| `UnknownSelectivity` | `true` | `DispatchBoundedRecentFirst` | `false` |
+| `UnknownSelectivity` | `false` | `DispatchBlockSharded` | `false` |
+
+**`planTimeDecline=true` means the query has NO safe answer at plan time** (`LowSelectivity` with
+no limit present: every per-block job would decline identically, so dispatching at all wastes N
+block round-trips on a certain failure, per team-lead ruling R6). When `planTimeDecline` is `true`,
+the returned `strategy` value is MEANINGLESS and MUST NOT be dispatched — the caller (tempo) must
+fail the query at plan time instead, mapping to the typed hard-error family. **This is deliberately
+NOT represented as a fake `DispatchStrategy` enum value** (e.g. an invented `DispatchDecline`
+constant) — decline is a distinct, non-dispatchable outcome, not a dispatch strategy, so it is
+returned out-of-band via this second bool. See `NOTE-QP-010` for the design rationale.
+
+**Deliberately EXCLUDED from this function:** `boundedEligible` (search-vs-metrics) and
+resolvability (index-coverage). Both are tempo-context concerns the caller must gate on FIRST —
+metrics callers never reach this function at all (team-lead ruling R2: metrics is never
+bounded-served, see `SPEC-VIS-2`/`NOTE-VI-096`), and an unresolvable plan is `DispatchBlockSharded`
+before selectivity is even considered. This keeps the five-row core here untestable-drift-proof in
+one place.
+
+**`DispatchStrategy` gains a third value, `DispatchBoundedRecentFirst`** (see `SPEC-QP-3`'s
+2026-07-08 addendum) — the #481 bounded-newest-first strategy, selected by tempo's frontend when a
+search query's index coverage is low/unknown but a limit is present. Unlike `DispatchTimeSliced`,
+`QueryPlan` carries ONLY this `Strategy` value for the bounded path — no budget fields
+(`MaxBlocks`/`MaxBytes`/`MaxDuration`): the querier (tempo's `backend_block.go`) owns and applies
+its own budget policy when it sees this signal via blockpack's `QueryOptions.RecentFirstBudget`
+(root `SPEC.md` `SPEC-ROOT-023`), mirroring how `IndexOnly`/`MostRecent` are tempo-set booleans on
+blockpack's `QueryOptions` rather than blockpack-computed values (plan-f.md Task 5's Option B,
+ratified).
+
+Back-ref: `internal/modules/queryplan/queryplan.go:SelectSearchStrategy,DispatchStrategy,DispatchBoundedRecentFirst`.
+Tests: `queryplan_test.go` (`TestSelectSearchStrategy_FiveRowCore`,
+`TestSelectSearchStrategy_NeverReturnsTimeSlicedOrFakeDeclineStrategy` — see `queryplan/TESTS.md`
+`TEST-QP-1`/`TEST-QP-2`). See `NOTES.md` NOTE-QP-010. Issue #481.

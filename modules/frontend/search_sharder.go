@@ -163,10 +163,21 @@ func (s asyncSearchSharder) RoundTrip(pipelineRequest pipeline.Request) (pipelin
 	// signal that tells it which one it's holding.
 	var plan *blockpack.QueryPlan
 	var planIsStructural bool
+	// F-6 (issue #481 parts 2/3, R6): a query with NO safe plan-time answer (low VCNT
+	// selectivity, no limit) must fail HERE — before any backend job is constructed — rather
+	// than dispatch N per-block jobs that would each independently decline identically.
+	hasLimit := searchReq.Limit > 0
 	if searchReq.Start != 0 && searchReq.End != 0 {
-		plan = buildQueryPlan(ctx, s.rawR, tenantID, s.indexPrefix, searchReq.Query, uint64(searchReq.Start), uint64(searchReq.End), s.cfg.ConcurrentRequests)
+		var planErr error
+		plan, planErr = buildQueryPlan(ctx, s.rawR, tenantID, s.indexPrefix, searchReq.Query, uint64(searchReq.Start), uint64(searchReq.End), s.cfg.ConcurrentRequests, hasLimit)
+		if planErr != nil {
+			return pipeline.NewBadRequest(planErr), nil
+		}
 		if plan == nil {
-			plan = buildStructuralQueryPlan(ctx, s.rawR, tenantID, s.indexPrefix, searchReq.Query, uint64(searchReq.Start), uint64(searchReq.End), s.cfg.ConcurrentRequests)
+			plan, planErr = buildStructuralQueryPlan(ctx, s.rawR, tenantID, s.indexPrefix, searchReq.Query, uint64(searchReq.Start), uint64(searchReq.End), s.cfg.ConcurrentRequests, hasLimit)
+			if planErr != nil {
+				return pipeline.NewBadRequest(planErr), nil
+			}
 			planIsStructural = plan != nil
 		}
 	}
@@ -270,6 +281,19 @@ func (s *asyncSearchSharder) backendRequests(ctx context.Context, tenantID strin
 		return
 	}
 
+	// DispatchBoundedRecentFirst (issue #481 part 3, F-5/F-6) falls through to here identically
+	// to DispatchBlockSharded and a nil plan — this switch deliberately has no
+	// `case blockpack.DispatchBoundedRecentFirst` branch. Per R17, the bounded-recent-first
+	// decision NEVER crosses the frontend/querier wire: there is no QueryPlan field a per-block
+	// backend request could carry it in (adding one needs protobuf generator surgery, unavailable
+	// in this environment and rejected by R17), so the querier's blockpackBlock.Fetch derives
+	// boundedAuthorized itself, locally, from the same hasLimit predicate this file already
+	// computed to select DispatchBoundedRecentFirst in the first place (see hasLimit above and
+	// tempodb/encoding/vblockpack/value_index_query.go's tryIndexFetch doc comment). The dispatch
+	// shape for a DispatchBoundedRecentFirst plan is therefore ordinary block-sharded fanout —
+	// only each block's own per-block decline handling changes, querier-side. A future phase
+	// (tracked informally as Phase G) may want a tracing attribute or job count hint surfaced here
+	// for observability, but no wire field is required for correctness.
 	blockIter := backendJobsFunc(blocks, s.cfg.TargetBytesPerRequest, s.cfg.MostRecentShards, searchReq.End)
 	blockIter(func(jobs int, sz uint64, completedThroughTime uint32) {
 		resp.TotalJobs += jobs

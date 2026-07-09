@@ -95,6 +95,13 @@ func TestSearch_EmitsBlockSpan(t *testing.T) {
 // per-step plan/scan I/O onto the span (issue #465). The test block has no
 // value index configured, so Fetch always takes the full-scan path and produces
 // QueryStats steps.
+//
+// F-9 (issue #481 parts 2/3, team-lead ruling R8) doc-comment clarification: createFetchTestBlock
+// (fetch_test.go) never calls withVIQueryReader, so getValueIndexQueryReader() returns nil here —
+// this test exercises the zeroth, config-level VI-DISABLED category (vr == nil), which R8 pins as
+// UNCHANGED by Phase F's decline-routing rewrite (F-8): declineOutcome's vr==nil branch is
+// deliberately exempt from the boundedAuthorized/ErrSearchNoCoverage backstop declineOutcomeBounded
+// implements for every OTHER routine decline. No code or assertion changes were needed here.
 func TestFetch_FullScanStatsOnSpan(t *testing.T) {
 	rec, tp := recordedSpans(t)
 	defer func() { _ = tp.Shutdown(context.Background()) }()

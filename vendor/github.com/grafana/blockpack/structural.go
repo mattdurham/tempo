@@ -71,6 +71,25 @@ func CompileStructuralLegs(traceqlQuery string) (leftProg, rightProg *Program, o
 	return modules_executor.CompileStructuralLegs(q)
 }
 
+// IsStructuralQuery reports whether traceqlQuery parses as a structural query (`{A} OP {B}`, any
+// chain length, any polarity) — REGARDLESS of node count, unlike CompileStructuralLegs' ok return
+// (issue #481 part 2, F-8), which conflates "not structural at all" with "structural but not
+// exactly 2 nodes" into the same ok=false. Tempo needs this distinction to decide whether a
+// compile-failed query (blockpack.CompileTraceQL only accepts filter expressions) that also
+// declined the 2-node index path is a genuinely bounded-eligible structural chain (1e/1f, F-3's
+// ExecuteStructural) or a pipeline/spanset-aggregate query (`{...} | count() > N`) — which must
+// NEVER be bounded, since its aggregate needs ALL matching spans to be correct (the same
+// wrong-answer risk R2 already rules out for metrics). A parse error returns false (the caller's
+// own downstream parse will surface the real error).
+func IsStructuralQuery(traceqlQuery string) bool {
+	parsed, err := traceqlparser.ParseTraceQL(traceqlQuery)
+	if err != nil {
+		return false
+	}
+	_, isStructural := parsed.(*traceqlparser.StructuralQuery)
+	return isStructural
+}
+
 // StructuralReaderProvider resolves a SourceRef (the S3 object key stamped on each SpanEntry,
 // NOTE-VI-076) to an already-open *Reader for that file — Option A's (team-lead ruling,
 // 2026-07-07) multi-file trace materialization primitive (plan-d.md D3). This is a zero-cost type

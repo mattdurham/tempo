@@ -95,6 +95,19 @@ func validateQueryOptions(opts QueryOptions) error {
 	if opts.StartNano > 0 && opts.EndNano > 0 && opts.StartNano > opts.EndNano {
 		return fmt.Errorf("invalid time range: StartNano (%d) > EndNano (%d)", opts.StartNano, opts.EndNano)
 	}
+	if opts.RecentFirstBudget != nil {
+		b := opts.RecentFirstBudget
+		if opts.Limit <= 0 && b.MaxBlocks <= 0 && b.MaxBytes <= 0 && b.MaxDuration <= 0 {
+			return fmt.Errorf(
+				"invalid RecentFirstBudget: at least one of Limit/MaxBlocks/MaxBytes/MaxDuration must be positive, or the bounded strategy has no way to ever stop",
+			)
+		}
+		if opts.MostRecent {
+			return fmt.Errorf(
+				"invalid QueryOptions: RecentFirstBudget and MostRecent are mutually exclusive (RecentFirstBudget is a strategy-engine signal, MostRecent is a user-facing hint)",
+			)
+		}
+	}
 	return nil
 }
 
@@ -195,7 +208,7 @@ func QueryTraceQLWithProgram(
 // as it does for the metrics path (NOTE-VI-033). sourceRef identifies which data file
 // r was opened against so results for other files are ignored.
 //
-// The value index is AUTHORITATIVE for the columns it covers (NOTE-VI-047, issue
+// The value index is AUTHORITATIVE for the columns it covers (NOTE-VI-096, issue
 // #474): when the query resolves against the index there is no speculative
 // "index answered but a scan is cheaper" fallback — a scan would only reproduce
 // the identical result at higher cost.
@@ -352,6 +365,20 @@ func QueryTraceQL(
 			TimeRange:  normalizeTimeRange(opts.StartNano, opts.EndNano),
 			StartBlock: opts.StartBlock,
 			BlockCount: opts.BlockCount,
+		}
+		// F-3 (issue #481 part 2): RecentFirstBudget activates the bounded newest-first
+		// structural path for 1e/1f decline categories (chains that flatten to other than
+		// exactly 2 nodes). executor.Options can't reference the root RecentFirstBudget type
+		// directly (executor is a lower-level package root already imports — that would be a
+		// cycle), so copy the three cap fields across; Direction is always Backward when the
+		// budget is set, per queryoptions.go's RecentFirstBudget doc comment.
+		if opts.RecentFirstBudget != nil {
+			execOpts.RecentFirstBudget = &modules_executor.RecentFirstBudget{
+				MaxBlocks:   opts.RecentFirstBudget.MaxBlocks,
+				MaxBytes:    opts.RecentFirstBudget.MaxBytes,
+				MaxDuration: opts.RecentFirstBudget.MaxDuration,
+			}
+			execOpts.Direction = modules_queryplanner.Backward
 		}
 		var execResult *modules_executor.StructuralResult
 		execResult, err = modules_executor.ExecuteStructural(ctx, r, q, execOpts)
@@ -525,12 +552,13 @@ func ExecuteMetricsTraceQL(
 
 	// NOTE-VI-033 (issue #460): try the zero-block-read value-index path first.
 	// count_over_time()/rate() without group-by are answerable from index TimeSec
-	// alone, and the index is authoritative for those shapes (NOTE-VI-047, #474):
-	// when it answers, that answer is complete. ExecuteTraceMetricsFromVI returns
-	// ok=false ONLY when the index genuinely cannot answer — an unsupported metric
-	// shape or a leaf column with no coverage — in which case we fall back to the
-	// full block scan, UNLESS opts.IndexOnly forbids that fallback (issue #487,
-	// holistic-review Issue 1/fix A — see IndexOnly's own doc comment).
+	// alone, and the index is authoritative for those shapes (NOTE-VI-096, #474/#481):
+	// when it answers, that answer is complete. Issue #481 part 3: ExecuteTraceMetricsFromVI
+	// now returns a typed sentinel error whenever the index genuinely cannot answer — an
+	// unsupported metric shape, a leaf column with no coverage, or a legacy TimeSec==0 block
+	// — propagated here unconditionally, regardless of opts.IndexOnly (see IndexOnly's own
+	// doc comment: there is no full-block-scan fallback left for it to forbid;
+	// ExecuteTraceMetrics, the scan engine, was deleted outright).
 	if opts.ValueIndex != nil {
 		viResult, ok, viErr := modules_executor.ExecuteTraceMetricsFromVI(ctx, opts.ValueIndex, prog, *spec)
 		if viErr != nil {
@@ -541,9 +569,9 @@ func ExecuteMetricsTraceQL(
 		}
 	}
 
-	if opts.IndexOnly {
-		return nil, ErrValueIndexNoCoverage
-	}
-
-	return modules_executor.ExecuteTraceMetrics(ctx, r, prog, spec)
+	// No ValueIndex was supplied at all: R8's distinct zeroth/config-level category — an
+	// operator-config action (value_index_query disabled), not a per-query-shape limitation,
+	// so this is a DIFFERENT sentinel from ErrMetricsNoCoverage (which fires when the index
+	// IS configured but a specific leaf/column isn't covered by it).
+	return nil, ErrMetricsValueIndexDisabled
 }

@@ -14,7 +14,7 @@ package blockpack
 //   - ValueIndexFileStore: the download contract (Size + ReadAt by object key).
 //   - BuildValueIndexSource: the orchestration that ties them together.
 //
-// The value index is authoritative for the columns it covers (NOTE-VI-047, issue
+// The value index is authoritative for the columns it covers (NOTE-VI-096, issue
 // #474): the querier falls back to a full scan only when the index genuinely cannot
 // answer (no coverage for a leaf, or a non-filter query), never speculatively when
 // it already produced a correct answer.

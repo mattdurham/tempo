@@ -32,6 +32,48 @@ import (
 // Blocks larger than 512 MB indicate a corrupt or malformed backend response.
 const maxBlobSize = 512 << 20 // 512 MB
 
+// Bounded newest-first read-path budget policy (issue #481 parts 2/3, F-8, R9/R17): the QUERIER
+// owns this policy, NOT the frontend's QueryPlan — R9 ruled the plan carries only the
+// DispatchBoundedRecentFirst Strategy signal, no budget fields, specifically so the querier can
+// tune its own I/O bound independent of frontend planning. These are INITIAL/DEFAULT values, not
+// derived from any measurement — flagged as a policy choice that may need operational tuning, not
+// a mechanically-determined constant. MaxBlocks/MaxBytes/MaxDuration are per-FILE caps (one
+// blockpack file = one Fetch/QueryRange call = tempo's notion of "one block"; internally a file
+// may contain many bounded-path-relevant internal blocks).
+const (
+	defaultBoundedRecentFirstMaxBlocks   = 50
+	defaultBoundedRecentFirstMaxBytes    = 64 << 20 // 64 MB
+	defaultBoundedRecentFirstMaxDuration = 2 * time.Second
+)
+
+// boundedRecentFirstPolicy is a package-level, mutex-guarded VARIABLE (not a const), specifically
+// so tests can inject a tight budget (issue #481-FOLLOWUP-1: the vr==nil WithLimit regression
+// pins, fetch_bounded_dispatch_test.go and structural_dispatch_test.go, could not turn genuinely
+// red on revert of the vr==nil fixes — the PRODUCTION default of 50 blocks never diverges from an
+// unbounded scan at any test-fixture size reasonable for a fast unit test). R9's own framing
+// ("the querier applies its own fixed/CONFIGURABLE budget policy") already anticipated this needed
+// to be adjustable, not hardcoded. setBoundedRecentFirstPolicyForTest (recentfirst_budget_test.go)
+// is the only intended mutator outside this file's own default.
+var (
+	boundedRecentFirstPolicyMu sync.RWMutex
+	boundedRecentFirstPolicy   = blockpack.RecentFirstBudget{
+		MaxBlocks:   defaultBoundedRecentFirstMaxBlocks,
+		MaxBytes:    defaultBoundedRecentFirstMaxBytes,
+		MaxDuration: defaultBoundedRecentFirstMaxDuration,
+	}
+)
+
+// newBoundedRecentFirstBudget returns a COPY of the querier's current budget policy for the
+// bounded newest-first read path (R9). A single constructor keeps the filter (F-2) and structural
+// (F-3) call sites in Fetch from drifting on the policy values. Returns a fresh pointer each call
+// so a caller can never mutate the shared policy through the returned value.
+func newBoundedRecentFirstBudget() *blockpack.RecentFirstBudget {
+	boundedRecentFirstPolicyMu.RLock()
+	defer boundedRecentFirstPolicyMu.RUnlock()
+	b := boundedRecentFirstPolicy
+	return &b
+}
+
 const (
 	attrPrefixSpanDot     = "span."
 	attrPrefixSpanColon   = "span:"
@@ -322,24 +364,46 @@ func (b *blockpackBlock) QueryRange(ctx context.Context, req *tempopb.QueryRange
 	}
 
 	// Cube query path: try answering from pre-aggregated cube files before
-	// falling through to the full block scan.
+	// falling through to the full block scan. cubeWarming (F-10, R1's self-healing story) is
+	// remembered and only surfaced if the VI/typed-error path below ALSO declines — if VI answers
+	// the query directly, the cube's own warming state is irrelevant (we already have a good
+	// answer) and must not leak into a success response.
+	var cubeWarming bool
 	if cqp := getCubeQueryPath(); cqp != nil {
-		if cubeResp, ok := cqp.tryQueryFromCube(ctx, b.meta.TenantID, req); ok {
+		cubeResp, ok, cubeErr := cqp.tryQueryFromCube(ctx, b.meta.TenantID, req)
+		if ok {
 			span.SetAttributes(attribute.Bool("cube.used", true))
 			return cubeResp, nil
 		}
+		cubeWarming = errors.Is(cubeErr, ErrCubeWarming)
 	}
 
 	result, err := blockpack.ExecuteMetricsTraceQL(ctx, r, req.Query, opts)
 	if err != nil {
-		// blockpack's own IndexOnly-aware decline (opts.IndexOnly above) surfaces as
-		// blockpack.ErrValueIndexNoCoverage — converted here to this package's own
-		// ErrSliceIndexCoverageGap so every caller (handleError, the combiner, tests)
-		// keeps checking exactly one sentinel for "a #487 slice job's index coverage
-		// gap", regardless of which of the two decline gates (indexCovered above, or
-		// this one) actually caught it.
-		if errors.Is(err, blockpack.ErrValueIndexNoCoverage) {
-			return nil, fmt.Errorf("blockpack QueryRange: %w", ErrSliceIndexCoverageGap)
+		// blockpack's own IndexOnly-aware decline (opts.IndexOnly above) used to surface as the
+		// single blockpack.ErrValueIndexNoCoverage sentinel — issue #481 part 3 (F-4) replaced it
+		// with three distinct sentinels (ErrMetricsShapeNotAnswerable/ErrMetricsNoCoverage/
+		// ErrMetricsLegacyTimeSecZero), deleted not aliased. For a #487 slice job (IndexOnly=true)
+		// ALL three still mean the same thing this package's callers (handleError, the combiner,
+		// tests) need: "this slice job's index path declined, hard-error with
+		// ErrSliceIndexCoverageGap" — R11-AMENDED's slice-job invariant is polarity/reason-
+		// agnostic. Slice jobs take priority over the cube-warming distinction below — a narrowed
+		// window has no safe fallback either way.
+		if errors.Is(err, blockpack.ErrMetricsShapeNotAnswerable) ||
+			errors.Is(err, blockpack.ErrMetricsNoCoverage) ||
+			errors.Is(err, blockpack.ErrMetricsLegacyTimeSecZero) {
+			if searchOpts.IndexOnly {
+				return nil, fmt.Errorf("blockpack QueryRange: %w", ErrSliceIndexCoverageGap)
+			}
+			if cubeWarming && errors.Is(err, blockpack.ErrMetricsShapeNotAnswerable) {
+				// R1's self-healing story: this shape IS potentially cube-answerable (it just
+				// declined on VI's narrower count/rate-only engine too), and the cube path fired
+				// creation on this exact query moments ago — surface the distinguishable,
+				// actionable "retry shortly" reason instead of the permanent "shape not
+				// answerable" one, which would incorrectly suggest retrying is pointless.
+				return nil, fmt.Errorf("blockpack QueryRange: %w", ErrCubeWarming)
+			}
+			return nil, fmt.Errorf("blockpack QueryRange: %w", err)
 		}
 		return nil, fmt.Errorf("blockpack QueryRange: %w", err)
 	}
@@ -751,23 +815,47 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 	var matches []blockpack.SpanMatch
 	var qs blockpack.QueryStats
 	indexAnswered := false
+	// boundedAuthorized (issue #481 parts 2/3, F-8, team-lead ruling R17 — supersedes the plan's
+	// original QueryPlan.Strategy-threading assumption, which never had a wire path and would
+	// have required protobuf-generator surgery unavailable in this environment): derived LOCALLY
+	// from whether this query carries a limit, exactly the same hasLimit predicate
+	// blockpack.SelectSearchStrategy already applies frontend-side (queryoptions.go, F-6) —
+	// re-evaluated here, not threaded over the wire, so there is only ever ONE implementation of
+	// "does this query have a limit", never two independently-maintained copies. The two-layer
+	// story: the FRONTEND's plan-time gate (buildQueryPlanFromProgram, R6) stays authoritative
+	// for QUERY-SHAPE-driven rejection (LowSelectivity+no-limit fails before any block is ever
+	// dispatched); this querier-local check additionally covers per-block declines the coarse,
+	// tenant-level VCNT classification the frontend used couldn't predict (R17's "coarse-signal"
+	// case) — a query the frontend classified Selective can still decline on an individual
+	// block, and if a limit is present, bounding the read here is still an honest, budgeted
+	// answer (R2), never a wrong one. indexOnly takes ABSOLUTE priority: forces
+	// boundedAuthorized=false regardless of limit, so a #487 slice job's decline always
+	// hard-errors with ErrSliceIndexCoverageGap (R11-AMENDED), never routes to bounded — a
+	// bounded-but-partial read across an already-narrowed slice window would compound two
+	// different kinds of incompleteness.
+	boundedAuthorized := !opts.IndexOnly && spanLimit > 0
+	// needsBoundedRead is set when a routine decline (filter OR structural) was relayed under
+	// boundedAuthorized — the switch below then sets queryOpts.RecentFirstBudget so the SAME
+	// QueryTraceQL/QueryTraceQLWithProgram calls that used to run an unconditional full scan
+	// instead run F-2's/F-3's bounded newest-first path.
+	var needsBoundedRead bool
 	// Index-driven path (blockpack issue #461): when the querier has a value-index
 	// reader configured and the query compiled to a filter program, try to answer
 	// it from the value index (discover + download + per-leaf predicate, then
 	// block-pruned fetch). The value index is AUTHORITATIVE for the columns it
 	// covers (blockpack NOTE-VI-047, issue #474): when it answers, that answer is
 	// the complete, correct result and we do not scan — there is no speculative
-	// "the index answered but a scan is cheaper" fallback. We fall through to the
-	// full-scan paths below ONLY when the index genuinely cannot answer (a routine
-	// decline): no coverage for a leaf (negation/unindexable predicate), a
-	// non-filter query, or a build-time coverage miss. An index/data INCONSISTENCY
-	// (the index had coverage but named a block/page the data file cannot resolve)
-	// is NOT a routine decline: it is index corruption and now FAILS the query
-	// rather than being masked by a silent scan (NOTE-VI-078, issue #481) — the
-	// authoritative-index contract SPEC-ROOT-019 describes, matching how the
-	// trace-by-id path (NOTE-VI-071) stopped masking the same skew behind a scan.
+	// "the index answered but a scan is cheaper" fallback. A routine decline (no coverage for a
+	// leaf, negation/unindexable predicate, a build-time coverage miss) now either routes to the
+	// bounded newest-first path (boundedAuthorized) or hard-errors (ErrSearchNoCoverage) — never
+	// an implicit unconditional scan (issue #481's central anti-pattern elimination, F-7/F-8). An
+	// index/data INCONSISTENCY (the index had coverage but named a block/page the data file
+	// cannot resolve) is NOT a routine decline: it is index corruption and FAILS the query
+	// rather than being masked (NOTE-VI-078, issue #481) — the authoritative-index contract
+	// SPEC-ROOT-019 describes, matching how the trace-by-id path (NOTE-VI-071) stopped masking
+	// the same skew behind a scan.
 	if compiledProgram != nil {
-		im, ok, istats, idxErr := b.tryIndexFetch(ctx, r, compiledProgram, query, queryOpts, opts.IndexOnly)
+		im, ok, istats, idxErr := b.tryIndexFetch(ctx, r, compiledProgram, query, queryOpts, opts.IndexOnly, boundedAuthorized)
 		// Record index-path I/O on the span whenever the index was consulted (any
 		// files were read), even if it ultimately declined and we fall back to a
 		// full scan (issue #465).
@@ -787,6 +875,12 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 				slog.Error("vblockpack Fetch: index-only slice job hit a coverage gap", "query", query, "err", idxErr)
 				return traceql.FetchSpansResponse{}, fmt.Errorf("vblockpack Fetch: %w", idxErr)
 			}
+			if errors.Is(idxErr, ErrSearchNoCoverage) {
+				// Routine decline, no bounded path authorized (no limit present) — hard error,
+				// never an implicit scan (F-7/R7).
+				slog.Error("vblockpack Fetch: index declined, no bounded path authorized", "query", query, "err", idxErr)
+				return traceql.FetchSpansResponse{}, fmt.Errorf("vblockpack Fetch: %w", idxErr)
+			}
 			// Authoritative-index inconsistency: fail the query, do not scan.
 			slog.Error("vblockpack Fetch: value index/data inconsistency", "query", query, "err", idxErr)
 			return traceql.FetchSpansResponse{}, fmt.Errorf("vblockpack Fetch: value index inconsistency: %w", idxErr)
@@ -794,7 +888,25 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 		if ok {
 			matches = im
 			indexAnswered = true
+		} else if getValueIndexQueryReader() != nil {
+			// Routine decline relayed under boundedAuthorized (declineOutcomeBounded's
+			// contract guarantees idxErr != nil whenever !boundedAuthorized, so reaching here
+			// with a configured reader, ok=false, idxErr=nil means boundedAuthorized was true).
+			needsBoundedRead = true
 		}
+		// else: vr == nil (R8's zeroth, config-level "index-driven path disabled entirely"
+		// category, issue #481-CRITICAL-1 fix). tryIndexFetch's OWN vr==nil branch returns via
+		// declineOutcome, not declineOutcomeBounded — (nil, false, stats, nil) UNCONDITIONALLY,
+		// independent of boundedAuthorized's value. Without this explicit re-check, a limit-
+		// bearing search request (the common case: page-size/top-N limits are set on virtually
+		// every real Tempo search) with vr == nil would incorrectly set needsBoundedRead = true
+		// below and apply F-2's bounded, POSSIBLY-PARTIAL newest-first budget instead of R8's
+		// required byte-identical, complete, UNBOUNDED scan — a silent correctness regression
+		// (fewer matches than actually exist), not merely a missing optimization. needsBoundedRead
+		// stays false here, so the final switch below falls through to an ordinary full scan,
+		// exactly as it did before issue #481, regardless of whether a limit happens to be
+		// present. See TestFetch_VIDisabled_StillFullScans_Unchanged_WithLimit
+		// (fetch_bounded_dispatch_test.go) for the real-write-path regression guard.
 	}
 	// Structural index-driven path (blockpack issue #489, plan-d.md DT1): an orthogonal sibling
 	// to the filter-program branch above — never nested inside it, so #481's eventual removal of
@@ -808,6 +920,16 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 	// block-sharded dispatch would return the query's full answer from every block overlapping
 	// the window instead of a partition of it (checkpoint raised with team-lead, not yet
 	// resolved) — this keeps the branch reachable only through a genuine #487 slice job.
+	// R12/F-7 implementation note (review Low Issue 3): the plan's "tryStructuralIndexFetch gains
+	// the IDENTICAL boundedAuthorized parameter" wording was NOT implemented literally —
+	// tryStructuralIndexFetch's own signature carries no boundedAuthorized parameter.
+	// boundedAuthorized-vs-hard-error branching for structural declines is instead implemented
+	// HERE, inline in Fetch (see the sok/sidxErr handling and the `blockpack.IsStructuralQuery(query)
+	// && boundedAuthorized` check below), consuming tryStructuralIndexFetch's existing two-value
+	// contract rather than threading a new parameter through it — functionally equivalent to R12's
+	// ruling and consistent with R17's local-derivation design, just Fetch-side instead of
+	// helper-side. Documented here so a future reader comparing plan-f.md's F-7 text to this code
+	// doesn't conclude the backstop is missing.
 	if compiledProgram == nil {
 		sm, sok, sistats, sidxErr := b.tryStructuralIndexFetch(ctx, query, queryOpts, opts.IndexOnly)
 		if sistats.FilesRead > 0 || sistats.Used {
@@ -830,19 +952,84 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 			slog.Error("vblockpack Fetch: structural value index/data inconsistency", "query", query, "err", sidxErr)
 			return traceql.FetchSpansResponse{}, fmt.Errorf("vblockpack Fetch: structural value index inconsistency: %w", sidxErr)
 		}
-		if sok {
+		switch {
+		case sok:
 			matches = sm
 			indexAnswered = true
+		case !opts.IndexOnly && getValueIndexQueryReader() == nil:
+			// vr == nil (R8's zeroth, config-level "index-driven path disabled entirely" category,
+			// team-lead ruling R18/issue #481-CRITICAL-2 fix): tryStructuralIndexFetch's own
+			// `if !indexOnly { return nil, false, stats, nil }` guard (value_index_structural_query.go)
+			// declines unconditionally WITHOUT ever checking vr — it collapses "vr disabled
+			// entirely", "a healthy 2-node chain whose slice-dispatch qualification already
+			// declined" and "a genuine 1e/1f chain" into the identical (sok=false, sidxErr=nil)
+			// signal. R18 explicitly rejects letting the vr==nil case fall into the
+			// IsStructuralQuery/boundedAuthorized routing below: R8's "keep the unconditional scan
+			// unchanged" zeroth category applies to ALL search — filter (tryIndexFetch's own
+			// dedicated, early vr==nil branch, declineOutcome not declineOutcomeBounded) AND
+			// structural/pipeline alike — so this check happens FIRST, before boundedAuthorized or
+			// IsStructuralQuery are even consulted, and applies equally to a pipeline/aggregate
+			// query reaching this same branch: with vr == nil there is no index to have declined
+			// against in the first place, so R2's "never bound a pipeline query" concern does not
+			// arise — needsBoundedRead simply stays false and the final switch below falls through
+			// to the SAME unconditional scan pipeline/structural queries always used pre-#481.
+			//
+			// Deliberate no-op: this case exists solely to take priority over the
+			// IsStructuralQuery/boundedAuthorized case below and fall through to the
+			// unconditional scan pipeline; there is nothing further to do here.
+		case !opts.IndexOnly:
+			// A compiledProgram==nil decline reaching here (vr configured, per the case above)
+			// is EITHER a genuine structural-chain decline (1e/1f — bounded-eligible via F-3's
+			// ExecuteStructural, blockpack-side) OR a pipeline/spanset-aggregate query
+			// (`{...} | count() > N`, also compile-failing CompileTraceQL per its own doc comment)
+			// — which must NEVER be bounded, since streamPipelineQuery explicitly runs "with no
+			// limit — we need all matching spans to compute aggregates" (query_traceql.go):
+			// truncating its input via RecentFirstBudget would silently produce a WRONG aggregate,
+			// the exact R2 anti-pattern this phase eliminates for metrics. blockpack.IsStructuralQuery
+			// (issue #481 part 2, F-8) makes this distinction explicitly — CompileStructuralLegs'
+			// own ok=false conflates "not structural" with "structural but not 2 nodes", so it
+			// cannot be reused here. R18: a structural query reaching HERE (vr configured) means
+			// the frontend's slice-dispatch qualification already found no index coverage for it —
+			// a silent unbounded per-file scan for an uncovered query is exactly the anti-pattern
+			// #481 eliminates, so this IS the intended, working-as-designed outcome, not a bug.
+			if blockpack.IsStructuralQuery(query) && boundedAuthorized {
+				needsBoundedRead = true
+			} else {
+				// Either a pipeline/aggregate query (never bounded, R2's reasoning) or a
+				// structural decline with no bounded authorization (no limit present) — hard
+				// error, never an implicit scan (F-7/R7/R17).
+				slog.Error("vblockpack Fetch: structural/pipeline query declined, no bounded path available", "query", query)
+				return traceql.FetchSpansResponse{}, fmt.Errorf("vblockpack Fetch: %w", ErrSearchNoCoverage)
+			}
 		}
+		// opts.IndexOnly && !sok: unreachable in practice — tryStructuralIndexFetch's own
+		// doc comment says it only runs under a genuine #487 slice job in the first place, and
+		// any indexOnly decline already returned above via ErrStructuralIndexCoverageGap.
+	}
+	if needsBoundedRead {
+		// The SAME QueryOptions.RecentFirstBudget field activates BOTH F-2's bounded filter
+		// path (compiledProgram != nil, via QueryTraceQLWithProgram) and F-3's bounded
+		// structural path (compiledProgram == nil, via QueryTraceQL's own structural branch) —
+		// purely by its presence. No Direction field exists on the root QueryOptions for tempo
+		// to set; blockpack derives Direction=Backward internally whenever RecentFirstBudget !=
+		// nil (F-1/F-2/F-3).
+		queryOpts.RecentFirstBudget = newBoundedRecentFirstBudget()
 	}
 	switch {
 	case indexAnswered:
 		// already populated from the index path
 	case compiledProgram != nil:
 		// Use the pre-compiled program when available (NOTE-049: compile-once for regex DFA reuse).
+		// needsBoundedRead (above) may have set queryOpts.RecentFirstBudget, activating F-2's
+		// bounded newest-first path instead of an unconditional scan.
 		matches, qs, fetchErr = blockpack.QueryTraceQLWithProgram(ctx, r, compiledProgram, queryOpts)
 	default:
-		// Fall back to the string-based path when compilation failed (structural/pipeline queries).
+		// Fall back to the string-based path when compilation failed — reached only for a
+		// genuine structural query (index-answered structural queries return above via
+		// indexAnswered; pipeline queries and any unauthorized structural decline already
+		// hard-errored above). needsBoundedRead (above) may have set
+		// queryOpts.RecentFirstBudget, activating F-3's bounded structural path instead of an
+		// unconditional scan.
 		matches, qs, fetchErr = blockpack.QueryTraceQL(ctx, r, query, queryOpts)
 	}
 	if len(qs.Steps) > 0 {
@@ -858,7 +1045,7 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 			spanAttrs = append(
 				spanAttrs,
 				attribute.Int64("scan."+step.Name+".io_ops", int64(step.IOOps)),
-				attribute.Int64("scan."+step.Name+".bytes_read", int64(step.BytesRead)),
+				attribute.Int64("scan."+step.Name+".bytes_read", step.BytesRead),
 				attribute.Int64("scan."+step.Name+".duration_ns", int64(step.Duration)),
 			)
 		}
@@ -1183,7 +1370,7 @@ func columnNameToAttribute(colName string) (traceql.Attribute, bool) {
 }
 
 // FetchTagValues implements the Searcher interface
-func (b *blockpackBlock) FetchTagValues(ctx context.Context, req traceql.FetchTagValuesRequest, cb traceql.FetchTagValuesCallback, mcb common.MetricsCallback, opts common.SearchOptions) error {
+func (b *blockpackBlock) FetchTagValues(ctx context.Context, req traceql.FetchTagValuesRequest, cb traceql.FetchTagValuesCallback, _ common.MetricsCallback, _ common.SearchOptions) error {
 	ctx, span := b.startBlockSpan(ctx, "vblockpack.backendBlock.FetchTagValues")
 	defer span.End()
 

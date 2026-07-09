@@ -91,6 +91,15 @@ func (cqp *cubeQueryPath) fetchVCNTSection(
 	dims []string,
 	minTS, maxTS uint64,
 ) ([]byte, []blockpack.VCNTChunkDirEntry) {
+	// F-10 (issue #481 part 3): a nil client (the test-only cqp.store injection seam,
+	// cubequerypath.go's objectStore(), covers the REGISTRY store only — this is a SEPARATE
+	// value-index store construction with no equivalent seam) is exactly the "absent
+	// capability" case this function's own doc comment already treats as safe/expected —
+	// same posture as "absent coverage": return an empty section rather than dereferencing a
+	// nil *minio.Client inside newBackfillVIStore's ListObjects call.
+	if cqp.client == nil {
+		return nil, nil
+	}
 	return buildVCNTSection(ctx, newBackfillVIStore(cqp.client, cqp.bucket), tenant, dims, minTS, maxTS)
 }
 

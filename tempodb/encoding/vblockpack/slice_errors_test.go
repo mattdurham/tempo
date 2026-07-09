@@ -119,8 +119,11 @@ func TestQueryRange_IndexOnlyReturnsTypedErrorWhenNoVICoverage(t *testing.T) {
 // coverage. Before this fix, blockpack.ExecuteMetricsTraceQL had no way to know this was an
 // IndexOnly job, so this exact decline silently fell back to a full, un-windowed scan even
 // under IndexOnly — precisely the double-counting risk IndexOnly exists to prevent. This test
-// pins that QueryRange now converts blockpack's own ErrValueIndexNoCoverage into
-// ErrSliceIndexCoverageGap instead.
+// pins that QueryRange now converts blockpack's own metrics decline sentinel underneath (the
+// group-by shape decline surfaces as blockpack.ErrMetricsShapeNotAnswerable — see
+// decline_errors.go's doc comment and backend_block.go's errors.Is chain; the pre-F-4
+// ErrValueIndexNoCoverage sentinel this comment used to name was replaced outright by F-4's
+// four-sentinel family and no longer exists) into ErrSliceIndexCoverageGap instead.
 func TestQueryRange_IndexOnlyReturnsTypedErrorOnGroupByInnerDecline(t *testing.T) {
 	dir := t.TempDir()
 	viStore := &fakeVISink{}

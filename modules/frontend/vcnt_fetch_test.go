@@ -8,6 +8,7 @@ package frontend
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"path"
 	"testing"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/backend/local"
+	"github.com/grafana/tempo/tempodb/encoding/vblockpack"
 )
 
 const testIndexPrefix = "indexes"
@@ -108,19 +110,22 @@ func TestFetchVCNTSection_MissingDimYieldsNoCoverageNotError(t *testing.T) {
 }
 
 func TestBuildQueryPlan_NilRawReaderReturnsNilPlan(t *testing.T) {
-	plan := buildQueryPlan(context.Background(), nil, "tenant-a", testIndexPrefix, `{ span.http.method = "GET" }`, 0, 200, 1000)
+	plan, err := buildQueryPlan(context.Background(), nil, "tenant-a", testIndexPrefix, `{ span.http.method = "GET" }`, 0, 200, 1000, false)
+	require.NoError(t, err)
 	require.Nil(t, plan)
 }
 
 func TestBuildQueryPlan_CompileFailureReturnsNilPlan(t *testing.T) {
 	rawR, _ := newLocalRawReadWriter(t)
-	plan := buildQueryPlan(context.Background(), rawR, "tenant-a", testIndexPrefix, `{ not a valid traceql`, 0, 200, 1000)
+	plan, err := buildQueryPlan(context.Background(), rawR, "tenant-a", testIndexPrefix, `{ not a valid traceql`, 0, 200, 1000, false)
+	require.NoError(t, err)
 	require.Nil(t, plan)
 }
 
 func TestBuildQueryPlan_EmptyQueryReturnsNilPlan(t *testing.T) {
 	rawR, _ := newLocalRawReadWriter(t)
-	plan := buildQueryPlan(context.Background(), rawR, "tenant-a", testIndexPrefix, "", 0, 200, 1000)
+	plan, err := buildQueryPlan(context.Background(), rawR, "tenant-a", testIndexPrefix, "", 0, 200, 1000, false)
+	require.NoError(t, err)
 	require.Nil(t, plan)
 }
 
@@ -139,7 +144,8 @@ func TestBuildQueryPlan_UnresolvableQueryReturnsNilPlanWithoutFetching(t *testin
 		vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 9}))
 
 	counting := &countingRawReader{RawReader: rawR}
-	plan := buildQueryPlan(context.Background(), counting, tenant, testIndexPrefix, `{ span.http.method = "GET" }`, 0, 200, 1000)
+	plan, err := buildQueryPlan(context.Background(), counting, tenant, testIndexPrefix, `{ span.http.method = "GET" }`, 0, 200, 1000, false)
+	require.NoError(t, err)
 	require.Nil(t, plan, "an unresolvable query (no value-index reader configured) must short-circuit to a nil plan")
 	require.Equal(t, 0, counting.findCalls, "CheckIndexCoverage must be checked before any VCNT fetch I/O — zero Find calls expected")
 	require.Equal(t, 0, counting.readCalls, "CheckIndexCoverage must be checked before any VCNT fetch I/O — zero Read calls expected")
@@ -162,4 +168,94 @@ func (c *countingRawReader) Find(ctx context.Context, keypath backend.KeyPath, f
 func (c *countingRawReader) Read(ctx context.Context, name string, keyPath backend.KeyPath, cacheInfo *backend.CacheInfo) (io.ReadCloser, int64, error) {
 	c.readCalls++
 	return c.RawReader.Read(ctx, name, keyPath, cacheInfo)
+}
+
+// F-6 (issue #481 parts 2/3): real-conversion-path tests for buildQueryPlanFromProgram's new
+// ClassifyProgramVCNT/SelectSearchStrategy wiring. Each test configures a real (test-scoped)
+// value-index reader via vblockpack.ConfigureValueIndexQueryForTest(emptyVIStore{}, ...) so
+// CheckIndexCoverage reports resolvable (emptyVIStore's own doc comment, metrics_query_range_
+// sharder_test.go, explains why an empty store still satisfies the "shape is buildable" half of
+// resolvability), writes real VCNT objects via the local backend to drive selectivity
+// classification, and compiles a real query via blockpack.CompileTraceQL/
+// CompileTraceQLMetricsFilter — never a hand-built Selectivity/*blockpack.Program value.
+
+// TestBuildQueryPlanFromProgram_LowSelectivityWithLimit_SelectsBoundedRecentFirst is a MUST per
+// plan-f.md Task 6: a search query whose predicate value covers most of the column's live spans
+// (LowSelectivity) with a limit present must select DispatchBoundedRecentFirst (R3).
+func TestBuildQueryPlanFromProgram_LowSelectivityWithLimit_SelectsBoundedRecentFirst(t *testing.T) {
+	restore := vblockpack.ConfigureValueIndexQueryForTest(emptyVIStore{}, testIndexPrefix)
+	defer restore()
+
+	rawR, rawW := newLocalRawReadWriter(t)
+	tenant := "tenant-a"
+	// "GET" accounts for 900/1000 of the column's live spans over [0,200) — LowSelectivity.
+	writeVCNTObject(t, rawW, "span.http.method",
+		vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 900, "POST": 100}))
+
+	plan, err := buildQueryPlan(context.Background(), rawR, tenant, testIndexPrefix,
+		`{ span.http.method = "GET" }`, 0, 200, 1000, true /* hasLimit */)
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+	require.Equal(t, blockpack.DispatchBoundedRecentFirst, plan.Strategy)
+}
+
+// TestBuildMetricsQueryPlanFromProgram_LowSelectivityWithoutLimit_NeverBoundedRecentFirst is a
+// MUST per R2/plan-f.md Task 6 — the wrong-answer guard: metrics is NEVER bounded-served (a
+// truncated aggregate is a wrong answer, not a partial one). A resolvable, LowSelectivity metrics
+// query must plan-time-decline (ErrPlanTimeLowSelectivityNoLimit), never select
+// DispatchBoundedRecentFirst regardless of anything resembling a "limit" on the metrics side.
+func TestBuildMetricsQueryPlanFromProgram_LowSelectivityWithoutLimit_NeverBoundedRecentFirst(t *testing.T) {
+	restore := vblockpack.ConfigureValueIndexQueryForTest(emptyVIStore{}, testIndexPrefix)
+	defer restore()
+
+	rawR, rawW := newLocalRawReadWriter(t)
+	tenant := "tenant-a"
+	writeVCNTObject(t, rawW, "span.http.method",
+		vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 900, "POST": 100}))
+
+	plan, err := buildMetricsQueryPlan(context.Background(), rawR, tenant, testIndexPrefix,
+		`{ span.http.method = "GET" } | rate()`, 0, 200, 1000)
+	require.Error(t, err, "a resolvable, LowSelectivity metrics query must plan-time-decline, not dispatch")
+	require.True(t, errors.Is(err, ErrPlanTimeLowSelectivityNoLimit))
+	require.Nil(t, plan, "no plan must be returned alongside a plan-time decline error")
+}
+
+// TestBuildQueryPlanFromProgram_UnknownSelectivity_WithLimit_SelectsBoundedRecentFirst covers
+// R3's UnknownSelectivity+limit row: no VCNT signal at all for the queried column (not even an
+// empty-but-present record) classifies as UnknownSelectivity, which — per R3 — is treated as
+// bounded-eligible when a limit exists (worst case: a few extra low-yield blocks, kept safe by
+// the hard cap).
+func TestBuildQueryPlanFromProgram_UnknownSelectivity_WithLimit_SelectsBoundedRecentFirst(t *testing.T) {
+	restore := vblockpack.ConfigureValueIndexQueryForTest(emptyVIStore{}, testIndexPrefix)
+	defer restore()
+
+	rawR, _ := newLocalRawReadWriter(t)
+	tenant := "tenant-a"
+	// No VCNT object written at all for this column — ClassifyProgramVCNT must read UnknownSelectivity.
+
+	plan, err := buildQueryPlan(context.Background(), rawR, tenant, testIndexPrefix,
+		`{ span.http.method = "GET" }`, 0, 200, 1000, true /* hasLimit */)
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+	require.Equal(t, blockpack.DispatchBoundedRecentFirst, plan.Strategy)
+}
+
+// TestBuildQueryPlanFromProgram_UnknownSelectivity_WithoutLimit_StaysIndexOnly covers R3's
+// UnknownSelectivity+no-limit row: with no selectivity signal AND no limit, there is no safe way
+// to guess whether an unbounded-equivalent read would be cheap or catastrophic, so the query
+// falls through to the existing index-only path (DispatchBlockSharded/DispatchTimeSliced,
+// hard-erroring on decline downstream) rather than being bounded-served.
+func TestBuildQueryPlanFromProgram_UnknownSelectivity_WithoutLimit_StaysIndexOnly(t *testing.T) {
+	restore := vblockpack.ConfigureValueIndexQueryForTest(emptyVIStore{}, testIndexPrefix)
+	defer restore()
+
+	rawR, _ := newLocalRawReadWriter(t)
+	tenant := "tenant-a"
+
+	plan, err := buildQueryPlan(context.Background(), rawR, tenant, testIndexPrefix,
+		`{ span.http.method = "GET" }`, 0, 200, 1000, false /* hasLimit */)
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+	require.NotEqual(t, blockpack.DispatchBoundedRecentFirst, plan.Strategy,
+		"UnknownSelectivity with no limit must stay on the index-only path, never bounded")
 }

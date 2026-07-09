@@ -652,3 +652,49 @@ Back-refs: `internal/modules/queryplan/indexable.go:AllLeavesIndexable,collectLe
 `internal/modules/vibuilder/builder.go:LeafIndexable` (NOTE-VI-085). See `SPECS.md` SPEC-QP-5,
 SPEC-QP-3 (the gate this function correctly feeds). Tests: `indexable_test.go`,
 `timeslice_test.go`. Issue #487.
+
+
+---
+
+## NOTE-QP-010: SelectSearchStrategy — reusing DispatchBlockSharded (not a fake enum value) to signal a non-dispatchable plan-time decline (issue #481 parts 2-3, F-5, team-lead ruling R13)
+
+*Added: 2026-07-08*
+
+**The design question:** `SelectSearchStrategy`'s `LowSelectivity`+no-limit row has no safe
+`DispatchStrategy` to return — every per-block job dispatched under this row would decline
+identically (no limit to bound the work, and pruning doesn't help), so dispatching AT ALL wastes N
+block round-trips reaching a certain failure (team-lead ruling R6). Two designs were available for
+signaling this:
+
+1. **Invent a new `DispatchStrategy` enum value** (e.g. `DispatchDecline`) meaning "there is no
+   valid strategy" (REJECTED). This conflates two different kinds of thing under one type: a
+   `DispatchStrategy` is supposed to mean "how to execute this query," and "there is no way to
+   execute this query" is not a way to execute it — it is the ABSENCE of one. A caller doing an
+   exhaustive switch over `DispatchStrategy` (a natural, idiomatic Go pattern for a small enum)
+   would need a permanent, unremovable case for a value that means "ignore the other return value
+   in this struct, check the OTHER return value instead" — an awkward, easy-to-forget contract to
+   express through a single return value alone.
+2. **Return the real `DispatchBlockSharded` value alongside a second, explicit `bool`, and
+   document the value as MEANINGLESS in that branch** (ADOPTED). `planTimeDecline bool` is the
+   sole, out-of-band decline signal — a caller MUST check it before ever consulting `strategy`, but
+   when it checks in the right order, there is no possibility of dispatching a decline as if it
+   were a real, safe-to-run strategy. `DispatchBlockSharded` is chosen as the paired,
+   never-meant-to-be-used value specifically because it is `DispatchStrategy`'s own Go zero value —
+   a caller that (incorrectly) ignores `planTimeDecline` and dispatches anyway gets the SAFEST
+   possible wrong behavior (a full, always-correct block-sharded scan) rather than an
+   uninitialized or nonsensical strategy value. This is a deliberate defense-in-depth choice, not
+   a claim that ignoring `planTimeDecline` is an intended or supported usage.
+
+**Why this shape, not a `(strategy DispatchStrategy, err error)` return instead:** an `error`
+return would suggest something went WRONG (a bug, a malformed input) — `planTimeDecline` is not an
+error condition, it is a correct, expected outcome of a correctly-functioning classifier looking at
+a genuinely unfavorable query shape. Keeping it a plain `bool` alongside the strategy value (rather
+than an `error`) matches this project's existing "decline vs. error" distinction used throughout
+the value-index/structural-query engines (e.g. `NOTE-QP-006`'s own three-state cost handling,
+`ErrStructuralIndexCoverageGap`'s own careful separation of routine decline from genuine error).
+
+Back-refs: `internal/modules/queryplan/queryplan.go:SelectSearchStrategy`. See `SPECS.md`
+SPEC-QP-6 (the full decision-table contract), `SPEC-QP-3`'s addendum (the third `DispatchStrategy`
+value this note's decline-signaling design coexists with). Tests: `queryplan_test.go`
+(`TestSelectSearchStrategy_FiveRowCore`,
+`TestSelectSearchStrategy_NeverReturnsTimeSlicedOrFakeDeclineStrategy`). Issue #481.

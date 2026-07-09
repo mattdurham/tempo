@@ -178,7 +178,14 @@ func (s queryRangeSharder) RoundTrip(pipelineRequest pipeline.Request) (pipeline
 	// this same condition and would discard any plan built here unused.
 	var plan *blockpack.QueryPlan
 	if req.Start != 0 && req.End != 0 {
-		plan = buildMetricsQueryPlan(ctx, s.rawR, tenantID, s.indexPrefix, req.Query, req.Start/uint64(time.Second), req.End/uint64(time.Second), s.cfg.ConcurrentRequests)
+		var planErr error
+		plan, planErr = buildMetricsQueryPlan(ctx, s.rawR, tenantID, s.indexPrefix, req.Query, req.Start/uint64(time.Second), req.End/uint64(time.Second), s.cfg.ConcurrentRequests)
+		if planErr != nil {
+			// F-6 (issue #481 parts 2/3, R6): a resolvable-but-low-selectivity metrics query has
+			// no safe answer (R2: metrics is never bounded-served) — fail HERE, at plan time,
+			// rather than dispatch N per-block jobs that would each independently decline.
+			return pipeline.NewBadRequest(planErr), nil
+		}
 	}
 	s.backendRequests(ctx, tenantID, pipelineRequest, *req, cutoff, targetBytesPerRequest, plan, reqCh, jobMetadata)
 
@@ -309,6 +316,10 @@ func (s *queryRangeSharder) backendRequests(ctx context.Context, tenantID string
 		return
 	}
 
+	// No `case blockpack.DispatchBoundedRecentFirst` here, unlike search_sharder.go's equivalent
+	// switch: buildMetricsQueryPlan always passes boundedEligible=false (R2, vcnt_fetch.go) — a
+	// metrics plan can never resolve to DispatchBoundedRecentFirst in the first place, so this
+	// fallthrough only ever sees DispatchBlockSharded or nil here.
 	blockIter := backendJobsFunc(blocks, targetBytesPerRequest, maxShards, uint32(time.Unix(0, int64(searchReq.End)).Unix()))
 	blockIter(func(jobs int, sz uint64, completedThroughTime uint32) {
 		jobMetadata.TotalJobs += jobs

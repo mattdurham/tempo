@@ -80,45 +80,6 @@ func Plan(prog *vm.Program, cost CostFunc) (Group, bool) {
 	return root, true
 }
 
-// ProgramLeafColumns returns the distinct column names named by prog's leaf
-// predicates, in stable first-seen order. It walks the full predicate tree the same
-// way Plan does — descending into every AND/OR composite — because a consumer
-// deciding which VCNT columns to fetch before classifying selectivity needs the
-// complete leaf-column set regardless of boolean structure (the selectivity verdict
-// keys on the plan's lead leaf, but the caller cannot know which leaf that is until
-// it has the VCNT data for all of them). Present-only leaves (Column set, no
-// Values/Min/Max/Pattern) are still columns and are included; a caller that only
-// wants point-lookup columns filters further.
-//
-// Returns nil when prog is nil, has no predicates, or names no columns.
-func ProgramLeafColumns(prog *vm.Program) []string {
-	if prog == nil || prog.Predicates == nil {
-		return nil
-	}
-	var out []string
-	seen := make(map[string]struct{})
-	var walk func(ns []vm.RangeNode)
-	walk = func(ns []vm.RangeNode) {
-		for i := range ns {
-			n := &ns[i]
-			if len(n.Children) > 0 {
-				walk(n.Children)
-				continue
-			}
-			if n.Column == "" {
-				continue
-			}
-			if _, dup := seen[n.Column]; dup {
-				continue
-			}
-			seen[n.Column] = struct{}{}
-			out = append(out, n.Column)
-		}
-	}
-	walk(prog.Predicates.Nodes)
-	return out
-}
-
 // planAndNodes builds a GroupAND from an implicitly-AND-combined node list. Leaf
 // children become directly-owned Leaves; composite children recurse (an AND
 // composite is flattened up into this group; an OR composite becomes a nested

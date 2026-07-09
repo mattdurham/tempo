@@ -19,16 +19,11 @@ import (
 type RangeNode = vm.RangeNode
 
 // LeafCost is a rough, comparable selectivity/cost estimate for a single leaf predicate,
-// returned by a CostFunc. See UnknownCost/KnownCost to construct one.
+// returned by a CostFunc. See queryplan.UnknownCost/queryplan.KnownCost to construct one — a
+// root-level re-export of those two constructors was removed as an unconsumed public export
+// (issue #481 F-11 sweep: zero callers in tempo or blockpack outside this package's own tests,
+// which construct a CostFunc by calling queryplan.UnknownCost/queryplan.KnownCost directly).
 type LeafCost = queryplan.LeafCost
-
-// UnknownCost is the sentinel LeafCost for a leaf with no cost signal — it sorts after
-// every Known cost during BuildQueryPlan's internal leaf-ordering pass.
-func UnknownCost() LeafCost { return queryplan.UnknownCost() }
-
-// KnownCost returns a LeafCost carrying a real signal. A negative count is clamped to
-// zero (a legitimate maximally-selective "zero live matches" signal, not unknown).
-func KnownCost(count int64) LeafCost { return queryplan.KnownCost(count) }
 
 // CostFunc estimates the cost of a single leaf RangeNode for BuildQueryPlan's internal
 // leaf-ordering pass. It must be pure and side-effect-free — it informs ordering only and
@@ -58,7 +53,9 @@ type QueryPlan = queryplan.QueryPlan
 
 // DispatchStrategy tells the caller (tempo's frontend) which job-construction path to use
 // for a query. DispatchBlockSharded (the zero value) is today's existing per-block job path,
-// unchanged. DispatchTimeSliced is the #487 opt-in narrowing.
+// unchanged. DispatchTimeSliced is the #487 opt-in narrowing. DispatchBoundedRecentFirst is
+// the #481 bounded-newest-first strategy — see queryplan.DispatchStrategy's own doc comment
+// for the full contract.
 type DispatchStrategy = queryplan.DispatchStrategy
 
 const (
@@ -66,10 +63,51 @@ const (
 	DispatchBlockSharded = queryplan.DispatchBlockSharded
 	// DispatchTimeSliced is the #487 opt-in narrowing; see DispatchStrategy's doc comment.
 	DispatchTimeSliced = queryplan.DispatchTimeSliced
+	// DispatchBoundedRecentFirst is the #481 bounded-newest-first strategy; see
+	// DispatchStrategy's doc comment.
+	DispatchBoundedRecentFirst = queryplan.DispatchBoundedRecentFirst
 	// DefaultK is the recommended default for BuildTimeSlices/BuildQueryPlan's k parameter —
 	// see queryplan.DefaultK's own doc comment (SPEC-QP-2/NOTE-QP-008) for the full rationale.
 	DefaultK = queryplan.DefaultK
 )
+
+// Selectivity classifies a query plan's VCNT-estimated match volume — see
+// queryplan.Selectivity's own doc comment for the full contract. Re-exported at root so
+// tempo's frontend can pass a classification result (from its own ClassifyProgramVCNT call,
+// #481 Task 6) to SelectSearchStrategy without importing the internal queryplan package.
+type Selectivity = queryplan.Selectivity
+
+const (
+	// UnknownSelectivity means no cost signal covered the plan's lead leaf.
+	UnknownSelectivity = queryplan.UnknownSelectivity
+	// Selective means the plan's lead leaf matches a small enough share of the column.
+	Selective = queryplan.Selective
+	// LowSelectivity means the plan's lead leaf matches most of the column's live values.
+	LowSelectivity = queryplan.LowSelectivity
+)
+
+// SelectSearchStrategy implements R3's ruling table for choosing a search-query dispatch
+// strategy from a VCNT selectivity classification and whether the query carries a limit
+// (issue #481 parts 2/3, team-lead ruling R13) — see queryplan.SelectSearchStrategy's own doc
+// comment for the full five-row decision table and the planTimeDecline contract. Tempo's
+// frontend (buildQueryPlanFromProgram, #481 Task 6) calls this directly for search callers
+// ONLY, after gating on boundedEligible/resolvability itself — metrics callers never reach it
+// (R2: metrics is never bounded-served).
+func SelectSearchStrategy(sel Selectivity, hasLimit bool) (strategy DispatchStrategy, planTimeDecline bool) {
+	return queryplan.SelectSearchStrategy(sel, hasLimit)
+}
+
+// ClassifyProgramVCNT classifies prog's predicate selectivity over [minTS, maxTS] from one
+// already-decoded VCNT section (issue #481 part 2, Task 6) — re-exported at root so tempo's
+// frontend (buildQueryPlanFromProgram) can call it directly on the SAME decoded section it
+// already fetches for TimeSliceOracle, without importing the internal queryplan package. See
+// queryplan.ClassifyProgramVCNT's own doc comment for the full contract (UnknownSelectivity on
+// no signal; performs no object-storage I/O — data/dir are the caller's already-decoded bytes).
+func ClassifyProgramVCNT(
+	prog *Program, data []byte, dir []VCNTChunkDirEntry, minTS, maxTS uint64,
+) Selectivity {
+	return queryplan.ClassifyProgramVCNT(prog, data, dir, minTS, maxTS)
+}
 
 // BuildQueryPlan composes a cost-based leaf plan and, when qualified, minute-aligned
 // TimeSlices for prog's predicate over [minTS, maxTS] — the #487 time-slice job-sharding

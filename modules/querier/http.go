@@ -17,6 +17,7 @@ import (
 	"github.com/grafana/tempo/pkg/api"
 	"github.com/grafana/tempo/pkg/model/trace"
 	"github.com/grafana/tempo/pkg/tempopb"
+	"github.com/grafana/tempo/tempodb/encoding/vblockpack"
 )
 
 const (
@@ -396,6 +397,18 @@ func handleError(w http.ResponseWriter, err error) {
 	// NOTE: we receive a GRPC error from the ingesters, and so we need to check the string content of error as well.
 	if errors.Is(err, trace.ErrTraceTooLarge) || strings.Contains(err.Error(), trace.ErrTraceTooLarge.Error()) {
 		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+
+	// F-10 (issue #481 part 3, team-lead ruling R5): a typed value-index/cube decline sentinel
+	// (blockpack's F-4 metrics-decline family, or tempo's own search/cube sentinels) is an
+	// actionable, query-shape-not-answerable condition, not an internal error — map it to a
+	// 4xx with a message naming the reason, rather than falling through to the opaque 500
+	// below. This is the SINGLE insertion point both SearchHandler's and QueryRangeHandler's
+	// errors funnel through (verified, not assumed — the frontend combiner only ever reads an
+	// already-converted HTTP status code, never the underlying Go error).
+	if status, message, matched := vblockpack.DeclineErrorToHTTPResponse(err); matched {
+		http.Error(w, message, status)
 		return
 	}
 

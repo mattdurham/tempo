@@ -287,7 +287,7 @@ func appendTraceBlockIndex(out []byte, dir []traceBlockDirEntry) []byte {
 
 // DecodeTraceGroups decodes a full TraceGroup index payload into every group it
 // holds. Only the v2 batched format (magic "VTG2") is supported — the legacy v1
-// flat-blob format's rollover window (NOTE-VI-047, issue #476) has closed, and a
+// flat-blob format's rollover window (NOTE-VI-079, issue #490) has closed, and a
 // file that doesn't carry the v2 magic is now a hard decode error, not a
 // fallback candidate. This whole-file decode is used by the compactor's merge
 // path (which must read every group) and by tests; the trace-by-id read path
