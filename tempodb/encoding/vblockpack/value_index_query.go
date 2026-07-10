@@ -250,7 +250,8 @@ func CheckIndexCoverage(ctx context.Context, tenant string, prog *blockpack.Prog
 		return false
 	}
 	cache := vr.cacheFor(tenant)
-	_, ok, err := blockpack.BuildValueIndexSource(ctx, cache, vr.store, prog, minSec, maxSec)
+	watermarks := watermarksForOrNil(ctx, tenant)
+	_, ok, err := blockpack.BuildValueIndexSource(ctx, cache, vr.store, prog, minSec, maxSec, watermarks)
 	if err != nil {
 		return false
 	}
@@ -290,7 +291,8 @@ func (b *blockpackBlock) tryIndexFetch(
 	minSec, maxSec := nanoWindowToSec(opts.StartNano, opts.EndNano)
 
 	cache := vr.cacheFor(b.meta.TenantID)
-	src, ok, err := blockpack.BuildValueIndexSource(ctx, cache, vr.store, prog, minSec, maxSec)
+	watermarks := watermarksForOrNil(ctx, b.meta.TenantID)
+	src, ok, err := blockpack.BuildValueIndexSource(ctx, cache, vr.store, prog, minSec, maxSec, watermarks)
 	if err != nil {
 		// A build-time error is an object-store/discovery failure (List error,
 		// corrupt-file decode). This is not the authoritative "index named a block
@@ -304,6 +306,11 @@ func (b *blockpackBlock) tryIndexFetch(
 	if !ok {
 		level.Info(util_log.Logger).Log("msg", "vblockpack: index fetch: no coverage",
 			"block", b.meta.BlockID, "tenant", b.meta.TenantID, "minSec", minSec, "maxSec", maxSec)
+		// #496/B1: every leaf's shape was unindexable (R3's permanent-decline case) --
+		// recordUsageForDeclinedQuery's own Indexable check correctly never records
+		// this, but it is still called here for the OTHER, indexable-but-uncovered
+		// leaves that a mixed query might contain alongside the unindexable one.
+		recordUsageForDeclinedQuery(ctx, b.meta.TenantID, prog, dedicatedColumnSet(b.meta.DedicatedColumns), time.Now())
 		return declineOutcomeBounded(indexOnly, boundedAuthorized, stats)
 	}
 	level.Info(util_log.Logger).Log("msg", "vblockpack: index fetch: coverage found",
@@ -314,6 +321,14 @@ func (b *blockpackBlock) tryIndexFetch(
 	stats.FilesRead = bs.FilesRead
 	stats.BytesRead = bs.BytesRead
 	stats.Hits = bs.Hits
+	// #496/B1: NOTE-VI-033's "Add even when empty" contract means ok=true here only
+	// means "at least one leaf has an indexable shape" -- it does NOT mean any VI
+	// files were actually ever discovered for that leaf's column (see
+	// backend_block.go's QueryRange for the fuller explanation of this same gate).
+	// bs.FilesRead == 0 is the real "genuinely missing index" signal.
+	if bs.FilesRead == 0 {
+		recordUsageForDeclinedQuery(ctx, b.meta.TenantID, prog, dedicatedColumnSet(b.meta.DedicatedColumns), time.Now())
+	}
 
 	sourceRef := blockObjectKey(b.meta.TenantID, b.meta.BlockID.String())
 	// The value index is authoritative for the columns it covers (blockpack

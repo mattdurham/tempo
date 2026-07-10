@@ -169,8 +169,11 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 			level.Warn(util_log.Logger).Log("msg", "vblockpack: value-index L0 skipped: seek failed", "block", sourceRef, "err", serr)
 		} else if r, rerr := blockpack.NewReaderFromProvider(&fileReaderProvider{f: tmp}); rerr != nil {
 			level.Warn(util_log.Logger).Log("msg", "vblockpack: value-index L0 skipped: open reader failed", "block", sourceRef, "err", rerr)
-		} else if werr := blockpack.WriteValueIndexL0(r, store, sourceRef, meta.TenantID, prefix); werr != nil {
-			level.Warn(util_log.Logger).Log("msg", "vblockpack: value-index L0 write failed", "block", sourceRef, "err", werr)
+		} else {
+			policy := BuildViColumnPolicyForTenant(ctx, cfg.Blockpack.ViUsage, meta.TenantID)
+			if werr := blockpack.WriteValueIndexL0(r, store, sourceRef, meta.TenantID, prefix, policy); werr != nil {
+				level.Warn(util_log.Logger).Log("msg", "vblockpack: value-index L0 write failed", "block", sourceRef, "err", werr)
+			}
 		}
 	}
 

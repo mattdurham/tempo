@@ -21,7 +21,7 @@ than deleted. `vibuilder/NOTES.md`'s own entries continue to use the separate, s
 counter (spanning `valueindex`/`valueindexcompactor`/`valueindexconsumer`/`executor`/`vibuilder`)
 — this SPEC-VB-N convention applies only to this file and to `TESTS.md`'s parallel `TEST-VB-N`.
 
-Next free ID: **SPEC-VB-4**.
+Next free ID: **SPEC-VB-6**.
 
 ---
 
@@ -158,3 +158,127 @@ the two decisions.
 
 Back-ref: `internal/modules/vibuilder/builder.go:LeafIndexable,buildPredicate`. See `NOTES.md`
 NOTE-VI-085. Test: `leaf_indexable_test.go`. Issue #487.
+
+## SPEC-VB-4: `ColumnWatermark`/`BuildSource`'s R7 coverage gate — both `src.Add` call sites (#496)
+*Added: 2026-07-10*
+
+**Contract:** `ColumnWatermark{Triggered bool, Done bool, WatermarkSec uint64}` is the
+query-time-relevant coverage state for one non-dedicated, usage-triggered column mid-backfill
+(#496 R7). `(w ColumnWatermark) CoversRange(minSec, maxSec uint64) bool`: `w.Done` → `true`
+unconditionally; `!w.Triggered` → `false` unconditionally (never indexed, no coverage);
+otherwise → `minSec >= w.WatermarkSec` (in-progress, newest-to-oldest fill: covered range is
+`[WatermarkSec, now]`; only the query's OLDEST bound can create a coverage gap). The boundary
+`minSec == WatermarkSec` covers (inclusive, not a strict `>`).
+
+**This logic must stay identical to `viusage.BackfillState.CoversRange`
+(`viusage/SPECS.md` SPEC-VIUSAGE-2)** — both express the same contract for the same underlying
+registry state, via two independently-defined value types (see this file's own `watermark.go`
+doc comment, and `viusage/NOTES.md` NOTE-VIUSAGE-7, for why they cannot share one type without
+an import cycle: `vibuilder.BuildSource` is the actual consumer of this gate, and root
+`blockpack` already imports `vibuilder`; `ColumnWatermark` cannot live in root without
+`vibuilder` needing to import root back, and cannot live in `viusage` either since `vibuilder`
+must not depend on `internal/modules/viusage` — this package's own dependency graph must stay a
+leaf).
+
+**Enforcement (`BuildSource(ctx, disc, store, prog, minSec, maxSec, watermarks
+map[string]ColumnWatermark) (*executor.SliceValueIndexSource, bool, error)`) — the ENTIRE R7
+enforcement point, at BOTH of this file's `src.Add` call sites, no other change to `BuildSource`'s
+decision logic:**
+
+```go
+if wm, ok := watermarks[w.col]; ok && !wm.CoversRange(minSec, maxSec) {
+    continue // leave uncovered; the executor's existing decline/fallback path fires
+}
+src.Add(w.col, w.colType, results)
+```
+
+1. The leaf-predicate loop (per-leaf `RangeNode` resolution).
+2. The match-all/`Columns`-list branch (`{} | rate()`-shaped queries) — a match-all query over
+   a partially-backfilled column has the IDENTICAL partial-coverage risk as a leaf predicate
+   and must be gated too; this is not an optional second application, both sites are required.
+
+`watermarks == nil` (the common case — dedicated columns, and every caller not participating
+in #496's usage-triggered backfill) → both gates degrade to a no-op (`ok` is always `false` for
+a nil map lookup) — `BuildSource` behaves EXACTLY as it did before #496, byte-for-byte, for
+every existing caller that passes `nil`. A column present in `watermarks` whose `CoversRange`
+is `false` is treated identically to "no VI files discovered at all for that column" — reusing
+100% of the existing, already-tested decline/fallback machinery rather than inventing a second
+decline path.
+
+**`ok`'s return-value contract under the gate (binding — a second, independent finding from
+the same mutation-check exercise that validated the gate itself, not merely a code-quality
+nit): `BuildSource`'s returned `added`/`ok` must reflect whether a leaf was ACTUALLY `Add`ed,
+never merely whether a leaf had a buildable predicate.** Before this fix, the leaf-predicate
+branch set `added = true` whenever `len(work) > 0` (i.e., at least one leaf resolved to a
+buildable predicate) — independent of whether the watermark gate above then skipped every
+single one of those leaves' `src.Add` calls. That bug would have silently reintroduced a
+false-complete answer through a SECOND path even with the `CoversRange` gate itself correctly
+in place: the caller would see `ok=true` and a `SliceValueIndexSource` with zero covered
+columns, mistaking "the index has no idea about any of these columns" for "the index confirms
+zero matches" — the same class of bug R7 exists to prevent, just one layer further out. Fixed
+via an `atomic.Bool anyLeafAdded`, set only inside the actual `src.Add` call (concurrent
+leaves each run in their own `errgroup.Go` goroutine, hence the atomic rather than a plain
+bool), with `added = true` set from `anyLeafAdded.Load()` after `g.Wait()`, not from
+`len(work) > 0`. Discovered during A5's own mandatory mutation-check step (plan.md 4.8 step
+3): removing the `CoversRange` gate alone was not sufficient to reproduce a clean pass/fail
+signal until this second bug was ALSO fixed, because the stale `len(work) > 0` tracking would
+have masked the adversarial test's intended failure mode on a naive first attempt. See
+`NOTES.md` for the full writeup of this second finding.
+
+Back-refs: `internal/modules/vibuilder/watermark.go:ColumnWatermark,CoversRange`,
+`internal/modules/vibuilder/builder.go:anyLeafAdded`,
+`internal/modules/vibuilder/builder.go:BuildSource` (both gate sites). See `viusage/SPECS.md`
+SPEC-VIUSAGE-2 (the duplicated-logic twin) and `NOTES.md` (this file) for the import-cycle
+placement rationale.
+
+## SPEC-VB-5: `LeafColumns` — per-leaf `{Column, ColType, Indexable}` enumeration, one entry per leaf occurrence (#496)
+*Added: 2026-07-10*
+
+**Contract:** `LeafColumns(prog *vm.Program) []LeafColumnInfo` enumerates every leaf's
+`{Column string, ColType modules_shared.ColumnType, Indexable bool}` in `prog`'s predicate
+tree, reusing `LeafIndexable`/`buildPredicate`'s exact per-leaf shape decision verbatim (never
+independently re-derived — same reuse discipline `LeafIndexable`'s own doc comment already
+establishes, SPEC-VB-3). Added for #496 (blockpack/#496)'s tempo-side B1 usage-recording
+hook, which needs per-leaf `{column, indexable}` visibility that `AllLeavesIndexable`'s
+aggregate boolean cannot provide — R3's decline-reason distinction requires knowing WHICH
+column a leaf named and WHETHER its shape was indexable, not just whether every leaf in the
+program collectively was.
+
+**One entry PER LEAF OCCURRENCE, deliberately NOT deduplicated by column name (binding).** A
+column referenced by two leaves (e.g. two comparisons against the same attribute) produces
+TWO entries — mirroring `collectLeaves`' own per-leaf granularity, since that is exactly the
+leaf set `LeafIndexable`/`buildPredicate` themselves operate over. **De-duplication, if a
+caller needs it, is the CALLER's responsibility, not this function's** — #496's own
+usage-recording hook needs to count "one distinct query referenced column X" (a per-query,
+per-column decision, R3's specific usage-counting semantics), which is a policy choice
+specific to that one consumer, not a property `LeafColumns` itself should bake in. Keeping
+`LeafColumns` a faithful, unopinionated mirror of the raw leaf tree avoids assuming any one
+consumer's counting rule is the only valid one — a hypothetical future caller might
+legitimately want per-leaf (not per-column) granularity for a different purpose (e.g.
+counting distinct predicate SHAPES against a column).
+
+**`ColType` is exposed, not just the `Indexable` boolean**, because #496's usage registry
+keys entries by `(Tenant, ColumnHash, ColumnType)` (`viusage/SPECS.md` SPEC-VIUSAGE-1) — a
+caller recording a use needs the SAME resolved type `buildPredicate` uses, not merely a shape
+verdict. `ColType` is the zero `modules_shared.ColumnType` when `Indexable` is `false`
+(`buildPredicate` never resolves a type for a shape it rejects) or for a match-all leaf (no
+predicate to type-check against).
+
+**Match-all case:** a match-all query (`prog.Predicates.Nodes` empty, `.Columns` populated —
+e.g. `{} | rate()`) returns one entry per listed column with `Indexable: true` and a zero
+`ColType` — mirrors `AllLeavesIndexable`'s own match-all handling (`BuildSource`'s
+`lookupColumnAll` path never rejects a column's shape in this case, but a match-all leaf has
+no predicate to resolve a type from).
+
+**Empty case:** a program referencing nothing at all (no `Nodes`, no `Columns`, or `prog ==
+nil`/`prog.Predicates == nil`) returns `nil`.
+
+**Root re-export:** `blockpack.LeafColumns`/`blockpack.LeafColumnInfo` (`valueindex_query.go`)
+are a thin function wrapper and type alias respectively, mirroring `ColumnWatermark`'s own
+re-export pattern (SPEC-VB-4) — root already imports `vibuilder` for
+`BuildSource`/`ColumnWatermark`, so this adds no new dependency direction.
+
+Back-refs: `internal/modules/vibuilder/builder.go:LeafColumns,LeafColumnInfo` (reuses
+`collectLeaves`, `buildPredicate` — see SPEC-VB-3), `valueindex_query.go:LeafColumns,
+LeafColumnInfo` (root re-export). See `viusage/SPECS.md` SPEC-VIUSAGE-1 (the
+`(Tenant, ColumnHash, ColumnType)` key `ColType` serves) for the intended #496 B1 consumer.

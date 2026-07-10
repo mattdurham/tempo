@@ -164,6 +164,85 @@ type BlockpackConfig struct {
 	// CubeCompactorInterval is the period between cube compaction passes
 	// (default: 5 minutes).
 	CubeCompactorInterval time.Duration `yaml:"cube_compactor_interval"`
+
+	// ViUsage configures #496's usage-triggered VI dedicated-column/backfill
+	// feature (R12's safety valve, the trigger threshold/window, the lease TTL,
+	// and the historical backfill window).
+	ViUsage ViUsageConfig `yaml:"vi_usage"`
+}
+
+// ViUsageConfig configures #496's usage-triggered VI column backfill feature
+// (blockpack's internal/modules/viusage, re-exported at blockpack's root as
+// Entry/Registry/BackfillEngine/etc. — see valueindex_usage.go/
+// valueindex_backfill.go in the blockpack repo).
+type ViUsageConfig struct {
+	// DedicatedColumnsEnabled is R12's safety valve: when false, the entire
+	// dedicated-column/usage-tracking/backfill machinery is disengaged and VI
+	// indexes every column unconditionally — byte-for-byte identical to
+	// pre-#496 behavior (a disabled blockpack.ColumnPolicy indexes everything,
+	// and this field must ALSO gate B1's usage-recording hook itself, not just
+	// the write-path policy, per R12's "no usage-tracking/backfill machinery
+	// engaged at all" requirement). Defaults to true.
+	DedicatedColumnsEnabled bool `yaml:"dedicated_columns_enabled"`
+
+	// DedicatedColumnsOverride replaces viusage.DefaultDedicatedColumns's
+	// provisional bootstrap list (R2) for this deployment when non-empty. This
+	// is a deployment-wide override, not literally keyed per tenant in a map —
+	// a simplification of the per-tenant precedent create.go:63-64 established
+	// for backend.DedicatedColumns (meta.DedicatedColumns-over-cfg.DedicatedColumns);
+	// full per-tenant support for VI's own dedicated list would additionally
+	// require plumbing through modules/overrides' per-tenant runtime config,
+	// which is a larger integration left for a follow-up once real usage data
+	// exists to justify it (R2's own "provisional, not final" framing).
+	DedicatedColumnsOverride []string `yaml:"dedicated_columns_override"`
+
+	// TriggerThreshold is R4's repeated-use trigger: the number of distinct
+	// queries referencing the same non-dedicated column within TriggerWindow
+	// required to fire a backfill. Default 3 — documented as an unmeasured,
+	// provisional starting point (no production usage-log exists yet to
+	// calibrate against).
+	TriggerThreshold int `yaml:"trigger_threshold"`
+
+	// TriggerWindow is the rolling window TriggerThreshold is evaluated over.
+	// Default 1h.
+	TriggerWindow time.Duration `yaml:"trigger_window"`
+
+	// LeaseTTL bounds how long a backfill lease (R8) is honored before a
+	// second replica may re-acquire it. Default 30m.
+	LeaseTTL time.Duration `yaml:"lease_ttl"`
+
+	// BackfillWindow is R4's historical backfill window — narrower than
+	// cube's 7 days, since VI backfill reads raw historical blocks (full
+	// block I/O), not cheap pre-extracted VI files. Default 48h.
+	BackfillWindow time.Duration `yaml:"backfill_window"`
+
+	// WatermarkCacheTTL bounds how long the querier's in-process watermark
+	// cache (viWatermarkCache) reuses a loaded usage-registry snapshot before
+	// re-fetching, mirroring ValueIndexQueryConfig.CacheTTL/backfillListTTL's
+	// identical short-TTL-collapses-concurrent-loads pattern. Default 30s.
+	WatermarkCacheTTL time.Duration `yaml:"watermark_cache_ttl"`
+}
+
+func (cfg *ViUsageConfig) applyDefaults() {
+	// Booleans default to false, so set true explicitly (R12: enabled by default).
+	if !cfg.DedicatedColumnsEnabled {
+		cfg.DedicatedColumnsEnabled = true
+	}
+	if cfg.TriggerThreshold == 0 {
+		cfg.TriggerThreshold = 3
+	}
+	if cfg.TriggerWindow == 0 {
+		cfg.TriggerWindow = time.Hour
+	}
+	if cfg.LeaseTTL == 0 {
+		cfg.LeaseTTL = 30 * time.Minute
+	}
+	if cfg.BackfillWindow == 0 {
+		cfg.BackfillWindow = 48 * time.Hour
+	}
+	if cfg.WatermarkCacheTTL == 0 {
+		cfg.WatermarkCacheTTL = 30 * time.Second
+	}
 }
 
 // ValueIndexQueryConfig configures the querier-side index-driven query path.
@@ -246,6 +325,7 @@ func (cfg *BlockpackConfig) applyDefaults() {
 	if cfg.ValueIndexPrefix == "" {
 		cfg.ValueIndexPrefix = "indexes"
 	}
+	cfg.ViUsage.applyDefaults()
 }
 
 // validate validates blockpack configuration

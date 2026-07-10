@@ -122,6 +122,7 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 		compactionLevel:   maxCompactionLevel + 1,
 		startTime:         minBlockStart,
 		endTime:           maxBlockEnd,
+		viUsage:           c.opts.BlockConfig.Blockpack.ViUsage,
 	}
 
 	// Initialize caches on first compaction (no-op if already initialized).
@@ -392,6 +393,9 @@ type tempoOutputStorage struct {
 	compactionLevel   uint32
 	startTime         time.Time
 	endTime           time.Time
+	// viUsage carries #496 R2/R12's write-path ColumnPolicy config (dedicated-list
+	// override + the enable switch) through to Put's WriteValueIndexL0 call.
+	viUsage common.ViUsageConfig
 
 	metas []*backend.BlockMeta
 }
@@ -448,8 +452,11 @@ func (s *tempoOutputStorage) Put(_ string, data []byte) error {
 		sourceRef := blockObjectKey(s.tenantID, uuid.UUID(newID).String())
 		if r, rerr := blockpack.NewReaderFromProvider(&bytesReaderProvider{data: data}); rerr != nil {
 			level.Warn(util_log.Logger).Log("msg", "vblockpack: value-index L0 skipped (compaction): open reader failed", "block", sourceRef, "err", rerr)
-		} else if werr := blockpack.WriteValueIndexL0(r, store, sourceRef, s.tenantID, prefix); werr != nil {
-			level.Warn(util_log.Logger).Log("msg", "vblockpack: value-index L0 write failed (compaction)", "block", sourceRef, "err", werr)
+		} else {
+			policy := BuildViColumnPolicyForTenant(ctx, s.viUsage, s.tenantID)
+			if werr := blockpack.WriteValueIndexL0(r, store, sourceRef, s.tenantID, prefix, policy); werr != nil {
+				level.Warn(util_log.Logger).Log("msg", "vblockpack: value-index L0 write failed (compaction)", "block", sourceRef, "err", werr)
+			}
 		}
 	}
 	return nil

@@ -716,3 +716,80 @@ Back-refs: `valueindex_l0write.go:WriteValueIndexL0`,
 `valueindex_l0write_test.go:TestWriteValueIndexL0_TraceIDPopulated`. See `SPECS.md` SPEC-VI-3
 (Caveat, resolved), NOTE-VI-042 (second addendum), NOTE-VI-067 (the upstream `TraceID`
 population fix this bug depended on being fixed first).
+
+## NOTE-VI-102 — R10 acknowledgment: #496 reopens the design question `NOTE-VI-018`'s "SUPERSEDED by NOTE-VI-027" annotation settled — why the new model differs in kind
+
+Date: 2026-07-10
+
+Per the team-lead ruling for blockpack/#496 (VI dedicated columns + query-usage-driven
+backfill, plan.md Section 0 R10), this entry explicitly acknowledges that #496 reopens the
+design question this module's own `NOTE-VI-018` (above) recorded as settled: `NOTE-VI-018`'s
+`> SUPERSEDED by NOTE-VI-027 (issues #414/#415)` annotation states that `DefaultValueIndexDenylist`
+was removed — "a nil denylist now indexes EVERY column (the index is policy-free; the querier
+decides at read time)." #496 (`blockpack.ColumnPolicy`, `valueindex/SPECS.md` SPEC-VI-11)
+reintroduces exactly this kind of writer-side column-inclusion policy, for the first time since
+that removal. Per R10's own binding text: "Do not silently reverse documented history without
+this acknowledgment" — this entry is that acknowledgment.
+
+**Documentation-hygiene note, stated explicitly rather than papered over:** the decision
+`NOTE-VI-018`'s annotation refers to as "NOTE-VI-027" was never actually given its OWN
+standalone dated entry anywhere in this module's, `valueindex`'s, or `valueindexcompactor`'s
+NOTES.md files — it exists only as this `NOTE-VI-018` annotation and as informal code-comment
+cross-references elsewhere (root `valueindex_extract.go`, several sites). Separately,
+`internal/modules/valueindex/NOTES.md` has its OWN, real, fully-written, unrelated
+`NOTE-VI-027` entry ("BlockRef: page-addressed block reference for v2 files," issue #417,
+dated 2026-06-28) — the ID `027` is double-used across this module family's nominally-shared
+`NOTE-VI-N` numbering space, a real, pre-existing violation of the "IDs never reused"
+convention every SPECS.md in this repo states. This was found and confirmed with the team lead
+during #496's spec-doc work (2026-07-10): a minor, pre-existing doc-hygiene issue, not
+introduced by #496 and not blocking for it — the team lead may open a small, separate cleanup
+ticket for it later. This entry cites `NOTE-VI-018` itself as the real historical record for
+the denylist-removal decision, not a nonexistent standalone `NOTE-VI-027`, and states the
+collision plainly rather than inventing a synthetic entry to paper over the gap. See
+`internal/modules/viusage/NOTES.md` NOTE-VIUSAGE-8 for the fuller writeup of this finding.
+
+**Why #496's model is different in KIND from the old denylist, not merely a reversal of the
+same decision:**
+
+1. **Usage-driven, not writer-imposed a priori.** The old `DefaultValueIndexDenylist`
+   statically declared 4 columns "useless as tag values" at the WRITER, unconditionally, for
+   every tenant, forever, based on a design-time judgment. #496's policy instead responds to
+   OBSERVED QUERY USAGE: `internal/modules/viusage`'s registry tracks real, distinct-query
+   references to a non-dedicated column and only indexes it once a repeated-use threshold is
+   crossed (R4) — the decision is made by what queries ACTUALLY ask for, not by a fixed,
+   pre-declared judgment about which columns matter.
+2. **Opt-in-over-time, not a binary always-index/never-index split.** The pre-#414/#415 world
+   (denylist) and the post-#414/#415 world (policy-free, nil denylist) both offered only two
+   states per column: excluded or included, fixed at write time with no path between them.
+   #496 introduces a genuine THIRD state a column can occupy — "not yet indexed, but will
+   become so automatically, without any code or config change, once usage crosses a
+   threshold" — that neither prior world had any equivalent of.
+3. **Caller-overridable dedicated list, not one global hardcoded constant.**
+   `viusage.DefaultDedicatedColumns` (`viusage/SPECS.md` SPEC-VIUSAGE-7) is explicitly
+   disclosed as a PROVISIONAL starting point a tenant may override (Part B's config wiring,
+   not yet landed as of this writing) — structurally different from a single hardcoded
+   constant applied identically and immutably everywhere, which is what the old denylist was.
+4. **The new permanent hard-exclusion set (`blockpack.HardExcludedColumns`, `valueindex/
+   SPECS.md` SPEC-VI-11) is orthogonal to, and narrower in scope than, the old denylist's
+   "useless as tag values" judgment.** It excludes exactly the 4 columns
+   (`span:id`/`span:parent_id`/`span:start`/`trace:id`) that are structurally unindexable as
+   ordinary per-column value-index entries for CORRECTNESS reasons tied to VI's own wire
+   format and addressing scheme (this module's own `SPEC-VI-4`'s `trace:id` exclusion is the
+   direct precedent this generalizes) — not a value judgment about which attributes are
+   worth indexing as tag values, which is what motivated the original, now-removed denylist.
+
+**Consequence for this module specifically:** this module's (`valueindexconsumer`) own
+extraction/buffering/flush code is UNCHANGED by #496 — #496's `ColumnPolicy` gates the ROOT
+package's `WriteValueIndexL0`/`extractBlockColumns` (the synchronous in-process write path,
+`NOTE-VI-042`), not this module's own async Redis/rqlite-consumer flush path
+(`Service.ingest`/`flushColumn`, `NOTE-VI-016`). This module's own pre-existing `trace:id`
+exclusion (`SPECS.md` SPEC-VI-4) remains exactly as it was — #496 did not need to touch it,
+and generalizes the SAME pattern (a permanent, sentinel-driven exclusion independent of
+operator configuration) into `HardExcludedColumns` for the root package's separate write path.
+
+Back-refs: `internal/modules/valueindexconsumer/NOTES.md:NOTE-VI-018` (the historical record
+being acknowledged), `valueindex_policy.go:ColumnPolicy,HardExcludedColumns` (root package, the
+new mechanism), `internal/modules/valueindex/SPECS.md` SPEC-VI-11,
+`internal/modules/viusage/SPECS.md` SPEC-VIUSAGE-6/7, `internal/modules/viusage/NOTES.md`
+NOTE-VIUSAGE-6/8 (the fuller version of both this acknowledgment and the ID-collision
+finding).

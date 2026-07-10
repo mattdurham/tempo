@@ -61,8 +61,13 @@ func (s *minioObjectStore) Get(ctx context.Context, path string) ([]byte, string
 	obj, err := s.client.GetObject(ctx, s.bucket, path, minio.GetObjectOptions{})
 	if err != nil {
 		resp := minio.ToErrorResponse(err)
-		if resp.Code == "NoSuchKey" || resp.StatusCode == 404 {
-			return nil, "", nil // empty index — first write
+		if resp.Code == minioNoSuchKeyCode || resp.StatusCode == 404 {
+			// bonus fix (mirrors #496's viusage.ErrNotFound fix, NOTE-VIUSAGE-10): must
+			// return blockpack.CubeErrNotFound (not a nil error) so cube.Registry.Load
+			// can distinguish a genuine miss from a real transient failure -- both
+			// previously had the identical (nil, "", ?) shape, which caused every real
+			// error to be silently treated as an empty index.
+			return nil, "", blockpack.CubeErrNotFound
 		}
 		return nil, "", err
 	}

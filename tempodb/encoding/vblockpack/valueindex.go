@@ -28,6 +28,12 @@ import (
 	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
 )
 
+// minioNoSuchKeyCode is minio's error Code for a 404 (object not found),
+// checked alongside the HTTP status across this package's several minio-backed
+// object-store implementations (cubemanager.go, value_index_query.go,
+// vi_backfill.go).
+const minioNoSuchKeyCode = "NoSuchKey"
+
 // fileReaderProvider implements blockpack.ReaderProvider over an *os.File using
 // pread (ReadAt), so the value-index extractor can stream a freshly-written block
 // from its temp file without buffering the whole encoded block in memory.

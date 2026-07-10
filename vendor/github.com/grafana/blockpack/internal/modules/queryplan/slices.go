@@ -236,7 +236,8 @@ func adaptiveWidthSlices(
 		counts[c.Minute] = count
 		total += count
 	}
-	target := total / int64(desiredSliceCount(concurrentRequests, k)) //nolint:gosec // desiredSliceCount is a small, non-negative slice-count divisor
+	divisor := int64(desiredSliceCount(concurrentRequests, k)) //nolint:gosec // small positive divisor
+	target := total / divisor
 
 	var slices []TimeSlice
 	sliceStart := start

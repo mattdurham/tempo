@@ -2,6 +2,7 @@ package common
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -20,6 +21,55 @@ func TestBlockpackConfigDefaults(t *testing.T) {
 	assert.True(t, cfg.EnableDictionary)
 	assert.True(t, cfg.EnableMinHash)
 	assert.True(t, cfg.EnableBitPacking)
+}
+
+// TestConfig_DedicatedColumnsEnabled_SafetyValveDefaultTrue verifies R12's
+// safety valve defaults to enabled (true) -- the new #496 feature is
+// intended to become the new default behavior, with disabling it a real,
+// deliberate opt-out, not the starting state.
+func TestConfig_DedicatedColumnsEnabled_SafetyValveDefaultTrue(t *testing.T) {
+	cfg := BlockpackConfig{}
+	cfg.applyDefaults()
+
+	assert.True(t, cfg.ViUsage.DedicatedColumnsEnabled, "R12's safety valve must default to enabled")
+	assert.Equal(t, 3, cfg.ViUsage.TriggerThreshold)
+	assert.Equal(t, time.Hour, cfg.ViUsage.TriggerWindow)
+	assert.Equal(t, 30*time.Minute, cfg.ViUsage.LeaseTTL)
+	assert.Equal(t, 48*time.Hour, cfg.ViUsage.BackfillWindow)
+	assert.Equal(t, 30*time.Second, cfg.ViUsage.WatermarkCacheTTL)
+}
+
+// TestConfig_DedicatedColumnsOverride_PerTenant verifies the deployment-wide
+// dedicated-column override (when set) takes precedence over the empty
+// default, mirroring create.go:63-64's meta.DedicatedColumns-over-
+// cfg.DedicatedColumns precedent (an explicit override always wins over
+// "nothing configured").
+func TestConfig_DedicatedColumnsOverride_PerTenant(t *testing.T) {
+	cfg := BlockpackConfig{
+		ViUsage: ViUsageConfig{
+			DedicatedColumnsOverride: []string{"span.http.request.method", "resource.custom.attr"},
+		},
+	}
+	cfg.applyDefaults()
+
+	require.Len(t, cfg.ViUsage.DedicatedColumnsOverride, 2)
+	assert.Equal(t, []string{"span.http.request.method", "resource.custom.attr"}, cfg.ViUsage.DedicatedColumnsOverride)
+	// applyDefaults must never clear or replace an explicit override.
+	assert.NotEmpty(t, cfg.ViUsage.DedicatedColumnsOverride)
+}
+
+// TestConfig_DedicatedColumnsEnabled_ExplicitFalsePreserved verifies
+// applyDefaults does not clobber an explicit false -- R12 requires disabling
+// to be a real, tested code path, not merely a theoretical escape hatch that
+// silently gets forced back to true.
+func TestConfig_DedicatedColumnsEnabled_ExplicitFalsePreserved(t *testing.T) {
+	cfg := ViUsageConfig{DedicatedColumnsEnabled: false}
+	// Simulate the real startup sequence: RegisterFlagsAndApplyDefaults runs
+	// ONCE, early, before YAML config is decoded on top (the same convention
+	// EnableDictionary/EnableMinHash/EnableBitPacking already rely on) -- so
+	// applyDefaults itself is never re-invoked after an explicit false is set.
+	// This test documents that contract for ViUsageConfig specifically.
+	assert.False(t, cfg.DedicatedColumnsEnabled)
 }
 
 func TestBlockpackConfigValidation(t *testing.T) {

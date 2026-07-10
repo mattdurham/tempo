@@ -86,6 +86,31 @@ type ValueIndexFileStore = vibuilder.FileStore
 // sentinel; recognize it with errors.Is(err, ErrValueIndexFileNotFound).
 var ErrValueIndexFileNotFound = vibuilder.ErrFileNotFound
 
+// ColumnWatermark is the query-time-relevant coverage state for one
+// non-dedicated, usage-triggered column mid-backfill (#496 R7, plan.md
+// Section 4.7): re-exported from vibuilder (not defined here directly) to
+// avoid an import cycle, since vibuilder.BuildSource -- which this package
+// already imports -- is the actual consumer of the gate.
+type ColumnWatermark = vibuilder.ColumnWatermark
+
+// LeafColumnInfo describes one leaf's column name and whether its predicate shape is
+// representable against the value index at all (#496/B1, SPEC-VB-5): re-exported from
+// vibuilder for the same reason ColumnWatermark is -- vibuilder.LeafIndexable is the
+// same per-leaf rule this repo's own index-source builder already relies on, so external
+// consumers needing per-leaf/per-column indexability (e.g. tempo's usage-recording hook,
+// which must distinguish "this column's predicate shape is permanently unindexable" from
+// "this column's shape is fine but genuinely has no coverage yet") get the exact same
+// decision buildPredicate makes, never an independently re-derived one.
+type LeafColumnInfo = vibuilder.LeafColumnInfo
+
+// LeafColumns enumerates every leaf's {Column, Indexable} in prog's predicate tree, one
+// entry per leaf occurrence (not deduplicated by column name -- see
+// vibuilder.LeafColumns' own doc comment for the full contract, including the match-all
+// and OR-composite cases).
+func LeafColumns(prog *Program) []LeafColumnInfo {
+	return vibuilder.LeafColumns(prog)
+}
+
 // BuildValueIndexSource assembles a SliceValueIndexSource for prog over the time
 // window [minSec, maxSec] using disc for cached file discovery and store for
 // downloads.
@@ -98,12 +123,18 @@ var ErrValueIndexFileNotFound = vibuilder.ErrFileNotFound
 // should fall back to a full scan rather than fail the query.
 //
 // disc is typically an *IndexFileCache; any FilesForTimeRange implementation works.
+//
+// watermarks (#496 R7) gates coverage for non-dedicated, usage-triggered
+// columns mid-backfill; nil means no gating (today's behavior, dedicated
+// columns) -- see vibuilder.BuildSource's own doc comment for the full
+// contract.
 func BuildValueIndexSource(
 	ctx context.Context,
 	disc *IndexFileCache,
 	store ValueIndexFileStore,
 	prog *Program,
 	minSec, maxSec uint64,
+	watermarks map[string]ColumnWatermark,
 ) (*SliceValueIndexSource, bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -111,7 +142,7 @@ func BuildValueIndexSource(
 	if disc == nil {
 		return nil, false, nil
 	}
-	return vibuilder.BuildSource(ctx, disc, store, prog, minSec, maxSec)
+	return vibuilder.BuildSource(ctx, disc, store, prog, minSec, maxSec, watermarks)
 }
 
 // BuildValueIndexSourceForMetrics is the metrics analog of BuildValueIndexSource:
@@ -125,12 +156,14 @@ func BuildValueIndexSource(
 // caller supplies the discovery window via minSec/maxSec.
 //
 // Returns the same (source, ok, err) contract as BuildValueIndexSource.
+// watermarks has the same #496 R7 contract as BuildValueIndexSource's.
 func BuildValueIndexSourceForMetrics(
 	ctx context.Context,
 	disc *IndexFileCache,
 	store ValueIndexFileStore,
 	query string,
 	minSec, maxSec uint64,
+	watermarks map[string]ColumnWatermark,
 ) (*SliceValueIndexSource, bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -144,5 +177,5 @@ func BuildValueIndexSourceForMetrics(
 		// full-scan metrics path.
 		return nil, false, fmt.Errorf("compile metrics query: %w", err)
 	}
-	return vibuilder.BuildSource(ctx, disc, store, prog, minSec, maxSec)
+	return vibuilder.BuildSource(ctx, disc, store, prog, minSec, maxSec, watermarks)
 }

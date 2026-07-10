@@ -444,3 +444,110 @@ Back-refs: `internal/modules/vibuilder/builder.go:LeafIndexable,buildPredicate`.
 SPEC-VB-3, `internal/modules/queryplan/NOTES.md` NOTE-QP-009 (the consumer-side rationale for
 `AllLeavesIndexable`), `SPECS.md`(`queryplan`) SPEC-QP-5. Test: `leaf_indexable_test.go`.
 Issue #487.
+
+## NOTE-VI-103: `ColumnWatermark` lives here, not root `blockpack`, to avoid an import cycle (#496, issue #487/T5b lineage, R7)
+
+*Added: 2026-07-10*
+
+`plan.md` Section 4.7 (blockpack/#496) proposed defining `ColumnWatermark` directly in the
+root `blockpack` package. That placement does not work: `vibuilder.BuildSource` is the actual
+consumer of the R7 coverage gate (`SPEC-VB-4`), and root `blockpack` already imports
+`vibuilder` (`BuildValueIndexSource` calls `vibuilder.BuildSource`) — if `ColumnWatermark` lived
+in root as originally proposed, `vibuilder` would need to import root to reference its own
+gate's parameter type, creating `blockpack → vibuilder → blockpack`.
+
+**Resolution:** `ColumnWatermark` is defined here (`watermark.go`), and root `blockpack`
+re-exports it via a plain type alias (`type ColumnWatermark = vibuilder.ColumnWatermark`,
+`valueindex_query.go`) — matching the existing `FileStore`/`ErrFileNotFound` re-export pattern
+already used in that file, so external callers of the public `BuildValueIndexSource` API never
+need to import an internal package directly, even though the type's own defining package is
+not root.
+
+**Consequence: this package must NOT import `internal/modules/viusage`, ever**, even though
+`ColumnWatermark`'s contract is logically "the same thing" as `viusage.BackfillState`
+(`viusage/SPECS.md` SPEC-VIUSAGE-1/2) — importing `viusage` here would risk recreating an
+equivalent cycle shape the moment `viusage` itself needs anything from `vibuilder` or root in a
+way that loops back. `ColumnWatermark` is therefore a small, deliberately duplicated value type
+(3 fields, 1 method) rather than an import of `viusage.BackfillState` — see `viusage/NOTES.md`
+NOTE-VIUSAGE-7 for the fuller cross-package writeup of this same constraint (it bit twice
+during #496's implementation, once for this type and once for A1's `ColumnPolicy`, which ended
+up in root for the mirror-image reason).
+
+Back-refs: `internal/modules/vibuilder/watermark.go:ColumnWatermark` (its own doc comment makes
+this same argument), root `valueindex_query.go:ColumnWatermark` (the alias). See `SPECS.md`
+SPEC-VB-4 and `viusage/NOTES.md` NOTE-VIUSAGE-7.
+
+## NOTE-VI-104: `LeafColumns` deliberately does not deduplicate by column name — de-dup is the caller's job (#496, B1 lineage)
+
+*Added: 2026-07-10*
+
+`LeafColumns` (`SPEC-VB-5`) returns one entry per LEAF occurrence in `prog`'s predicate tree,
+not one per distinct column name — a column named by two leaves produces two entries. This
+was a deliberate design choice made when adding the function for #496's tempo-side B1
+usage-recording hook, which specifically needs "one distinct query referenced column X"
+(R3's own usage-counting semantics) — a decision that could easily have been baked into
+`LeafColumns` itself (return a de-duplicated `map[string]LeafColumnInfo` or similar) instead
+of left to the caller.
+
+**Why the caller, not `LeafColumns`, owns de-duplication:** `LeafColumns` exists specifically
+to mirror `collectLeaves`'s own per-leaf granularity — the same leaf set `LeafIndexable`/
+`buildPredicate` already operate over, with no independent re-derivation of that tree walk.
+Baking in ANY particular caller's counting rule (de-dup by column name, which is what B1
+happens to need) would make `LeafColumns` opinionated about one specific consumer's semantics,
+foreclosing other plausible future consumers with different counting needs — e.g. a caller
+wanting to count distinct predicate SHAPES against a column (which legitimately wants
+per-leaf, not per-column, granularity) would be unable to recover that information from an
+already-deduplicated result. Keeping `LeafColumns` a faithful, unopinionated mirror of the raw
+leaf tree, and pushing R3's specific "count distinct queries per column" rule onto B1's own
+implementation instead, keeps this function reusable rather than single-purpose.
+
+Regression-pinned by `TestLeafColumns_DuplicateColumnAcrossTwoLeavesProducesTwoEntries`
+(`leaf_columns_test.go`, `TESTS.md` TEST-VB-6) — this is the test that would fail if a future
+change accidentally introduced de-duplication into `LeafColumns` itself.
+
+Back-ref: `internal/modules/vibuilder/builder.go:LeafColumns`'s own doc comment (states this
+same reasoning). See `SPECS.md` SPEC-VB-5.
+
+## NOTE-VI-105: A5's mutation-check confirmed, and a SECOND independent bug it caught — `added`/`ok` was tracking "had a buildable predicate," not "actually Added" (#496, R7)
+
+*Added: 2026-07-10*
+
+Plan.md 4.8 step 3 requires a manual mutation-check for the R7 adversarial test
+(`TestQueryDeclinesOnPartialBackfillCoverage_NotFalseComplete`): temporarily remove the
+`!wm.CoversRange(...)` gate from `BuildSource`, confirm the test now fails, restore it, confirm
+it passes again. **Confirmed performed (coder-1, task #108/A5):** the gate
+(`if wm, ok := watermarks[w.col]; ok && !wm.CoversRange(minSec, maxSec) { return nil }`) was
+temporarily removed from the leaf-loop, marked with a `MUTATION-CHECK-TEMP-REMOVED` comment.
+Re-running the adversarial test's "full 48h window declines" subtest failed exactly as
+expected — `Should be false` / a real `*executor.SliceValueIndexSource` returned instead of
+`nil`, reproducing the literal false-complete bug the gate exists to prevent (ok=true with a
+real span returned despite only 6 of 48 hours actually backfilled). The gate was restored and
+both the decline subtest and its control-query sibling passed again.
+
+**A second, independent bug surfaced by the SAME mutation-check exercise, not merely by the
+gate's removal:** `BuildSource`'s leaf-loop was setting `added = true` whenever `len(work) >
+0` — i.e., whenever at least one leaf resolved to a buildable predicate — regardless of
+whether the watermark gate then skipped every one of those leaves' `src.Add` calls. This bug
+is INDEPENDENT of the gate itself: even with `CoversRange` correctly wired, a caller could
+still have observed `ok=true` alongside a `SliceValueIndexSource` with zero actually-covered
+columns — the exact same "false complete" failure mode R7 exists to prevent, manifesting one
+layer further out in `BuildSource`'s own return-value bookkeeping rather than in the gate
+condition itself. This bug's existence meant the mutation-check's FIRST attempt (gate removed,
+naive `len(work) > 0` tracking still in place) did not cleanly isolate the gate's own
+contribution — both bugs had to be found and fixed together to get a clean signal.
+
+**Fix:** `added` is now tracked via an `atomic.Bool anyLeafAdded`, set to `true` ONLY inside
+the actual `src.Add` call (each leaf runs in its own `errgroup.Go` goroutine, hence the atomic
+rather than a plain `bool` — `src` itself is separately documented as mutex-protected for
+`RecordFileIO`/`Add`, but the LOCAL `added` bookkeeping needed its own concurrency-safe
+tracking). After `g.Wait()`, `added = true` is set from `anyLeafAdded.Load()`, never from
+`len(work) > 0`.
+
+**Regression guard:** covered by the adversarial test itself (`TestQueryDeclinesOnPartialBackfillCoverage_NotFalseComplete`'s "full 48h window declines" subtest asserts `ok=false`, which this fix is
+required for) — no separate dedicated unit test for the `atomic.Bool` mechanism itself exists,
+since the adversarial test's own assertion is what would regress if this fix were reverted.
+
+Back-ref: `internal/modules/vibuilder/builder.go:BuildSource` (the `anyLeafAdded` tracking).
+See `SPECS.md` SPEC-VB-4's own binding paragraph on this exact contract, and
+`internal/modules/viusage/TESTS.md`'s R7 adversarial-test entry (cross-references this note
+for the confirmed mutation-check outcome).

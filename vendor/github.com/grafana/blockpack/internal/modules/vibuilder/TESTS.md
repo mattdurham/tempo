@@ -14,7 +14,7 @@ SPEC-ROOT-009 — distinct from `valueindex/TESTS.md`'s own `TEST-VI-N` counter,
 `SPEC-VB-N`/`SPEC-VI-N` separation established in this package's `SPECS.md`). IDs are assigned
 in ascending order and never reused or renumbered.
 
-Next free ID: **TEST-VB-5**.
+Next free ID: **TEST-VB-7**.
 
 ---
 
@@ -119,3 +119,81 @@ can represent and reject everything else, with no I/O.
 **Spec invariants tested:** SPEC-VB-3.
 
 Back-ref: `internal/modules/vibuilder/leaf_indexable_test.go`. Issue #487.
+
+## TEST-VB-5: `ColumnWatermark`/`BuildSource`'s R7 coverage gate — boundary conditions and both `src.Add` sites (#496)
+*Added: 2026-07-10*
+
+**Scenario:** `ColumnWatermark.CoversRange`'s 4 branches (SPEC-VB-4) and `BuildSource`'s two
+gated `src.Add` call sites (leaf predicates, match-all/`Columns` list) — both need the gate,
+and an absent watermark entry must behave exactly as pre-#496.
+
+**Setup/Assertions:**
+- `TestColumnWatermark_CoversRange_DoneAlwaysTrue`, `_NeverTriggeredAlwaysFalse`,
+  `_InProgressCoversOnlyFromWatermarkForward`, `_InProgressExactlyAtWatermarkBoundaryCovers`
+  (`watermark_test.go`) — direct-call tests covering all 4 branches, including the explicit
+  `minSec == WatermarkSec` boundary-inclusive case.
+- `TestBuildSource_WatermarkGateSkipsUncoveredColumn` / `_WatermarkCoveredColumnResolves`
+  (`builder_watermark_test.go`) — a leaf-predicate column with an uncovered/covered watermark
+  is skipped/resolved accordingly.
+- `TestBuildSource_WatermarkAbsentColumnUnaffected` — no watermark entry for a column (the
+  common case, dedicated columns) behaves exactly as pre-#496 — `ok=false` in the map lookup
+  degrades the gate to a no-op.
+- `TestBuildSource_MixedLeaves_OneGatedOneNot_EdgeCase1` — plan.md's own "Edge Case 1: a query
+  references BOTH a dedicated and a non-dedicated column in one predicate tree" — one leaf
+  gated, one not, in the SAME query.
+- `TestBuildSource_MatchAll_WatermarkGateSkipsUncoveredColumn` /
+  `_MatchAll_WatermarkCoveredColumnResolves` — the SECOND `src.Add` call site (match-all/
+  `Columns`-list queries have the identical partial-coverage risk as leaf predicates and must
+  be gated too, per plan.md 4.7's explicit two-call-site callout).
+
+**Spec invariants tested:** SPEC-VB-4.
+
+Back-refs: `internal/modules/vibuilder/watermark_test.go` (4 tests),
+`internal/modules/vibuilder/builder_watermark_test.go` (7 tests). Cross-referenced (not
+duplicated) from `internal/modules/viusage/TESTS.md`'s own #496 test-plan record.
+
+---
+
+## TEST-VB-6: `LeafColumns` — per-leaf enumeration, no dedup, match-all handling, ColType resolution, root re-export parity (#496)
+*Added: 2026-07-10*
+
+**Scenario:** SPEC-VB-5's full contract: nil/empty handling, single-leaf indexable/
+unindexable shapes, mixed indexable+unindexable leaves each reported, the load-bearing
+no-dedup guarantee, OR-composite descent, the match-all case, `ColType` resolution, and root
+re-export parity.
+
+**Setup/Assertions (`leaf_columns_test.go`):**
+- `TestLeafColumns_NilOrEmptyReturnsNil` — a nil program or a program with no `Nodes`/
+  `Columns` returns `nil`.
+- `TestLeafColumns_SingleEqualityLeafIsIndexable` — a plain equality leaf reports
+  `Indexable: true` with its resolved `ColType`.
+- `TestLeafColumns_RequirePresentLeafIsNotIndexable` / `_MultiValueLeafIsNotIndexable` — shapes
+  `LeafIndexable`/`buildPredicate` already reject report `Indexable: false`.
+- `TestLeafColumns_MixedIndexableAndUnindexableLeavesReportsEach` — a program with BOTH shapes
+  reports one entry per leaf with the correct verdict per leaf, not a single aggregate.
+- `TestLeafColumns_DuplicateColumnAcrossTwoLeavesProducesTwoEntries` — **load-bearing, the
+  binding no-dedup guarantee**: the same column named by two leaves produces TWO entries, not
+  one — proving `LeafColumns` does not silently collapse repeats, leaving de-duplication (if a
+  caller needs it) entirely to the caller.
+- `TestLeafColumns_ORCompositeDescendsIntoChildren` — an OR-composite node's children are
+  individually enumerated (via `collectLeaves`'s own tree walk), not skipped or flattened
+  incorrectly.
+- `TestLeafColumns_MatchAllColumnListReportsEachAsIndexable` — a match-all query
+  (`{} | rate()`-shaped, `Nodes` empty, `Columns` populated) reports one entry per listed
+  column, `Indexable: true`, zero `ColType` (no predicate to resolve a type from).
+- `TestLeafColumns_ColTypeResolvedForEachIndexableShape` — `ColType` matches
+  `buildPredicate`'s own resolved type for each indexable leaf, not merely a nonzero
+  placeholder.
+
+**Root re-export parity (`valueindex_leafcolumns_test.go`, root package):**
+- `TestLeafColumns_RootReexportMatchesVibuilderPackage` — `blockpack.LeafColumns` produces the
+  identical result as `vibuilder.LeafColumns` for the same program (mirrors the existing
+  `TestAllLeavesIndexable_RootReexportMatchesQueryplanPackage` pattern for the analogous
+  aggregate function).
+- `TestLeafColumns_RootReexportNilProgram` — the root re-export handles a nil program
+  identically to the vibuilder function (`nil`, no panic).
+
+**Spec invariants tested:** SPEC-VB-5.
+
+Back-refs: `internal/modules/vibuilder/leaf_columns_test.go` (9 tests),
+`valueindex_leafcolumns_test.go` (2 tests, root package).

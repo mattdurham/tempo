@@ -164,7 +164,7 @@ func (t *App) initValueIndexConsumer() (services.Service, error) {
 	consumerCloser = func() { _ = rc.Close() }
 
 	bucket := t.cfg.StorageConfig.Trace.S3.Bucket
-	extractor := &tempoVICExtractor{client: s3Client, bucket: bucket}
+	extractor := &tempoVICExtractor{client: s3Client, bucket: bucket, viUsage: t.cfg.StorageConfig.Trace.Block.Blockpack.ViUsage}
 	store := &tempoVICPutter{client: s3Client, bucket: bucket}
 
 	svc, err := vicconsumer.NewService(vicCfg, consumer, extractor, store)
@@ -253,8 +253,21 @@ func (t *App) initValueIndexCompactor() (services.Service, error) {
 // ── S3 extractor for consumer ─────────────────────────────────────────────────
 
 type tempoVICExtractor struct {
-	client *minio.Client
-	bucket string
+	client  *minio.Client
+	bucket  string
+	viUsage common.ViUsageConfig
+}
+
+// tenantFromBlockKey extracts the leading "<tenant>/" segment from a block
+// object key ("<tenant>/<blockID>/data.blockpack"), mirroring
+// vblockpack.parseBlockObjectKey's convention (unexported there, so this is
+// a minimal, purpose-built duplicate rather than a cross-package reach into
+// vblockpack's internals for one string split).
+func tenantFromBlockKey(key string) string {
+	if idx := strings.Index(key, "/"); idx > 0 {
+		return key[:idx]
+	}
+	return ""
 }
 
 func (e *tempoVICExtractor) Extract(ctx context.Context, event blockevents.Message, yield func(vicconsumer.ColumnEntry) error) error {
@@ -307,12 +320,21 @@ func (e *tempoVICExtractor) Extract(ctx context.Context, event blockevents.Messa
 	// Extraction (the two-phase intrinsic + attribute column walk and the per-span
 	// TimeSec from span:start) is delegated to blockpack.ExtractValueIndexEntries
 	// (NOTE-VI-018, blockpack issue #401) so this module and the standalone
-	// value-index-consumer binary share one implementation. nil denylist indexes
-	// every column (NOTE-VI-027, blockpack issue #414): the value index is
-	// policy-free and the querier decides which columns are useful at read time.
-	// Time-domain intrinsics (span:start/end/duration) are truncated to millisecond
-	// precision during extraction (blockpack issue #415).
-	return blockpack.ExtractValueIndexEntries(reader, nil, func(e blockpack.ValueIndexEntry) error {
+	// value-index-consumer binary share one implementation.
+	//
+	// #496 Fix B: resolves the real ColumnPolicy via
+	// vblockpack.BuildViColumnPolicyForTenant, mirroring create.go/compactor.go's
+	// synchronous write path. Note this standalone consumer target does not call
+	// vblockpack.ConfigureViWatermarkCache anywhere in its own init path (that
+	// singleton is installed by tempodb.NewV2Backend, not this binary's startup),
+	// so the triggered-column half of the policy is always empty here -- the
+	// dedicated-list half (DedicatedColumnsEnabled/DedicatedColumnsOverride)
+	// still applies correctly, which is the config this legacy, not-currently-
+	// deployed Redis-consumer path can act on today. Time-domain intrinsics
+	// (span:start/end/duration) are truncated to millisecond precision during
+	// extraction (blockpack issue #415).
+	policy := vblockpack.BuildViColumnPolicyForTenant(ctx, e.viUsage, tenantFromBlockKey(key))
+	return blockpack.ExtractValueIndexEntries(reader, policy, func(e blockpack.ValueIndexEntry) error {
 		return yield(vicconsumer.ColumnEntry{
 			ColName:   e.ColName,
 			Value:     e.Value,

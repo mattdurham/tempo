@@ -16,6 +16,7 @@ import (
 	gkLog "github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/google/uuid"
+	blockpack "github.com/grafana/blockpack"
 	minio "github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/prometheus/client_golang/prometheus"
@@ -309,6 +310,19 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 		}
 		// Wire cube query path on querier targets.
 		vblockpack.ConfigureCubeQueryPath(true, cfg.S3)
+		// #496 Fix B (go-presubmit.md/review.md CRITICAL Issue 2): the write-path
+		// targets (block-builder, backend-worker compactor) need the SAME watermark
+		// cache the querier installs below -- not to gate query coverage here, but
+		// because create.go/compactor.go's ColumnPolicy construction needs the
+		// tenant's current triggered-column set (every key of WatermarksFor's
+		// result, since that map is already built from Backfill.Triggered=true
+		// entries only). Installing it here too means a pure write-only target
+		// (ValueIndexQuery.Enabled=false) still has a live cache to read from,
+		// independent of whether this process also happens to be a querier.
+		vu := cfg.Block.Blockpack.ViUsage
+		if werr := vblockpack.ConfigureViWatermarkCache(cfg.S3, vu.DedicatedColumnsEnabled, vu.WatermarkCacheTTL); werr != nil {
+			level.Warn(logger).Log("msg", "vi watermark cache: failed to build S3 client; write-path ColumnPolicy will index every column", "err", werr)
+		}
 	}
 	// Querier-side index-driven query path (blockpack issue #461). Only when
 	// enabled and backed by S3 — the value index lives in the same bucket as the
@@ -321,6 +335,38 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 			vblockpack.ConfigureValueIndexQuery(client, cfg.S3.Bucket, viq.IndexPrefix, viq.CacheTTL, viq.ContentCacheBytes)
 		} else {
 			level.Warn(logger).Log("msg", "value-index query: failed to build S3 client; index path disabled", "err", cerr)
+		}
+		// #496 B3: usage-recording hook + backfill trigger, only meaningful on the
+		// same querier targets where the index-driven query path itself is active
+		// (B1's 3 call sites all live inside the index-attempt paths ConfigureValueIndexQuery
+		// enables above). vu.DedicatedColumnsEnabled=false (R12) makes ConfigureViUsage
+		// install a nil recorder, so every call site's getViUsageRecorder()==nil check
+		// makes the hook a zero-function-call no-op -- the full end-to-end loop (query
+		// -> usage hook -> registry -> trigger -> B2's backfill launcher -> watermark
+		// persist -> B3's watermark cache -> back into the query path) closes from this
+		// one call.
+		vu := cfg.Block.Blockpack.ViUsage
+		usageCfg := blockpack.Config{DedicatedColumnsEnabled: vu.DedicatedColumnsEnabled}
+		triggerCfg := blockpack.TriggerConfig{
+			Threshold:       vu.TriggerThreshold,
+			WindowSeconds:   uint64(vu.TriggerWindow.Seconds()),
+			LeaseTTLSeconds: uint64(vu.LeaseTTL.Seconds()),
+		}
+		if uerr := vblockpack.ConfigureViUsage(cfg.S3, usageCfg, triggerCfg); uerr != nil {
+			level.Warn(logger).Log("msg", "vi usage: failed to build S3 client; usage-recording hook disabled", "err", uerr)
+		}
+		// #496 B3 fix (go-presubmit.md CRITICAL finding): the R7 watermark gate is
+		// installed here too, alongside the usage-recording hook -- without this,
+		// every one of the 6 real BuildValueIndexSource/ForMetrics call sites passes
+		// a literal nil for watermarks forever, making the query-time gate dead code
+		// in production even though usage recording/triggering/backfill (above) is
+		// genuinely live. vu.DedicatedColumnsEnabled=false installs a nil cache (not
+		// a cache returning empty maps), so watermarksForOrNil short-circuits without
+		// any registry I/O, matching R12's "no machinery engaged at all" for the
+		// query-time gate the same way it already does for the write-path policy and
+		// the usage-recording hook.
+		if werr := vblockpack.ConfigureViWatermarkCache(cfg.S3, vu.DedicatedColumnsEnabled, vu.WatermarkCacheTTL); werr != nil {
+			level.Warn(logger).Log("msg", "vi watermark cache: failed to build S3 client; R7 gate disabled (queries proceed without partial-coverage gating)", "err", werr)
 		}
 	}
 

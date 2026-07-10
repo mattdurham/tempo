@@ -20,9 +20,18 @@ const MaxCubesPerTenant = 1000
 const indexVersion = 1
 
 // ObjectStore is the minimal S3-compatible interface the Registry needs.
-// Get returns the raw bytes and the current ETag. ConditionalPut writes only when
-// the stored ETag matches the supplied etag ("" for create-if-not-exists).
-// A 412-equivalent conflict is signaled by returning ErrConflict.
+// Get returns the raw bytes and the current ETag. A missing object MUST be signaled by
+// returning ErrNotFound (wrapped or bare) — NEVER by returning a nil error alongside
+// empty (data, etag): that shape is indistinguishable from a genuine transient failure (a
+// real implementation's SDK error can itself carry empty data/etag), and Registry.Load
+// treats ONLY errors.Is(err, ErrNotFound) as "empty index" (go-presubmit.md CRITICAL
+// finding, originally found in viusage's independently-copied version of this same
+// pattern — see internal/modules/viusage/NOTES.md NOTE-VIUSAGE-10: inferring not-found
+// from value shape previously let a real Get error be silently swallowed as an empty
+// index, causing the conditional-PUT retry loop to persist an unconditional PUT that
+// destroyed every other tracked cube's state for the tenant). ConditionalPut writes only
+// when the stored ETag matches the supplied etag ("" for create-if-not-exists). A
+// 412-equivalent conflict is signaled by returning ErrConflict.
 type ObjectStore interface {
 	Get(ctx context.Context, path string) (data []byte, etag string, err error)
 	ConditionalPut(ctx context.Context, path string, data []byte, etag string) error
@@ -30,6 +39,12 @@ type ObjectStore interface {
 
 // ErrConflict is returned by ObjectStore.ConditionalPut when the ETag does not match.
 var ErrConflict = errors.New("cube: conditional PUT conflict (412)")
+
+// ErrNotFound is returned by ObjectStore.Get when the requested object does not exist.
+// This is the ONLY signal Registry.Load treats as "empty index" — any other non-nil error
+// (even one with an empty-shaped data/etag return, exactly like a genuine 404) is a real
+// failure and propagates as one.
+var ErrNotFound = errors.New("cube: object not found")
 
 // cubeIndex is the JSON structure stored in index.json.
 type cubeIndex struct {
@@ -57,13 +72,14 @@ func (r *Registry) indexPath() string {
 	return r.tenant + "/cubes/index.json"
 }
 
-// Load fetches and decodes the current index. Returns an empty index when the file
-// does not exist yet.
+// Load fetches and decodes the current index. Returns an empty index when the file does
+// not exist yet (ObjectStore.Get returned ErrNotFound). Any OTHER error propagates as a
+// real failure, regardless of the accompanying (data, etag) shape — see ObjectStore's own
+// doc comment for why shape-based inference is unsafe.
 func (r *Registry) Load(ctx context.Context) ([]RegistryEntry, string, error) {
 	data, etag, err := r.store.Get(ctx, r.indexPath())
 	if err != nil {
-		// Treat "not found" (empty data + empty etag) as an empty index.
-		if len(data) == 0 && etag == "" {
+		if errors.Is(err, ErrNotFound) {
 			return nil, "", nil
 		}
 		return nil, "", fmt.Errorf("cube registry: load: %w", err)

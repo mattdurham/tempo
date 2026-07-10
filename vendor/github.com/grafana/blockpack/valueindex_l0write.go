@@ -77,7 +77,18 @@ type l0TraceAccum struct {
 // nil. Extraction or write errors are returned; the caller (block creation /
 // compaction) treats a value-index write failure as best-effort and must not fail
 // the block write on it — the index can always be rebuilt from the source block.
-func WriteValueIndexL0(r *Reader, store ObjectPutter, sourceRef, tenant, indexPrefix string) error {
+//
+// policy (#496, plan.md Section 4.6) gates which columns become their own
+// standalone per-column L0 file: a disabled (zero-value) policy indexes every
+// column, reproducing pre-#496 behavior bit-for-bit. Extraction itself always
+// runs unfiltered (see the ExtractValueIndexEntries call below) — policy is
+// applied in this function's own yield callback, AFTER the span:id
+// trace-group accumulation, so the trace-by-id index (which depends on
+// receiving span:id's own loop-yielded entries) is never affected by the
+// caller's column policy, mirroring valueindexconsumer's identical
+// "unconditional trace-by-id buffering, regardless of the configured column
+// allowlist" pattern (service.go).
+func WriteValueIndexL0(r *Reader, store ObjectPutter, sourceRef, tenant, indexPrefix string, policy ColumnPolicy) error {
 	if r == nil || store == nil {
 		return nil
 	}
@@ -105,9 +116,13 @@ func WriteValueIndexL0(r *Reader, store ObjectPutter, sourceRef, tenant, indexPr
 	// exactly one block synchronously -- no cross-call buffering is needed.
 	traceGroups := make(map[[16]byte]*l0TraceAccum)
 
-	// nil denylist indexes every column (NOTE-VI-027, issue #414): the value index
-	// is policy-free; the querier decides which columns are useful at read time.
-	err := ExtractValueIndexEntries(r, nil, func(e ValueIndexEntry) error {
+	// Extraction always runs with a disabled (zero-value) policy (NOTE-VI-027,
+	// issue #414): span:id/parent_id/trace:id/start must reach this callback
+	// unfiltered for the structural stamping and trace-group accumulation below
+	// to work. The caller's real column policy (#496) is applied further down,
+	// after those structural special cases, gating only whether a column becomes
+	// its own standalone L0 file.
+	err := ExtractValueIndexEntries(r, ColumnPolicy{}, func(e ValueIndexEntry) error {
 		// Trace-by-ID index: triggered on the span:id sentinel column, independent of
 		// the configured column allowlist -- trace-by-id coverage must not depend on
 		// which attribute columns an operator chose to index. Mirrors
@@ -146,6 +161,15 @@ func WriteValueIndexL0(r *Reader, store ObjectPutter, sourceRef, tenant, indexPr
 		if e.ColName == modules_shared.TraceIDColumnName {
 			return nil
 		}
+		// SPEC-VI-11, #496 R2/4.6: the caller's column policy gates every OTHER
+		// column's eligibility for a standalone L0 file (dedicated-list /
+		// usage-triggered allowlist, plus HardExcludedColumns permanently
+		// excluding span:id/span:parent_id/span:start regardless of policy.Allow
+		// membership). A disabled (zero-value) policy indexes everything, matching
+		// this function's pre-#496 behavior bit-for-bit (R12 safety valve).
+		if !policy.Allowed(e.ColName) {
+			return nil
+		}
 		typeName := valueindex.ColTypeName(e.ColType)
 		if typeName == "" {
 			// Unindexable type (NOTE-VI-024): skip rather than bucket under an
@@ -162,30 +186,7 @@ func WriteValueIndexL0(r *Reader, store ObjectPutter, sourceRef, tenant, indexPr
 			}
 			groups[key] = g
 		}
-		// TraceID is stamped per row by ExtractValueIndexEntries (Stage 5,
-		// traceindex.go wiring plan) and must be threaded through here: bucket
-		// stream-compaction merge/dedup keys SpanRefs by TraceID
-		// (bucketmerge.go/stream_compaction.go), so a hardcoded zero would make
-		// every distinct trace observed at the same (SourceRef, BlockRef) collide
-		// under one shared key and silently lose spans on the first compaction.
-		switch {
-		case e.BlockRef.PageNum > 0 || e.BlockRef.LenPages > 0:
-			if e.SpanID != ([8]byte{}) {
-				rowIdx := uint16(e.RowIdx) //nolint:gosec // RowIdx bounded by MaxBlockSpans ≤ 65534
-				return g.writer.AddEntryV4(
-					e.Value,
-					e.TraceID,
-					sourceRef,
-					e.BlockRef,
-					e.TimeSec,
-					e.SpanID,
-					rowIdx,
-				)
-			}
-			return g.writer.AddEntryV2(e.Value, e.TraceID, sourceRef, e.BlockRef, e.TimeSec)
-		default:
-			return g.writer.AddEntry(e.Value, e.TraceID, sourceRef, e.BlockID, e.TimeSec)
-		}
+		return addValueIndexEntryToGroup(g, e, sourceRef)
 	})
 	if err != nil {
 		return fmt.Errorf("blockpack: WriteValueIndexL0: extract: %w", err)
@@ -198,6 +199,70 @@ func WriteValueIndexL0(r *Reader, store ObjectPutter, sourceRef, tenant, indexPr
 	}
 
 	return flushAndPutTraceGroups(store, traceGroups, tenant, indexPrefix)
+}
+
+// addValueIndexEntryToGroup adds one extracted entry to g's writer, choosing
+// AddEntry/AddEntryV2/AddEntryV4 by which identity fields e carries. TraceID
+// is threaded through in every case (Stage 5, traceindex.go wiring plan):
+// bucket stream-compaction merge/dedup keys SpanRefs by TraceID
+// (bucketmerge.go/stream_compaction.go), so a hardcoded zero would make every
+// distinct trace observed at the same (SourceRef, BlockRef) collide under one
+// shared key and silently lose spans on the first compaction. Shared by
+// WriteValueIndexL0's streaming yield callback and FlushAndPutValueIndexColumn
+// (#496's backfill engine helper) so the identity-dispatch logic has exactly
+// one implementation.
+func addValueIndexEntryToGroup(g *l0Group, e ValueIndexEntry, sourceRef string) error {
+	switch {
+	case e.BlockRef.PageNum > 0 || e.BlockRef.LenPages > 0:
+		if e.SpanID != ([8]byte{}) {
+			rowIdx := uint16(e.RowIdx) //nolint:gosec // RowIdx bounded by MaxBlockSpans ≤ 65534
+			return g.writer.AddEntryV4(e.Value, e.TraceID, sourceRef, e.BlockRef, e.TimeSec, e.SpanID, rowIdx)
+		}
+		return g.writer.AddEntryV2(e.Value, e.TraceID, sourceRef, e.BlockRef, e.TimeSec)
+	default:
+		return g.writer.AddEntry(e.Value, e.TraceID, sourceRef, e.BlockID, e.TimeSec)
+	}
+}
+
+// FlushAndPutValueIndexColumn builds one value-index L0 file from entries --
+// all observed in a single source block, and therefore sharing one sourceRef
+// -- for one (colName, colType) pair, and PUTs it through the exact same
+// key convention flushAndPutL0 uses:
+//
+//	<tenant>/<indexPrefix>/<colHash>/<typeName>/L0-<wallMinSec>-<wallMaxSec>-<id>.blockpack
+//
+// Exported for #496's backfill engine (root's own BackfillEngine,
+// valueindex_backfill.go -- relocated from internal/modules/viusage per
+// NOTE-VIUSAGE-7's addendum since tempo cannot import an internal/ package;
+// plan.md Section 4.3), which extracts entries for exactly one triggered
+// column via ExtractValueIndexEntriesForColumns and needs this package's
+// unexported flushAndPutL0/l0Group file-key-format logic without duplicating
+// it -- a drift here would make valueindexcompactor's column-scoped discovery
+// silently miss the backfilled files. A caller processing multiple blocks
+// (BackfillEngine.Run's newest-to-oldest walk) calls this once per block, each
+// with that block's own sourceRef.
+func FlushAndPutValueIndexColumn(
+	entries []ValueIndexEntry,
+	store ObjectPutter,
+	sourceRef, tenant, indexPrefix, colName string,
+	colType ColumnType,
+) error {
+	if len(entries) == 0 || store == nil {
+		return nil
+	}
+	if indexPrefix == "" {
+		indexPrefix = defaultL0IndexPrefix
+	}
+
+	g := &l0Group{writer: valueindex.NewWriter(colName, colType), colName: colName, colType: colType}
+	defer g.writer.Close()
+
+	for _, e := range entries {
+		if err := addValueIndexEntryToGroup(g, e, sourceRef); err != nil {
+			return fmt.Errorf("blockpack: FlushAndPutValueIndexColumn: add entry: %w", err)
+		}
+	}
+	return flushAndPutL0(store, g, tenant, indexPrefix)
 }
 
 // flushAndPutTraceGroups encodes the trace groups accumulated during one

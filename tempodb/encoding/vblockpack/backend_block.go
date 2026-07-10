@@ -351,9 +351,30 @@ func (b *blockpackBlock) QueryRange(ctx context.Context, req *tempopb.QueryRange
 	if vr := getValueIndexQueryReader(); vr != nil {
 		minSec, maxSec := nanoWindowToSec(req.Start, req.End)
 		cache := vr.cacheFor(b.meta.TenantID)
-		if src, ok, berr := blockpack.BuildValueIndexSourceForMetrics(ctx, cache, vr.store, req.Query, minSec, maxSec); berr == nil && ok {
+		watermarks := watermarksForOrNil(ctx, b.meta.TenantID)
+		src, ok, berr := blockpack.BuildValueIndexSourceForMetrics(ctx, cache, vr.store, req.Query, minSec, maxSec, watermarks)
+		if berr == nil && ok {
 			opts.ValueIndex = src
 			indexCovered = true
+		}
+		// #496/B1: NOTE-VI-033's "Add even when empty" contract means BuildSource's ok
+		// (and a per-column LookupResults hit) is satisfied by ANY indexable-shaped
+		// leaf, REGARDLESS of whether any VI files were ever discovered for that
+		// column -- ok=false only ever happens when EVERY leaf's shape is
+		// unindexable (R3's own permanent-decline case, which must never be
+		// recorded anyway). The real "genuinely missing index" signal is
+		// src.Stats().FilesRead == 0: zero files were ever discovered for this
+		// query's leaves, as opposed to files existing but simply matching
+		// nothing. berr != nil (a real discovery/decode error) is excluded --
+		// that is not evidence of a missing index, it is a storage-layer failure.
+		filesRead := 0
+		if berr == nil && src != nil {
+			filesRead = src.Stats().FilesRead
+		}
+		if berr == nil && filesRead == 0 {
+			if prog, _, cerr := blockpack.CompileTraceQLMetricsFilter(req.Query); cerr == nil {
+				recordUsageForDeclinedQuery(ctx, b.meta.TenantID, prog, dedicatedColumnSet(b.meta.DedicatedColumns), time.Now())
+			}
 		}
 	}
 	// issue #493: vi.covered is informative on every exit path (success or decline), including

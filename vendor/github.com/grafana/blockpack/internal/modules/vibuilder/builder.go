@@ -30,6 +30,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 
 	"golang.org/x/sync/errgroup"
 
@@ -111,12 +112,25 @@ type FileDiscoverer interface {
 //
 // A download or discovery error is returned; the caller should fall back to a full
 // scan on error rather than fail the query.
+//
+// watermarks (#496 R7, plan.md Section 4.7) gates coverage for non-dedicated,
+// usage-triggered columns mid-backfill: keyed by column name, nil (or a
+// column simply absent from the map -- the common case for dedicated columns,
+// which are never usage-tracked) means no gating, exactly today's behavior. A
+// column present in watermarks whose CoversRange(minSec, maxSec) is false is
+// left un-Added, so the executor's existing decline/fallback path fires --
+// identical to "no VI files discovered at all." This is the single most
+// important correctness gate in the whole #496 feature: VI's index is
+// documented as authoritative (NOTE-VI-096, issue #474), so a query must
+// NEVER assemble a "complete" answer from a column whose historical backfill
+// is still in progress for the queried time range.
 func BuildSource(
 	ctx context.Context,
 	disc FileDiscoverer,
 	store FileStore,
 	prog *vm.Program,
 	minSec, maxSec uint64,
+	watermarks map[string]ColumnWatermark,
 ) (*modules_executor.SliceValueIndexSource, bool, error) {
 	if prog == nil || disc == nil || store == nil {
 		return nil, false, nil
@@ -159,6 +173,7 @@ func BuildSource(
 	if len(work) > 0 {
 		g, gctx := errgroup.WithContext(ctx)
 		g.SetLimit(leafConcurrency)
+		var anyLeafAdded atomic.Bool
 		for _, w := range work {
 			g.Go(func() error {
 				results, filesRead, bytesRead, err := lookupColumn(
@@ -178,16 +193,32 @@ func BuildSource(
 				// counts the bytes of any files we read deciding it was empty. src is
 				// mutex-protected, safe from concurrent leaves.
 				src.RecordFileIO(filesRead, bytesRead)
+				// #496 R7: a column mid-backfill whose watermark does not yet cover
+				// this query's window must be left un-Added -- see BuildSource's own
+				// doc comment for why this is the feature's single most important
+				// correctness gate.
+				if wm, ok := watermarks[w.col]; ok && !wm.CoversRange(minSec, maxSec) {
+					return nil
+				}
 				// Add even when empty: a covered-but-empty column is coverage, not
 				// fallback (NOTE-VI-033).
 				src.Add(w.col, w.colType, results)
+				anyLeafAdded.Store(true)
 				return nil
 			})
 		}
 		if err := g.Wait(); err != nil {
 			return nil, false, err
 		}
-		added = true
+		// #496 R7: added must reflect whether a leaf was ACTUALLY Added, not merely
+		// whether a leaf had a buildable predicate (len(work) > 0) -- the watermark
+		// gate above can now skip src.Add for every leaf in work, and reporting
+		// added=true anyway would silently reintroduce a "false complete" answer:
+		// the caller sees ok=true and a source with zero covered columns, mistaking
+		// "the index has no idea" for "the index confirms zero matches."
+		if anyLeafAdded.Load() {
+			added = true
+		}
 	}
 
 	// Match-all over an explicit column list (`{} | rate()` compiles with Columns
@@ -200,6 +231,12 @@ func BuildSource(
 				return nil, false, err
 			}
 			src.RecordFileIO(filesRead, bytesRead)
+			// #496 R7: a match-all query (`{} | rate()`) over a partially-backfilled
+			// column has the identical partial-coverage risk as a leaf predicate --
+			// same gate as above, second (and last) src.Add call site in this file.
+			if wm, ok := watermarks[col]; ok && !wm.CoversRange(minSec, maxSec) {
+				continue
+			}
 			src.Add(col, colType, results)
 			added = true
 		}
@@ -300,6 +337,63 @@ func LeafIndexable(n *vm.RangeNode) bool {
 	}
 	_, _, ok := buildPredicate(&leaf{node: n})
 	return ok
+}
+
+// LeafColumnInfo describes one leaf's column name, its resolved value-index column
+// type (when Indexable), and whether its predicate shape is representable against
+// the value index at all (LeafIndexable's exact per-leaf decision, reused verbatim
+// here — never independently re-derived). ColType is the zero modules_shared.ColumnType
+// when Indexable is false (buildPredicate never resolves a type for a shape it
+// rejects) or for a match-all leaf (no predicate to type-check against).
+type LeafColumnInfo struct {
+	Column    string
+	ColType   modules_shared.ColumnType
+	Indexable bool
+}
+
+// LeafColumns enumerates every leaf's {Column, ColType, Indexable} in prog's predicate
+// tree, one entry per LEAF occurrence — NOT deduplicated by column name. A column
+// referenced by multiple leaves (e.g. two comparisons against the same attribute)
+// produces one entry per leaf, mirroring collectLeaves' own per-leaf granularity, since
+// that is exactly the leaf set LeafIndexable/buildPredicate themselves operate over.
+// Callers needing a per-query, per-column decision (e.g. #496's usage-recording hook,
+// which must count "one distinct query referenced column X" rather than "one leaf
+// referenced column X") must de-duplicate by Column themselves.
+//
+// ColType is exposed (not just the Indexable bool) because #496's usage registry keys
+// entries by (Tenant, ColumnHash, ColumnType) — a caller recording a use needs the same
+// resolved type buildPredicate uses, not just a shape verdict.
+//
+// A match-all query (prog.Predicates.Nodes empty, Columns populated — e.g. `{} |
+// rate()`) returns one entry per listed column with Indexable=true and a zero ColType
+// (mirrors AllLeavesIndexable's own match-all handling: BuildSource's lookupColumnAll
+// path never rejects a column's shape in this case, but a match-all leaf has no
+// predicate to resolve a type from). A program referencing nothing at all (no Nodes,
+// no Columns) returns nil.
+//
+// SPEC-VB-5.
+func LeafColumns(prog *vm.Program) []LeafColumnInfo {
+	if prog == nil || prog.Predicates == nil {
+		return nil
+	}
+	preds := prog.Predicates
+	if len(preds.Nodes) == 0 && len(preds.Columns) == 0 {
+		return nil
+	}
+	if len(preds.Nodes) == 0 {
+		out := make([]LeafColumnInfo, len(preds.Columns))
+		for i, c := range preds.Columns {
+			out[i] = LeafColumnInfo{Column: c, Indexable: true}
+		}
+		return out
+	}
+	leaves := collectLeaves(preds.Nodes)
+	out := make([]LeafColumnInfo, len(leaves))
+	for i := range leaves {
+		_, colType, ok := buildPredicate(&leaves[i])
+		out[i] = LeafColumnInfo{Column: leaves[i].col, ColType: colType, Indexable: ok}
+	}
+	return out
 }
 
 // buildRangePredicate builds a between/range predicate from a leaf's Min/Max

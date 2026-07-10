@@ -277,6 +277,8 @@ func (w *BackendWorker) processJobs(ctx context.Context) error {
 		return w.processRedactionJob(ctx, resp)
 	case tempopb.JobType_JOB_TYPE_CUBE_BACKFILL:
 		return w.processCubeBackfillJob(ctx, resp)
+	case tempopb.JobType_JOB_TYPE_VI_BACKFILL:
+		return w.processViBackfillJob(ctx, resp)
 	default:
 		return fmt.Errorf("unknown job type: %s", resp.Type.String())
 	}
@@ -311,6 +313,49 @@ func (w *BackendWorker) processCubeBackfillJob(ctx context.Context, resp *tempop
 
 	// Run backfill synchronously (the worker goroutine is already async).
 	vblockpack.RunCubeBackfill(ctx, entry, w.s3Cfg)
+
+	return w.callSchedulerWithBackoff(ctx, func(ctx context.Context) error {
+		_, err := w.backendScheduler.UpdateJob(ctx, &tempopb.UpdateJobStatusRequest{
+			JobId:  resp.JobId,
+			Status: tempopb.JobStatus_JOB_STATUS_SUCCEEDED,
+		})
+		return err
+	})
+}
+
+// processViBackfillJob executes a #496 usage-triggered VI column backfill
+// job, mirroring processCubeBackfillJob's shape. Unlike RunCubeBackfill
+// (void return), vblockpack.RunViBackfill returns an error that is
+// propagated to failJob rather than silently swallowed -- a backfill run
+// that could not persist its watermark (R7/R9) should surface as a failed
+// job, not a silent success, so the scheduler's own retry/observability
+// machinery sees it.
+func (w *BackendWorker) processViBackfillJob(ctx context.Context, resp *tempopb.NextJobResponse) error {
+	tenant := resp.Detail.Tenant
+	if tenant == "" {
+		return w.failJob(ctx, resp.JobId, "vi backfill job missing tenant")
+	}
+	if resp.Detail.ViBackfill == nil {
+		return w.failJob(ctx, resp.JobId, "vi backfill job missing detail")
+	}
+	if w.s3Cfg == nil {
+		return w.failJob(ctx, resp.JobId, "vi backfill: S3 not configured on worker")
+	}
+
+	entry := blockpack.Entry{
+		Tenant:     tenant,
+		ColumnHash: resp.Detail.ViBackfill.ColumnHash,
+		ColumnName: resp.Detail.ViBackfill.ColumnName,
+		ColumnType: resp.Detail.ViBackfill.ColumnType,
+	}
+
+	level.Info(log.Logger).Log("msg", "processing vi backfill job",
+		"job_id", resp.JobId, "tenant", tenant, "column", entry.ColumnName)
+
+	// Run backfill synchronously (the worker goroutine is already async).
+	if err := vblockpack.RunViBackfill(ctx, entry, w.s3Cfg); err != nil {
+		return w.failJob(ctx, resp.JobId, fmt.Sprintf("vi backfill failed: %v", err))
+	}
 
 	return w.callSchedulerWithBackoff(ctx, func(ctx context.Context) error {
 		_, err := w.backendScheduler.UpdateJob(ctx, &tempopb.UpdateJobStatusRequest{

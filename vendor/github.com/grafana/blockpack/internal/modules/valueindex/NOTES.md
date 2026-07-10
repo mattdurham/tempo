@@ -1740,3 +1740,48 @@ Date: 2026-07-10
 **Regression test.** `TestParseFilename_RejectsVcntSuffix`/`TestParseFilenameV2_RejectsVcntSuffix` (`filename_test.go`, `filename_v2_test.go`) assert `ParseFilename("L0-100-200-abc.vcnt")` and `ParseFilenameV2("L0-100-200-abc.vcnt")` both return a non-nil error — the exact adversarial filename from the live incident. Mutation-verified: reverting either `base == name` check in isolation reproduces the corresponding test failure (parse succeeds when it must not).
 
 Back-refs: `internal/modules/valueindex/filename.go:ParseFilename, ParseFilenameV2`. Tests: `internal/modules/valueindex/filename_test.go:TestParseFilename_RejectsVcntSuffix`, `internal/modules/valueindex/filename_v2_test.go:TestParseFilenameV2_RejectsVcntSuffix`. See NOTE-VI-096 (`internal/modules/valueindexcompactor/NOTES.md`) for root cause 1 of this same incident.
+
+## NOTE-VI-100 — #496's `ColumnPolicy` makes "policy-free" extraction conditionally overridable; the underlying extraction primitives are unchanged
+
+Date: 2026-07-10
+
+`extractBlockColumns`/`ExtractValueIndexEntries` (root package) have been "policy-free by
+design" since NOTE-VI-027 (issues #414/#415, denylist removal — see
+`valueindexconsumer/NOTES.md`'s `NOTE-VI-018` for the historical record; the `NOTE-VI-027` ID
+itself collides with this module's own unrelated BlockRef entry above, a pre-existing
+documentation-hygiene issue independently confirmed and flagged with the team lead, not
+something #496 caused): a nil/disabled denylist indexes every column, and the querier decides
+at read time which columns matter. #496 (blockpack/#496) reopens this specific design
+question — see `valueindexconsumer/NOTES.md`'s dedicated R10 acknowledgment entry for why the
+new model is different in kind (usage-driven, opt-in-over-time, caller-overridable) rather
+than a silent reversal of NOTE-VI-027's decision.
+
+**What actually changed here, precisely:** `ExtractValueIndexEntries`'s second parameter
+changed from a `denylist map[string]struct{}` (nil = index everything) to `policy
+ColumnPolicy` (`SPEC-VI-11`) — a breaking signature change, acceptable per this repo's "no
+backwards compat ever" convention (every existing call site was updated in the same change:
+`cmd/deadcode/main.go`'s anchor call, `cmd/value-index-consumer/main.go`,
+`valueindexconsumer`'s own extractor wiring, and every existing test). The DEFAULT behavior
+for every EXISTING caller that does not opt into #496's new policy machinery is
+`ColumnPolicy{}` (`Enabled: false`) — which reproduces the pre-#496 nil-denylist behavior
+byte-for-byte, per `SPEC-VI-11`'s own binding zero-value clause. `extractBlockColumns`'s
+underlying per-block column walk, value decoding, `TimeSec` resolution, and millisecond-
+truncation-for-time-intrinsics logic (this module's other NOTE-VI-027, issue #415) are
+UNCHANGED — only the column-inclusion decision at the yield boundary gained a richer
+parameter shape. No existing test asserting "column X is present/absent for reason Y" needed
+its own assertion changed, only its `ExtractValueIndexEntries`/`WriteValueIndexL0` call site's
+argument.
+
+**This module's own extraction internals do not know or care WHY a column is or is not
+allowed** — `ColumnPolicy.Allowed` is a pure predicate the caller constructs
+(`BuildColumnPolicy`, `SPEC-VI-11`) from usage-registry state (`viusage`) that lives entirely
+outside this module. `valueindex`'s role in #496 is exactly the same narrow role it has always
+had: decode block columns and yield entries for the ones the caller says it wants. The USAGE-
+DRIVEN part of the decision (why a column becomes "wanted") is deliberately kept out of this
+module, in `internal/modules/viusage`, per the two-repo/module split the team-lead ruling
+established (plan.md R6).
+
+Back-refs: `valueindex_extract.go:ExtractValueIndexEntries,extractBlockColumns,
+ExtractValueIndexEntriesForColumns` (root package), `valueindex_l0write.go:WriteValueIndexL0`
+(root package). See `SPECS.md` SPEC-VI-11, `valueindexconsumer/NOTES.md`'s R10 acknowledgment
+entry (the full "why different in kind" argument), and `viusage/NOTES.md` NOTE-VIUSAGE-6/7.

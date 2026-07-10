@@ -553,3 +553,59 @@ Date: 2026-07-10
 Back-ref: `internal/modules/valueindexcompactor/service.go:buildWorkList`. Tested by
 `TestBuildWorkList_ExcludesUniqueValuesDirectory`. See NOTE-VI-095
 (`internal/modules/valueindex/NOTES.md`) for root cause 2 of this same incident.
+
+## NOTE-VI-101 — Verified: no changes needed for #496's usage-triggered backfill columns (R6's "zero special-casing" claim, checked not assumed)
+
+Date: 2026-07-10
+
+#496 (VI dedicated columns + query-usage-driven backfill, plan.md R6) claims a usage-triggered
+column's backfilled L0 files require ZERO special-casing in this compactor — the normal
+column-scoped compaction lap picks them up exactly like any other column's files. Per A7's own
+checklist item ("VERIFY, don't assume"), this was checked directly against this package's
+actual code, not accepted on the plan's say-so alone.
+
+**What was checked:** `buildWorkList`/`compactColumn` (`service.go`) for any assumption a
+newly-backfilled column could violate — a hardcoded column-name list, a cardinality
+heuristic, or a "this directory always has N files by now" assumption.
+
+**Finding: none exist.** This package's file-discovery/grouping is structural, not
+column-name-aware:
+- `compactTenant`'s three-step directory walk (NOTE-VI-017-b) groups by `path.Dir(key)` —
+  `<tenant>/indexes/<col_hash>/<type>/` — which is derived purely from the object key's own
+  path structure, not from any enumerated set of expected column names. A newly-backfilled
+  column's L0 files land under this exact same layout (per `viusage/SPECS.md` SPEC-VIUSAGE-5's
+  binding claim that `BackfillEngine` writes via `blockpack.FlushAndPutValueIndexColumn`,
+  the identical file-key convention `WriteValueIndexL0`/`flushAndPutL0` use) and are
+  discovered by the SAME generic walk with no code change.
+- The only per-column-NAME-specific logic anywhere in this package is
+  `isTraceIndexColDir`/`traceindex_dispatch.go`'s hash-equality check against `trace:id`'s own
+  hash (SPEC-VI-7) — a special case for the ONE structurally-different file format
+  (`TraceGroup`, not `BucketGroup`) this package has ever needed to distinguish. A
+  usage-triggered column's backfilled files are ordinary `BucketGroup`-format files (same as
+  any dedicated or previously-manually-indexed column) and do not touch this dispatch branch
+  at all — `viusage`'s own `HardExcludedColumns` (`valueindex/SPECS.md` SPEC-VI-11) already
+  permanently excludes `trace:id` from ever reaching a usage-triggered backfill path in the
+  first place, so this compactor's trace-index special case and #496's backfill mechanism
+  never interact.
+- `buildWorkList`'s ONLY other name-based exclusion is the `unique_values` directory-skip
+  guard (NOTE-VI-096, today's date's own live-incident hotfix, unrelated to #496) — a
+  structural VCNT-vs-VI directory-scope guard, not a per-column allow/deny list. It has no
+  interaction with #496's backfill either.
+- No cardinality or "this many files by now" heuristic exists anywhere in `compactColumn`'s
+  batch-selection logic (`CompactThresholdFiles`, `CompactMaxInputFiles`,
+  `effectiveBatchBytes`) that assumes anything about WHICH columns exist or how many files a
+  given column directory should have accumulated — these are all generic, per-directory
+  thresholds applied uniformly regardless of column identity.
+
+**Conclusion: confirmed, no code changes needed in this package for #496.** This entry is the
+explicit "checked, no-op" record A7's own checklist requires, contingent on
+`viusage/TESTS.md` `TEST-VIUSAGE-21`'s (`TestBackfillEngine_WritesViaExistingL0FileLayout`)
+exact-file-key-format assertion continuing to hold — if that assertion ever regresses (the
+backfilled file-key shape drifts from `flushAndPutL0`'s convention even slightly), this
+compactor's file-discovery would silently miss the drifted files, and this "no changes needed"
+conclusion would no longer hold. That test, not this note, is the actual regression guard;
+this note documents WHY it is sufficient.
+
+Back-refs: `internal/modules/valueindexcompactor/service.go:buildWorkList,compactTenant,
+compactColumn`, `internal/modules/valueindexcompactor/traceindex_dispatch.go:
+isTraceIndexColDir`. See `viusage/SPECS.md` SPEC-VIUSAGE-5, `valueindex/SPECS.md` SPEC-VI-11.

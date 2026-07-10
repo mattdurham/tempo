@@ -64,6 +64,14 @@ type CubeObjectStore = cube.ObjectStore
 // CubeErrConflict is returned by CubeObjectStore.ConditionalPut on a 412 conflict.
 var CubeErrConflict = cube.ErrConflict
 
+// CubeErrNotFound is returned by CubeObjectStore.Get when the requested object does not
+// exist — the ONLY signal CubeRegistry.Load treats as "empty index" (go-presubmit.md
+// CRITICAL finding, bonus-fixed here mirroring viusage's #120 fix — see
+// internal/modules/viusage/NOTES.md NOTE-VIUSAGE-10). External CubeObjectStore
+// implementations (e.g. tempo's minio-backed store) MUST return this (wrapped or bare) on
+// a genuine 404, never a nil error with empty data.
+var CubeErrNotFound = cube.ErrNotFound
+
 // CubeHeaderSize is the number of bytes in a cube file header.
 // A ranged GET of the first CubeHeaderSize bytes is sufficient to read
 // MinMinute, MaxMinute, and Resolution without downloading the whole file.

@@ -35,6 +35,7 @@ package vblockpack
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/go-kit/log/level"
 	blockpack "github.com/grafana/blockpack"
@@ -72,26 +73,39 @@ func (b *blockpackBlock) tryStructuralIndexFetch(
 
 	minSec, maxSec := nanoWindowToSec(opts.StartNano, opts.EndNano)
 	cache := vr.cacheFor(b.meta.TenantID)
+	watermarks := watermarksForOrNil(ctx, b.meta.TenantID)
 
 	if isNegatedStructuralOp(op) {
 		// DT1b (issue #489 holistic review, HIGH finding): negated ops (!>>, !>, !~) route to
 		// D6's own root wrapper instead of falling through to "for D6" (a permanent decline).
-		return b.tryNegatedStructuralIndexFetch(ctx, query, rightProg, vr, cache, minSec, maxSec, indexOnly, opts, stats)
+		return b.tryNegatedStructuralIndexFetch(ctx, query, rightProg, vr, cache, minSec, maxSec, indexOnly, opts, stats, watermarks)
 	}
 
-	leftSrc, leftOK, buildErr := blockpack.BuildValueIndexSource(ctx, cache, vr.store, leftProg, minSec, maxSec)
+	leftSrc, leftOK, buildErr := blockpack.BuildValueIndexSource(ctx, cache, vr.store, leftProg, minSec, maxSec, watermarks)
 	if buildErr != nil {
 		level.Warn(util_log.Logger).Log("msg", "vblockpack: structural index fetch: build left source error",
 			"block", b.meta.BlockID, "err", buildErr)
 		return structuralDeclineOutcome(indexOnly, stats)
 	}
 	if !leftOK {
+		// #496/B1: every leaf's shape was unindexable (R3's permanent-decline case) --
+		// recordUsageForDeclinedQuery's own Indexable check correctly never records
+		// this. The right leg's own decline is deliberately not recorded (see the
+		// doc comment below): it is optional/best-effort, never a hard decline.
+		recordUsageForDeclinedQuery(ctx, b.meta.TenantID, leftProg, dedicatedColumnSet(b.meta.DedicatedColumns), time.Now())
 		return structuralDeclineOutcome(indexOnly, stats)
 	}
 	bs := leftSrc.Stats()
 	stats.FilesRead = bs.FilesRead
 	stats.BytesRead = bs.BytesRead
 	stats.Hits = bs.Hits
+	// #496/B1: NOTE-VI-033's "Add even when empty" contract means leftOK=true only
+	// means "at least one leaf has an indexable shape" -- bs.FilesRead == 0 is the
+	// real "genuinely missing index" signal (see value_index_query.go's
+	// tryIndexFetch for the fuller explanation of this same gate).
+	if bs.FilesRead == 0 {
+		recordUsageForDeclinedQuery(ctx, b.meta.TenantID, leftProg, dedicatedColumnSet(b.meta.DedicatedColumns), time.Now())
+	}
 
 	// rightSource is optional (D4/D5's own documented contract): R is only ever used for the
 	// cost-based intersection prefilter, never required for correctness -- confirmation of R's
@@ -100,7 +114,7 @@ func (b *blockpackBlock) tryStructuralIndexFetch(
 	// the whole attempt.
 	var rightSrc blockpack.ValueIndexSource
 	if rightProg != nil {
-		if rs, rightOK, rightErr := blockpack.BuildValueIndexSource(ctx, cache, vr.store, rightProg, minSec, maxSec); rightErr == nil &&
+		if rs, rightOK, rightErr := blockpack.BuildValueIndexSource(ctx, cache, vr.store, rightProg, minSec, maxSec, watermarks); rightErr == nil &&
 			rightOK {
 			rightSrc = rs
 			rbs := rs.Stats()
@@ -165,20 +179,31 @@ func (b *blockpackBlock) tryNegatedStructuralIndexFetch(
 	indexOnly bool,
 	opts blockpack.QueryOptions,
 	stats indexFetchStats,
+	watermarks map[string]blockpack.ColumnWatermark,
 ) ([]blockpack.SpanMatch, bool, indexFetchStats, error) {
-	rightSrc, rightOK, buildErr := blockpack.BuildValueIndexSource(ctx, cache, vr.store, rightProg, minSec, maxSec)
+	rightSrc, rightOK, buildErr := blockpack.BuildValueIndexSource(ctx, cache, vr.store, rightProg, minSec, maxSec, watermarks)
 	if buildErr != nil {
 		level.Warn(util_log.Logger).Log("msg", "vblockpack: negated structural index fetch: build right source error",
 			"block", b.meta.BlockID, "err", buildErr)
 		return structuralDeclineOutcome(indexOnly, stats)
 	}
 	if !rightOK {
+		// #496/B1: every leaf's shape was unindexable (R3's permanent-decline case) --
+		// recordUsageForDeclinedQuery's own Indexable check correctly never records
+		// this.
+		recordUsageForDeclinedQuery(ctx, b.meta.TenantID, rightProg, dedicatedColumnSet(b.meta.DedicatedColumns), time.Now())
 		return structuralDeclineOutcome(indexOnly, stats)
 	}
 	bs := rightSrc.Stats()
 	stats.FilesRead = bs.FilesRead
 	stats.BytesRead = bs.BytesRead
 	stats.Hits = bs.Hits
+	// #496/B1: NOTE-VI-033's "Add even when empty" contract means rightOK=true only
+	// means "at least one leaf has an indexable shape" -- bs.FilesRead == 0 is the
+	// real "genuinely missing index" signal.
+	if bs.FilesRead == 0 {
+		recordUsageForDeclinedQuery(ctx, b.meta.TenantID, rightProg, dedicatedColumnSet(b.meta.DedicatedColumns), time.Now())
+	}
 
 	matches, structOK, structErr := blockpack.QueryNegatedStructuralFromIndex(
 		ctx, query, rightSrc,

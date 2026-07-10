@@ -14,7 +14,7 @@ across the whole value-index pipeline's NOTES.md files by established convention
 assigned in ascending order and never reused or renumbered; superseded entries are marked
 `[SUPERSEDED by SPEC-VI-N]` rather than deleted.
 
-Next free ID: **SPEC-VI-11**.
+Next free ID: **SPEC-VI-12**.
 
 ---
 
@@ -500,3 +500,86 @@ Back-refs: `internal/modules/valueindex/bucketquery_ranged.go:QueryBucketFileRan
 (its two `SPEC-VI-4`-tagged comparison sites are the file-level and per-block time-prune checks
 in steps 2 and 4 above), `internal/modules/valueindex/bucketquery.go:QueryBucketFiles,matchGroupsInBlock`
 (the shared helper). See `NOTES.md` NOTE-VI-081/082/083 and `SPECS.md` SPEC-VI-4.
+
+---
+
+## SPEC-VI-11: `ColumnPolicy` — root-package allow-list-with-hard-exclusion column indexing policy (#496)
+*Added: 2026-07-10*
+
+**Contract:** `blockpack.ColumnPolicy{Allow map[string]struct{}, AlwaysExclude
+map[string]struct{}, Enabled bool}` controls which columns `WriteValueIndexL0`/
+`extractBlockColumns`/`ExtractValueIndexEntries` (root package, `valueindex_extract.go`/
+`valueindex_l0write.go`) persist as standard per-column value-index entries. It is an
+allow-list-with-hard-exclusion, not a bare denylist — the caller only needs to know the small,
+curated set of columns it wants indexed, not a block's full column universe (a bare denylist
+would require enumerating every column name in the block to exclude the ones not wanted,
+which the caller cannot know ahead of extraction without a redundant pre-pass).
+
+**`(p ColumnPolicy) Allowed(name string) bool`:** `!p.Enabled` → `true` (disabled policy
+indexes everything — see the R12 zero-value clause below). Otherwise: `p.AlwaysExclude[name]`
+present → `false` unconditionally (AlwaysExclude wins over Allow — a column mistakenly placed
+in both a caller's dedicated list AND `AlwaysExclude` is still excluded). Otherwise:
+`p.Allow[name]` presence determines the result.
+
+**Zero-value / R12 safety-valve semantics (binding):** `ColumnPolicy{}` (`Enabled: false`)
+indexes EVERY column — byte-for-byte identical to the pre-#496 nil-denylist behavior,
+INCLUDING `HardExcludedColumns` NOT being enforced. This is deliberate: disabling the #496
+feature disables its ENTIRE policy layer, not merely the dedicated-list half of it — a
+`ColumnPolicy{Enabled: false}` is not "index everything except the 4 hard-excluded columns," it
+is genuinely "index everything," matching today's production behavior exactly.
+
+**`HardExcludedColumns` (binding, permanent regardless of Enabled/Allow):**
+`{"span:id", "span:parent_id", "trace:id", "span:start"}` — permanently excluded from the
+standard per-column value index whenever `Enabled=true`, regardless of dedicated-list
+membership or usage-triggered backfill status (#496 R2; history in NOTES.md's cross-reference
+to `valueindexconsumer/NOTES.md`'s R10 entry). `trace:id` is already excluded independently via
+`WriteValueIndexL0`'s pre-existing `TraceGroup`-routing special case
+(`valueindexconsumer/SPECS.md` SPEC-VI-4's precedent); the other three are not excluded
+anywhere else in the codebase and rely entirely on this set for their exclusion.
+
+**`BuildColumnPolicy(enabled bool, dedicatedList, triggeredColumns []string) ColumnPolicy`:**
+computes the effective policy a forward-write-path caller should use — `Allow` is the union of
+`dedicatedList` and `triggeredColumns`; `AlwaysExclude` is always `HardExcludedColumns`. A
+column is indexed iff it is in `dedicatedList` OR `triggeredColumns`, AND is NOT in
+`HardExcludedColumns`.
+
+**Enforcement points (both, binding — both must apply the SAME policy for a given write to be
+correct):**
+1. `extractBlockColumns`'s per-column loop (`valueindex_extract.go`) — `!policy.Allowed(colKey.
+   Name)` skips the column before any value is yielded.
+2. `WriteValueIndexL0`'s yield callback (`valueindex_l0write.go`) — a SECOND `!policy.Allowed
+   (e.ColName)` check, defensive/redundant with (1) for `WriteValueIndexL0`'s own callers but
+   necessary because `ExtractValueIndexEntriesForColumns` (SPEC-VI-11's own allowlist wrapper,
+   below) deliberately runs extraction with a DISABLED policy internally, so `WriteValueIndexL0`
+   itself is the only enforcement point for callers that go through that wrapper.
+
+**`ExtractValueIndexEntriesForColumns(r, allowlist, yield)` — the backfill engine's allowlist
+wrapper (plan.md Section 4.5):** a thin filter around `ExtractValueIndexEntries` that reuses the
+exact same per-block walk and column-value decoding, filtering at the YIELD boundary to only
+pass through entries for columns named in `allowlist`. Internally calls `ExtractValueIndexEntries`
+with a DISABLED (`ColumnPolicy{}`) policy so structural columns (`span:id`, `trace:id`, etc.)
+still flow through the underlying extraction unfiltered — the allowlist filter, not
+`ColumnPolicy`, is what scopes the output to one column. This keeps `extractBlockColumns`'s
+policy semantics and every EXISTING caller (`WriteValueIndexL0`, `valueindexconsumer`)
+completely unchanged; the backfill engine's "index only this one triggered column against
+history" requirement is satisfied without touching extraction internals at all.
+
+**Package-placement note (see NOTES.md's cross-reference and `viusage/NOTES.md` NOTE-VIUSAGE-7
+for the full reasoning):** `ColumnPolicy` lives in the ROOT `blockpack` package
+(`valueindex_policy.go`), not `internal/modules/viusage` as originally proposed in plan.md
+Section 4.6 — moved during implementation to avoid a `blockpack ↔ viusage` import cycle once
+`BackfillEngine` needed to import root `blockpack` for `*Reader`/`ObjectPutter`/
+`ExtractValueIndexEntriesForColumns`. `BackfillEngine` itself was subsequently relocated the
+same direction, out of `viusage` entirely and into root's own `valueindex_backfill.go`, for the
+identical import-cycle reason (see NOTE-VIUSAGE-7's addendum) — so it is no longer accurate to
+describe it as `viusage.BackfillEngine`. `viusage.DefaultDedicatedColumns` (the actual dedicated-
+column LIST, distinct from the policy MECHANISM) correctly stayed in `viusage`
+(`viusage/SPECS.md` SPEC-VIUSAGE-7) — only the policy/enforcement TYPE (and, later,
+`BackfillEngine`) moved here.
+
+Back-refs: `valueindex_policy.go:ColumnPolicy,HardExcludedColumns,Allowed,BuildColumnPolicy`
+(root package), `valueindex_extract.go:extractBlockColumns,ExtractValueIndexEntries,
+ExtractValueIndexEntriesForColumns` (root package), `valueindex_l0write.go:WriteValueIndexL0`
+(root package). See `NOTES.md`'s #496 cross-reference entry, `viusage/SPECS.md`
+SPEC-VIUSAGE-6/7, and `valueindexconsumer/SPECS.md` SPEC-VI-4 (the `trace:id` exclusion
+precedent this generalizes).

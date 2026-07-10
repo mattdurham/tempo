@@ -36,6 +36,9 @@ const (
 	JobType_JOB_TYPE_RETENTION     JobType = 2
 	JobType_JOB_TYPE_REDACTION     JobType = 3
 	JobType_JOB_TYPE_CUBE_BACKFILL JobType = 4
+	// JobType_JOB_TYPE_VI_BACKFILL (#496 B2): a usage-triggered value-index
+	// column backfill job, mirroring JOB_TYPE_CUBE_BACKFILL's dispatch shape.
+	JobType_JOB_TYPE_VI_BACKFILL JobType = 5
 )
 
 var JobType_name = map[int32]string{
@@ -44,6 +47,7 @@ var JobType_name = map[int32]string{
 	2: "JOB_TYPE_RETENTION",
 	3: "JOB_TYPE_REDACTION",
 	4: "JOB_TYPE_CUBE_BACKFILL",
+	5: "JOB_TYPE_VI_BACKFILL",
 }
 
 var JobType_value = map[string]int32{
@@ -52,6 +56,7 @@ var JobType_value = map[string]int32{
 	"JOB_TYPE_RETENTION":     2,
 	"JOB_TYPE_REDACTION":     3,
 	"JOB_TYPE_CUBE_BACKFILL": 4,
+	"JOB_TYPE_VI_BACKFILL":   5,
 }
 
 func (x JobType) String() string {
@@ -247,6 +252,172 @@ func (m *CubeBackfillDetail) Reset()         { *m = CubeBackfillDetail{} }
 func (m *CubeBackfillDetail) String() string { return m.CubeID }
 func (*CubeBackfillDetail) ProtoMessage()    {}
 
+// ViBackfillDetail contains fields for a #496 usage-triggered VI column
+// backfill job — the (tenant, column) key needed to reconstruct a
+// blockpack.Entry on the worker side (Tenant is shared via JobDetail.Tenant,
+// not duplicated here).
+type ViBackfillDetail struct {
+	ColumnHash string `protobuf:"bytes,1,opt,name=column_hash,json=columnHash,proto3" json:"column_hash,omitempty"`
+	ColumnName string `protobuf:"bytes,2,opt,name=column_name,json=columnName,proto3" json:"column_name,omitempty"`
+	ColumnType string `protobuf:"bytes,3,opt,name=column_type,json=columnType,proto3" json:"column_type,omitempty"`
+}
+
+func (m *ViBackfillDetail) Reset()         { *m = ViBackfillDetail{} }
+func (m *ViBackfillDetail) String() string { return m.ColumnName }
+func (*ViBackfillDetail) ProtoMessage()    {}
+
+func (m *ViBackfillDetail) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *ViBackfillDetail) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *ViBackfillDetail) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	if len(m.ColumnType) > 0 {
+		i -= len(m.ColumnType)
+		copy(dAtA[i:], m.ColumnType)
+		i = encodeVarintBackendwork(dAtA, i, uint64(len(m.ColumnType)))
+		i--
+		dAtA[i] = 0x1a
+	}
+	if len(m.ColumnName) > 0 {
+		i -= len(m.ColumnName)
+		copy(dAtA[i:], m.ColumnName)
+		i = encodeVarintBackendwork(dAtA, i, uint64(len(m.ColumnName)))
+		i--
+		dAtA[i] = 0x12
+	}
+	if len(m.ColumnHash) > 0 {
+		i -= len(m.ColumnHash)
+		copy(dAtA[i:], m.ColumnHash)
+		i = encodeVarintBackendwork(dAtA, i, uint64(len(m.ColumnHash)))
+		i--
+		dAtA[i] = 0xa
+	}
+	return len(dAtA) - i, nil
+}
+
+func (m *ViBackfillDetail) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	l = len(m.ColumnHash)
+	if l > 0 {
+		n += 1 + l + sovBackendwork(uint64(l))
+	}
+	l = len(m.ColumnName)
+	if l > 0 {
+		n += 1 + l + sovBackendwork(uint64(l))
+	}
+	l = len(m.ColumnType)
+	if l > 0 {
+		n += 1 + l + sovBackendwork(uint64(l))
+	}
+	return n
+}
+
+func (m *ViBackfillDetail) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowBackendwork
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: ViBackfillDetail: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: ViBackfillDetail: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1, 2, 3:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for ViBackfillDetail field %d", wireType, fieldNum)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowBackendwork
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthBackendwork
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex < 0 {
+				return ErrInvalidLengthBackendwork
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			switch fieldNum {
+			case 1:
+				m.ColumnHash = string(dAtA[iNdEx:postIndex])
+			case 2:
+				m.ColumnName = string(dAtA[iNdEx:postIndex])
+			case 3:
+				m.ColumnType = string(dAtA[iNdEx:postIndex])
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipBackendwork(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthBackendwork
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+
 // JobDetail contains the specific details for each job type
 type JobDetail struct {
 	Tenant string `protobuf:"bytes,1,opt,name=tenant,proto3" json:"tenant,omitempty"`
@@ -258,6 +429,17 @@ type JobDetail struct {
 	// call. Enables future Status/Cancel RPCs keyed on the original submission.
 	BatchId      string              `protobuf:"bytes,5,opt,name=batch_id,json=batchId,proto3" json:"batch_id,omitempty"`
 	CubeBackfill *CubeBackfillDetail `protobuf:"bytes,6,opt,name=cube_backfill,json=cubeBackfill,proto3" json:"cube_backfill,omitempty"`
+	// ViBackfill carries #496 B2's usage-triggered VI column backfill job
+	// detail. Unlike CubeBackfill (field 6, above), this field IS actually
+	// wired into MarshalToSizedBuffer/Unmarshal/Size below -- verified via a
+	// round-trip test, since CubeBackfill's own equivalent wiring was found
+	// (while implementing this) to be silently absent from all three methods,
+	// meaning JobDetail.CubeBackfill never survives a real Marshal/Unmarshal
+	// round-trip despite being actively read by backendworker.go's
+	// processCubeBackfillJob. Reported to team lead as a standalone finding
+	// (mirrors the R9 cube-watermark-persistence gap in kind); NOT fixed here
+	// as it is out of #496's scope (cube's own code).
+	ViBackfill *ViBackfillDetail `protobuf:"bytes,7,opt,name=vi_backfill,json=viBackfill,proto3" json:"vi_backfill,omitempty"`
 }
 
 func (m *JobDetail) Reset()         { *m = JobDetail{} }
@@ -1543,6 +1725,18 @@ func (m *JobDetail) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
+	if m.ViBackfill != nil {
+		{
+			size, err := m.ViBackfill.MarshalToSizedBuffer(dAtA[:i])
+			if err != nil {
+				return 0, err
+			}
+			i -= size
+			i = encodeVarintBackendwork(dAtA, i, uint64(size))
+		}
+		i--
+		dAtA[i] = 0x3a
+	}
 	if len(m.BatchId) > 0 {
 		i -= len(m.BatchId)
 		copy(dAtA[i:], m.BatchId)
@@ -2058,6 +2252,10 @@ func (m *JobDetail) Size() (n int) {
 	}
 	l = len(m.BatchId)
 	if l > 0 {
+		n += 1 + l + sovBackendwork(uint64(l))
+	}
+	if m.ViBackfill != nil {
+		l = m.ViBackfill.Size()
 		n += 1 + l + sovBackendwork(uint64(l))
 	}
 	return n
@@ -2715,6 +2913,42 @@ func (m *JobDetail) Unmarshal(dAtA []byte) error {
 				return io.ErrUnexpectedEOF
 			}
 			m.BatchId = string(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
+		case 7:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ViBackfill", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowBackendwork
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthBackendwork
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthBackendwork
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.ViBackfill == nil {
+				m.ViBackfill = &ViBackfillDetail{}
+			}
+			if err := m.ViBackfill.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
 			iNdEx = postIndex
 		default:
 			iNdEx = preIndex

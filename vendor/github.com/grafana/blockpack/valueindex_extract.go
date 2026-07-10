@@ -46,11 +46,11 @@ type ValueIndexEntry struct {
 // ExtractValueIndexEntries reads every indexable (column, span) observation from
 // one blockpack and streams it to yield (NOTE-VI-018, issue #401).
 //
-// The value index is a policy-free, general-purpose lookup structure: it indexes
-// every column the reader exposes (NOTE-VI-027, issue #414). There is no built-in
-// denylist — callers (the querier) decide which columns are useful at read time,
-// not the writer. A nil denylist therefore indexes everything; callers that
-// genuinely need to exclude columns pass an explicit non-nil denylist.
+// The value index is a policy-free, general-purpose lookup structure by default:
+// a disabled policy (the zero value) indexes every column the reader exposes
+// (NOTE-VI-027, issue #414). Callers that need to restrict which columns are
+// extracted (#496's dedicated-column + usage-triggered-backfill policy) pass an
+// explicit Enabled policy — see ColumnPolicy.
 //
 // The high-cardinality time-domain intrinsics (span:start, span:end,
 // span:duration) are stored as raw nanosecond uint64 values, which would
@@ -60,16 +60,17 @@ type ValueIndexEntry struct {
 // stored block columns remain nanosecond precision for range queries. The column
 // type is unchanged (still uint64 milliseconds, not a duration type).
 //
-// Columns in denylist are skipped; a nil denylist indexes every column. yield is
-// called once per present span value; if it returns an error, extraction stops and
-// returns that error. A column absent from a block simply produces no calls.
+// Columns policy.Allowed rejects are skipped; a disabled (zero-value) policy
+// indexes every column. yield is called once per present span value; if it
+// returns an error, extraction stops and returns that error. A column absent
+// from a block simply produces no calls.
 //
 // TimeSec on each entry is the span's start time in seconds, resolved from the
 // span:start intrinsic by (blockIdx, rowIdx); it is 0 when the file has no
 // span:start column.
 func ExtractValueIndexEntries(
 	r *Reader,
-	denylist map[string]struct{},
+	policy ColumnPolicy,
 	yield func(ValueIndexEntry) error,
 ) error {
 	if r == nil {
@@ -88,7 +89,31 @@ func ExtractValueIndexEntries(
 	// NOTE-436: all columns (intrinsic and attribute alike) are inner-block columns.
 	// A single per-block column walk yields every value — there is no IntrinsicTOC
 	// fallback phase.
-	return extractBlockColumns(r, denylist, startSecByRef, blockRefByIdx, yield)
+	return extractBlockColumns(r, policy, startSecByRef, blockRefByIdx, yield)
+}
+
+// ExtractValueIndexEntriesForColumns is a thin allowlist wrapper around
+// ExtractValueIndexEntries for the #496 backfill engine's use (plan.md Section
+// 4.5): it reuses the exact same per-block walk and column-value decoding,
+// filtering at the yield boundary to only pass through entries for columns
+// named in allowlist. This keeps extractBlockColumns' policy semantics and
+// every existing caller (WriteValueIndexL0, valueindexconsumer) completely
+// unchanged — the backfill engine's "index only this one triggered column
+// against history" requirement is satisfied without touching the extraction
+// internals at all. Extraction itself runs with a disabled (zero-value)
+// policy so structural columns (span:id, trace:id, etc.) still flow through
+// unfiltered; allowlist is applied only at the yield boundary.
+func ExtractValueIndexEntriesForColumns(
+	r *Reader,
+	allowlist map[string]struct{},
+	yield func(ValueIndexEntry) error,
+) error {
+	return ExtractValueIndexEntries(r, ColumnPolicy{}, func(e ValueIndexEntry) error {
+		if _, ok := allowlist[e.ColName]; !ok {
+			return nil
+		}
+		return yield(e)
+	})
 }
 
 // buildBlockRefByIdx precomputes the v2 page-aligned file locator (NOTE-V2-002) for
@@ -192,11 +217,11 @@ func buildSpanStartSecByRef(r *modules_reader.Reader) map[uint32]uint64 {
 }
 
 // extractBlockColumns parses each inner block one at a time and yields every present
-// value of every non-denied column it exposes. NOTE-436: this is the only extraction
+// value of every column policy.Allowed permits. NOTE-436: this is the only extraction
 // path — all columns live in inner blocks.
 func extractBlockColumns(
 	r *modules_reader.Reader,
-	denylist map[string]struct{},
+	policy ColumnPolicy,
 	startSecByRef map[uint32]uint64,
 	blockRefByIdx []modules_shared.BlockFileRef,
 	yield func(ValueIndexEntry) error,
@@ -229,7 +254,8 @@ func extractBlockColumns(
 		// the new trace-group buffer's per-row grouping.
 		traceIDCol := block.Block.GetColumn(modules_shared.TraceIDColumnName)
 		for colKey, col := range block.Block.Columns() {
-			if _, denied := denylist[colKey.Name]; denied {
+			// SPEC-VI-11: ColumnPolicy enforcement point for extraction.
+			if !policy.Allowed(colKey.Name) {
 				continue
 			}
 			colType := col.Type
