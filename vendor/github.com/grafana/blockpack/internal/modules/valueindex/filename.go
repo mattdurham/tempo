@@ -24,6 +24,12 @@ func FormatFilename(level int, id string) string {
 // Returns an error if the filename does not match the expected L<N>-<id>.blockpack format.
 func ParseFilename(name string) (level int, id string, err error) {
 	base := strings.TrimSuffix(name, ".blockpack")
+	// NOTE-VI-095: TrimSuffix silently no-ops when the suffix is absent, so without this
+	// check a non-.blockpack file (e.g. a VCNT .vcnt file) whose dash-structure happens to
+	// match L<N>-<id> would parse "successfully" -- see NOTES.md dated entry.
+	if base == name {
+		return 0, "", fmt.Errorf("valueindex: filename %q missing .blockpack suffix", name)
+	}
 	if !strings.HasPrefix(base, "L") {
 		return 0, "", fmt.Errorf("valueindex: filename %q missing L<level>- prefix", name)
 	}
@@ -65,13 +71,21 @@ type FileMeta struct {
 // see NOTE-VI-030).
 func ParseFilenameV2(name string) (FileMeta, error) {
 	base := strings.TrimSuffix(name, ".blockpack")
+	// NOTE-VI-095: TrimSuffix silently no-ops when the suffix is absent -- see ParseFilename
+	// and NOTES.md dated entry for why this explicit check is required.
+	if base == name {
+		return FileMeta{}, fmt.Errorf("valueindex: filename %q missing .blockpack suffix", name)
+	}
 	if !strings.HasPrefix(base, "L") {
 		return FileMeta{}, fmt.Errorf("valueindex: filename %q missing L<level>- prefix", name)
 	}
 	parts := strings.SplitN(base[1:], "-", 4)
 	// v2: L<level>-<minTS>-<maxTS>-<id> (4 parts after stripping "L")
 	if len(parts) != 4 {
-		return FileMeta{}, fmt.Errorf("valueindex: filename %q is not a v2 filename (expected L<level>-<minTS>-<maxTS>-<id>.blockpack)", name)
+		return FileMeta{}, fmt.Errorf(
+			"valueindex: filename %q is not a v2 filename (expected L<level>-<minTS>-<maxTS>-<id>.blockpack)",
+			name,
+		)
 	}
 	lv, err := strconv.Atoi(parts[0])
 	if err != nil {

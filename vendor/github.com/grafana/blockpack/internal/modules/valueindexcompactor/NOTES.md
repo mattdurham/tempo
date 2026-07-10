@@ -537,3 +537,19 @@ pipeline is handled by skipping and preserving, never by silently deleting.
 
 Back-ref: `internal/modules/valueindexcompactor/traceindex_dispatch.go:mergeTraceLevel`. Tested
 by `TestMergeTraceLevel_CorruptInputSkippedNotAborted`. See `SPECS.md` SPEC-VI-7.
+
+## NOTE-VI-096 — buildWorkList must never treat VCNT's `unique_values/` directory as a VI column-hash directory (live data-loss incident hotfix, root cause 1 of 2)
+
+Date: 2026-07-10
+
+**The bug.** `buildWorkList` listed ALL children of `<tenant>/indexes/` and treated every one as a VI column-hash directory, with no exclusion for `unique_values/` — which is actually VCNT's (valuecounts') own top-level directory (VCNT's files live at `<tenant>/indexes/unique_values/<colHash>/...`, established in `valuecountscompactor/service.go` via `path.Join(tenant, cfg.IndexPrefix, "unique_values")`). Confirmed live in a dev Kubernetes environment: VI's compactor descended into `unique_values/`, listed a `.vcnt` file as a candidate, `Peek()`'d it, saw VCNT's `VCN1` magic instead of VI's `VBG2`, concluded it was legacy junk, and `Delete()`'d it — permanently destroying legitimate VCNT data.
+
+**The fix.** `buildWorkList`'s column-directory loop now compares `colName := path.Base(strings.TrimSuffix(colDir, "/"))` against the literal `"unique_values"` and `continue`s before any further processing (shard-ownership check, `ListDirs` into it, or adding any of its type-dirs to the work list). VI must never descend into `unique_values/` at all — it is not, and never will be, a VI column.
+
+**Why this is independent from NOTE-VI-095 and both had to be fixed.** This directory-scope bug and the filename-suffix-validation bug (`valueindex/filename.go`'s `ParseFilename`/`ParseFilenameV2`, NOTE-VI-095) are two separate failure paths into the same outcome — fixing only one leaves the other as a live path to the identical data loss. This note's fix stops VI from ever discovering a `.vcnt` file as a candidate in the first place; NOTE-VI-095's fix is defense in depth for the case a `.vcnt` file somehow still reaches VI's filename parser.
+
+**Regression test.** `TestBuildWorkList_ExcludesUniqueValuesDirectory` (`worklist_test.go`) seeds a `.vcnt` file with a VI-v2-shaped, 4-dash-part name directly under `unique_values/<colHash>/`, alongside a real VI column directory with a real `.blockpack` file, calls `buildWorkList` directly, and asserts `unique_values` never appears in any returned `columnWork.colDir` while the real VI column is still discovered. Mutation-verified: reverting the `colName == "unique_values"` guard reproduces the test failure (the VCNT directory is surfaced as a work-list candidate).
+
+Back-ref: `internal/modules/valueindexcompactor/service.go:buildWorkList`. Tested by
+`TestBuildWorkList_ExcludesUniqueValuesDirectory`. See NOTE-VI-095
+(`internal/modules/valueindex/NOTES.md`) for root cause 2 of this same incident.
