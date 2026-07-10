@@ -9,6 +9,7 @@ package vblockpack
 // to compile until vcntwriter.go is restructured (TDD red step).
 
 import (
+	"path"
 	"sync"
 	"testing"
 
@@ -337,4 +338,70 @@ func TestVCNTFlush_CrossBlockMinuteCoalescing(t *testing.T) {
 	assert.Equal(t, uint64(60), merged[0].TimeStart)
 	assert.Equal(t, uint64(60), merged[0].TimeEnd)
 	assert.Equal(t, int64(2), merged[0].Count)
+}
+
+// keyForColumn returns the single fakeVCNTStore key written for colName, failing the test if
+// zero or more than one key matches.
+func keyForColumn(t *testing.T, store *fakeVCNTStore, colName string) string {
+	t.Helper()
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	colHash := blockpack.VCNTColHash(colName)
+	var key string
+	for k := range store.objs {
+		if !stringsContains(k, colHash) {
+			continue
+		}
+		require.Empty(t, key, "expected exactly one key written for column %q, found a second: %q", colName, k)
+		key = k
+	}
+	require.NotEmpty(t, key, "expected a key to have been written for column %q", colName)
+	return key
+}
+
+// TestVCNTFlush_WritesV2KeyFormatWithGenuineRange proves flush() writes a v2-format .vcnt
+// key whose embedded [WallMinSec, WallMaxSec] is the genuine min/max across the flushed
+// records — not hardcoded, not the first/last record in whatever map-iteration order flush()
+// happens to build records in (issue #494, R5).
+func TestVCNTFlush_WritesV2KeyFormatWithGenuineRange(t *testing.T) {
+	store := newFakeVCNTStore()
+	acc := newVCNTAccumulator()
+	acc.addTrace(traceWithSpanAt(60*1_000_000_000, "op-a"))
+	acc.addTrace(traceWithSpanAt(120*1_000_000_000, "op-b"))
+	acc.addTrace(traceWithSpanAt(180*1_000_000_000, "op-c"))
+	acc.flush(store, "tenant1", "indexes")
+
+	key := keyForColumn(t, store, "span:name")
+	meta, err := blockpack.VCNTParseFilenameV2(path.Base(key))
+	require.NoError(t, err)
+	assert.Equal(t, 0, meta.Level)
+	assert.Equal(t, uint64(60), meta.WallMinSec)
+	assert.Equal(t, uint64(180), meta.WallMaxSec)
+}
+
+// TestVCNTFlush_KeyRangeCorrectDespiteMapIterationOrder is the mandatory adversarial test
+// (issue #494, R5, mirrors R3's requirement applied to tempo's write call site): accumulator
+// state is populated directly (bypassing addTrace) so the fixture doesn't depend on
+// floor/bucket derivation. Go's map iteration order is randomized per-run, so the loop
+// re-creates the map fresh each iteration and asserts the computed range is correct on every
+// run, giving confidence flush()'s key range doesn't depend on iteration order.
+func TestVCNTFlush_KeyRangeCorrectDespiteMapIterationOrder(t *testing.T) {
+	for i := 0; i < 20; i++ {
+		store := newFakeVCNTStore()
+		acc := newVCNTAccumulator()
+		acc.counts = map[string]map[uint64]map[string]int64{
+			"span:name": {
+				300:  {"c": 1},
+				9999: {"b": 1},
+				60:   {"a": 1},
+			},
+		}
+		acc.flush(store, "tenant1", "indexes")
+
+		key := keyForColumn(t, store, "span:name")
+		meta, err := blockpack.VCNTParseFilenameV2(path.Base(key))
+		require.NoError(t, err)
+		assert.Equal(t, uint64(60), meta.WallMinSec, "iteration %d", i)
+		assert.Equal(t, uint64(9999), meta.WallMaxSec, "iteration %d", i)
+	}
 }

@@ -11,7 +11,7 @@ SPEC-ROOT-009 — this file's own sequence, numbering from 1, independent of
 `internal/modules/valuecountscompactor/TESTS.md`'s own separate `TEST-VC-N` sequence). IDs are
 assigned in ascending order and never reused or renumbered.
 
-Next free ID: **TEST-VC-9**.
+Next free ID: **TEST-VC-11**.
 
 ---
 
@@ -142,3 +142,62 @@ isolate its target `(column, value)` from unrelated columns/values sharing the s
 **Spec invariants tested:** SPEC-VC-6.
 
 Back-ref: `internal/modules/valuecounts/perminute_test.go`. Issue #487, task C1.
+
+---
+
+## TEST-VC-9: filename_v2_test.go — FormatFilenameV2/ParseFilenameV2/IsInTimeRange/SortFileMetas
+*Added: 2026-07-10*
+
+**Scenario:** Locks in SPEC-VC-7's v2 filename contract: round-trip encoding, the strict
+4-dash-part shape with no v1 fallback, the `wallMinSec > wallMaxSec` rejection, and the
+`IsInTimeRange`/`SortFileMetas` helpers built on `FileMeta` (issue #494).
+
+**Setup/Assertions (`filename_v2_test.go`):**
+
+- `TestFormatFilenameV2_RoundTrip` — `FormatFilenameV2(1, 100, 200, "abc123")` produces
+  `"L1-100-200-abc123.vcnt"`; `ParseFilenameV2` on that string returns the exact original
+  `FileMeta`.
+- `TestFormatFilenameV2_MinEqualsMax` — `WallMinSec == WallMaxSec` (a file covering exactly one
+  instant) round-trips without error.
+- `TestParseFilenameV2_MalformedInputs` — table of 8 malformed shapes (wrong suffix, missing `L`
+  prefix, v1 2-part shape, non-integer level/minSec/maxSec, empty id segment, and the reversed
+  range `"L0-500-100-abc.vcnt"`) each return a non-nil error and a zero `FileMeta`.
+- `TestParseFilenameV2_V1ShapeReturnsError` — a genuine v1 filename produced by
+  `FormatFilename` is fed to `ParseFilenameV2`; asserts a non-nil error. This is the mandatory
+  R4 regression guard: the exact mechanism by which a straggler v1-format file is safely skipped
+  by `compactColumn` with no special-case code.
+- `TestIsInTimeRange` — table of 7 cases (overlap at start/end, exact match, query-inside-file,
+  file-inside-query, disjoint before, disjoint after) against a fixed `FileMeta{WallMinSec:
+  1000, WallMaxSec: 2000}`.
+- `TestSortFileMetas` — three `FileMeta` values sort ascending by `(Level, WallMinSec,
+  WallMaxSec)` in that priority order.
+
+**Spec invariants tested:** SPEC-VC-7.
+
+Back-ref: `internal/modules/valuecounts/filename_v2_test.go`. Issue #494, task A1/#91.
+
+---
+
+## TEST-VC-10: timerange_test.go — TimeRange full-scan and non-monotonic-TimeEnd correctness
+*Added: 2026-07-10*
+
+**Scenario:** Locks in SPEC-VC-7's `TimeRange` contract: a full `O(n)` scan for both bounds,
+with the mandatory R3 adversarial guard against assuming `TimeEnd` is sort-order-monotonic
+(NOTE-VC-002) — the exact bug class this function exists to prevent (issue #494).
+
+**Setup/Assertions (`timerange_test.go`):**
+
+- `TestTimeRange_Empty` — `TimeRange(nil)` returns `(0, 0)`.
+- `TestTimeRange_SingleRecord` — a single `{TimeStart: 42, TimeEnd: 99}` record returns
+  `(42, 99)`.
+- `TestTimeRange_MaxTimeEndNotLastSortedRecord` — three records sorted by `TimeStart` ascending
+  where the FIRST record has the far-largest `TimeEnd` (9999) and the LAST has a small one (600).
+  Asserts `maxSec == 9999`, explicitly not `600` (the last-sorted record's `TimeEnd` — the bug a
+  naive "return the last element" implementation would produce).
+- `TestTimeRange_MinAlsoComputedByScan` — the smallest `TimeStart` is not the first record in the
+  slice; asserts the true minimum (100) is still found, proving `TimeRange` does not assume any
+  pre-sort by `TimeStart` either.
+
+**Spec invariants tested:** SPEC-VC-7.
+
+Back-ref: `internal/modules/valuecounts/timerange_test.go`. Issue #494, task A1/#91.

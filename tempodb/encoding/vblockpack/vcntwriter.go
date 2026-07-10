@@ -11,7 +11,12 @@ package vblockpack
 // Flush(), the accumulated counts are encoded and PUT to S3 as one .vcnt
 // file per column under:
 //
-//	<tenant>/indexes/unique_values/<colHash>/L0-<id>.vcnt
+//	<tenant>/indexes/unique_values/<colHash>/L0-<minSec>-<maxSec>-<id>.vcnt
+//
+// The v2 filename embeds the genuine wall-clock time range spanned by that
+// column's flushed records (issue #494), scanned via blockpack.VCNTRecordTimeRange
+// so downstream compaction can cluster same-level files by time range without
+// decoding them.
 
 import (
 	"encoding/binary"
@@ -146,9 +151,10 @@ func (a *vcntAccumulator) snapshot() []blockpack.VCNTRecord {
 }
 
 // flush encodes accumulated per-minute-bucket counts and PUTs one .vcnt file
-// per column. Each record's TimeStart/TimeEnd is its own minute bucket (point
-// convention — see plan.md Phase 3 Decision 1), not a caller-supplied block
-// window.
+// per column, keyed with a v2 filename that embeds the genuine wall-clock
+// time range spanned by that column's records (issue #494). Each record's
+// TimeStart/TimeEnd is its own minute bucket (point convention — see plan.md
+// Phase 3 Decision 1), not a caller-supplied block window.
 func (a *vcntAccumulator) flush(store blockpack.ObjectPutter, tenant, indexPrefix string) {
 	if store == nil || len(a.counts) == 0 {
 		return
@@ -166,10 +172,11 @@ func (a *vcntAccumulator) flush(store blockpack.ObjectPutter, tenant, indexPrefi
 				})
 			}
 		}
+		minSec, maxSec := blockpack.VCNTRecordTimeRange(records)
 		blockpack.SortVCNTRecords(records)
 		data := blockpack.EncodeVCNTFile(records, 0)
 		id := blockpack.VCNTNewID()
-		key := blockpack.VCNTObjectKey(tenant, indexPrefix, colName, id)
+		key := blockpack.VCNTObjectKeyV2(tenant, indexPrefix, colName, id, minSec, maxSec)
 		if putErr := store.Put(key, data); putErr != nil {
 			level.Warn(util_log.Logger).Log(
 				"msg", "vblockpack: vcnt write failed",

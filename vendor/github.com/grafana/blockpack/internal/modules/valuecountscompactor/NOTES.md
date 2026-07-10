@@ -14,9 +14,10 @@ ruling (2026-07-02): `valuecounts` and `valuecountscompactor` are the analogous
 core-format/compactor-service pair for VCNT that `valueindex`/`valueindexcompactor` are for VI.
 
 `valuecounts/NOTES.md` currently holds NOTE-VC-001 through NOTE-VC-006, NOTE-VC-008, and
-NOTE-VC-015 (NOTE-VC-007 was left explicitly reserved for this file — see the inline note in
-`valuecounts/NOTES.md` at that point in the sequence). This file also holds NOTE-VC-009 and
-NOTE-VC-010. Next free ID: **NOTE-VC-011**.
+NOTE-VC-011 through NOTE-VC-017 (NOTE-VC-007 was left explicitly reserved for this file — see the
+inline note in `valuecounts/NOTES.md` at that point in the sequence). This file also holds
+NOTE-VC-009, NOTE-VC-010, and (as of 2026-07-10, issue #494) NOTE-VC-018. Next free ID:
+**NOTE-VC-019**.
 
 ---
 
@@ -188,3 +189,116 @@ decode path changes, not just the production code paths themselves.
 Back-refs: `internal/modules/valuecountscompactor/service_test.go` (`putL0`, `putL0Multi`),
 `internal/modules/valuecountscompactor/service_internal_test.go` (`putVCNT`). See
 `internal/modules/valuecounts/NOTES.md` NOTE-VC-005 (addendum), NOTE-VC-015; `SPECS.md` SPEC-VC-4.
+
+## NOTE-VC-018 — Time-cluster-based compaction: design rationale, tie-break, deployment prerequisite (issue #494)
+
+Date: 2026-07-10
+
+### Why input-side, pre-decode clustering — and why the previously-considered post-decode approach was superseded
+
+Issue #494 asked for compaction to actually merge files whose time ranges overlap or sit close
+together, not just any same-level files. An earlier brainstorm considered a post-decode
+partitioning approach: decode every same-level candidate file first, then partition the
+resulting records by time range before writing outputs. That design existed specifically to
+cope with a permanent-unknown-range case — VCNT filenames carried no time information at all
+(v1 shape), so there was no way to know a file's range without decoding it, and V1 files with
+no way to acquire a range would need to stay in that "unknown, must-decode-to-find-out" state
+indefinitely.
+
+Two decisions eliminated that permanent-unknown-range case and made input-side (pre-decode)
+clustering both simpler and a more literal fulfillment of "merge files with overlapping/similar
+time ranges": (1) v2 filenames (`valuecounts.FormatFilenameV2`/`ParseFilenameV2`, this blockpack
+change) embed the genuine range directly in the object key, so a candidate's range is knowable
+in O(1) without any decode; and (2) the mandatory full VCNT data wipe (see the deployment
+prerequisite below) retires every pre-existing v1 file, so there is no long-lived population of
+genuinely-unknown-range files this design needs to accommodate — any v1 straggler that survives
+the wipe is a narrow, temporary, self-limiting edge case (see below), not the steady-state this
+compactor must be designed around. Once the "permanently unknown range" case is off the table,
+clustering on the already-known, already-cheap filename-embedded range before ever touching
+object storage for a `Get` is strictly simpler than decoding first and partitioning after: it
+lets `compactColumn` decide which files to merge, and how many `mergeLevel` calls a level needs,
+without any decode at all for files that end up in a losing (unmerged) cluster.
+
+### The tie-break rule: most files wins, ties broken by earliest start
+
+`pickCluster` selects the cluster with the most files; ties are broken by the smallest (earliest)
+`minSec` across the tied clusters. Rationale: the primary goal of compaction is reducing file
+count (fewer, larger files), so all else equal the cluster that reduces file count the most
+should be preferred. The earliest-start tie-break is a secondary, deterministic preference for
+processing older data first — older clusters are more likely to represent columns that have
+stopped receiving new same-range writes and are therefore "settled" (unlikely to gain more
+files that would have merged even more advantageously later), whereas a very recent cluster may
+still be actively accumulating new L0 files from an in-progress ingest window. Neither factor
+(byte size, cluster span width, file recency beyond this tie-break) is considered — this is a
+deliberately simple two-factor rule, not a full cost model.
+
+### Known limitation — potential cluster starvation under skewed, continuous ingest
+
+The "most files wins" tie-break has no age/staleness factor beyond the same-count tie-break
+above. Under a continuous, sufficiently skewed ingest pattern (e.g. one hot time range
+perpetually accumulating new L0 files faster than a level's other, older/smaller clusters can
+grow), it is plausible — though not proven or demonstrated by any current test — that a level
+could keep favoring the largest cluster indefinitely, leaving a smaller, older cluster
+perpetually short of `CompactThresholdFiles` and never selected. This is a known, accepted
+design tradeoff for this iteration, not a bug: `pickCluster` is deliberately a simple two-factor
+rule (SPEC-VC-3), not a full cost model, and the scenario requires a specific, sustained ingest
+skew to manifest at all. If this is ever observed in production (e.g. via a persistently
+low-level-count metric for a specific column combined with growing file counts), the fix would
+likely add an age/staleness factor to `pickCluster`'s selection (e.g. preferring a cluster whose
+oldest file exceeds some age threshold, independent of file count) — flagged here as a future
+consideration, not committed to in this design.
+
+### MaxTimeSpanPerMerge's 86400s default is a tuning placeholder
+
+`DefaultMaxTimeSpanPerMerge = 86400` (24h) bounds how wide a single cluster's `[minSec, maxSec]`
+span may grow before `clusterByTimeRange` starts a new cluster. This value is a conservative
+starting default, not a tuned production number — real tuning data from production
+query-window/retention observation does not exist yet at the time this shipped. Widening it
+merges more files per pass (fewer total files, more decode work per merge); narrowing it does
+the opposite. Revisit once production file-count/cluster-width telemetry is available.
+
+### Hard deployment prerequisite: full VCNT data wipe, coordinated with tempo's L0 writer change
+
+This design has **zero backward-compatibility code**, per this project's standing directive:
+`valuecounts.ParseFilenameV2` (SPEC-VC-7 in `valuecounts/SPECS.md`) has no v1 fallback — a
+v1-shaped filename is a defined parse error, not a degenerate case handled specially. This means
+three changes must land together as a single all-or-nothing deployment, not a staged rollout:
+
+1. This blockpack change (`compactColumn`/`mergeLevel` now require v2 filenames to select or
+   produce anything).
+2. tempo's `vcntwriter.go` L0 writer switching to `VCNTObjectKeyV2`/`VCNTFormatFilenameV2` (Part
+   B of #494, out of this repo's scope) — otherwise every newly-written L0 file becomes
+   invisible to the compactor the moment Part A deploys, accumulating unprocessed files forever.
+3. A full VCNT data wipe (every existing `.vcnt` file, every tenant, every environment) —
+   otherwise every pre-existing v1-format file becomes a permanent straggler (see below).
+
+This is flagged prominently here because it is an unusual, one-time operational requirement, not
+a normal "deploy and forget" change — see `.bob/state/plan.md`'s "Deployment Notes" section for
+the full recommended sequencing.
+
+### v1-straggler-file safety: permanently, safely skipped — not corrupted, not force-migrated
+
+If the wipe/coordination is not perfectly simultaneous (e.g. a v1 file written just before the
+wipe, or the wipe missing an object due to an operational gap), that file is not corrupted, not
+force-migrated, and never merged: `ParseFilenameV2`'s defined error on a v1-shaped name causes
+`compactColumn`'s parse loop to increment `filesSkipped` and leave the file exactly where it is,
+indefinitely, until it is either manually cleaned up or naturally expired by whatever upstream
+retention process governs `.vcnt` objects generally. It can never re-enter the merge pipeline
+under this design (there is no path by which a `ParseFilenameV2` failure gets a second, more
+lenient parse attempt). `TestCompactColumn_V1FormatFilesAreSkippedNotMerged` (TESTS.md
+TEST-VC-27) locks in exactly this behavior.
+
+### Out of scope: listing-time pruning on the tempo side
+
+A companion tempo-side follow-up (R8, out of scope for this blockpack change) would let tempo's
+own listing/read paths use the v2 filename's embedded range to prune candidate files at
+listing time before ever fetching them — analogous to how block-level min/max pruning already
+works for blockpack data files. That is a read-path optimization independent of this
+compaction-time clustering change and is tracked separately.
+
+Back-refs: `internal/modules/valuecountscompactor/cluster.go` (`clusterByTimeRange`,
+`pickCluster`), `internal/modules/valuecountscompactor/service.go` (`compactColumn`),
+`internal/modules/valuecountscompactor/config.go` (`MaxTimeSpanPerMerge`,
+`DefaultMaxTimeSpanPerMerge`). `SPECS.md` SPEC-VC-3. `valuecounts/NOTES.md` NOTE-VC-017 (the
+filename-format side of this change). `.bob/state/plan.md` "Deployment Notes" section (full
+sequencing detail, out of this file's scope to duplicate).

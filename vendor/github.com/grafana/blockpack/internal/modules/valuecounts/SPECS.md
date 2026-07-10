@@ -16,7 +16,7 @@ module's SPECS.md numbers from 1, per the established convention in
 independent per-file counters). IDs are assigned in ascending order and never reused or
 renumbered; superseded entries are marked `[SUPERSEDED by SPEC-VC-N]` rather than deleted.
 
-Next free ID: **SPEC-VC-7**.
+Next free ID: **SPEC-VC-8**.
 
 ---
 
@@ -230,3 +230,83 @@ already-decoded VCNT section (`data`/`dir`) and opens no blockpack data files.
 
 Back-refs: `perminute.go:SelectivityPerMinute`, `MinuteCount`. Test: `perminute_test.go`. Issue
 #487, task C1. See `NOTES.md` NOTE-VC-016.
+
+---
+
+## SPEC-VC-7: FormatFilenameV2 / ParseFilenameV2 v2 filename contract; TimeRange full-scan guarantee
+*Added: 2026-07-10*
+
+**Contract:** `FormatFilenameV2(level int, wallMinSec, wallMaxSec uint64, id string) string`
+produces a `.vcnt` filename of the form `L<level>-<wallMinSec>-<wallMaxSec>-<id>.vcnt` — a
+strict superset of the v1 shape (`L<level>-<id>.vcnt`, `FormatFilename`/`ParseFilename`, unchanged)
+that additionally embeds the file's genuine wall-clock time range, so a compactor can select
+merge candidates by time proximity in O(1) per file (no decode required) rather than only by
+compaction level (issue #494).
+
+**`ParseFilenameV2(name string) (FileMeta, error)` rules:**
+
+- Requires exactly 4 dash-separated parts after the mandatory `L` prefix and `.vcnt` suffix:
+  `<level>-<wallMinSec>-<wallMaxSec>-<id>`. **There is no v1 fallback** — a syntactically valid
+  v1 filename (2 parts: `<level>-<id>`) is a defined parse error here, not a silently-accepted
+  degenerate case, per this project's no-backward-compatibility directive (issue #494, R4/R1).
+  This is the exact, sole mechanism by which a straggler v1-format file is safely and
+  permanently skipped (never merged, never corrupted) by any caller that switches to
+  `ParseFilenameV2` — see `valuecountscompactor` SPEC-VC-3 and NOTES.md's new dated entry.
+- `level` and both `wallMinSec`/`wallMaxSec` segments must parse as their respective integer
+  types (`strconv.Atoi`, `strconv.ParseUint(..., 64)`); the `id` segment must be non-empty.
+  Any failure returns a zero `FileMeta` and a wrapped error — never a partially-populated
+  `FileMeta`.
+- **`wallMinSec > wallMaxSec` is rejected as a malformed filename** — a reversed range can never
+  be produced by a well-formed writer (the range is the true `[min TimeStart, max TimeEnd]`
+  scan of the records the file contains, so `min <= max` always), so a filename claiming
+  otherwise is corrupt or adversarial input. This validation is the root-cause fix for a
+  finding (task #100, 2026-07-10) that `valuecountscompactor`'s pure-function
+  `clusterByTimeRange` was the only place defending against a reversed range, via an explicit
+  (not merely commented-away) underflow guard on its own `uint64` subtraction — `ParseFilenameV2`
+  rejecting the malformed input at its origin protects every consumer of `FileMeta`, not just
+  that one call site; `clusterByTimeRange`'s own guard remains as defense-in-depth against a
+  `levelFile` constructed by a future caller that bypasses `ParseFilenameV2`.
+- `FileMeta{Filename, ID, Level, WallMinSec, WallMaxSec}` is the parsed result; there is no
+  `WallMinSec == WallMaxSec` restriction — a file covering exactly one instant is valid.
+
+**`(*FileMeta) IsInTimeRange(queryMinSec, queryMaxSec uint64) bool` contract:** returns
+`m.WallMaxSec >= queryMinSec && m.WallMinSec <= queryMaxSec` — standard half-open-interval
+overlap test against the file's own `[WallMinSec, WallMaxSec]`. An exact-boundary touch (query
+range's edge equals the file range's edge) counts as overlapping.
+
+**`SortFileMetas(metas []FileMeta)` contract:** sorts ascending by `(Level, WallMinSec,
+WallMaxSec)` in that priority order — mirrors `lessFileMeta`'s exact comparator. Not currently
+consumed by production code in this package (`valuecountscompactor` sorts its own `levelFile`
+slice independently inside `clusterByTimeRange`/`capBatchBytes`); provided as a public
+convenience for any future caller that needs a deterministic ordering directly over parsed
+`FileMeta` values.
+
+**`TimeRange(records []Record) (minSec, maxSec uint64)` contract:** returns the true
+`(min(TimeStart), max(TimeEnd))` across every record via a full, unconditional `O(n)` scan.
+**Callers must never assume sort-order monotonicity on `TimeEnd`** — `Compact`'s own sort order
+is `(ColumnName, TimeStart, Value, Count)` (SPEC-VC-1); `TimeEnd` is explicitly not a sort key
+(NOTE-VC-002), so the record with the largest `TimeStart` (sorted last) does not necessarily
+carry the largest `TimeEnd`. `TimeRange` does not special-case a pre-sorted or single-chunk
+input to avoid a full scan — the scan is the entire guarantee. Returns `(0, 0)` for an empty
+slice (not an error — there is no valid non-degenerate range to report for zero records).
+
+**Rationale:** Both contracts exist to support issue #494's compaction-time clustering: a
+compactor needs (a) a way to know a candidate file's time range without decoding it
+(`FormatFilenameV2`/`ParseFilenameV2`, read from the object key alone), and (b) a way to compute
+the genuine range of a just-merged output before writing its v2 filename
+(`TimeRange`, over the already-decoded, already-`Compact`-ed record slice `mergeLevel` holds in
+memory). `TimeRange` is factored into this shared package (rather than duplicated in
+`valuecountscompactor` and tempo's `vcntwriter.go`) specifically so this non-monotonicity
+correctness property is proven once via `TestTimeRange_MaxTimeEndNotLastSortedRecord` and reused
+by both real call sites through the `VCNTRecordTimeRange` re-export (`vcnt.go`), rather than
+each maintaining its own copy that could silently regress to the "last-sorted record's TimeEnd"
+bug this test exists to catch.
+
+Back-refs: `internal/modules/valuecounts/filename.go` (`FormatFilenameV2`, `ParseFilenameV2`,
+`FileMeta`, `IsInTimeRange`, `SortFileMetas`, `lessFileMeta`), `internal/modules/valuecounts/timerange.go`
+(`TimeRange`). Root-package re-exports: `vcnt.go` (`VCNTFormatFilenameV2`, `VCNTParseFilenameV2`,
+`VCNTFileMeta`, `VCNTRecordTimeRange`, `VCNTObjectKeyV2`). Consumer:
+`internal/modules/valuecountscompactor/service.go` (`compactColumn`'s `ParseFilenameV2` parse
+loop, `mergeLevel`'s `TimeRange` call before writing the merged output's v2 filename — see
+`valuecountscompactor` SPEC-VC-3). Tests: `filename_v2_test.go`, `timerange_test.go` — see
+`TESTS.md` TEST-VC-9/TEST-VC-10.

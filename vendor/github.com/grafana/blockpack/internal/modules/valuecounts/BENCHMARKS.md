@@ -10,7 +10,7 @@ SPEC-ROOT-009 — this file's own sequence, numbering from 1, independent of
 `internal/modules/valuecountscompactor/BENCHMARKS.md`'s own separate `BENCH-VC-N` sequence).
 IDs are assigned in ascending order and never reused or renumbered.
 
-Next free ID: **BENCH-VC-2**.
+Next free ID: **BENCH-VC-3**.
 
 ---
 
@@ -35,3 +35,27 @@ multi-run/pinned-CPU measurement.
 doubles (single-run baseline, so a smaller `ns/op` delta may just be noise).
 
 Back-ref: `internal/modules/valuecounts/selfdescribing_bench_test.go:BenchmarkEncodeDecodeVCNTFile_RoundTrip`.
+
+---
+
+## BENCH-VC-2: FormatFilenameV2 / ParseFilenameV2 / TimeRange — considered, not needed (issue #494)
+*Added: 2026-07-10*
+
+**Considered:** whether the new v2-filename helpers (`FormatFilenameV2`, `ParseFilenameV2`,
+`IsInTimeRange`, `SortFileMetas`) and the new `TimeRange` scan warrant a dedicated benchmark
+baseline in this file.
+
+**Decision: not needed.** All of these are either `O(1)` string formatting/parsing over a
+handful of already-in-memory integers (the filename helpers), or a single `O(n)` linear scan
+over a slice the caller already holds fully decoded in memory (`TimeRange`, called once per
+`mergeLevel` merge over its already-`Compact`-ed `merged` output — see
+`valuecountscompactor` SPEC-VC-1/SPEC-VC-3). None of these introduce a new I/O-bound hot path
+distinct from what BENCH-VC-1 (`EncodeVCNTFile`/`DecodeVCNTFile`) and
+`valuecountscompactor` BENCH-VC-1/BENCH-VC-2 (`mergeLevel`, which already includes a `Compact`
+call of the same order of magnitude as `TimeRange`'s own scan) already cover. A dedicated
+microbenchmark here would measure noise-level `O(n)`-over-memory costs already dwarfed by the
+decode/`Compact`/encode costs the existing benchmarks measure end-to-end.
+
+Back-ref: `internal/modules/valuecounts/filename.go` (`FormatFilenameV2`, `ParseFilenameV2`,
+`IsInTimeRange`, `SortFileMetas`), `internal/modules/valuecounts/timerange.go` (`TimeRange`).
+`SPECS.md` SPEC-VC-7.

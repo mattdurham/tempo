@@ -484,6 +484,11 @@ const (
 	// Consolidated per-tenant count files live at
 	// indexes/<tenant>/unique_values/<column_hash>/L<level>-<id>.vcnt (issue #400).
 	ValueCountsFilenamePattern = "L%d-%s.vcnt"
+
+	// ValueCountsFilenamePatternV2 embeds wall-clock time range for O(1) input-side
+	// clustering during compaction, mirroring ValueIndexFilenamePatternV2 (issue #494).
+	// fmt.Sprintf(ValueCountsFilenamePatternV2, level, wallMinSec, wallMaxSec, id)
+	ValueCountsFilenamePatternV2 = "L%d-%d-%d-%s.vcnt"
 )
 
 // MaxIntrinsicRows is the safety cap on accumulated rows in a single intrinsic column.

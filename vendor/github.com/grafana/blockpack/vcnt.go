@@ -5,8 +5,13 @@ package blockpack
 // per-column span counts during block writes and write L0 .vcnt files to S3,
 // without importing internal packages directly.
 //
-// Key layout for .vcnt files:
+// Key layout for .vcnt files (v1, still supported, unchanged):
 //   <tenant>/indexes/unique_values/<colHash>/<type>/L0-<id>.vcnt
+//
+// As of issue #494, a second, additive v2 key layout also exists, embedding the file's
+// wall-clock time range for O(1) input-side clustering during compaction:
+//   <tenant>/indexPrefix/unique_values/<colHash>/L<level>-<wallMinSec>-<wallMaxSec>-<id>.vcnt
+// See VCNTObjectKeyV2/VCNTFormatFilenameV2/VCNTParseFilenameV2 below.
 
 import (
 	"path"
@@ -92,6 +97,36 @@ func VCNTNewID() string {
 func VCNTObjectKey(tenant, indexPrefix, colName, id string) string {
 	colHash := valuecounts.ColHash(colName)
 	filename := valuecounts.FormatFilename(0, id)
+	return path.Join(tenant, indexPrefix, "unique_values", colHash, filename)
+}
+
+// VCNTFormatFilenameV2 returns a .vcnt filename that embeds the file's wall-clock time range
+// for O(1) input-side clustering during compaction (issue #494).
+func VCNTFormatFilenameV2(level int, wallMinSec, wallMaxSec uint64, id string) string {
+	return valuecounts.FormatFilenameV2(level, wallMinSec, wallMaxSec, id)
+}
+
+// VCNTFileMeta holds the parsed metadata from a v2 .vcnt filename.
+type VCNTFileMeta = valuecounts.FileMeta
+
+// VCNTParseFilenameV2 parses a v2 .vcnt filename into its components.
+func VCNTParseFilenameV2(name string) (VCNTFileMeta, error) {
+	return valuecounts.ParseFilenameV2(name)
+}
+
+// VCNTRecordTimeRange scans records and returns (minSec, maxSec): the minimum TimeStart and
+// maximum TimeEnd across every record, computed via a full O(n) scan (issue #494, R3/R5).
+func VCNTRecordTimeRange(records []VCNTRecord) (minSec, maxSec uint64) {
+	return valuecounts.TimeRange(records)
+}
+
+// VCNTObjectKeyV2 returns the full S3 object key for a .vcnt file using the v2 filename
+// format, which embeds the file's wall-clock time range (issue #494):
+//
+//	<tenant>/indexPrefix/unique_values/<colHash>/L<level>-<wallMinSec>-<wallMaxSec>-<id>.vcnt
+func VCNTObjectKeyV2(tenant, indexPrefix, colName, id string, wallMinSec, wallMaxSec uint64) string {
+	colHash := valuecounts.ColHash(colName)
+	filename := valuecounts.FormatFilenameV2(0, wallMinSec, wallMaxSec, id)
 	return path.Join(tenant, indexPrefix, "unique_values", colHash, filename)
 }
 

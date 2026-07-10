@@ -200,29 +200,41 @@ func (s *Service) resolveTenants(ctx context.Context) ([]string, error) {
 	return tenants, nil
 }
 
-// levelFile pairs a key with its parsed compaction level and object size.
+// levelFile pairs a key with its parsed compaction level, object size, and wall-clock time
+// range (minSec/maxSec, from the v2 filename — issue #494). minSec/maxSec are populated by
+// compactColumn's ParseFilenameV2 parse and consumed by clusterByTimeRange/pickCluster.
 type levelFile struct {
-	key   string
-	level int
-	size  int64
+	key    string
+	level  int
+	size   int64
+	minSec uint64
+	maxSec uint64
 }
 
-// compactColumn compacts the lowest compaction level present in one column directory, if that
-// level has at least CompactThresholdFiles files. Returns true when a merge was performed,
-// false when there was nothing to do. Unlike valueindexcompactor's compactColumn there is no
-// Peek/magic-purge branch: VCNT files carry no magic header, so an unparseable filename is the
-// only skip signal, and skipped files are left in place (a name-parse failure doesn't prove
-// the object is actually garbage the way a wrong-magic 4-byte header does).
+// compactColumn compacts one time-cluster of same-level files in one column directory, if that
+// cluster has at least CompactThresholdFiles files. Candidate files are parsed via
+// valuecounts.ParseFilenameV2 (an unparseable filename -- including any straggler v1-format
+// file, issue #494 R4 -- increments the skip counter and is left in place, exactly as with a
+// magic-header mismatch elsewhere in this codebase). Same-level candidates are then greedily
+// clustered by wall-clock time range (clusterByTimeRange) and one cluster is chosen
+// (pickCluster: most files wins, ties broken by earliest start -- see cluster.go's doc
+// comments for the full rule). The chosen cluster must itself meet CompactThresholdFiles --
+// meeting the threshold at the level's raw total is not sufficient, since the level's files
+// may be split across disjoint clusters none of which individually qualify. Returns true when
+// a merge was performed, false when there was nothing to do.
 func (s *Service) compactColumn(ctx context.Context, colDir string, objs []Object) (bool, error) {
 	byLevel := make(map[int][]levelFile, len(objs))
 	var skipped int
 	for _, obj := range objs {
-		level, _, err := valuecounts.ParseFilename(path.Base(obj.Key))
+		meta, err := valuecounts.ParseFilenameV2(path.Base(obj.Key))
 		if err != nil {
 			skipped++
 			continue
 		}
-		byLevel[level] = append(byLevel[level], levelFile{key: obj.Key, level: level, size: obj.Size})
+		byLevel[meta.Level] = append(byLevel[meta.Level], levelFile{
+			key: obj.Key, level: meta.Level, size: obj.Size,
+			minSec: meta.WallMinSec, maxSec: meta.WallMaxSec,
+		})
 	}
 	s.metrics.incSkipped(skipped)
 
@@ -233,36 +245,43 @@ func (s *Service) compactColumn(ctx context.Context, colDir string, objs []Objec
 	sort.Ints(levels)
 
 	for _, lvl := range levels {
-		files := byLevel[lvl]
-		if len(files) < s.cfg.CompactThresholdFiles {
+		clusters := clusterByTimeRange(byLevel[lvl], s.cfg.MaxTimeSpanPerMerge)
+		chosen := pickCluster(clusters)
+		if len(chosen) < s.cfg.CompactThresholdFiles {
 			continue
 		}
-		// Cap the batch by total input bytes (oldest files first) so peak memory stays
-		// bounded regardless of individual file size. The decoded-record-count admission
-		// gate (MaxRecordsPerMerge) is a separate, independent cap enforced inside
-		// mergeLevel, since record counts aren't knowable from Object.Size alone.
-		sort.Slice(files, func(i, j int) bool { return files[i].key < files[j].key })
-		if s.cfg.CompactBatchBytes > 0 {
-			var batchBytes int64
-			for cut := range files {
-				batchBytes += files[cut].size
-				if batchBytes > s.cfg.CompactBatchBytes {
-					// Always include at least CompactThresholdFiles to make progress.
-					if cut < s.cfg.CompactThresholdFiles {
-						cut = s.cfg.CompactThresholdFiles
-					}
-					files = files[:cut]
-					break
-				}
-			}
-		}
-		if err := s.mergeLevel(ctx, colDir, files); err != nil {
+		chosen = s.capBatchBytes(chosen)
+		if err := s.mergeLevel(ctx, colDir, chosen); err != nil {
 			return false, err
 		}
 		s.metrics.incColumnsCompacted(lvl)
 		return true, nil
 	}
 	return false, nil
+}
+
+// capBatchBytes trims files (oldest-by-key first) down to CompactBatchBytes total input bytes,
+// always keeping at least CompactThresholdFiles files so a pass makes progress even if the
+// very first file alone exceeds the cap. Applied WITHIN a single already-chosen time cluster
+// (issue #494, R2) -- the decoded-record-count admission gate (MaxRecordsPerMerge) is a
+// separate, independent cap enforced inside mergeLevel, since record counts aren't knowable
+// from Object.Size alone.
+func (s *Service) capBatchBytes(files []levelFile) []levelFile {
+	if s.cfg.CompactBatchBytes <= 0 {
+		return files
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].key < files[j].key })
+	var batchBytes int64
+	for cut := range files {
+		batchBytes += files[cut].size
+		if batchBytes > s.cfg.CompactBatchBytes {
+			if cut < s.cfg.CompactThresholdFiles {
+				cut = s.cfg.CompactThresholdFiles
+			}
+			return files[:cut]
+		}
+	}
+	return files
 }
 
 // mergeLevel reads files at one level (stopping early if MaxRecordsPerMerge is reached),
@@ -272,6 +291,11 @@ func (s *Service) compactColumn(ctx context.Context, colDir string, objs []Objec
 // format, then deletes only the inputs actually processed. Write-then-delete: inputs are only
 // removed after the merged output's Put succeeds. Files left unprocessed because the record
 // ceiling was hit are deferred to the next pass, not deleted or otherwise touched.
+//
+// Output filenames are v2-format (valuecounts.FormatFilenameV2, issue #494), embedding the
+// genuine [minSec,maxSec] range returned by valuecounts.TimeRange(merged) — a full scan of the
+// merged records, never a copy of one input's range or the last-sorted record's TimeEnd. See
+// SPEC-VC-3/SPEC-VC-7.
 //
 // NOTE-VC-009 (known, documented residual risk — not eliminated by the retry mitigation
 // below): unlike valueindexcompactor, valuecounts.Compact SUMS Count per merge key rather than
@@ -338,8 +362,9 @@ func (s *Service) mergeLevel(ctx context.Context, colDir string, files []levelFi
 	merged := valuecounts.Compact(all)
 	var written int
 	if len(merged) > 0 {
+		minSec, maxSec := valuecounts.TimeRange(merged)
 		data := valuecounts.EncodeVCNTFile(merged, 0)
-		key := path.Join(colDir, valuecounts.FormatFilename(outputLevel, valuecounts.NewID()))
+		key := path.Join(colDir, valuecounts.FormatFilenameV2(outputLevel, minSec, maxSec, valuecounts.NewID()))
 		if err := s.store.Put(ctx, key, data); err != nil {
 			s.metrics.incError(compactorOpPut)
 			return fmt.Errorf("valuecountscompactor: put %q: %w", key, err)

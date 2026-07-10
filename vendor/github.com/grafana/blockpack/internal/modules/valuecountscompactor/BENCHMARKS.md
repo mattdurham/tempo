@@ -10,7 +10,7 @@ SPEC-ROOT-009 — this file's own sequence, numbering from 1, independent of
 `internal/modules/valuecounts/BENCHMARKS.md`'s own separate `BENCH-VC-N` sequence). IDs are
 assigned in ascending order and never reused or renumbered.
 
-Next free ID: **BENCH-VC-3**.
+Next free ID: **BENCH-VC-4**.
 
 ---
 
@@ -86,3 +86,28 @@ per-record cost by more than ~20% — a growing gap between the two would indica
 itself is adding overhead disproportionate to the records it lets through.
 
 Back-ref: `internal/modules/valuecountscompactor/service_bench_test.go:BenchmarkMergeLevel_AtMaxRecordsPerMerge`.
+
+---
+
+## BENCH-VC-3: BenchmarkClusterByTimeRange — recommended, not yet implemented (issue #494)
+*Added: 2026-07-10*
+
+**Recommendation:** `clusterByTimeRange` now runs on every `compactColumn` call (once per level
+per column per compaction pass) — a strict behavioral upgrade from the prior lexicographic
+key-sort it replaced, since it also does a linear greedy-walk over the sorted slice. Given how
+much more frequently this executes relative to `mergeLevel` itself (every `compactColumn` call
+vs. only calls that actually admit a winning cluster), a dedicated benchmark at a few realistic
+per-level file counts (e.g. 10, 100, 1000 files) was recommended (plan.md Step A6.8) to confirm
+the sort+walk cost stays negligible relative to `mergeLevel`'s own per-merge cost (BENCH-VC-1/
+BENCH-VC-2) at realistic scale.
+
+**Status: not yet implemented.** No `BenchmarkClusterByTimeRange` exists in this package as of
+this spec-doc pass (verified via `grep -rn "^func Benchmark"` across this module — only
+`BenchmarkMergeLevel`/`BenchmarkMergeLevel_AtMaxRecordsPerMerge` exist). This is flagged as an
+open follow-up rather than silently marked done — `clusterByTimeRange`'s own algorithmic
+complexity is `O(n log n)` (the sort) `+ O(n)` (the greedy walk) per call, which is unlikely to
+dominate `mergeLevel`'s decode/`Compact`/encode cost at the file counts `CompactThresholdFiles`
+realistically triggers on, but this has not been empirically confirmed via benchmark.
+
+Back-ref: `internal/modules/valuecountscompactor/cluster.go:clusterByTimeRange`. `SPECS.md`
+SPEC-VC-3.

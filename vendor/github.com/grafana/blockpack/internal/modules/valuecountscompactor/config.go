@@ -30,6 +30,11 @@ const (
 	// per-file sizes can let a byte-capped batch admit far more records than the byte number
 	// suggests. Estimate pending real dev-03 file-count/cardinality data.
 	DefaultMaxRecordsPerMerge = 3_000_000
+	// DefaultMaxTimeSpanPerMerge bounds the wall-clock width [minSec,maxSec] a single cluster
+	// of same-level files may span before compactColumn splits it into a separate cluster
+	// (issue #494). 24h is a conservative starting default pending real tuning data from
+	// production query-window/retention observation — see NOTES.md.
+	DefaultMaxTimeSpanPerMerge uint64 = 24 * 60 * 60 // 86400 seconds
 )
 
 // Config configures the value-counts compactor. It maps to the optional
@@ -68,6 +73,13 @@ type Config struct {
 	// single mergeLevel call, independent of CompactBatchBytes' compressed-byte
 	// cap. Defaults to DefaultMaxRecordsPerMerge when <= 0.
 	MaxRecordsPerMerge int `yaml:"max_records_per_merge"`
+	// MaxTimeSpanPerMerge bounds the wall-clock time span [minSec,maxSec] a single
+	// time-cluster of same-level candidate files may span before compactColumn splits it into
+	// a separate cluster (issue #494). Defaults to DefaultMaxTimeSpanPerMerge when 0 — this
+	// differs from clusterByTimeRange's own pure-function "0 means no cap" semantics, since no
+	// production code path can invoke clusterByTimeRange with 0 after withDefaults runs; see
+	// clusterByTimeRange's doc comment.
+	MaxTimeSpanPerMerge uint64 `yaml:"max_time_span_per_merge"`
 	// Enabled turns the compactor on. When false the service does nothing.
 	Enabled bool `yaml:"enabled"`
 	// ShardCount is the total number of compactor replicas sharing work. When > 1
@@ -95,6 +107,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.MaxRecordsPerMerge <= 0 {
 		c.MaxRecordsPerMerge = DefaultMaxRecordsPerMerge
+	}
+	if c.MaxTimeSpanPerMerge == 0 {
+		c.MaxTimeSpanPerMerge = DefaultMaxTimeSpanPerMerge
 	}
 	return c
 }

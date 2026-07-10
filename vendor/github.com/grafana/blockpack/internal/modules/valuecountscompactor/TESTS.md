@@ -11,7 +11,7 @@ SPEC-ROOT-009 — this file's own sequence, numbering from 1, independent of
 `internal/modules/valuecounts/TESTS.md`'s own separate `TEST-VC-N` sequence). IDs are assigned
 in ascending order and never reused or renumbered.
 
-Next free ID: **TEST-VC-25**.
+Next free ID: **TEST-VC-30**.
 
 ---
 
@@ -396,3 +396,154 @@ cap.
 **Spec invariants tested:** SPEC-VC-2 (progress floor, `compactColumn` side).
 
 Back-ref: `internal/modules/valuecountscompactor/service_internal_test.go:TestCompactColumn_BatchBytesCap_FirstFileAloneExceedsCap`.
+
+
+---
+
+## TEST-VC-25: cluster_test.go — clusterByTimeRange greedy-walk clustering
+*Added: 2026-07-10*
+
+**Scenario:** Locks in SPEC-VC-3's `clusterByTimeRange` contract: overlapping files form one
+cluster, a time gap exceeding `maxSpan` splits into disjoint clusters, `maxSpan == 0` means no
+cap, every file appears in exactly one output cluster (never split or dropped), a single
+wide-range file always forms its own singleton cluster, cluster ordering is deterministic
+regardless of input order, and the `candMax-candMin` subtraction never underflows on a
+caller-supplied reversed-range `levelFile` (issue #494; the underflow guard is task #100's fix).
+
+**Setup/Assertions (`cluster_test.go`):**
+
+- `TestClusterByTimeRange_EmptyInput` — `clusterByTimeRange(nil, 100)` returns empty.
+- `TestClusterByTimeRange_SingleClusterWhenAllOverlap` — 3 files with overlapping
+  `[minSec,maxSec]` ranges within a generous `maxSpan=1000` produce exactly 1 cluster of 3.
+- `TestClusterByTimeRange_SplitsIntoDisjointClusters` — 2 nearby files plus 1 file ~10000s away,
+  `maxSpan=100` — produces 2 clusters (sizes 2 and 1); the lone file is isolated.
+- `TestClusterByTimeRange_ZeroMaxSpanMeansNoCap` — 3 wildly-separated files (0, ~100000,
+  ~999999999) with `maxSpan=0` — produces exactly 1 cluster of all 3 (pure-function-only
+  behavior; no production caller can reach `maxSpan=0` since `Config.withDefaults()` never
+  leaves `MaxTimeSpanPerMerge` at 0).
+- `TestClusterByTimeRange_NoFileSplitAcrossClusters` — 50 randomly-generated files
+  (seeded RNG), `maxSpan=100`. Asserts every input file's key appears in exactly one output
+  cluster and the total file count across all clusters equals the input count.
+- `TestClusterByTimeRange_SingleWideFileAlwaysFormsItsOwnCluster` — one file spanning
+  `[0, 1_000_000]` with `maxSpan=100` forms a singleton cluster (a single file's own span, even
+  if it alone exceeds `maxSpan`, is never rejected or split — there is nothing to split it
+  against).
+- `TestClusterByTimeRange_DeterministicOrderingOnEqualRanges` — 3 files sharing an identical
+  `[10,20]` range are fed in two different input orderings; asserts byte-identical cluster
+  output both times, with files ordered `a, b, c` (the `key` tiebreak in `clusterByTimeRange`'s
+  own sort).
+- `TestClusterByTimeRange_ReversedRangeFileDoesNotUnderflow` — a `levelFile{minSec: 500, maxSec:
+  100}` (reversed range, which cannot occur via `valuecounts.ParseFilenameV2` in production but
+  is a caller precondition this pure function must not assume) is fed alongside a well-formed
+  file. Asserts `clusterByTimeRange` does not panic and every input file still appears in the
+  output (total count preserved) — the regression guard for task #100's finding.
+
+**Spec invariants tested:** SPEC-VC-3.
+
+Back-ref: `internal/modules/valuecountscompactor/cluster_test.go`. Issue #494, task A3/#93; guard
+test added by fix task #100.
+
+---
+
+## TEST-VC-26: cluster_test.go — pickCluster tie-break rule
+*Added: 2026-07-10*
+
+**Scenario:** Locks in SPEC-VC-3's `pickCluster` contract (Design Decision 1): the cluster with
+the most files wins outright; a tie on file count is broken by the smallest (earliest) `minSec`
+across the tied clusters (issue #494).
+
+**Setup/Assertions (`cluster_test.go`):**
+
+- `TestPickCluster_MostFilesWins` — 3 clusters of sizes 1, 3, 2; asserts the 3-file cluster is
+  chosen regardless of its position in the input or its `minSec` values.
+- `TestPickCluster_TiesBrokenByEarliestWallMinSec` — 2 clusters, both size 2, one starting at
+  `minSec=5000` and the other at `minSec=1000`; asserts the earlier-starting (`minSec=1000`)
+  cluster wins.
+- `TestPickCluster_EmptyInput` — `pickCluster(nil)` returns `nil`.
+
+**Spec invariants tested:** SPEC-VC-3.
+
+Back-ref: `internal/modules/valuecountscompactor/cluster_test.go`. Issue #494, task A3/#93.
+
+---
+
+## TEST-VC-27: compactColumn cluster-selection integration (service_internal_test.go)
+*Added: 2026-07-10*
+
+**Scenario:** Locks in SPEC-VC-3's end-to-end `compactColumn` behavior: only the winning
+cluster is merged while a disjoint cluster is left untouched even if it also meets the
+threshold; the threshold gate applies to the winning cluster's own file count, not the level's
+raw total; `CompactBatchBytes` trims only within the chosen cluster; and a legitimate v1-format
+file is left completely untouched rather than merged or corrupted (issue #494, R2/R4).
+
+**Setup/Assertions (`service_internal_test.go`):**
+
+- `TestCompactColumn_ClusterSelection_OnlyOverlappingClusterMerged` — two disjoint 2-file
+  clusters (`minSec` ~0 and ~100000, `MaxTimeSpanPerMerge=100`) both individually meet
+  `CompactThresholdFiles=2`. Asserts `compactColumn` merges exactly one cluster (the
+  earliest-starting, per `pickCluster`'s tie-break) and leaves the other cluster's files in
+  place untouched.
+- `TestCompactColumn_WinningClusterBelowThreshold_SkipsLevel` — 4 widely-separated (>100s apart,
+  `MaxTimeSpanPerMerge=100`) singleton 1-file clusters, `CompactThresholdFiles=2`. Asserts
+  `compactColumn` returns `merged=false` and performs no merge — the level's raw total (4) meets
+  the threshold but no single cluster does.
+- `TestCompactColumn_BatchBytesCapAppliesWithinChosenCluster` — a 4-file overlapping winning
+  cluster (100 bytes each) plus a disjoint 1-file cluster far away in time, `CompactBatchBytes=
+  250` (caps the winning cluster to fewer than 4 files). Asserts the winning cluster is trimmed
+  by the byte cap while the disjoint cluster's file is untouched regardless of the cap.
+- `TestCompactColumn_V1FormatFilesAreSkippedNotMerged` — 3 legitimate v1-format files (written
+  via `valuecounts.FormatFilename`, pre-#494 shape) alongside 2 v2-format files meeting the
+  threshold. Asserts the v2 files are merged normally while the v1 files remain completely
+  untouched (not deleted, not corrupted) and increment `filesSkipped` — the mandatory R4
+  no-backward-compat regression guard.
+
+**Spec invariants tested:** SPEC-VC-3.
+
+Back-ref: `internal/modules/valuecountscompactor/service_internal_test.go`. Issue #494, task
+A4/#95.
+
+---
+
+## TEST-VC-28: TestMergeLevel_OutputUsesFormatFilenameV2WithGenuineRange
+*Added: 2026-07-10*
+
+**Scenario:** Locks in SPEC-VC-1's updated output-filename rule: `mergeLevel` writes its merged
+output using `valuecounts.FormatFilenameV2` with the genuine `valuecounts.TimeRange`-scanned
+range across all merged records — not one input's own range, and not the last-sorted input's
+range (issue #494, R3). The fixture is deliberately adversarial on the same axis as `valuecounts`
+TEST-VC-10: records are sorted by `(ColumnName, TimeStart, ...)` before the scan, so the fixture
+gives the SMALLER-`TimeStart` (first-sorted) input the WIDER `TimeEnd` — a naive "return the
+last-sorted record's `TimeEnd`" implementation would wrongly report a narrower max.
+
+**Setup (`service_test.go`):** two L0 inputs: `(TimeStart=0, TimeEnd=9999)` and
+`(TimeStart=200, TimeEnd=250)`.
+
+**Assertions:** exactly one output file exists; its filename parses via `ParseFilenameV2` to
+`WallMinSec=0, WallMaxSec=9999`; independently re-decoding the output and re-running
+`valuecounts.TimeRange` on the decoded records reproduces the same `(0, 9999)` pair, confirming
+the written filename matches the actual output content, not just the merge inputs.
+
+**Spec invariants tested:** SPEC-VC-1 (as updated), `valuecounts` SPEC-VC-7.
+
+Back-ref: `internal/modules/valuecountscompactor/service_test.go:TestMergeLevel_OutputUsesFormatFilenameV2WithGenuineRange`.
+Issue #494, task A4/#95; fixture corrected by fix task #101 (the original fixture did not
+actually reach the non-monotonic-`TimeEnd` regression it claimed to guard — see NOTES.md).
+
+---
+
+## TEST-VC-29: TestConfig_WithDefaults_MaxTimeSpanPerMerge
+*Added: 2026-07-10*
+
+**Scenario:** `Config.withDefaults()` fills `MaxTimeSpanPerMerge` with
+`DefaultMaxTimeSpanPerMerge` (86400s) when unset (`0`), and preserves an explicitly-set value
+otherwise — same `<=0`-or-`0`-means-default convention as every other numeric knob in `Config`
+(issue #494).
+
+**Assertions:** `Config{}.withDefaults().MaxTimeSpanPerMerge == DefaultMaxTimeSpanPerMerge`;
+`Config{MaxTimeSpanPerMerge: 3600}.withDefaults().MaxTimeSpanPerMerge == 3600`.
+
+**Spec invariants tested:** SPEC-VC-3 (the config knob `clusterByTimeRange` is driven by in
+production).
+
+Back-ref: `internal/modules/valuecountscompactor/config_test.go:TestConfig_WithDefaults_MaxTimeSpanPerMerge`.
+Issue #494, task A5/#94.

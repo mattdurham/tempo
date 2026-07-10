@@ -367,7 +367,16 @@ tempo `cube_backfill.go:buildVCNTSection` lists+downloads the `.vcnt` files unde
 `unique_values/<colHash>/` prefix (through the shared `cachingStore`-wrapped `minioVIStore`, issue
 #478) and calls this to build the section `maybeCreateCube` hands to `TryCreate`. VCNT filenames carry
 no embedded time range (unlike VI files), so all of a column's files are fetched and the query window
-is applied at the record level by the gate's `ValuesInRange` decode.
+is applied at the record level by the gate's `ValuesInRange` decode. **[Superseded by NOTE-VC-017,
+issue #494, 2026-07-10]** — VCNT filenames now DO carry a genuine embedded time range
+(`FormatFilenameV2`/`ParseFilenameV2`, once the three-part deployment described in NOTE-VC-017
+lands together: this blockpack change, tempo's L0-writer switch, and the full VCNT data wipe).
+This sentence is left as written for historical accuracy about `VCNTBuildSectionFromObjects`'s
+original design constraint (2026-07-06); that function itself is unaffected by #494's filename
+change — it still fetches and decodes whatever files exist under the prefix and does not filter
+by the filename-embedded range, so its own "fetch everything, filter at record level" behavior is
+unchanged even though the underlying files it fetches now happen to carry more metadata in their
+names.
 
 **Addendum (2026-07-07, go-presubmit Fix 4):** the skip-on-error design above is unchanged, but it
 previously gave zero operator visibility into how many objects were skipped, unlike the sibling
@@ -564,3 +573,70 @@ single pass as the minute-bucket sum, avoiding a full per-value map for a query 
 one value).
 
 Back-refs: `SelectivityPerMinute`, `MinuteCount` in perminute.go. Issue #487, task C1.
+
+---
+
+## NOTE-VC-017 — VCNT filenames now embed a genuine wall-clock time range (issue #494)
+
+Date: 2026-07-10
+
+### Why
+
+`valuecountscompactor`'s prior file-selection strategy only understood compaction level
+(`L<level>-<id>.vcnt`, v1) — it could group same-level files for merging but had no way to
+prefer merging files whose time ranges actually overlap or sit close together, since the
+filename carried no time information and decoding every candidate file just to inspect its
+range would defeat the point of a cheap, listing-time selection strategy. Issue #494 asked for
+compaction to actually merge files with overlapping/similar time ranges, which requires that
+range to be visible without a decode.
+
+### What was added
+
+- **`FormatFilenameV2`/`ParseFilenameV2`** (`filename.go`): a strict, 4-dash-part filename shape
+  `L<level>-<wallMinSec>-<wallMaxSec>-<id>.vcnt` that embeds the file's `[min TimeStart, max
+  TimeEnd]` range directly in the object key. See `SPECS.md` SPEC-VC-7 for the full contract,
+  including the "no v1 fallback" parsing rule and the `wallMinSec > wallMaxSec` rejection.
+- **`TimeRange(records []Record) (minSec, maxSec uint64)`** (`timerange.go`, new file): computes
+  the genuine range via a full `O(n)` scan, deliberately never assuming `TimeEnd` is
+  sort-order-monotonic (NOTE-VC-002) — factored into this shared package rather than duplicated
+  in `valuecountscompactor` and tempo's `vcntwriter.go` so the non-monotonicity correctness
+  property is proven once (`TestTimeRange_MaxTimeEndNotLastSortedRecord`) and reused by both real
+  call sites.
+- **Root-package re-exports** (`vcnt.go`, task A-2/#92): `VCNTFormatFilenameV2`,
+  `VCNTFileMeta` (alias for `FileMeta`), `VCNTParseFilenameV2`, `VCNTRecordTimeRange`, and
+  `VCNTObjectKeyV2` (the v2 analog of the existing `VCNTObjectKey`, building the full S3 key from
+  tenant/indexPrefix/column/id plus the new range parameters) — added under the blanket
+  public-API change permission already in effect for this pipeline (NOTE-VC-015).
+- **`valuecountscompactor`'s `compactColumn`/`mergeLevel` switched to v2 exclusively** — see that
+  module's own new dated NOTE for the clustering design built on top of this filename change
+  (`valuecountscompactor/NOTES.md`, new entry) and `SPECS.md` SPEC-VC-3.
+
+### The three-things-must-land-together constraint — no gradual/mixed-format transition
+
+This filename change has **zero backward-compatibility code by design** (this project's standing
+no-backward-compat directive): `ParseFilenameV2` treats a v1-shaped filename as a plain parse
+error, with no fallback path to the old 2-part shape. This means three separate changes must land
+together as a single all-or-nothing deployment, not a staged rollout:
+
+1. **This blockpack change** — `valuecountscompactor` requires v2 filenames to select anything.
+2. **tempo's `vcntwriter.go` L0 writer switch** (Part B of #494, out of this repo's scope) — must
+   start producing v2 filenames, or every newly-written L0 file becomes invisible to the
+   compactor from the moment Part A deploys.
+3. **A full VCNT data wipe** (every existing `.vcnt` file, every tenant, every environment) — any
+   pre-existing v1-format file that survives the wipe does not get force-migrated or corrupted;
+   it simply sits permanently unparseable, and therefore permanently unmerged, by
+   `compactColumn`'s `ParseFilenameV2` parse loop (see `valuecountscompactor` NOTES.md's own new
+   entry for the full straggler-file safety argument).
+
+There is no intermediate state where some files are v1 and some v2 within the same deployment —
+by design, per this project's no-backward-compat directive, not an oversight.
+
+Back-refs: `internal/modules/valuecounts/filename.go` (`FormatFilenameV2`, `ParseFilenameV2`,
+`FileMeta`), `internal/modules/valuecounts/timerange.go` (`TimeRange`), `vcnt.go`
+(`VCNTFormatFilenameV2`, `VCNTParseFilenameV2`, `VCNTFileMeta`, `VCNTRecordTimeRange`,
+`VCNTObjectKeyV2`). `SPECS.md` SPEC-VC-7. Tests: `filename_v2_test.go`, `timerange_test.go` — see
+`TESTS.md` TEST-VC-9/TEST-VC-10. Supersedes the "VCNT filenames carry no embedded time range"
+statement in NOTE-VC-012 (which remains, marked superseded, for historical accuracy about
+`VCNTBuildSectionFromObjects`'s original 2026-07-06 design constraint). See
+`valuecountscompactor/NOTES.md`'s own new dated entry for the clustering algorithm built on top
+of this filename change, and its `SPECS.md` SPEC-VC-3.
