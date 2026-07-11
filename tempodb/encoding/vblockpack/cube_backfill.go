@@ -226,6 +226,68 @@ numeric:
 	return string(b)
 }
 
+// runCubeBackfillCore is launchBackfill/RunCubeBackfill's dependency-injected
+// core: constructs the CubeRegistry from objStore and runs the CubeBackfiller,
+// persisting progress via CubeRegistry.UpdateWatermarks on EVERY successful
+// progressFn callback, not just on Done (R9 -- go-presubmit.md/review.md's
+// #496-planning-time finding: launchBackfill/RunCubeBackfill's progressFn
+// previously only logged, so a backfill pass never itself advanced the
+// registry; the watermark only ever moved later, incidentally, via a
+// subsequent compaction pass calling this SAME UpdateWatermarks method).
+// Mirrors vi_backfill.go's runViBackfillCore split so this is unit-testable
+// against fakes without a live S3/minio server (cube_backfill.go previously
+// had no test coverage at all — the exact R9 gap this closes).
+//
+// Unlike VI's BackfillProgress (whose LastError field is effectively unused —
+// BackfillEngine.Run/processBlocks return real errors directly, never via
+// progressFn), cube's own Backfiller.Run calls progressFn on a per-minute
+// processMinute failure too (LastError set, Watermark.WatermarkMinute left at
+// the prior, already-covered boundary) and continues to the next older
+// minute rather than aborting. Persisting on that call would be a genuine
+// no-op at best (the reported minute was already covered by an earlier
+// successful call) and a false completeness claim at worst (if it was the
+// very first call, before anything was ever covered) — so persistence here is
+// gated on prog.LastError == nil, persisting exactly the single minute
+// [wm.WatermarkMinute, wm.WatermarkMinute] that call's real work newly
+// covered; CubeRegistry.UpdateWatermarks' own min-of-mins/max-of-maxes
+// expansion (registry.go) accumulates these into the run's full covered
+// range as newest-to-oldest processing proceeds.
+func runCubeBackfillCore(
+	ctx context.Context,
+	entry blockpack.CubeRegistryEntry,
+	src blockpack.CubeValueIndexSource,
+	objStore blockpack.CubeObjectStore,
+	cfg blockpack.CubeBackfillConfig,
+) error {
+	registry := blockpack.NewCubeRegistry(objStore, entry.Tenant)
+	bf := blockpack.NewCubeBackfiller(entry, src, cfg)
+	return bf.Run(ctx, 0, func(prog blockpack.CubeBackfillProgress) error {
+		if prog.LastError == nil {
+			wm := prog.Watermark
+			if uwErr := registry.UpdateWatermarks(
+				ctx, entry.CubeID, blockpack.CubeRollupL0, wm.WatermarkMinute, wm.WatermarkMinute,
+			); uwErr != nil {
+				// A persist failure aborts the run rather than continuing to spend
+				// backfill I/O the registry cannot yet account for (R7's VI precedent,
+				// applied here too): mirrors runViBackfillCore's identical posture.
+				level.Warn(util_log.Logger).Log(
+					"msg", "vblockpack: cube backfill: watermark persist failed",
+					"tenant", entry.Tenant, "cube_id", entry.CubeID, "err", uwErr,
+				)
+				return uwErr
+			}
+		}
+		if prog.Watermark.Done {
+			level.Info(util_log.Logger).Log(
+				"msg", "vblockpack: cube backfill complete",
+				"tenant", entry.Tenant,
+				"cube_id", entry.CubeID,
+			)
+		}
+		return nil
+	})
+}
+
 // launchBackfill starts a background goroutine that backfills a newly-created cube
 // from the value index, reading VI files newest→oldest for the configured window.
 func launchBackfill(entry blockpack.CubeRegistryEntry) {
@@ -238,12 +300,12 @@ func launchBackfill(entry blockpack.CubeRegistryEntry) {
 		indexPrefix: defaultValueIndexPref,
 	}
 	store := &s3ObjectPutter{client: cqp.client, bucket: cqp.bucket}
+	objStore := &minioObjectStore{client: cqp.client, bucket: cqp.bucket}
 	cfg := blockpack.CubeBackfillConfig{
 		Store:         store,
 		Workers:       4,
 		WindowMinutes: 60 * 24 * 7, // 7 days
 	}
-	bf := blockpack.NewCubeBackfiller(entry, src, cfg)
 
 	go func() {
 		level.Info(util_log.Logger).Log(
@@ -251,17 +313,7 @@ func launchBackfill(entry blockpack.CubeRegistryEntry) {
 			"tenant", entry.Tenant,
 			"cube_id", entry.CubeID,
 		)
-		err := bf.Run(context.Background(), 0, func(prog blockpack.CubeBackfillProgress) error {
-			if prog.Watermark.Done {
-				level.Info(util_log.Logger).Log(
-					"msg", "vblockpack: cube backfill complete",
-					"tenant", entry.Tenant,
-					"cube_id", entry.CubeID,
-				)
-			}
-			return nil
-		})
-		if err != nil {
+		if err := runCubeBackfillCore(context.Background(), entry, src, objStore, cfg); err != nil {
 			level.Warn(util_log.Logger).Log(
 				"msg", "vblockpack: cube backfill error",
 				"tenant", entry.Tenant,
@@ -297,19 +349,13 @@ func RunCubeBackfill(ctx context.Context, entry blockpack.CubeRegistryEntry, s3c
 		indexPrefix: defaultValueIndexPref,
 	}
 	store := &s3ObjectPutter{client: client, bucket: s3cfg.Bucket}
+	objStore := &minioObjectStore{client: client, bucket: s3cfg.Bucket}
 	cfg := blockpack.CubeBackfillConfig{
 		Store:         store,
 		Workers:       4,
 		WindowMinutes: 60 * 24 * 7,
 	}
-	bf := blockpack.NewCubeBackfiller(entry, src, cfg)
-	err = bf.Run(ctx, 0, func(prog blockpack.CubeBackfillProgress) error {
-		if prog.Watermark.Done {
-			level.Info(util_log.Logger).Log("msg", "vblockpack: cube backfill complete",
-				"tenant", entry.Tenant, "cube_id", entry.CubeID)
-		}
-		return nil
-	})
+	err = runCubeBackfillCore(ctx, entry, src, objStore, cfg)
 	if err != nil && !errors.Is(err, ctx.Err()) {
 		level.Warn(util_log.Logger).Log("msg", "vblockpack: cube backfill error",
 			"tenant", entry.Tenant, "cube_id", entry.CubeID, "err", err)
