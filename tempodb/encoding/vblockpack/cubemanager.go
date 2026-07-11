@@ -62,8 +62,7 @@ type minioObjectStore struct {
 func (s *minioObjectStore) Get(ctx context.Context, path string) ([]byte, string, error) {
 	obj, err := s.client.GetObject(ctx, s.bucket, path, minio.GetObjectOptions{})
 	if err != nil {
-		resp := minio.ToErrorResponse(err)
-		if resp.Code == minioNoSuchKeyCode || resp.StatusCode == 404 {
+		if isMinioNoSuchKey(err) {
 			// bonus fix (mirrors #496's viusage.ErrNotFound fix, NOTE-VIUSAGE-10): must
 			// return blockpack.CubeErrNotFound (not a nil error) so cube.Registry.Load
 			// can distinguish a genuine miss from a real transient failure -- both
@@ -76,6 +75,13 @@ func (s *minioObjectStore) Get(ctx context.Context, path string) ([]byte, string
 	defer func() { _ = obj.Close() }()
 	data, err := io.ReadAll(obj)
 	if err != nil {
+		// minio-go's GetObject is lazy -- see isMinioNoSuchKey's doc comment
+		// (valueindex.go) for the full explanation; the real 404 for a nonexistent key
+		// surfaces here, not from GetObject itself, and needs the identical
+		// classification or the registry can never be created for a brand-new tenant.
+		if isMinioNoSuchKey(err) {
+			return nil, "", blockpack.CubeErrNotFound
+		}
 		return nil, "", err
 	}
 	info, err := s.client.StatObject(ctx, s.bucket, path, minio.StatObjectOptions{})

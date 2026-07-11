@@ -35,6 +35,21 @@ import (
 // vi_backfill.go).
 const minioNoSuchKeyCode = "NoSuchKey"
 
+// isMinioNoSuchKey reports whether err is minio's NoSuchKey/404 response, however it
+// surfaced. minio-go's GetObject is lazy: for a nonexistent key it returns a reader with
+// a nil error, and the real 404 only appears on the first Read from that reader (e.g.
+// inside io.ReadAll) -- an error from EITHER GetObject itself OR the first subsequent
+// read must be classified through this same check, since minio.ToErrorResponse works
+// identically regardless of which call actually triggered the underlying HTTP request.
+// A caller that only checks GetObject's own error (the natural but incomplete first
+// instinct) will misclassify every "genuinely missing object" case as a hard error
+// instead of blockpack.ErrNotFound/CubeErrNotFound, live-confirmed to silently prevent a
+// tenant's usage/cube registry from ever being created in the first place.
+func isMinioNoSuchKey(err error) bool {
+	resp := minio.ToErrorResponse(err)
+	return resp.Code == minioNoSuchKeyCode || resp.StatusCode == 404
+}
+
 // fileReaderProvider implements blockpack.ReaderProvider over an *os.File using
 // pread (ReadAt), so the value-index extractor can stream a freshly-written block
 // from its temp file without buffering the whole encoded block in memory.

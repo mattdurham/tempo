@@ -50,8 +50,7 @@ type viUsageObjectStore struct {
 func (s *viUsageObjectStore) Get(ctx context.Context, path string) ([]byte, string, error) {
 	obj, err := s.client.GetObject(ctx, s.bucket, path, minio.GetObjectOptions{})
 	if err != nil {
-		resp := minio.ToErrorResponse(err)
-		if resp.Code == minioNoSuchKeyCode || resp.StatusCode == 404 {
+		if isMinioNoSuchKey(err) {
 			// #496 go-presubmit.md CRITICAL fix: must return blockpack.ErrNotFound (not a
 			// nil error) so Registry.Load can distinguish a genuine miss from a real
 			// transient failure -- both previously had the identical (nil, "", ?) shape,
@@ -63,6 +62,18 @@ func (s *viUsageObjectStore) Get(ctx context.Context, path string) ([]byte, stri
 	defer func() { _ = obj.Close() }()
 	data, err := io.ReadAll(obj)
 	if err != nil {
+		// minio-go's GetObject is lazy: for a nonexistent key it returns a reader with a
+		// nil error, and the real 404 only surfaces here, on the first Read (empirically
+		// confirmed live: this branch was returning the raw, untranslated minio error
+		// "The specified key does not exist." on every tenant's first-ever registry
+		// access, which Registry.Load treated as a hard failure -- so the registry file
+		// was NEVER created, and no column ever crossed the trigger threshold, for the
+		// entire lifetime of any tenant that had not already had one created some other
+		// way). Apply the exact same NoSuchKey/404 classification as the GetObject error
+		// above.
+		if isMinioNoSuchKey(err) {
+			return nil, "", blockpack.ErrNotFound
+		}
 		return nil, "", err
 	}
 	info, statErr := s.client.StatObject(ctx, s.bucket, path, minio.StatObjectOptions{})
