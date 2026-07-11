@@ -111,6 +111,16 @@ func LeafColumns(prog *Program) []LeafColumnInfo {
 	return vibuilder.LeafColumns(prog)
 }
 
+// ColHash returns the 32-char lower-hex column-directory hash used in the value index's file
+// layout (the same hash valueindex.ColHash produces internally) — re-exported here so external
+// callers needing to call IndexFileCache.FilesForTimeRange directly (e.g. tempo's frontend-side
+// plan-time usage-recording check, RecordUsageIfNoIndexCoverage) can compute the lookup key
+// without importing blockpack's internal valueindex package. Mirrors ColTypeName's identical
+// re-export rationale (valueindex_usage.go).
+func ColHash(colName string) string {
+	return valueindex.ColHash(colName)
+}
+
 // BuildValueIndexSource assembles a SliceValueIndexSource for prog over the time
 // window [minSec, maxSec] using disc for cached file discovery and store for
 // downloads.

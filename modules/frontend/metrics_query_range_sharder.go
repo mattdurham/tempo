@@ -174,8 +174,9 @@ func (s queryRangeSharder) RoundTrip(pipelineRequest pipeline.Request) (pipeline
 	// this same condition and would discard any plan built here unused.
 	var plan *blockpack.QueryPlan
 	if req.Start != 0 && req.End != 0 {
+		dedicated := s.overrides.DedicatedColumns(tenantID)
 		var planErr error
-		plan, planErr = buildMetricsQueryPlan(ctx, s.rawR, tenantID, req.Query, req.Start/uint64(time.Second), req.End/uint64(time.Second), s.cfg.ConcurrentRequests)
+		plan, planErr = buildMetricsQueryPlan(ctx, s.rawR, tenantID, dedicated, req.Query, req.Start/uint64(time.Second), req.End/uint64(time.Second), s.cfg.ConcurrentRequests)
 		if planErr != nil {
 			// F-6 (issue #481 parts 2/3, R6): a resolvable-but-low-selectivity metrics query has
 			// no safe answer (R2: metrics is never bounded-served) — fail HERE, at plan time,

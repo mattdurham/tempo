@@ -11,9 +11,12 @@ import (
 	"errors"
 	"io"
 	"path"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/grafana/blockpack"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -143,21 +146,21 @@ func TestFetchVCNTSection_MissingDimYieldsNoCoverageNotError(t *testing.T) {
 }
 
 func TestBuildQueryPlan_NilRawReaderReturnsNilPlan(t *testing.T) {
-	plan, err := buildQueryPlan(context.Background(), nil, "tenant-a", `{ span.http.method = "GET" }`, 0, 200, 1000, false)
+	plan, err := buildQueryPlan(context.Background(), nil, "tenant-a", nil, `{ span.http.method = "GET" }`, 0, 200, 1000, false)
 	require.NoError(t, err)
 	require.Nil(t, plan)
 }
 
 func TestBuildQueryPlan_CompileFailureReturnsNilPlan(t *testing.T) {
 	rawR, _ := newLocalRawReadWriter(t)
-	plan, err := buildQueryPlan(context.Background(), rawR, "tenant-a", `{ not a valid traceql`, 0, 200, 1000, false)
+	plan, err := buildQueryPlan(context.Background(), rawR, "tenant-a", nil, `{ not a valid traceql`, 0, 200, 1000, false)
 	require.NoError(t, err)
 	require.Nil(t, plan)
 }
 
 func TestBuildQueryPlan_EmptyQueryReturnsNilPlan(t *testing.T) {
 	rawR, _ := newLocalRawReadWriter(t)
-	plan, err := buildQueryPlan(context.Background(), rawR, "tenant-a", "", 0, 200, 1000, false)
+	plan, err := buildQueryPlan(context.Background(), rawR, "tenant-a", nil, "", 0, 200, 1000, false)
 	require.NoError(t, err)
 	require.Nil(t, plan)
 }
@@ -177,7 +180,7 @@ func TestBuildQueryPlan_UnresolvableQueryReturnsNilPlanWithoutFetching(t *testin
 		vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 9}))
 
 	counting := &countingRawReader{RawReader: rawR}
-	plan, err := buildQueryPlan(context.Background(), counting, tenant, `{ span.http.method = "GET" }`, 0, 200, 1000, false)
+	plan, err := buildQueryPlan(context.Background(), counting, tenant, nil, `{ span.http.method = "GET" }`, 0, 200, 1000, false)
 	require.NoError(t, err)
 	require.Nil(t, plan, "an unresolvable query (no value-index reader configured) must short-circuit to a nil plan")
 	require.Equal(t, 0, counting.findCalls, "CheckIndexCoverage must be checked before any VCNT fetch I/O — zero Find calls expected")
@@ -301,7 +304,7 @@ func TestBuildQueryPlanFromProgram_LowSelectivityWithLimit_SelectsBoundedRecentF
 	writeVCNTObject(t, rawW, "span.http.method",
 		vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 900, "POST": 100}))
 
-	plan, err := buildQueryPlan(context.Background(), rawR, tenant,
+	plan, err := buildQueryPlan(context.Background(), rawR, tenant, nil,
 		`{ span.http.method = "GET" }`, 0, 200, 1000, true /* hasLimit */)
 	require.NoError(t, err)
 	require.NotNil(t, plan)
@@ -322,7 +325,7 @@ func TestBuildMetricsQueryPlanFromProgram_LowSelectivityWithoutLimit_NeverBounde
 	writeVCNTObject(t, rawW, "span.http.method",
 		vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 900, "POST": 100}))
 
-	plan, err := buildMetricsQueryPlan(context.Background(), rawR, tenant,
+	plan, err := buildMetricsQueryPlan(context.Background(), rawR, tenant, nil,
 		`{ span.http.method = "GET" } | rate()`, 0, 200, 1000)
 	require.Error(t, err, "a resolvable, LowSelectivity metrics query must plan-time-decline, not dispatch")
 	require.True(t, errors.Is(err, ErrPlanTimeLowSelectivityNoLimit))
@@ -342,7 +345,7 @@ func TestBuildQueryPlanFromProgram_UnknownSelectivity_WithLimit_SelectsBoundedRe
 	tenant := "tenant-a"
 	// No VCNT object written at all for this column — ClassifyProgramVCNT must read UnknownSelectivity.
 
-	plan, err := buildQueryPlan(context.Background(), rawR, tenant,
+	plan, err := buildQueryPlan(context.Background(), rawR, tenant, nil,
 		`{ span.http.method = "GET" }`, 0, 200, 1000, true /* hasLimit */)
 	require.NoError(t, err)
 	require.NotNil(t, plan)
@@ -361,7 +364,7 @@ func TestBuildQueryPlanFromProgram_UnknownSelectivity_WithoutLimit_StaysIndexOnl
 	rawR, _ := newLocalRawReadWriter(t)
 	tenant := "tenant-a"
 
-	plan, err := buildQueryPlan(context.Background(), rawR, tenant,
+	plan, err := buildQueryPlan(context.Background(), rawR, tenant, nil,
 		`{ span.http.method = "GET" }`, 0, 200, 1000, false /* hasLimit */)
 	require.NoError(t, err)
 	require.NotNil(t, plan)
@@ -434,7 +437,7 @@ func TestBuildQueryPlanFromProgram_AttachesQualificationOutcome(t *testing.T) {
 		writeVCNTObject(t, rawW, "span.http.method", vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 9}))
 
 		span := runWithSpan(t, func(ctx context.Context) {
-			plan, err := buildQueryPlan(ctx, rawR, "tenant-a", `{ span.http.method = "GET" }`, 0, 200, 1000, false)
+			plan, err := buildQueryPlan(ctx, rawR, "tenant-a", nil, `{ span.http.method = "GET" }`, 0, 200, 1000, false)
 			require.NoError(t, err)
 			require.Nil(t, plan)
 		})
@@ -450,7 +453,7 @@ func TestBuildQueryPlanFromProgram_AttachesQualificationOutcome(t *testing.T) {
 		writeVCNTObject(t, rawW, "span.http.method", vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 900, "POST": 100}))
 
 		span := runWithSpan(t, func(ctx context.Context) {
-			plan, err := buildQueryPlan(ctx, rawR, "tenant-a", `{ span.http.method = "GET" }`, 0, 200, 1000, false)
+			plan, err := buildQueryPlan(ctx, rawR, "tenant-a", nil, `{ span.http.method = "GET" }`, 0, 200, 1000, false)
 			require.Error(t, err)
 			require.Nil(t, plan)
 		})
@@ -466,7 +469,7 @@ func TestBuildQueryPlanFromProgram_AttachesQualificationOutcome(t *testing.T) {
 		writeVCNTObject(t, rawW, "span.http.method", vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 900, "POST": 100}))
 
 		span := runWithSpan(t, func(ctx context.Context) {
-			plan, err := buildMetricsQueryPlan(ctx, rawR, "tenant-a", `{ span.http.method = "GET" } | rate()`, 0, 200, 1000)
+			plan, err := buildMetricsQueryPlan(ctx, rawR, "tenant-a", nil, `{ span.http.method = "GET" } | rate()`, 0, 200, 1000)
 			require.Error(t, err)
 			require.Nil(t, plan)
 		})
@@ -485,7 +488,7 @@ func TestBuildQueryPlanFromProgram_AttachesQualificationOutcome(t *testing.T) {
 
 		var capturedPlan *blockpack.QueryPlan
 		span := runWithSpan(t, func(ctx context.Context) {
-			plan, err := buildQueryPlan(ctx, rawR, "tenant-a", `{ span.http.method = "POST" }`, 0, 200, 1000, false)
+			plan, err := buildQueryPlan(ctx, rawR, "tenant-a", nil, `{ span.http.method = "POST" }`, 0, 200, 1000, false)
 			require.NoError(t, err)
 			require.NotNil(t, plan)
 			capturedPlan = plan
@@ -524,7 +527,7 @@ func TestBuildQueryPlanFromProgram_AttachesLeadDetail(t *testing.T) {
 	writeVCNTObject(t, rawW, "span.http.method", vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 900, "POST": 100}))
 
 	ctx, span := tracer.Start(context.Background(), "test.caller")
-	plan, err := buildQueryPlan(ctx, rawR, "tenant-a", `{ span.http.method = "GET" }`, 0, 200, 1000, true)
+	plan, err := buildQueryPlan(ctx, rawR, "tenant-a", nil, `{ span.http.method = "GET" }`, 0, 200, 1000, true)
 	require.NoError(t, err)
 	require.NotNil(t, plan)
 	span.End()
@@ -561,7 +564,7 @@ func TestFetchVCNTFetch_EmitsChildSpanWithFileStats(t *testing.T) {
 	writeVCNTObject(t, rawW, "span.http.method",
 		vcntObj(t, "span.http.method", 120, map[string]int64{"GET": 2}))
 
-	plan, err := buildQueryPlan(context.Background(), rawR, "tenant-a", `{ span.http.method = "POST" }`, 0, 200, 1000, false)
+	plan, err := buildQueryPlan(context.Background(), rawR, "tenant-a", nil, `{ span.http.method = "POST" }`, 0, 200, 1000, false)
 	require.NoError(t, err)
 	require.NotNil(t, plan)
 
@@ -574,4 +577,140 @@ func TestFetchVCNTFetch_EmitsChildSpanWithFileStats(t *testing.T) {
 	bytesRead, ok := attrs["bytes.read"]
 	require.True(t, ok)
 	require.Positive(t, bytesRead.AsInt64())
+}
+
+// fakeFrontendUsageRecorder is this package's own local usageRecorder fake (the frontend
+// package cannot reuse vblockpack's unexported fakeUsageRecorder, which lives in a different
+// package) — installed via vblockpack.ConfigureViUsageRecorder, an unexported-interface-
+// parameter/exported-function pattern that is structurally satisfied across package
+// boundaries in Go, no test-only exported wrapper needed.
+type fakeFrontendUsageRecorder struct {
+	mu    sync.Mutex
+	calls []string // colName per call
+}
+
+func (f *fakeFrontendUsageRecorder) RecordUse(
+	_ context.Context, _, colName, _ string, _ time.Time,
+) (blockpack.TriggerResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, colName)
+	return blockpack.TriggerResult{}, nil
+}
+
+func (f *fakeFrontendUsageRecorder) columns() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cols := make([]string, len(f.calls))
+	copy(cols, f.calls)
+	return cols
+}
+
+// countingVIStoreFrontend wraps emptyVIStore, counting Size/ReadAt calls so a test can assert
+// the discovery-only mechanism contract: the frontend plan-time path must never download a
+// value-index file's content, only List it via IndexFileCache.FilesForTimeRange.
+type countingVIStoreFrontend struct {
+	emptyVIStore
+	sizeCalls, readAtCalls int
+}
+
+func (c *countingVIStoreFrontend) Size(key string) (int64, error) {
+	c.sizeCalls++
+	return c.emptyVIStore.Size(key)
+}
+
+func (c *countingVIStoreFrontend) ReadAt(key string, p []byte, off int64) (int, error) {
+	c.readAtCalls++
+	return c.emptyVIStore.ReadAt(key, p, off)
+}
+
+// TestBuildQueryPlanFromProgram_RecordsUsageForUncoveredNonDedicatedColumn drives the REAL
+// buildQueryPlan entry point with a genuinely uncovered, non-dedicated column, asserting the
+// configured frontend-side recorder fires for it — proving RecordUsageIfNoIndexCoverage is
+// actually reachable from buildQueryPlanFromProgram, not just correct in isolation.
+func TestBuildQueryPlanFromProgram_RecordsUsageForUncoveredNonDedicatedColumn(t *testing.T) {
+	rec := &fakeFrontendUsageRecorder{}
+	vblockpack.ConfigureViUsageRecorder(rec)
+	t.Cleanup(func() { vblockpack.ConfigureViUsageRecorder(nil) })
+
+	restore := vblockpack.ConfigureValueIndexQueryForTest(emptyVIStore{}, testIndexPrefix)
+	defer restore()
+
+	rawR, _ := newLocalRawReadWriter(t)
+	_, err := buildQueryPlan(context.Background(), rawR, "tenant-a", nil, `{ span.never.indexed.rec1 = "x" }`, 0, 200, 1000, false)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"span.never.indexed.rec1"}, rec.columns())
+}
+
+// TestBuildQueryPlanFromProgram_DedicatedColumnNeverRecorded: an otherwise-uncovered column
+// already declared dedicated must never be recorded, even though it would otherwise qualify.
+func TestBuildQueryPlanFromProgram_DedicatedColumnNeverRecorded(t *testing.T) {
+	rec := &fakeFrontendUsageRecorder{}
+	vblockpack.ConfigureViUsageRecorder(rec)
+	t.Cleanup(func() { vblockpack.ConfigureViUsageRecorder(nil) })
+
+	restore := vblockpack.ConfigureValueIndexQueryForTest(emptyVIStore{}, testIndexPrefix)
+	defer restore()
+
+	rawR, _ := newLocalRawReadWriter(t)
+	dedicated := backend.DedicatedColumns{{Scope: backend.DedicatedColumnScopeSpan, Name: "never.indexed.rec2"}}
+	_, err := buildQueryPlan(context.Background(), rawR, "tenant-a", dedicated, `{ span.never.indexed.rec2 = "x" }`, 0, 200, 1000, false)
+	require.NoError(t, err)
+
+	assert.Empty(t, rec.columns())
+}
+
+// TestBuildQueryPlanFromProgram_UsageRecordingNeverDownloadsContent is the mechanism-not-outcome
+// test proving the frontend-level call path is discovery-only, never downloading content.
+//
+// Deviates from plan.md's literal "covered case via mapListVIStore" framing: BuildValueIndexSource
+// (called by CheckIndexCoverage, which runs immediately AFTER RecordUsageIfNoIndexCoverage in the
+// same buildQueryPlanFromProgram call) genuinely downloads file content for any column with a
+// real, discoverable file (verified by reading vibuilder.BuildSource/lookupColumn/
+// queryKeysRanged) — so a "covered" scenario would show sizeCalls/readAtCalls > 0 from
+// CheckIndexCoverage's own, unrelated download, not from RecordUsageIfNoIndexCoverage, making the
+// assertion fail for reasons that have nothing to do with this task's correctness. An uncovered
+// scenario isolates the intended claim just as well: queryKeysRanged short-circuits to zero
+// downloads when FilesForTimeRange discovers no files at all, so this proves BOTH halves of the
+// plan-time path (the new call and the existing CheckIndexCoverage gate) are discovery-only end
+// to end for a column with nothing to fetch.
+func TestBuildQueryPlanFromProgram_UsageRecordingNeverDownloadsContent(t *testing.T) {
+	rec := &fakeFrontendUsageRecorder{}
+	vblockpack.ConfigureViUsageRecorder(rec)
+	t.Cleanup(func() { vblockpack.ConfigureViUsageRecorder(nil) })
+
+	counting := &countingVIStoreFrontend{}
+	restore := vblockpack.ConfigureValueIndexQueryForTest(counting, testIndexPrefix)
+	defer restore()
+
+	rawR, _ := newLocalRawReadWriter(t)
+	_, _ = buildQueryPlan(context.Background(), rawR, "tenant-a", nil, `{ span.never.indexed.rec3 = "x" }`, 0, 200, 1000, false)
+
+	assert.Equal(t, 0, counting.sizeCalls, "must never download a value-index file's content")
+	assert.Equal(t, 0, counting.readAtCalls, "must never download a value-index file's content")
+}
+
+// TestBuildQueryPlanFromProgram_RunsIndependentlyOfCheckIndexCoverageOutcome drives the exact
+// scenario the "Exact insertion point" correction exists to fix: a query mixing an unindexable
+// leaf on one column (forcing CheckIndexCoverage's AllLeavesIndexable gate to decline the WHOLE
+// query) with an indexable, genuinely-uncovered leaf on a DIFFERENT column — the second column
+// must still be recorded, proving RecordUsageIfNoIndexCoverage runs BEFORE, and independent of,
+// the CheckIndexCoverage early return.
+func TestBuildQueryPlanFromProgram_RunsIndependentlyOfCheckIndexCoverageOutcome(t *testing.T) {
+	rec := &fakeFrontendUsageRecorder{}
+	vblockpack.ConfigureViUsageRecorder(rec)
+	t.Cleanup(func() { vblockpack.ConfigureViUsageRecorder(nil) })
+
+	restore := vblockpack.ConfigureValueIndexQueryForTest(emptyVIStore{}, testIndexPrefix)
+	defer restore()
+
+	rawR, _ := newLocalRawReadWriter(t)
+	plan, err := buildQueryPlan(context.Background(), rawR, "tenant-a", nil,
+		`{ span.custom.attr != "x" && span.never.indexed.rec4 = "y" }`, 0, 200, 1000, false)
+	require.NoError(t, err)
+	require.Nil(t, plan, "CheckIndexCoverage must decline this mixed unindexable/indexable query")
+
+	assert.Contains(t, rec.columns(), "span.never.indexed.rec4",
+		"RecordUsageIfNoIndexCoverage must run before CheckIndexCoverage's early return, independent of its outcome")
 }

@@ -105,6 +105,17 @@ func (r *realUsageRecorder) RecordUse(
 // watermark-persist -> watermark cache -> back into the query path loop
 // closes end-to-end from this one call.
 //
+// KNOWN, ACCEPTED, PRE-EXISTING BEHAVIOR (not introduced or changed by the frontend-side
+// RecordUsageIfNoIndexCoverage call site): onShouldBackfill is wired unconditionally here, so
+// the first process -- querier OR frontend -- whose RecordUse call wins the trigger lease
+// launches BackfillEngine.Run's background goroutine IN THAT PROCESS. This was already true for
+// the frontend process before the frontend ever called into this hook (ConfigureViUsage runs
+// identically in both processes via tempodb.New/modules/storage), simply dormant because nothing
+// called RecordUseAndMaybeTrigger from frontend code. Team-lead ruling (2026-07-11): inherit
+// this as-is; the cross-process lease (SPEC-VIUSAGE-3) is the correctness boundary regardless of
+// which process launches the goroutine, bounded by updateEntryWithRetry's 5-attempt retry cap
+// (SPEC-VIUSAGE-4) rather than an unconditional guarantee. Do not add a disabling variant.
+//
 // enabled gates the WHOLE hook, not just Config.DedicatedColumnsEnabled's
 // internal no-op: when false, ConfigureViUsageRecorder is never called at
 // all, so viUsageRecorderPtr stays nil and every one of the 3 call sites'
@@ -232,6 +243,39 @@ func dedicatedColumnSet(dcs backend.DedicatedColumns) map[string]struct{} {
 	return set
 }
 
+// viUsageColInfo is one column's ALL-not-ANY indexability reduction over every leaf in a
+// program that references it, shared by recordUsageForDeclinedQuery and
+// RecordUsageIfNoIndexCoverage -- see reduceLeafColumnsAllIndexable's own doc comment for
+// the full rationale (mirrors AllLeavesIndexable/SPEC-QP-5's own aggregation rule).
+type viUsageColInfo struct {
+	colType      blockpack.ColumnType
+	allIndexable bool
+}
+
+// reduceLeafColumnsAllIndexable reduces prog's blockpack.LeafColumns to one decision per
+// distinct column: allIndexable is true only when EVERY leaf referencing that column has an
+// indexable shape (ALL-not-ANY) -- see recordUsageForDeclinedQuery's own doc comment
+// (unchanged) for the full negation-safety rationale this exists to preserve. order
+// preserves first-seen column order so callers iterate deterministically.
+func reduceLeafColumnsAllIndexable(prog *blockpack.Program) (order []string, byCol map[string]viUsageColInfo) {
+	byCol = make(map[string]viUsageColInfo)
+	order = make([]string, 0)
+	for _, lc := range blockpack.LeafColumns(prog) {
+		info, ok := byCol[lc.Column]
+		if !ok {
+			order = append(order, lc.Column)
+			info = viUsageColInfo{allIndexable: true}
+		}
+		if !lc.Indexable {
+			info.allIndexable = false
+		} else if info.colType == 0 {
+			info.colType = lc.ColType
+		}
+		byCol[lc.Column] = info
+	}
+	return order, byCol
+}
+
 // recordUsageForDeclinedQuery is the shared R3 decision function for all 3 call sites.
 // For every column blockpack.LeafColumns finds leaves for in prog, it records a use IFF:
 //   - EVERY leaf referencing that column has an indexable shape (ALL-not-ANY, mirroring
@@ -261,35 +305,7 @@ func recordUsageForDeclinedQuery(
 	if rec == nil {
 		return
 	}
-
-	// Reduce ALL-not-ANY per column, mirroring AllLeavesIndexable/SPEC-QP-5's own
-	// aggregation rule: TraceQL's `!=` compiles to a RequirePresent-only leaf ANDed
-	// with an OR-of-two-ranges leaf on the SAME column (see the T5b
-	// TestQualification_MixedIndexableAndNegatedLeafForcesBlockSharded fixture) --
-	// naively recording on the first indexable OCCURRENCE would record this
-	// negated query anyway via its indexable sibling leaf, exactly the
-	// permanent-decline case R3 says must never be recorded. A column only
-	// qualifies if EVERY leaf referencing it is indexable.
-	type colInfo struct {
-		colType      blockpack.ColumnType
-		allIndexable bool
-	}
-	byCol := make(map[string]colInfo)
-	order := make([]string, 0)
-	for _, lc := range blockpack.LeafColumns(prog) {
-		info, ok := byCol[lc.Column]
-		if !ok {
-			order = append(order, lc.Column)
-			info = colInfo{allIndexable: true}
-		}
-		if !lc.Indexable {
-			info.allIndexable = false
-		} else if info.colType == 0 {
-			info.colType = lc.ColType
-		}
-		byCol[lc.Column] = info
-	}
-
+	order, byCol := reduceLeafColumnsAllIndexable(prog)
 	for _, col := range order {
 		info := byCol[col]
 		if !info.allIndexable {
@@ -303,6 +319,65 @@ func recordUsageForDeclinedQuery(
 			continue
 		}
 		colTypeName := blockpack.ColTypeName(info.colType)
+		_, _ = rec.RecordUse(ctx, tenant, col, colTypeName, now)
+	}
+}
+
+// RecordUsageIfNoIndexCoverage is the frontend plan-time counterpart to
+// recordUsageForDeclinedQuery: it checks each qualifying column's value-index file coverage
+// directly via the frontend process's own already-live IndexFileCache (discovery only, no
+// download) and records a "missing index" use on the frontend's own request-scoped ctx when
+// coverage is genuinely absent. This fixes the root cause that recordUsageForDeclinedQuery's
+// existing querier-side call sites run inside the querier's per-block Fetch/QueryRange, whose
+// ctx is starved/canceled before a slow registry conditional-PUT round-trip can complete.
+//
+// dedicated is the raw backend.DedicatedColumns the caller's RoundTrip already has (no
+// conversion needed at the call site) -- dedicatedColumnSet is built once, internally, since
+// modules/frontend cannot call the unexported helper itself.
+//
+// Reuses the SAME package-level viUsageRateLimit singleton recordUsageForDeclinedQuery uses:
+// a burst from both the frontend's call and the querier's own call for the same (tenant,
+// column) within the 10s window collapses via the same rate limiter only when both calls
+// happen to run in the SAME process; cross-process it is 2 independent rate limiters --
+// bounded double-cost only, never a correctness issue, per SPEC-VIUSAGE-3's lease mechanism.
+func RecordUsageIfNoIndexCoverage(
+	ctx context.Context,
+	tenant string,
+	prog *blockpack.Program,
+	dedicated backend.DedicatedColumns,
+	minSec, maxSec uint64,
+	now time.Time,
+) {
+	rec := getViUsageRecorder()
+	if rec == nil {
+		return
+	}
+	vr := getValueIndexQueryReader()
+	if vr == nil {
+		return
+	}
+	cache := vr.cacheFor(tenant)
+	dedicatedSet := dedicatedColumnSet(dedicated)
+
+	order, byCol := reduceLeafColumnsAllIndexable(prog)
+	for _, col := range order {
+		info := byCol[col]
+		if !info.allIndexable {
+			continue // R3: permanent decline -- negation/RequirePresent-only/multi-value
+		}
+		if _, ok := dedicatedSet[col]; ok {
+			continue // already forward-indexed
+		}
+		colTypeName := blockpack.ColTypeName(info.colType)
+		colHash := blockpack.ColHash(col)
+		files, err := cache.FilesForTimeRange(ctx, colHash, colTypeName, minSec, maxSec)
+		if err != nil || len(files) > 0 {
+			continue // discovery error, or genuine coverage: not a "missing index" signal
+		}
+		key := tenant + "|" + col
+		if !viUsageRateLimit.allow(key, now) {
+			continue
+		}
 		_, _ = rec.RecordUse(ctx, tenant, col, colTypeName, now)
 	}
 }

@@ -18,6 +18,7 @@ import (
 	"io"
 	"path"
 	"strings"
+	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -152,7 +153,7 @@ func splitObjectKey(fullKey string) (backend.KeyPath, string) {
 // which enforces per-query completeness against one block's real data, needs a *blockpack.Reader
 // and is unreachable from this block-independent plan-time call site).
 func buildQueryPlan(
-	ctx context.Context, rawR backend.RawReader, tenant, query string,
+	ctx context.Context, rawR backend.RawReader, tenant string, dedicated backend.DedicatedColumns, query string,
 	minTS, maxTS uint64, concurrentRequests int, hasLimit bool,
 ) (*blockpack.QueryPlan, error) {
 	if rawR == nil || query == "" {
@@ -162,7 +163,7 @@ func buildQueryPlan(
 	if err != nil || prog == nil {
 		return nil, nil
 	}
-	return buildQueryPlanFromProgram(ctx, rawR, tenant, prog, minTS, maxTS, concurrentRequests, true, hasLimit)
+	return buildQueryPlanFromProgram(ctx, rawR, tenant, dedicated, prog, minTS, maxTS, concurrentRequests, true, hasLimit)
 }
 
 // buildMetricsQueryPlan is buildQueryPlan's metrics sibling (holistic-review Issue 2/B): a real
@@ -186,7 +187,7 @@ func buildQueryPlan(
 // keep an unsupported metrics shape on the safe, working block-sharded path instead of it
 // depending on a typed error the user would otherwise see.
 func buildMetricsQueryPlan(
-	ctx context.Context, rawR backend.RawReader, tenant, query string,
+	ctx context.Context, rawR backend.RawReader, tenant string, dedicated backend.DedicatedColumns, query string,
 	minTS, maxTS uint64, concurrentRequests int,
 ) (*blockpack.QueryPlan, error) {
 	if rawR == nil || query == "" {
@@ -198,7 +199,7 @@ func buildMetricsQueryPlan(
 	}
 	// boundedEligible=false (R2: metrics is never bounded-served); hasLimit is irrelevant on
 	// this path and unused by buildQueryPlanFromProgram's boundedEligible=false branch.
-	return buildQueryPlanFromProgram(ctx, rawR, tenant, prog, minTS, maxTS, concurrentRequests, false, false)
+	return buildQueryPlanFromProgram(ctx, rawR, tenant, dedicated, prog, minTS, maxTS, concurrentRequests, false, false)
 }
 
 // buildQueryPlanFromProgram is the shared tail buildQueryPlan/buildStructuralQueryPlan (search,
@@ -220,8 +221,8 @@ func buildMetricsQueryPlan(
 // pass it as false and it is never read on the boundedEligible=false branch, since R2 already
 // forecloses metrics ever reaching DispatchBoundedRecentFirst regardless of a limit.
 func buildQueryPlanFromProgram(
-	ctx context.Context, rawR backend.RawReader, tenant string, prog *blockpack.Program,
-	minTS, maxTS uint64, concurrentRequests int, boundedEligible, hasLimit bool,
+	ctx context.Context, rawR backend.RawReader, tenant string, dedicated backend.DedicatedColumns,
+	prog *blockpack.Program, minTS, maxTS uint64, concurrentRequests int, boundedEligible, hasLimit bool,
 ) (*blockpack.QueryPlan, error) {
 	// issue #493 Task 4a/4b: attach qualification/plan attributes to whatever span is already
 	// active on ctx — this function has no span of its own; ctx is the SAME ctx
@@ -230,6 +231,17 @@ func buildQueryPlanFromProgram(
 	// span directly, with zero signature changes needed to thread a span parameter through 3 call
 	// sites (buildQueryPlan/buildStructuralQueryPlan/buildMetricsQueryPlan all tail-call here).
 	span := trace.SpanFromContext(ctx)
+
+	// Root-cause fix (issue #496 follow-up): record on the frontend's own long-lived ctx,
+	// independent of whatever CheckIndexCoverage decides below — a query can be overall
+	// shape-indexable while one specific leaf column genuinely has zero VI files, and
+	// CheckIndexCoverage's early return below must not suppress recording for the (more
+	// common) fully-uncovered case. The querier's own recordUsageForDeclinedQuery call sites
+	// (value_index_query.go, value_index_structural_query.go, backend_block.go) remain
+	// untouched as a backstop; this call fixes the root cause that those run inside the
+	// querier's per-block Fetch/QueryRange, whose ctx is starved/canceled before a slow
+	// registry conditional-PUT round-trip can complete.
+	vblockpack.RecordUsageIfNoIndexCoverage(ctx, tenant, prog, dedicated, minTS, maxTS, time.Now())
 
 	// (Issue 4/holistic-review fix E) Check resolvability BEFORE any VCNT fetch I/O.
 	// allLeavesResolvable is BuildQueryPlan's ONLY gate on Strategy (see its own doc comment):

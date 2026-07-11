@@ -34,7 +34,7 @@ import (
 // left leg (match-all anchor, `{} >> {...}`) declines: there is no reasonable way to VI-discover
 // "every trace" from the search index without defeating the point of the index-driven path.
 func buildStructuralQueryPlan(
-	ctx context.Context, rawR backend.RawReader, tenant, query string,
+	ctx context.Context, rawR backend.RawReader, tenant string, dedicated backend.DedicatedColumns, query string,
 	minTS, maxTS uint64, concurrentRequests int, hasLimit bool,
 ) (*blockpack.QueryPlan, error) {
 	if rawR == nil || query == "" {
@@ -47,7 +47,7 @@ func buildStructuralQueryPlan(
 	// boundedEligible=true (issue #481 part 2, 1e/1f): structural chains that flatten to other
 	// than exactly 2 nodes are bounded-eligible the same as plain search — F-3's bounded
 	// structural path in blockpack is the consumer once the querier sees DispatchBoundedRecentFirst.
-	return buildQueryPlanFromProgram(ctx, rawR, tenant, leftProg, minTS, maxTS, concurrentRequests, true, hasLimit)
+	return buildQueryPlanFromProgram(ctx, rawR, tenant, dedicated, leftProg, minTS, maxTS, concurrentRequests, true, hasLimit)
 }
 
 // structuralTimeSlicedJobsFunc is timeSlicedJobsFunc's structural-query sibling (issue #489,

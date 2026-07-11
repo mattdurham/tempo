@@ -364,6 +364,213 @@ func TestRecordUsage_SearchPath_Structural(t *testing.T) {
 	assert.Contains(t, rec.columns(), "span.never.indexed")
 }
 
+// countingVIStore wraps a *fakeVISink, counting Size/ReadAt calls so a test can assert the
+// discovery-only mechanism contract: RecordUsageIfNoIndexCoverage must never download a
+// value-index file's content, only List it via IndexFileCache.FilesForTimeRange.
+type countingVIStore struct {
+	*fakeVISink
+	sizeCalls, readAtCalls int
+}
+
+func (c *countingVIStore) Size(key string) (int64, error) {
+	c.sizeCalls++
+	return c.fakeVISink.Size(key)
+}
+
+func (c *countingVIStore) ReadAt(key string, p []byte, off int64) (int, error) {
+	c.readAtCalls++
+	return c.fakeVISink.ReadAt(key, p, off)
+}
+
+// TestRecordUsageIfNoIndexCoverage_NonDedicatedUncoveredColumnRecorded is the plan-time analog
+// of TestRecordUsage_TrulyMissingIndex_IsRecorded: a genuinely uncovered, non-dedicated column
+// must be recorded from the frontend's own discovery-only check.
+func TestRecordUsageIfNoIndexCoverage_NonDedicatedUncoveredColumnRecorded(t *testing.T) {
+	resetViUsageRateLimit(t)
+	rec := &fakeUsageRecorder{}
+	withUsageRecorder(t, rec)
+
+	viStore := &fakeVISink{}
+	withVISink(t, viStore, "indexes")
+	withVIQueryReader(t, viStore, "indexes")
+
+	dir := t.TempDir()
+	meta, _ := writeSvcBlock(t, dir, viStore, "test-tenant", uuid.New(), "svc-alpha", 3)
+
+	prog, err := blockpack.CompileTraceQL(`{ span.never.indexed = "x" }`, blockpack.QueryOptions{})
+	require.NoError(t, err)
+
+	minSec, maxSec := uint64(meta.StartTime.Unix()), uint64(meta.EndTime.Unix())
+	RecordUsageIfNoIndexCoverage(context.Background(), "test-tenant", prog, nil, minSec, maxSec, time.Now())
+
+	assert.Equal(t, []string{"span.never.indexed"}, rec.columns())
+}
+
+// TestRecordUsageIfNoIndexCoverage_CoveredColumnNotRecorded: a column genuinely written/indexed
+// by writeSvcBlock (resource.service.name) has real file coverage — FilesForTimeRange must
+// return a non-empty listing, so it must never be recorded.
+func TestRecordUsageIfNoIndexCoverage_CoveredColumnNotRecorded(t *testing.T) {
+	resetViUsageRateLimit(t)
+	rec := &fakeUsageRecorder{}
+	withUsageRecorder(t, rec)
+
+	viStore := &fakeVISink{}
+	withVISink(t, viStore, "indexes")
+	withVIQueryReader(t, viStore, "indexes")
+
+	dir := t.TempDir()
+	meta, _ := writeSvcBlock(t, dir, viStore, "test-tenant", uuid.New(), "svc-alpha", 3)
+
+	prog, err := blockpack.CompileTraceQL(`{ resource.service.name = "svc-alpha" }`, blockpack.QueryOptions{})
+	require.NoError(t, err)
+
+	minSec, maxSec := uint64(meta.StartTime.Unix()), uint64(meta.EndTime.Unix())
+	RecordUsageIfNoIndexCoverage(context.Background(), "test-tenant", prog, nil, minSec, maxSec, time.Now())
+
+	assert.Empty(t, rec.columns(), "a genuinely covered column must never be recorded")
+}
+
+// TestRecordUsageIfNoIndexCoverage_DedicatedColumnNotRecorded: an otherwise-uncovered column
+// already declared dedicated (already forward-indexed) must never be recorded, mirroring
+// recordUsageForDeclinedQuery's own dedicated-column rule (R3).
+func TestRecordUsageIfNoIndexCoverage_DedicatedColumnNotRecorded(t *testing.T) {
+	resetViUsageRateLimit(t)
+	rec := &fakeUsageRecorder{}
+	withUsageRecorder(t, rec)
+
+	viStore := &fakeVISink{}
+	withVISink(t, viStore, "indexes")
+	withVIQueryReader(t, viStore, "indexes")
+
+	dir := t.TempDir()
+	meta, _ := writeSvcBlock(t, dir, viStore, "test-tenant", uuid.New(), "svc-alpha", 3)
+
+	prog, err := blockpack.CompileTraceQL(`{ span.never.indexed = "x" }`, blockpack.QueryOptions{})
+	require.NoError(t, err)
+
+	dedicated := backend.DedicatedColumns{{Scope: backend.DedicatedColumnScopeSpan, Name: "never.indexed"}}
+	minSec, maxSec := uint64(meta.StartTime.Unix()), uint64(meta.EndTime.Unix())
+	RecordUsageIfNoIndexCoverage(context.Background(), "test-tenant", prog, dedicated, minSec, maxSec, time.Now())
+
+	assert.Empty(t, rec.columns(), "a dedicated column must never be recorded, even if genuinely uncovered")
+}
+
+// TestRecordUsageIfNoIndexCoverage_NegatedPredicateNotRecorded mirrors
+// TestRecordUsage_NegatedPredicate_NotRecorded's R3 permanent-decline case (`!=` compiles to a
+// RequirePresent-only leaf) at plan time.
+func TestRecordUsageIfNoIndexCoverage_NegatedPredicateNotRecorded(t *testing.T) {
+	resetViUsageRateLimit(t)
+	rec := &fakeUsageRecorder{}
+	withUsageRecorder(t, rec)
+
+	viStore := &fakeVISink{}
+	withVISink(t, viStore, "indexes")
+	withVIQueryReader(t, viStore, "indexes")
+
+	dir := t.TempDir()
+	meta, _ := writeSvcBlock(t, dir, viStore, "test-tenant", uuid.New(), "svc-alpha", 3)
+
+	prog, err := blockpack.CompileTraceQL(`{ span.custom.attr != "x" }`, blockpack.QueryOptions{})
+	require.NoError(t, err)
+
+	minSec, maxSec := uint64(meta.StartTime.Unix()), uint64(meta.EndTime.Unix())
+	RecordUsageIfNoIndexCoverage(context.Background(), "test-tenant", prog, nil, minSec, maxSec, time.Now())
+
+	assert.Empty(t, rec.columns(), "a negated predicate's RequirePresent-only leaf must never be recorded")
+}
+
+// TestRecordUsageIfNoIndexCoverage_NilRecorderNoOps: with no recorder configured, the call must
+// be a complete no-op — no panic.
+func TestRecordUsageIfNoIndexCoverage_NilRecorderNoOps(t *testing.T) {
+	resetViUsageRateLimit(t)
+	withUsageRecorder(t, nil)
+
+	viStore := &fakeVISink{}
+	withVISink(t, viStore, "indexes")
+	withVIQueryReader(t, viStore, "indexes")
+
+	dir := t.TempDir()
+	meta, _ := writeSvcBlock(t, dir, viStore, "test-tenant", uuid.New(), "svc-alpha", 3)
+
+	prog, err := blockpack.CompileTraceQL(`{ span.never.indexed = "x" }`, blockpack.QueryOptions{})
+	require.NoError(t, err)
+
+	minSec, maxSec := uint64(meta.StartTime.Unix()), uint64(meta.EndTime.Unix())
+	assert.NotPanics(t, func() {
+		RecordUsageIfNoIndexCoverage(context.Background(), "test-tenant", prog, nil, minSec, maxSec, time.Now())
+	})
+}
+
+// TestRecordUsageIfNoIndexCoverage_NilQueryReaderNoOps: with the index-driven query path
+// disabled entirely (vr == nil), the zeroth no-op gate must apply even though a recorder is
+// configured and the column would otherwise qualify.
+func TestRecordUsageIfNoIndexCoverage_NilQueryReaderNoOps(t *testing.T) {
+	resetViUsageRateLimit(t)
+	rec := &fakeUsageRecorder{}
+	withUsageRecorder(t, rec)
+	withVIQueryReader(t, nil, "")
+
+	prog, err := blockpack.CompileTraceQL(`{ span.never.indexed = "x" }`, blockpack.QueryOptions{})
+	require.NoError(t, err)
+
+	RecordUsageIfNoIndexCoverage(context.Background(), "test-tenant", prog, nil, 0, 1_000_000_000, time.Now())
+
+	assert.Empty(t, rec.columns())
+}
+
+// TestRecordUsageIfNoIndexCoverage_RateLimitSharedWithQuerierPath is the concrete regression pin
+// for Item 5's "double-recording is bounded" claim (in-process half): recordUsageForDeclinedQuery
+// and RecordUsageIfNoIndexCoverage must share the same viUsageRateLimit singleton, so a burst
+// across both functions for the SAME (tenant, column) still collapses to one recorded use.
+func TestRecordUsageIfNoIndexCoverage_RateLimitSharedWithQuerierPath(t *testing.T) {
+	resetViUsageRateLimit(t)
+	rec := &fakeUsageRecorder{}
+	withUsageRecorder(t, rec)
+
+	viStore := &fakeVISink{}
+	withVISink(t, viStore, "indexes")
+	withVIQueryReader(t, viStore, "indexes")
+
+	dir := t.TempDir()
+	meta, _ := writeSvcBlock(t, dir, viStore, "test-tenant", uuid.New(), "svc-alpha", 3)
+
+	prog, err := blockpack.CompileTraceQL(`{ span.never.indexed = "x" }`, blockpack.QueryOptions{})
+	require.NoError(t, err)
+
+	now := time.Now()
+	minSec, maxSec := uint64(meta.StartTime.Unix()), uint64(meta.EndTime.Unix())
+	recordUsageForDeclinedQuery(context.Background(), "test-tenant", prog, nil, now)
+	RecordUsageIfNoIndexCoverage(context.Background(), "test-tenant", prog, nil, minSec, maxSec, now)
+
+	assert.Len(t, rec.columns(), 1, "both functions must share the same rate limiter for the same (tenant, column)")
+}
+
+// TestRecordUsageIfNoIndexCoverage_NeverDownloadsFileContent is the mechanism-not-outcome test
+// design point 1 explicitly requires: the frontend-side check must be discovery-only (List via
+// FilesForTimeRange), never downloading (Size/ReadAt) a value-index file's content.
+func TestRecordUsageIfNoIndexCoverage_NeverDownloadsFileContent(t *testing.T) {
+	resetViUsageRateLimit(t)
+	rec := &fakeUsageRecorder{}
+	withUsageRecorder(t, rec)
+
+	viStore := &fakeVISink{}
+	withVISink(t, viStore, "indexes")
+	counting := &countingVIStore{fakeVISink: viStore}
+	withVIQueryReader(t, counting, "indexes")
+
+	dir := t.TempDir()
+	meta, _ := writeSvcBlock(t, dir, viStore, "test-tenant", uuid.New(), "svc-alpha", 3)
+
+	prog, err := blockpack.CompileTraceQL(`{ span.never.indexed = "x" }`, blockpack.QueryOptions{})
+	require.NoError(t, err)
+
+	minSec, maxSec := uint64(meta.StartTime.Unix()), uint64(meta.EndTime.Unix())
+	RecordUsageIfNoIndexCoverage(context.Background(), "test-tenant", prog, nil, minSec, maxSec, time.Now())
+
+	assert.Equal(t, 0, counting.sizeCalls, "must never download a value-index file's content")
+	assert.Equal(t, 0, counting.readAtCalls, "must never download a value-index file's content")
+}
+
 // TestRealUsageRecorder_ForwardsToRegistryAndTriggersOnShouldBackfill exercises
 // realUsageRecorder against a real blockpack.Registry (backed by the same
 // fakeViObjectStore B2's tests use, vi_backfill_test.go) — the production

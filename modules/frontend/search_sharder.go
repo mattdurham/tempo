@@ -161,13 +161,14 @@ func (s asyncSearchSharder) RoundTrip(pipelineRequest pipeline.Request) (pipelin
 	// than dispatch N per-block jobs that would each independently decline identically.
 	hasLimit := searchReq.Limit > 0
 	if searchReq.Start != 0 && searchReq.End != 0 {
+		dedicated := s.overrides.DedicatedColumns(tenantID)
 		var planErr error
-		plan, planErr = buildQueryPlan(ctx, s.rawR, tenantID, searchReq.Query, uint64(searchReq.Start), uint64(searchReq.End), s.cfg.ConcurrentRequests, hasLimit)
+		plan, planErr = buildQueryPlan(ctx, s.rawR, tenantID, dedicated, searchReq.Query, uint64(searchReq.Start), uint64(searchReq.End), s.cfg.ConcurrentRequests, hasLimit)
 		if planErr != nil {
 			return pipeline.NewBadRequest(planErr), nil
 		}
 		if plan == nil {
-			plan, planErr = buildStructuralQueryPlan(ctx, s.rawR, tenantID, searchReq.Query, uint64(searchReq.Start), uint64(searchReq.End), s.cfg.ConcurrentRequests, hasLimit)
+			plan, planErr = buildStructuralQueryPlan(ctx, s.rawR, tenantID, dedicated, searchReq.Query, uint64(searchReq.Start), uint64(searchReq.End), s.cfg.ConcurrentRequests, hasLimit)
 			if planErr != nil {
 				return pipeline.NewBadRequest(planErr), nil
 			}
