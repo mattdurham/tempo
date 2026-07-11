@@ -22,12 +22,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/go-kit/log/level" //nolint:all deprecated
 	blockpack "github.com/grafana/blockpack"
 	"github.com/grafana/tempo/tempodb/backend"
 	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
+	util_log "github.com/grafana/tempo/pkg/util/log"
 )
 
 // usageRecorder is the injectable seam for #496's usage-recording hook (R3/R4),
@@ -438,24 +441,43 @@ func RecordUsageIfNoIndexCoverage(
 	dedicatedSet := dedicatedColumnSet(dedicated)
 
 	order, byCol := reduceLeafColumnsAllIndexable(prog)
+	if strings.Contains(strings.Join(order, ","), "zz_post_deploy_check") {
+		level.Info(util_log.Logger).Log("msg", "TEMP-DEBUG RecordUsageIfNoIndexCoverage: columns", "tenant", tenant, "order", strings.Join(order, ","))
+	}
 	for _, col := range order {
 		info := byCol[col]
+		debug := strings.Contains(col, "zz_post_deploy_check")
 		if !info.allIndexable {
+			if debug {
+				level.Info(util_log.Logger).Log("msg", "TEMP-DEBUG skip: not allIndexable", "col", col)
+			}
 			continue // R3: permanent decline -- negation/RequirePresent-only/multi-value
 		}
 		if _, ok := dedicatedSet[col]; ok {
+			if debug {
+				level.Info(util_log.Logger).Log("msg", "TEMP-DEBUG skip: dedicated", "col", col)
+			}
 			continue // already forward-indexed
 		}
 		colTypeName := blockpack.ColTypeName(info.colType)
 		colHash := blockpack.ColHash(col)
 		files, err := cache.FilesForTimeRange(ctx, colHash, colTypeName, minSec, maxSec)
 		if err != nil || len(files) > 0 {
+			if debug {
+				level.Info(util_log.Logger).Log("msg", "TEMP-DEBUG skip: files/err", "col", col, "err", err, "numFiles", len(files))
+			}
 			continue // discovery error, or genuine coverage: not a "missing index" signal
 		}
 		key := tenant + "|" + col
 		if !viUsageRateLimit.allow(key, now) {
+			if debug {
+				level.Info(util_log.Logger).Log("msg", "TEMP-DEBUG skip: rate limited", "col", col)
+			}
 			continue
 		}
-		_, _ = rec.RecordUse(ctx, tenant, col, colTypeName, now)
+		result, recErr := rec.RecordUse(ctx, tenant, col, colTypeName, now)
+		if debug {
+			level.Info(util_log.Logger).Log("msg", "TEMP-DEBUG RecordUse result", "col", col, "err", recErr, "shouldBackfill", result.ShouldBackfill, "triggered", result.Entry.Backfill.Triggered, "done", result.Entry.Backfill.Done, "leaseInProgress", result.Entry.Backfill.BackfillInProgress, "useTimestamps", len(result.Entry.UseTimestamps))
+		}
 	}
 }
