@@ -271,22 +271,30 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 	// CreateBlock/Compact also call this, but the querier never runs those paths.
 	// NOTE: In local benchmarks with minio, bbolt overhead (mmap memmove + GC pressure)
 	// exceeds the S3 latency savings. The disk cache helps more with real S3 (50-100ms RTT).
-	if cfg.Block != nil {
-		bp := cfg.Block.Blockpack
-		vblockpack.ConfigureCacheTiered(
-			bp.FileCachePath,
-			bp.FileCacheMaxBytes,
-			bp.MemCacheServers,
-			bp.MetadataMemCacheServers,
-		)
-	}
+	// cfg.Block is provably non-nil here (validateConfig already errored otherwise) --
+	// see the write-path gate below for the full rationale.
+	bp := cfg.Block.Blockpack
+	vblockpack.ConfigureCacheTiered(
+		bp.FileCachePath,
+		bp.FileCacheMaxBytes,
+		bp.MemCacheServers,
+		bp.MetadataMemCacheServers,
+	)
 	// Writer-side synchronous value-index write path (blockpack NOTE-VI-042,
 	// issue #464). On writer targets (block-builder, backend-worker) with S3, the
 	// block-builder and compactor write L0 value-index files after each flush.
 	// Disabled by default; the write path is a no-op when value_index_enabled is
 	// false. Replaces the old async block-events publish path (no Redis broker).
-	if cfg.Block != nil && cfg.Block.Blockpack.ValueIndexEnabled &&
-		cfg.Backend == backend.S3 && cfg.S3 != nil {
+	//
+	// No cfg.Block/cfg.S3 nil-checks here (2026-07-11 cleanup): both are already
+	// provably non-nil by this point — validateConfig (called at the top of New)
+	// hard-errors on cfg.Block == nil before this line is ever reached, and the
+	// switch statement above already returned an error from s3.New(nil) if
+	// cfg.Backend == backend.S3 with cfg.S3 == nil. A silent, no-op skip here for
+	// either condition would look like intentional graceful degradation when it is
+	// actually unreachable — exactly the kind of silent gap that let query-frontend
+	// run for months without RecordUsageIfNoIndexCoverage ever firing.
+	if cfg.Block.Blockpack.ValueIndexEnabled && cfg.Backend == backend.S3 {
 		vblockpack.ConfigureValueIndex(true, cfg.S3, cfg.Block.Blockpack.ValueIndexPrefix)
 		// Wire cube ingest manager alongside value-index (same S3 bucket, same gate).
 		// The manager loads the cube registry at startup and accumulates per-minute
@@ -310,12 +318,12 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 			level.Warn(logger).Log("msg", "vi watermark cache: failed to build S3 client; write-path ColumnPolicy will index every column", "err", werr)
 		}
 	}
-	// Querier-side index-driven query path (blockpack issue #461). Only when
-	// enabled and backed by S3 — the value index lives in the same bucket as the
-	// trace blocks. Disabled by default: the query path then falls back to a full
-	// block scan, byte-identical to before.
-	if cfg.Block != nil && cfg.Block.Blockpack.ValueIndexQuery.Enabled &&
-		cfg.Backend == backend.S3 && cfg.S3 != nil {
+	// Index-driven query path (blockpack issue #461). Always active on any target
+	// backed by S3 (2026-07-11 ruling, no opt-in) — the value index lives in the
+	// same bucket as the trace blocks. Falls back to a full block scan when the
+	// index lacks coverage for a query. See the write-path gate above for why this
+	// omits cfg.Block/cfg.S3 nil-checks (both provably non-nil here already).
+	if cfg.Backend == backend.S3 {
 		viq := cfg.Block.Blockpack.ValueIndexQuery
 		if client, cerr := newMinioForValueIndex(cfg.S3); cerr == nil {
 			vblockpack.ConfigureValueIndexQuery(client, cfg.S3.Bucket, viq.IndexPrefix, viq.CacheTTL, viq.ContentCacheBytes)

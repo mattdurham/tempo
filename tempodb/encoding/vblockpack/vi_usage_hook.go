@@ -165,6 +165,14 @@ func getViUsageRecorder() usageRecorder {
 	return viUsageRecorderPtr
 }
 
+// ViUsageRecorderConfiguredForTest reports whether the process-level usage recorder
+// singleton is currently installed (non-nil) — i.e. whether ConfigureViUsage has run and
+// installed a real recorder (not the disabled/nil case). See
+// ValueIndexQueryConfiguredForTest's doc comment for why this exists.
+func ViUsageRecorderConfiguredForTest() bool {
+	return getViUsageRecorder() != nil
+}
+
 // viUsageRateLimiter collapses a burst of concurrent identical (tenant, column)
 // usage-record attempts into one registry round-trip within ttl, mirroring
 // cubequerypath.go's maybeCreateCube rate-limit pattern (R4's explicit reuse ask).

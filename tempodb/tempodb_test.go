@@ -4,11 +4,15 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"math/rand"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -32,8 +36,10 @@ import (
 	"github.com/grafana/tempo/pkg/util/test"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/backend/local"
+	"github.com/grafana/tempo/tempodb/backend/s3"
 	"github.com/grafana/tempo/tempodb/encoding"
 	"github.com/grafana/tempo/tempodb/encoding/common"
+	"github.com/grafana/tempo/tempodb/encoding/vblockpack"
 	"github.com/grafana/tempo/tempodb/wal"
 )
 
@@ -1062,4 +1068,59 @@ func TestReaderExposesRawReader(t *testing.T) {
 	got, err := io.ReadAll(rc)
 	require.NoError(t, err)
 	require.Equal(t, content, got)
+}
+
+// TestValueIndexQueryWiring_NoExplicitConfigStillInstalled is a regression test for a real
+// live gap (2026-07-11): a target whose own YAML never mentions `value_index_query` or
+// `vi_usage` at all (e.g. query-frontend's own configmap, historically) got NO
+// viQueryReaderPtr/viUsageRecorderPtr installed at all, silently no-oping
+// vblockpack.RecordUsageIfNoIndexCoverage even though its own call-chain code was correct —
+// because ValueIndexQueryConfig.Enabled used to default to false and nothing ever set it.
+//
+// This exercises the REAL tempodb.New wiring path end to end (not the test-only
+// ConfigureValueIndexQueryForTest/ConfigureViUsageRecorder direct-injection shortcuts the
+// rest of vblockpack's test suite uses) — proving the wiring itself is correct, which the
+// existing unit tests structurally could not catch since they bypass this exact gate.
+// RegisterFlagsAndApplyDefaults (not a bare struct literal) is used deliberately, to mirror
+// how a real YAML config actually gets its defaults applied in production.
+func TestValueIndexQueryWiring_NoExplicitConfigStillInstalled(t *testing.T) {
+	// Minimal S3-compatible mock: tempodb.New's S3 path confirms via one ListObjects call
+	// before returning — see tempodb/backend/s3/s3_test.go's own fakeServer for the identical
+	// pattern this mirrors.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><ListBucketResult></ListBucketResult>`))
+	}))
+	t.Cleanup(server.Close)
+
+	var blockCfg common.BlockConfig
+	blockCfg.RegisterFlagsAndApplyDefaults("test", flag.NewFlagSet("test", flag.ContinueOnError))
+	blockCfg.Version = encoding.DefaultEncoding().Version()
+	// Deliberately do NOT touch blockCfg.Blockpack.ValueIndexQuery or .ViUsage at all --
+	// the whole point is to prove the wiring activates with zero explicit opt-in, exactly
+	// as a real config that never mentions these sections would after applyDefaults runs.
+
+	tempDir := t.TempDir()
+	cfg := &Config{
+		Backend: backend.S3,
+		S3: &s3.Config{
+			Bucket:   "test-bucket",
+			Region:   "us-east-1",
+			Endpoint: strings.TrimPrefix(server.URL, "http://"),
+			Insecure: true,
+		},
+		Block:         &blockCfg,
+		WAL:           &wal.Config{Filepath: path.Join(tempDir, "wal")},
+		BlocklistPoll: 0,
+		Search: &SearchConfig{
+			ChunkSizeBytes:  1_000_000,
+			ReadBufferCount: 8, ReadBufferSizeBytes: 4 * 1024 * 1024,
+		},
+	}
+	_, _, _, err := New(cfg, nil, log.NewNopLogger())
+	require.NoError(t, err)
+
+	assert.True(t, vblockpack.ValueIndexQueryConfiguredForTest(),
+		"value-index query reader must be installed even with zero explicit value_index_query config")
+	assert.True(t, vblockpack.ViUsageRecorderConfiguredForTest(),
+		"usage recorder must be installed even with zero explicit vi_usage config")
 }

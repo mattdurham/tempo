@@ -148,6 +148,16 @@ func ConfigureValueIndexQueryForTest(store interface {
 	}
 }
 
+// ValueIndexQueryConfiguredForTest reports whether the process-level value-index query
+// reader singleton is currently installed (non-nil) — i.e. whether ConfigureValueIndexQuery
+// has run and succeeded. Exported for wiring-regression tests that call the REAL
+// tempodb.New path (not ConfigureValueIndexQueryForTest's direct injection) and need to
+// observe whether the real config-driven wiring actually installed the reader, without
+// needing to make it all the way through a real query to find out indirectly.
+func ValueIndexQueryConfiguredForTest() bool {
+	return getValueIndexQueryReader() != nil
+}
+
 // getValueIndexQueryReader returns the configured reader, or nil when the
 // index-driven path is disabled.
 func getValueIndexQueryReader() *viQueryReader {

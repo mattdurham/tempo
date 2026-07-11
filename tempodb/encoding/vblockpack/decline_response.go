@@ -65,11 +65,14 @@ func DeclineErrorToHTTPResponse(err error) (status int, message string, matched 
 			true
 
 	case errors.Is(err, blockpack.ErrMetricsValueIndexDisabled):
-		// Distinct from the per-shape limitations above: this is an OPERATOR configuration
-		// issue (value_index_query.enabled=false), not a property of the query itself — per
-		// coder-f1's #70 fix, this must not be lumped with the per-shape sentinels.
+		// Distinct from the per-shape limitations above: this is an OPERATOR/DEPLOYMENT
+		// issue (the value index isn't reachable on this querier at all — no S3 backend
+		// configured, or the S3 client failed to build), not a property of the query
+		// itself — per coder-f1's #70 fix, this must not be lumped with the per-shape
+		// sentinels. There is no longer an explicit opt-out setting (2026-07-11, the
+		// index-driven query path is unconditional on any S3-backed target).
 		return http.StatusUnprocessableEntity,
-			"metrics query requires the value index, which is not configured for this querier (value_index_query.enabled)",
+			"metrics query requires the value index, which is not reachable on this querier (no S3 backend configured, or the S3 client failed to initialize)",
 			true
 
 	case errors.Is(err, ErrCubeWarming):

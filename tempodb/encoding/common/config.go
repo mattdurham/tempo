@@ -127,11 +127,11 @@ type BlockpackConfig struct {
 	// goroutine inside the value-index-compactor Tempo target. Disabled by default.
 	ValueCountCompactor ValueCountCompactorConfig `yaml:"value_count_compactor"`
 
-	// ValueIndexQuery configures the querier-side index-driven query path
-	// (blockpack issue #461). When enabled, the blockpack querier discovers and
-	// downloads value-index files to answer search/metrics queries with block-level
-	// pruning, falling back to a full block scan when the index lacks coverage.
-	// Disabled by default; queriers opt in via value_index_query.enabled.
+	// ValueIndexQuery configures the index-driven query path (blockpack issue #461).
+	// Always active on any target with an S3 backend (2026-07-11 ruling, no opt-in) --
+	// the blockpack querier/frontend discovers and downloads value-index files to
+	// answer search/metrics queries with block-level pruning, falling back to a full
+	// block scan when the index lacks coverage.
 	ValueIndexQuery ValueIndexQueryConfig `yaml:"value_index_query"`
 
 	// ValueIndexEnabled turns on the synchronous in-process value-index write path
@@ -238,10 +238,16 @@ func (cfg *ViUsageConfig) applyDefaults() {
 	}
 }
 
-// ValueIndexQueryConfig configures the querier-side index-driven query path.
+// ValueIndexQueryConfig configures the index-driven query path. Always active on any
+// target with cfg.Block != nil and an S3 backend (2026-07-11 ruling) -- there is no
+// remaining reason to run this path opt-in; a target that never explicitly enabled it
+// (e.g. query-frontend's own config, which never had a value_index_query section at all)
+// silently never got viQueryReaderPtr/viUsageRecorderPtr installed, which was the root
+// cause of a live gap in RecordUsageIfNoIndexCoverage. Removed the Enabled field
+// entirely rather than defaulting it to true, since a bool config field that can never
+// actually be set to false (Go's zero value is indistinguishable from "omitted") is
+// worse than no field at all.
 type ValueIndexQueryConfig struct {
-	// Enabled turns on the index-driven query path on this querier.
-	Enabled bool `yaml:"enabled"`
 	// IndexPrefix is the S3 key prefix under which value-index files live. It must
 	// match the consumer/compactor index_prefix (default: "indexes").
 	IndexPrefix string `yaml:"index_prefix"`
