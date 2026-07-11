@@ -55,6 +55,17 @@ func writeVCNTObject(t *testing.T, rawW backend.RawWriter, column string, data [
 	require.NoError(t, rawW.Write(t.Context(), name, keypath, bytes.NewReader(data), int64(len(data)), nil))
 }
 
+// writeVCNTObjectV2 writes data using the v2 filename format with an explicit wall-clock
+// range, for pruning tests (writeVCNTObject above stays v1-shaped on purpose, exercising the
+// "unknown range, always fetch" fallback path).
+func writeVCNTObjectV2(t *testing.T, rawW backend.RawWriter, column string, data []byte, wallMinSec, wallMaxSec uint64) {
+	t.Helper()
+	colHash := blockpack.VCNTColHash(column)
+	name := blockpack.VCNTFormatFilenameV2(0, wallMinSec, wallMaxSec, blockpack.VCNTNewID())
+	keypath := backend.KeyPath{"tenant-a", testIndexPrefix, "unique_values", colHash}
+	require.NoError(t, rawW.Write(t.Context(), name, keypath, bytes.NewReader(data), int64(len(data)), nil))
+}
+
 func newLocalRawReadWriter(t *testing.T) (backend.RawReader, backend.RawWriter) {
 	t.Helper()
 	_, rawW, _, err := local.New(&local.Config{Path: path.Join(t.TempDir(), "traces")})
@@ -65,7 +76,9 @@ func newLocalRawReadWriter(t *testing.T) (backend.RawReader, backend.RawWriter) 
 }
 
 func TestFetchVCNTSection_NilRawReaderReturnsNil(t *testing.T) {
-	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), nil, "tenant-a", testIndexPrefix, []string{"resource.service.name"})
+	// A real, deliberately chosen window (not a leftover placeholder) — irrelevant here since
+	// a nil rawR short-circuits before the prune check is ever reached.
+	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), nil, "tenant-a", testIndexPrefix, []string{"resource.service.name"}, 0, 200)
 	require.Nil(t, data)
 	require.Nil(t, dir)
 	require.Zero(t, filesCount)
@@ -74,7 +87,9 @@ func TestFetchVCNTSection_NilRawReaderReturnsNil(t *testing.T) {
 
 func TestFetchVCNTSection_NoDimsReturnsNil(t *testing.T) {
 	rawR, _ := newLocalRawReadWriter(t)
-	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), rawR, "tenant-a", testIndexPrefix, nil)
+	// A real, deliberately chosen window (not a leftover placeholder) — irrelevant here since
+	// no dims means the per-file loop never runs.
+	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), rawR, "tenant-a", testIndexPrefix, nil, 0, 200)
 	require.Nil(t, data)
 	require.Nil(t, dir)
 	require.Zero(t, filesCount)
@@ -95,7 +110,9 @@ func TestFetchVCNTSection_MergesObjectsForRequestedDims(t *testing.T) {
 	writeVCNTObject(t, rawW, "span.http.method",
 		vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 9}))
 
-	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), rawR, tenant, testIndexPrefix, []string{"resource.service.name"})
+	// This test's fixtures are v1-shaped (writeVCNTObject), so the window below is inert by
+	// design — the new TestFetchVCNTSection_* pruning tests below are what actually exercises it.
+	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), rawR, tenant, testIndexPrefix, []string{"resource.service.name"}, 0, 200)
 	require.NotNil(t, data)
 	require.NotEmpty(t, dir)
 	// filesCount/bytesRead (issue #493 Task 4c): exactly the 2 resource.service.name objects
@@ -116,7 +133,9 @@ func TestFetchVCNTSection_MergesObjectsForRequestedDims(t *testing.T) {
 
 func TestFetchVCNTSection_MissingDimYieldsNoCoverageNotError(t *testing.T) {
 	rawR, _ := newLocalRawReadWriter(t)
-	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), rawR, "tenant-a", testIndexPrefix, []string{"resource.service.name"})
+	// A real, deliberately chosen window (not a leftover placeholder) — irrelevant here since
+	// there is no coverage for this dim at all.
+	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), rawR, "tenant-a", testIndexPrefix, []string{"resource.service.name"}, 0, 200)
 	require.Nil(t, data)
 	require.Nil(t, dir)
 	require.Zero(t, filesCount)
@@ -163,6 +182,82 @@ func TestBuildQueryPlan_UnresolvableQueryReturnsNilPlanWithoutFetching(t *testin
 	require.Nil(t, plan, "an unresolvable query (no value-index reader configured) must short-circuit to a nil plan")
 	require.Equal(t, 0, counting.findCalls, "CheckIndexCoverage must be checked before any VCNT fetch I/O — zero Find calls expected")
 	require.Equal(t, 0, counting.readCalls, "CheckIndexCoverage must be checked before any VCNT fetch I/O — zero Read calls expected")
+}
+
+// TEST-495-fetch-1: a v2-shaped .vcnt file whose embedded range provably does not overlap the
+// query window must never be Read (issue #495) — asserted via countingRawReader's actual Read
+// call count, not merely via the output section (R7a mechanism assertion). Find still runs — it
+// must, to discover the file exists at all — only Read must be zero.
+func TestFetchVCNTSection_OutOfRangeV2FileNeverFetched(t *testing.T) {
+	rawR, rawW := newLocalRawReadWriter(t)
+	tenant := "tenant-a"
+	writeVCNTObjectV2(t, rawW, "span.http.method",
+		vcntObj(t, "span.http.method", 500, map[string]int64{"GET": 1}), 500, 600)
+
+	counting := &countingRawReader{RawReader: rawR}
+	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), counting, tenant, testIndexPrefix, []string{"span.http.method"}, 0, 100)
+	require.Nil(t, data)
+	require.Nil(t, dir)
+	require.Zero(t, filesCount)
+	require.Zero(t, bytesRead)
+	require.Equal(t, 0, counting.readCalls, "out-of-range v2 file must never be Read")
+}
+
+// TEST-495-fetch-2: a v2-shaped .vcnt file whose embedded range overlaps the query window must
+// still be fetched (sibling positive case).
+func TestFetchVCNTSection_InRangeV2FileStillFetched(t *testing.T) {
+	rawR, rawW := newLocalRawReadWriter(t)
+	tenant := "tenant-a"
+	writeVCNTObjectV2(t, rawW, "span.http.method",
+		vcntObj(t, "span.http.method", 500, map[string]int64{"GET": 1}), 500, 600)
+
+	counting := &countingRawReader{RawReader: rawR}
+	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), counting, tenant, testIndexPrefix, []string{"span.http.method"}, 100, 700)
+	require.NotNil(t, data)
+	require.NotEmpty(t, dir)
+	require.Equal(t, 1, filesCount)
+	require.Positive(t, bytesRead)
+	require.Equal(t, 1, counting.readCalls, "in-range v2 file must be Read")
+}
+
+// TEST-495-fetch-3: a v1-shaped .vcnt file (unknown range) must always be fetched regardless of
+// the query window (issue #495 R7b).
+func TestFetchVCNTSection_V1ShapedFileStillFetchedRegardlessOfWindow(t *testing.T) {
+	rawR, rawW := newLocalRawReadWriter(t)
+	tenant := "tenant-a"
+	writeVCNTObject(t, rawW, "span.http.method",
+		vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 1}))
+
+	counting := &countingRawReader{RawReader: rawR}
+	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), counting, tenant, testIndexPrefix, []string{"span.http.method"}, 900, 1000)
+	require.NotNil(t, data)
+	require.NotEmpty(t, dir)
+	require.Equal(t, 1, filesCount)
+	require.Positive(t, bytesRead)
+	require.Equal(t, 1, counting.readCalls, "v1-shaped file must be fetched despite unrelated window")
+}
+
+// TEST-495-fetch-4: query windows that merely touch a v2 file's boundary must still be treated
+// as overlapping and fetched (issue #495 R7c) — pins the inclusive-both-ends formula at the
+// integration level.
+func TestFetchVCNTSection_BoundaryTouchingWindowsIncluded(t *testing.T) {
+	tenant := "tenant-a"
+	for _, window := range []struct{ minTS, maxTS uint64 }{
+		{200, 300},
+		{0, 100},
+	} {
+		rawR, rawW := newLocalRawReadWriter(t)
+		writeVCNTObjectV2(t, rawW, "span.http.method",
+			vcntObj(t, "span.http.method", 100, map[string]int64{"GET": 1}), 100, 200)
+
+		counting := &countingRawReader{RawReader: rawR}
+		data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), counting, tenant, testIndexPrefix, []string{"span.http.method"}, window.minTS, window.maxTS)
+		require.NotNil(t, data, "window [%d,%d]: expected boundary-touching file to be fetched", window.minTS, window.maxTS)
+		require.NotEmpty(t, dir)
+		require.Equal(t, 1, filesCount)
+		require.Positive(t, bytesRead)
+		require.Equal(t, 1, counting.readCalls, "window [%d,%d]: expected boundary-touching file to be Read", window.minTS, window.maxTS)
+	}
 }
 
 // countingRawReader wraps a real backend.RawReader and counts Find/Read calls, so a test can

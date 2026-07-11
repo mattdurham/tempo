@@ -69,6 +69,27 @@ func vcntObjKey(tenant, column, id string) string {
 	return blockpack.VCNTObjectKey(tenant, defaultValueIndexPref, column, id)
 }
 
+// vcntObjKeyV2 builds the S3 key a v2-format .vcnt object would live under, embedding an
+// explicit wall-clock range for pruning tests.
+func vcntObjKeyV2(tenant, column, id string, wallMinSec, wallMaxSec uint64) string {
+	colHash := blockpack.VCNTColHash(column)
+	filename := blockpack.VCNTFormatFilenameV2(0, wallMinSec, wallMaxSec, id)
+	return path.Join(tenant, defaultValueIndexPref, "unique_values", colHash, filename)
+}
+
+// countingVCNTStore wraps memVCNTStore and records every key passed to Get, so a test can
+// assert a file was never fetched (not merely "absent from the output section" — a bug that
+// filters post-fetch instead of pre-fetch could satisfy that weaker assertion by accident).
+type countingVCNTStore struct {
+	*memVCNTStore
+	gotKeys []string
+}
+
+func (c *countingVCNTStore) Get(ctx context.Context, key string) ([]byte, error) {
+	c.gotKeys = append(c.gotKeys, key)
+	return c.memVCNTStore.Get(ctx, key)
+}
+
 func vcntObj(t *testing.T, column string, values map[string]int64) []byte {
 	t.Helper()
 	var recs []blockpack.VCNTRecord
@@ -174,5 +195,118 @@ func TestBuildVCNTSection_NoCoverageReturnsNil(t *testing.T) {
 	data, dir := buildVCNTSection(context.Background(), store, "tenant-c", []string{"resource.service.name"}, 0, 120)
 	if data != nil || dir != nil {
 		t.Fatalf("expected nil section for absent coverage, got data=%d dir=%d", len(data), len(dir))
+	}
+}
+
+// TEST-495-fetch-1: a v2-shaped .vcnt file whose embedded range provably does not overlap
+// the query window must never be fetched (issue #495) — asserted via the actual Get call
+// recorded by countingVCNTStore, not merely via the output section (R7a mechanism assertion).
+func TestBuildVCNTSection_OutOfRangeV2FileNeverFetched(t *testing.T) {
+	tenant := "tenant-a"
+	key := vcntObjKeyV2(tenant, "span:kind", "id1", 500, 600)
+	store := &countingVCNTStore{memVCNTStore: &memVCNTStore{objects: map[string][]byte{
+		key: vcntObj(t, "span:kind", map[string]int64{"server": 1}),
+	}}}
+
+	data, dir := buildVCNTSection(context.Background(), store, tenant, []string{"span:kind"}, 0, 100)
+	if data != nil || dir != nil {
+		t.Fatalf("expected nil section for out-of-range v2 file, got data=%d dir=%d", len(data), len(dir))
+	}
+	for _, got := range store.gotKeys {
+		if got == key {
+			t.Fatalf("out-of-range v2 file %q must never be passed to Get", key)
+		}
+	}
+}
+
+// TEST-495-fetch-2: a v2-shaped .vcnt file whose embedded range overlaps the query window
+// must still be fetched (sibling positive case to TestBuildVCNTSection_OutOfRangeV2FileNeverFetched).
+func TestBuildVCNTSection_InRangeV2FileStillFetched(t *testing.T) {
+	tenant := "tenant-a"
+	key := vcntObjKeyV2(tenant, "span:kind", "id1", 500, 600)
+	store := &countingVCNTStore{memVCNTStore: &memVCNTStore{objects: map[string][]byte{
+		key: vcntObj(t, "span:kind", map[string]int64{"server": 1}),
+	}}}
+
+	data, dir := buildVCNTSection(context.Background(), store, tenant, []string{"span:kind"}, 100, 700)
+	if len(data) == 0 || len(dir) == 0 {
+		t.Fatalf("expected a non-empty section for in-range v2 file, got data=%d dir=%d", len(data), len(dir))
+	}
+	found := false
+	for _, got := range store.gotKeys {
+		if got == key {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected in-range v2 file %q to be passed to Get", key)
+	}
+
+	// vcntObj hardcodes each record's own TimeStart/TimeEnd to 60, independent of the
+	// filename's embedded v2 range (500,600) used above purely for file-level pruning -- so
+	// the record-level selectivity check below uses a window covering 60, not 100,700.
+	est, err := blockpack.VCNTSelectivityInRange(data, dir, "span:kind", []byte("server"), 0, 120)
+	if err != nil {
+		t.Fatalf("VCNTSelectivityInRange: %v", err)
+	}
+	if !est.Covered || est.Count != 1 {
+		t.Fatalf("VCNTSelectivityInRange(span:kind=server): Covered=%v Count=%d, want Covered=true Count=1",
+			est.Covered, est.Count)
+	}
+}
+
+// TEST-495-fetch-3: a v1-shaped .vcnt file (unknown range) must always be fetched regardless
+// of the query window (issue #495 R7b) — pins the "unknown range, never dropped" fallback at
+// the integration level, not just the helper's own unit test.
+func TestBuildVCNTSection_V1ShapedFileStillFetchedRegardlessOfWindow(t *testing.T) {
+	tenant := "tenant-a"
+	key := vcntObjKey(tenant, "span:kind", "L0-v1id")
+	store := &countingVCNTStore{memVCNTStore: &memVCNTStore{objects: map[string][]byte{
+		key: vcntObj(t, "span:kind", map[string]int64{"server": 1}),
+	}}}
+
+	data, dir := buildVCNTSection(context.Background(), store, tenant, []string{"span:kind"}, 900, 1000)
+	if len(data) == 0 || len(dir) == 0 {
+		t.Fatalf("expected a non-empty section for v1-shaped file, got data=%d dir=%d", len(data), len(dir))
+	}
+	found := false
+	for _, got := range store.gotKeys {
+		if got == key {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected v1-shaped file %q to be fetched despite unrelated window", key)
+	}
+}
+
+// TEST-495-fetch-4: query windows that merely touch a v2 file's boundary (WallMaxSec ==
+// queryMinSec, or WallMinSec == queryMaxSec) must still be treated as overlapping and fetched
+// (issue #495 R7c) — pins the inclusive-both-ends formula at the integration level.
+func TestBuildVCNTSection_BoundaryTouchingWindowsIncluded(t *testing.T) {
+	tenant := "tenant-a"
+	key := vcntObjKeyV2(tenant, "span:kind", "id1", 100, 200)
+
+	for _, window := range []struct{ minSec, maxSec uint64 }{
+		{200, 300},
+		{0, 100},
+	} {
+		store := &countingVCNTStore{memVCNTStore: &memVCNTStore{objects: map[string][]byte{
+			key: vcntObj(t, "span:kind", map[string]int64{"server": 1}),
+		}}}
+		data, dir := buildVCNTSection(context.Background(), store, tenant, []string{"span:kind"}, window.minSec, window.maxSec)
+		if len(data) == 0 || len(dir) == 0 {
+			t.Fatalf("window [%d,%d]: expected boundary-touching file to be fetched, got data=%d dir=%d",
+				window.minSec, window.maxSec, len(data), len(dir))
+		}
+		found := false
+		for _, got := range store.gotKeys {
+			if got == key {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("window [%d,%d]: expected boundary-touching file %q to be passed to Get", window.minSec, window.maxSec, key)
+		}
 	}
 }

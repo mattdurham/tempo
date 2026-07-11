@@ -72,6 +72,7 @@ var ErrPlanTimeLowSelectivityNoLimit = errors.New(
 // own.
 func fetchVCNTSection(
 	ctx context.Context, rawR backend.RawReader, tenant, indexPrefix string, dims []string,
+	minTS, maxTS uint64,
 ) (data []byte, dir []blockpack.VCNTChunkDirEntry, filesCount int, bytesRead int64) {
 	if rawR == nil || len(dims) == 0 {
 		return nil, nil, 0, 0
@@ -93,6 +94,9 @@ func fetchVCNTSection(
 
 		for _, k := range keys {
 			keypath, name := splitObjectKey(k)
+			if !vblockpack.VCNTFileOverlapsRange(name, minTS, maxTS) {
+				continue
+			}
 			rc, _, err := rawR.Read(ctx, name, keypath, nil)
 			if err != nil {
 				continue
@@ -252,7 +256,7 @@ func buildQueryPlanFromProgram(
 	// reuse of blockpack.query) — a distinct I/O phase (S3 Find+Read fan-out) worth timing on
 	// its own, not routine attribute promotion onto an existing span.
 	vcntCtx, vcntSpan := tracer.Start(ctx, "frontend.vcntFetch")
-	data, dir, filesCount, bytesRead := fetchVCNTSection(vcntCtx, rawR, tenant, indexPrefix, dims)
+	data, dir, filesCount, bytesRead := fetchVCNTSection(vcntCtx, rawR, tenant, indexPrefix, dims, minTS, maxTS)
 	if vcntSpan.IsRecording() {
 		vcntSpan.SetAttributes(
 			attribute.Int("files.count", filesCount),

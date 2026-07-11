@@ -78,10 +78,13 @@ func newBackfillVIStore(client *minio.Client, bucket string) valueIndexStore {
 // backfill/query paths use (issue #478), so repeated gate attempts for the same dims
 // collapse to cached LISTs/GETs rather than re-hitting S3.
 //
-// VCNT filenames (L<N>-<id>.vcnt) carry no embedded time range — unlike VI files —
-// so all of a column's .vcnt files are fetched and the query window is applied at the
-// record level by the gate's ValuesInRange decode. minTS/maxTS are accepted here only
-// to document that scoping contract; they are not used to prune the file list.
+// VCNT filenames written since issue #494 embed a wall-clock time range (v2 format,
+// L<level>-<wallMinSec>-<wallMaxSec>-<id>.vcnt); VCNTFileOverlapsRange (issue #495) uses that
+// range to skip GET-ing files that provably cannot overlap [minTS, maxTS], before any S3 read.
+// A v1-shaped or unparseable filename is always fetched (unknown range, never dropped). The
+// query window is still additionally applied at the record level by the gate's ValuesInRange
+// decode after fetch — this file-level check only avoids unnecessary GETs, it does not replace
+// that record-level filtering.
 //
 // On any error (or absent coverage) it returns a nil/empty section, which the gate
 // treats as "no coverage" and passes by default — a VCNT read failure must never block
@@ -113,7 +116,7 @@ func buildVCNTSection(
 	store valueIndexStore,
 	tenant string,
 	dims []string,
-	_, _ uint64,
+	minSec, maxSec uint64,
 ) ([]byte, []blockpack.VCNTChunkDirEntry) {
 	var objects [][]byte
 	for _, dim := range dims {
@@ -125,6 +128,9 @@ func buildVCNTSection(
 		}
 		for _, k := range keys {
 			if path.Ext(k) != ".vcnt" {
+				continue
+			}
+			if !VCNTFileOverlapsRange(path.Base(k), minSec, maxSec) {
 				continue
 			}
 			data, getErr := store.Get(ctx, k)
