@@ -18,8 +18,10 @@ package blockpack
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path"
+	"time"
 
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/grafana/blockpack/internal/modules/valueindex"
@@ -314,6 +316,45 @@ func flushAndPutTraceGroups(
 	)
 	if err := store.Put(key, data); err != nil {
 		return fmt.Errorf("blockpack: WriteValueIndexL0: put %q: %w", key, err)
+	}
+	return nil
+}
+
+// columnMetadata is the small, human-readable JSON blob writeColumnMetadata writes to
+// <tenant>/<indexPrefix>/<colHash>/metadata.json -- letting an operator identify which
+// real column name/type a colHash directory belongs to, and when it was first
+// registered, without needing to consult viusage's own <tenant>/viusage/index.json
+// registry or grep logs.
+type columnMetadata struct {
+	ColumnName string `json:"column_name"`
+	ColumnType string `json:"column_type"`
+	CreatedAt  string `json:"created_at"` // RFC3339, from Entry.CreatedAt
+}
+
+// writeColumnMetadata PUTs a columnMetadata blob to
+// <tenant>/<indexPrefix>/<colHash>/metadata.json. One level up from flushAndPutL0's own
+// <colHash>/<typeName>/ files, so it describes the column as a whole rather than one
+// (colHash, typeName) shard. Idempotent: called once per BackfillEngine.Run invocation
+// (including R8 crash-self-heal re-triggers), each producing byte-identical content, so
+// repeated calls are harmless overwrites.
+func writeColumnMetadata(store ObjectPutter, tenant, indexPrefix, colName, colType string, createdAtSec uint64) error {
+	if store == nil {
+		return nil
+	}
+	if indexPrefix == "" {
+		indexPrefix = defaultL0IndexPrefix
+	}
+	data, err := json.Marshal(columnMetadata{
+		ColumnName: colName,
+		ColumnType: colType,
+		CreatedAt:  time.Unix(int64(createdAtSec), 0).UTC().Format(time.RFC3339), //nolint:gosec // unix seconds fits int64 for any realistic timestamp
+	})
+	if err != nil {
+		return fmt.Errorf("blockpack: writeColumnMetadata: marshal: %w", err)
+	}
+	key := path.Join(tenant, indexPrefix, valueindex.ColHash(colName), "metadata.json")
+	if err := store.Put(key, data); err != nil {
+		return fmt.Errorf("blockpack: writeColumnMetadata: put %q: %w", key, err)
 	}
 	return nil
 }
