@@ -9,6 +9,7 @@ import (
 	"github.com/grafana/tempo/pkg/cache"
 	"github.com/grafana/tempo/pkg/usagestats"
 	"github.com/grafana/tempo/tempodb"
+	"github.com/grafana/tempo/tempodb/backend"
 )
 
 var (
@@ -54,6 +55,19 @@ func NewStore(cfg Config, cacheProvider cache.Provider, logger log.Logger) (Stor
 
 	s.Service = services.NewIdleService(s.starting, s.stopping)
 	return s, nil
+}
+
+// RawReader implements tempodb.RawReaderProvider by forwarding to the underlying Reader's
+// own capability. Required because embedding tempodb.Reader here as an interface-typed field
+// only promotes methods declared on that interface -- it does not promote RawReader(), even
+// though the concrete *readerWriter tempodb.New returns implements it. Without this, every
+// reader.(tempodb.RawReaderProvider) assertion against a *store (frontend search/structural/
+// metrics sharders) silently fails and their VCNT-fetch/plan-time codepaths never engage.
+func (s *store) RawReader() backend.RawReader {
+	if rrp, ok := s.Reader.(tempodb.RawReaderProvider); ok {
+		return rrp.RawReader()
+	}
+	return nil
 }
 
 func (s *store) starting(_ context.Context) error {
