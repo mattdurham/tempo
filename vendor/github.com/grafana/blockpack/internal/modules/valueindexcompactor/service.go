@@ -226,14 +226,6 @@ func (s *Service) buildWorkList(ctx context.Context) []columnWork {
 		}
 		for _, colDir := range colDirs {
 			colName := path.Base(strings.TrimSuffix(colDir, "/"))
-			// NOTE-VI-096: "unique_values" is VCNT's top-level directory
-			// (<tenant>/indexes/unique_values/<colHash>/...), not a VI column-hash
-			// directory. VI must never descend into it -- doing so previously let VI's
-			// compactor pick up .vcnt files as false-positive candidates and delete them
-			// on magic-byte mismatch. See NOTES.md dated entry.
-			if colName == "unique_values" {
-				continue
-			}
 			if s.cfg.ShardCount > 1 && !s.ownsShard(colName) {
 				continue
 			}

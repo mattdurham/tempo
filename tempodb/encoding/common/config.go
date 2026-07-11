@@ -446,7 +446,6 @@ type ValueIndexCompactorConfig struct {
 // Mirrors valuecountscompactor.Config for YAML decoding without a direct blockpack import.
 type ValueCountCompactorConfig struct {
 	Enabled               bool          `yaml:"enabled"`
-	IndexPrefix           string        `yaml:"index_prefix"`
 	Tenants               []string      `yaml:"tenants"`
 	CompactInterval       time.Duration `yaml:"compact_interval"`
 	CompactThresholdFiles int           `yaml:"compact_threshold_files"`

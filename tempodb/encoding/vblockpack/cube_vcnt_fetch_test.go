@@ -64,9 +64,9 @@ func (m *memVCNTStore) ReadAt(key string, p []byte, off int64) (int, error) {
 }
 
 // vcntObjKey builds the S3 key a .vcnt object for column would live under, mirroring
-// blockpack.VCNTObjectKey's layout (<tenant>/indexes/unique_values/<colHash>/L0-<id>.vcnt).
+// blockpack.VCNTObjectKey's layout (<tenant>/value_counts/<colHash>/L0-<id>.vcnt).
 func vcntObjKey(tenant, column, id string) string {
-	return blockpack.VCNTObjectKey(tenant, defaultValueIndexPref, column, id)
+	return blockpack.VCNTObjectKey(tenant, column, id)
 }
 
 // vcntObjKeyV2 builds the S3 key a v2-format .vcnt object would live under, embedding an
@@ -74,7 +74,7 @@ func vcntObjKey(tenant, column, id string) string {
 func vcntObjKeyV2(tenant, column, id string, wallMinSec, wallMaxSec uint64) string {
 	colHash := blockpack.VCNTColHash(column)
 	filename := blockpack.VCNTFormatFilenameV2(0, wallMinSec, wallMaxSec, id)
-	return path.Join(tenant, defaultValueIndexPref, "unique_values", colHash, filename)
+	return path.Join(tenant, "value_counts", colHash, filename)
 }
 
 // countingVCNTStore wraps memVCNTStore and records every key passed to Get, so a test can
@@ -165,7 +165,7 @@ func TestBuildVCNTSection_MergesPerDim(t *testing.T) {
 func TestBuildVCNTSection_IgnoresNonVCNTKeys(t *testing.T) {
 	tenant := "tenant-b"
 	colHash := blockpack.VCNTColHash("span:kind")
-	prefix := path.Join(tenant, defaultValueIndexPref, "unique_values", colHash)
+	prefix := path.Join(tenant, "value_counts", colHash)
 	store := &memVCNTStore{objects: map[string][]byte{
 		vcntObjKey(tenant, "span:kind", "L0-ccc"): vcntObj(t, "span:kind", map[string]int64{"server": 1}),
 		path.Join(prefix, "junk.tmp"):             []byte("garbage that must be ignored"),

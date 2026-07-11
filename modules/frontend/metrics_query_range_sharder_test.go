@@ -839,12 +839,10 @@ func (*testNotFoundError) Error() string { return "not found (test fake)" }
 // tests use) bypasses that constructor entirely and leaves rawR nil forever.
 type mockReaderWithRawReader struct {
 	*mockReader
-	rawR        backend.RawReader
-	indexPrefix string
+	rawR backend.RawReader
 }
 
 func (m *mockReaderWithRawReader) RawReader() backend.RawReader { return m.rawR }
-func (m *mockReaderWithRawReader) IndexPrefix() string          { return m.indexPrefix }
 
 // TestMetricsQueryRangeSharder_TimeSlicedDispatch_ReachesDispatchTimeSlicedThroughRealCompile is
 // the REQUIRED end-to-end regression test for holistic-review Issue 2/B: before this fix,
@@ -871,9 +869,8 @@ func TestMetricsQueryRangeSharder_TimeSlicedDispatch_ReachesDispatchTimeSlicedTh
 
 	rawR, _ := newLocalRawReadWriter(t)
 	reader := &mockReaderWithRawReader{
-		mockReader:  &mockReader{metas: []*backend.BlockMeta{bm}},
-		rawR:        rawR,
-		indexPrefix: testIndexPrefix,
+		mockReader: &mockReader{metas: []*backend.BlockMeta{bm}},
+		rawR:       rawR,
 	}
 
 	o, err := overrides.NewOverrides(overrides.Config{}, nil, prometheus.NewRegistry())
@@ -958,9 +955,8 @@ func TestMetricsQueryRangeSharder_GroupByQueryStaysBlockSharded(t *testing.T) {
 
 	rawR, _ := newLocalRawReadWriter(t)
 	reader := &mockReaderWithRawReader{
-		mockReader:  &mockReader{metas: []*backend.BlockMeta{bm}},
-		rawR:        rawR,
-		indexPrefix: testIndexPrefix,
+		mockReader: &mockReader{metas: []*backend.BlockMeta{bm}},
+		rawR:       rawR,
 	}
 
 	o, err := overrides.NewOverrides(overrides.Config{}, nil, prometheus.NewRegistry())

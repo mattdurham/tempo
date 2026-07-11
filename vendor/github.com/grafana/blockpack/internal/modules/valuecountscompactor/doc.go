@@ -10,7 +10,7 @@
 // # Pipeline
 //
 //	for each tenant:
-//	  for each column_hash directory under <index_prefix>/<tenant>/unique_values/:
+//	  for each column_hash directory under <tenant>/value_counts/:
 //	    list VCNT files at the lowest compaction level present
 //	    if count >= compact_threshold_files:
 //	      decode inputs (self-describing or legacy single-chunk format)
@@ -30,7 +30,11 @@
 //     SourceExister equivalent.
 //   - One-level directory walk: VCNT's key layout has no <type> segment
 //     (unlike valueindexcompactor's three-level walk), so buildWorkList walks
-//     unique_values/<colHash>/ directly.
+//     <tenant>/value_counts/<colHash>/ directly. value_counts is a direct child
+//     of tenant -- a sibling of VI's index_prefix tree and cube's own top-level
+//     prefix, not nested under either (NOTE-VC-019; this structurally
+//     eliminates the VI/VCNT directory-collision class of bug fixed by
+//     NOTE-VI-096, since the two subsystems no longer share any directory tree).
 //   - Decoded-record-count admission gate: MaxRecordsPerMerge bounds peak
 //     decoded memory directly, independent of and in addition to
 //     CompactBatchBytes' compressed-byte cap, since weak compression at VCNT's

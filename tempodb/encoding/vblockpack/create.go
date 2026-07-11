@@ -152,7 +152,7 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 	// for tag autocomplete and cardinality queries. Best-effort; skipped when
 	// value_index_enabled is false.
 	if vcntAcc != nil {
-		vcntAcc.flush(getVCNTSink(), meta.TenantID, defaultValueIndexPref)
+		vcntAcc.flush(getVCNTSink(), meta.TenantID)
 	}
 	if cm != nil {
 		cm.flush(meta.TenantID)

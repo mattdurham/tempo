@@ -71,7 +71,7 @@ var ErrPlanTimeLowSelectivityNoLimit = errors.New(
 // child span it wraps this call in, without this function needing any tracing awareness of its
 // own.
 func fetchVCNTSection(
-	ctx context.Context, rawR backend.RawReader, tenant, indexPrefix string, dims []string,
+	ctx context.Context, rawR backend.RawReader, tenant string, dims []string,
 	minTS, maxTS uint64,
 ) (data []byte, dir []blockpack.VCNTChunkDirEntry, filesCount int, bytesRead int64) {
 	if rawR == nil || len(dims) == 0 {
@@ -81,7 +81,7 @@ func fetchVCNTSection(
 	var objects [][]byte
 	for _, dim := range dims {
 		colHash := blockpack.VCNTColHash(dim)
-		prefix := backend.KeyPath{tenant, indexPrefix, "unique_values", colHash}
+		prefix := backend.KeyPath{tenant, "value_counts", colHash}
 
 		var keys []string
 		// Find errors (e.g. the prefix doesn't exist yet for this column) are not fatal —
@@ -152,7 +152,7 @@ func splitObjectKey(fullKey string) (backend.KeyPath, string) {
 // which enforces per-query completeness against one block's real data, needs a *blockpack.Reader
 // and is unreachable from this block-independent plan-time call site).
 func buildQueryPlan(
-	ctx context.Context, rawR backend.RawReader, tenant, indexPrefix, query string,
+	ctx context.Context, rawR backend.RawReader, tenant, query string,
 	minTS, maxTS uint64, concurrentRequests int, hasLimit bool,
 ) (*blockpack.QueryPlan, error) {
 	if rawR == nil || query == "" {
@@ -162,7 +162,7 @@ func buildQueryPlan(
 	if err != nil || prog == nil {
 		return nil, nil
 	}
-	return buildQueryPlanFromProgram(ctx, rawR, tenant, indexPrefix, prog, minTS, maxTS, concurrentRequests, true, hasLimit)
+	return buildQueryPlanFromProgram(ctx, rawR, tenant, prog, minTS, maxTS, concurrentRequests, true, hasLimit)
 }
 
 // buildMetricsQueryPlan is buildQueryPlan's metrics sibling (holistic-review Issue 2/B): a real
@@ -186,7 +186,7 @@ func buildQueryPlan(
 // keep an unsupported metrics shape on the safe, working block-sharded path instead of it
 // depending on a typed error the user would otherwise see.
 func buildMetricsQueryPlan(
-	ctx context.Context, rawR backend.RawReader, tenant, indexPrefix, query string,
+	ctx context.Context, rawR backend.RawReader, tenant, query string,
 	minTS, maxTS uint64, concurrentRequests int,
 ) (*blockpack.QueryPlan, error) {
 	if rawR == nil || query == "" {
@@ -198,7 +198,7 @@ func buildMetricsQueryPlan(
 	}
 	// boundedEligible=false (R2: metrics is never bounded-served); hasLimit is irrelevant on
 	// this path and unused by buildQueryPlanFromProgram's boundedEligible=false branch.
-	return buildQueryPlanFromProgram(ctx, rawR, tenant, indexPrefix, prog, minTS, maxTS, concurrentRequests, false, false)
+	return buildQueryPlanFromProgram(ctx, rawR, tenant, prog, minTS, maxTS, concurrentRequests, false, false)
 }
 
 // buildQueryPlanFromProgram is the shared tail buildQueryPlan/buildStructuralQueryPlan (search,
@@ -220,7 +220,7 @@ func buildMetricsQueryPlan(
 // pass it as false and it is never read on the boundedEligible=false branch, since R2 already
 // forecloses metrics ever reaching DispatchBoundedRecentFirst regardless of a limit.
 func buildQueryPlanFromProgram(
-	ctx context.Context, rawR backend.RawReader, tenant, indexPrefix string, prog *blockpack.Program,
+	ctx context.Context, rawR backend.RawReader, tenant string, prog *blockpack.Program,
 	minTS, maxTS uint64, concurrentRequests int, boundedEligible, hasLimit bool,
 ) (*blockpack.QueryPlan, error) {
 	// issue #493 Task 4a/4b: attach qualification/plan attributes to whatever span is already
@@ -256,7 +256,7 @@ func buildQueryPlanFromProgram(
 	// reuse of blockpack.query) — a distinct I/O phase (S3 Find+Read fan-out) worth timing on
 	// its own, not routine attribute promotion onto an existing span.
 	vcntCtx, vcntSpan := tracer.Start(ctx, "frontend.vcntFetch")
-	data, dir, filesCount, bytesRead := fetchVCNTSection(vcntCtx, rawR, tenant, indexPrefix, dims, minTS, maxTS)
+	data, dir, filesCount, bytesRead := fetchVCNTSection(vcntCtx, rawR, tenant, dims, minTS, maxTS)
 	if vcntSpan.IsRecording() {
 		vcntSpan.SetAttributes(
 			attribute.Int("files.count", filesCount),

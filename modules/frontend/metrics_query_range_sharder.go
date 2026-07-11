@@ -42,11 +42,10 @@ type queryRangeSharder struct {
 	instantMode            bool
 	jobsPerQuery           *prometheus.HistogramVec
 
-	// rawR/indexPrefix (issue #487) back the frontend-local VCNT fetch buildQueryPlan uses to
-	// build a real #487 QueryPlan at RoundTrip's backendRequests call site. See
-	// asyncSearchSharder's identical fields for the full rationale.
-	rawR        backend.RawReader
-	indexPrefix string
+	// rawR (issue #487) backs the frontend-local VCNT fetch buildQueryPlan uses to build a
+	// real #487 QueryPlan at RoundTrip's backendRequests call site. See asyncSearchSharder's
+	// identical field for the full rationale.
+	rawR backend.RawReader
 }
 
 type QueryRangeSharderConfig struct {
@@ -64,10 +63,8 @@ type QueryRangeSharderConfig struct {
 // newAsyncQueryRangeSharder creates a sharding middleware for search
 func newAsyncQueryRangeSharder(reader tempodb.Reader, o overrides.Interface, cfg QueryRangeSharderConfig, skipASTTransformations []string, instantMode bool, jobsPerQuery *prometheus.HistogramVec, logger log.Logger) pipeline.AsyncMiddleware[combiner.PipelineResponse] {
 	var rawR backend.RawReader
-	var indexPrefix string
 	if rrp, ok := reader.(tempodb.RawReaderProvider); ok {
 		rawR = rrp.RawReader()
-		indexPrefix = rrp.IndexPrefix()
 	}
 	return pipeline.AsyncMiddlewareFunc[combiner.PipelineResponse](func(next pipeline.AsyncRoundTripper[combiner.PipelineResponse]) pipeline.AsyncRoundTripper[combiner.PipelineResponse] {
 		return queryRangeSharder{
@@ -80,8 +77,7 @@ func newAsyncQueryRangeSharder(reader tempodb.Reader, o overrides.Interface, cfg
 			logger:                 logger,
 			jobsPerQuery:           jobsPerQuery,
 
-			rawR:        rawR,
-			indexPrefix: indexPrefix,
+			rawR: rawR,
 		}
 	})
 }
@@ -179,7 +175,7 @@ func (s queryRangeSharder) RoundTrip(pipelineRequest pipeline.Request) (pipeline
 	var plan *blockpack.QueryPlan
 	if req.Start != 0 && req.End != 0 {
 		var planErr error
-		plan, planErr = buildMetricsQueryPlan(ctx, s.rawR, tenantID, s.indexPrefix, req.Query, req.Start/uint64(time.Second), req.End/uint64(time.Second), s.cfg.ConcurrentRequests)
+		plan, planErr = buildMetricsQueryPlan(ctx, s.rawR, tenantID, req.Query, req.Start/uint64(time.Second), req.End/uint64(time.Second), s.cfg.ConcurrentRequests)
 		if planErr != nil {
 			// F-6 (issue #481 parts 2/3, R6): a resolvable-but-low-selectivity metrics query has
 			// no safe answer (R2: metrics is never bounded-served) — fail HERE, at plan time,

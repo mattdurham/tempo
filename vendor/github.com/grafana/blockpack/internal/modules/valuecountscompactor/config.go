@@ -11,9 +11,6 @@ import (
 
 // Default configuration values for the value-counts compactor.
 const (
-	// DefaultIndexPrefix is the object-storage key prefix under which value
-	// counts index files live. Must match the consumer's index_prefix.
-	DefaultIndexPrefix = "indexes"
 	// DefaultCompactInterval is the wall-clock period between compaction passes
 	// over all tenants and columns.
 	DefaultCompactInterval = 5 * time.Minute
@@ -41,7 +38,6 @@ const (
 // `value_counts_compactor` YAML block.
 //
 //	value_counts_compactor:
-//	  index_prefix: "indexes"
 //	  compact_interval: 5m
 //	  compact_threshold_files: 8
 //	  tenants:
@@ -52,9 +48,6 @@ type Config struct {
 	// occurs. It is not settable from YAML; the embedder (tempo) injects it
 	// programmatically.
 	Registerer prometheus.Registerer `yaml:"-"`
-	// IndexPrefix is the object-storage key prefix for value counts files.
-	// Defaults to DefaultIndexPrefix when empty. Must match the consumer.
-	IndexPrefix string `yaml:"index_prefix"`
 	// Tenants is the explicit list of tenant IDs to compact. A single entry of
 	// "*" means all tenants (discovered by listing the prefix). Must be
 	// non-empty.
@@ -93,9 +86,6 @@ type Config struct {
 
 // withDefaults returns a copy of c with empty/zero fields filled in.
 func (c Config) withDefaults() Config {
-	if c.IndexPrefix == "" {
-		c.IndexPrefix = DefaultIndexPrefix
-	}
 	if c.CompactInterval <= 0 {
 		c.CompactInterval = DefaultCompactInterval
 	}

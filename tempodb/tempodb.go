@@ -48,10 +48,6 @@ const (
 	BlockIDMin = "00000000-0000-0000-0000-000000000000"
 	// BlockIDMax is the maximum possible value for a block id as a string
 	BlockIDMax = "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF"
-
-	// defaultIndexPrefix mirrors vblockpack.ConfigureValueIndexQuery's own default,
-	// applied by RawReaderProvider.IndexPrefix when value_index_query.index_prefix is unset.
-	defaultIndexPrefix = "indexes"
 )
 
 var (
@@ -130,24 +126,14 @@ type Reader interface {
 
 // RawReaderProvider is an OPTIONAL capability a Reader implementation may satisfy, exposing
 // the backend.RawReader tempodb already builds and holds internally (whichever concrete
-// backend — local/S3/GCS/Azure — the deployment is configured with), plus the configured
-// VCNT/value-index key prefix (cfg.Block.Blockpack.ValueIndexQuery.IndexPrefix — the same
-// prefix the querier's own index-driven query path already reads from; see
-// vblockpack.ConfigureValueIndexQuery's call site). Bundling both on one interface, rather
-// than adding a second new frontend Config/YAML field for the prefix, keeps issue #487's
-// frontend-side VCNT fetch fully config-drift-free — it derives everything from the same
-// already-configured backend/config tempodb itself uses, per team-lead's checkpoint ruling.
-// It is a separate interface from Reader (not a new Reader method) so existing Reader
-// implementations, fakes, and mocks across the codebase are unaffected — callers that need raw,
-// generic List/Read access (issue #487: frontend-side VCNT fetch, which needs to address
-// `<tenant>/indexes/unique_values/...` keys outside Reader's block-oriented key layout) type-
-// assert for this capability rather than requiring every Reader to support it.
+// backend — local/S3/GCS/Azure — the deployment is configured with). It is a separate
+// interface from Reader (not a new Reader method) so existing Reader implementations, fakes,
+// and mocks across the codebase are unaffected — callers that need raw, generic List/Read
+// access (issue #487: frontend-side VCNT fetch, which needs to address `<tenant>/value_counts/
+// ...` keys outside Reader's block-oriented key layout) type-assert for this capability rather
+// than requiring every Reader to support it.
 type RawReaderProvider interface {
 	RawReader() backend.RawReader
-	// IndexPrefix returns the configured VCNT/value-index key prefix (default "indexes"
-	// when unset in YAML, matching vblockpack's own default), so a caller doesn't need to
-	// duplicate that default separately.
-	IndexPrefix() string
 }
 
 type Compactor interface {
@@ -757,20 +743,6 @@ func (rw *readerWriter) Shutdown() {
 // backend the rest of tempodb uses — no new object-store client or config.
 func (rw *readerWriter) RawReader() backend.RawReader {
 	return rw.rawR
-}
-
-// IndexPrefix implements RawReaderProvider: it returns the configured VCNT/value-index key
-// prefix (cfg.Block.Blockpack.ValueIndexQuery.IndexPrefix), applying the same "indexes"
-// default vblockpack.ConfigureValueIndexQuery applies when it is unset in YAML, so a caller
-// (the frontend's VCNT fetch) never has to duplicate that default.
-func (rw *readerWriter) IndexPrefix() string {
-	if rw.cfg == nil || rw.cfg.Block == nil {
-		return defaultIndexPrefix
-	}
-	if p := rw.cfg.Block.Blockpack.ValueIndexQuery.IndexPrefix; p != "" {
-		return p
-	}
-	return defaultIndexPrefix
 }
 
 // EnableCompaction activates the compaction/retention loops

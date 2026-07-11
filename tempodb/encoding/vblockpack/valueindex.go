@@ -77,7 +77,7 @@ var (
 	defaultValueIndexPref = "indexes"
 
 	// vcntSink is set alongside valueIndexSink — same S3 client, same bucket.
-	// VCNT files go under <tenant>/indexes/unique_values/<colHash>/L0-<id>.vcnt
+	// VCNT files go under <tenant>/value_counts/<colHash>/L0-<id>.vcnt
 	vcntSink blockpack.ObjectPutter
 )
 

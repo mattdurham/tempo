@@ -323,11 +323,11 @@ func TestVCNTFlush_CrossBlockMinuteCoalescing(t *testing.T) {
 
 	accA := newVCNTAccumulator()
 	accA.addTrace(traceWithSpanAt(65*1_000_000_000, "op-a")) // bucket 60
-	accA.flush(store, "tenant1", "indexes")
+	accA.flush(store, "tenant1")
 
 	accB := newVCNTAccumulator()
 	accB.addTrace(traceWithSpanAt(68*1_000_000_000, "op-a")) // also bucket 60, independent flush
-	accB.flush(store, "tenant1", "indexes")
+	accB.flush(store, "tenant1")
 
 	decoded := store.recordsForColumn("span:name")
 	require.NotEmpty(t, decoded, "flush must have written span:name records to the fake store")
@@ -369,7 +369,7 @@ func TestVCNTFlush_WritesV2KeyFormatWithGenuineRange(t *testing.T) {
 	acc.addTrace(traceWithSpanAt(60*1_000_000_000, "op-a"))
 	acc.addTrace(traceWithSpanAt(120*1_000_000_000, "op-b"))
 	acc.addTrace(traceWithSpanAt(180*1_000_000_000, "op-c"))
-	acc.flush(store, "tenant1", "indexes")
+	acc.flush(store, "tenant1")
 
 	key := keyForColumn(t, store, "span:name")
 	meta, err := blockpack.VCNTParseFilenameV2(path.Base(key))
@@ -396,7 +396,7 @@ func TestVCNTFlush_KeyRangeCorrectDespiteMapIterationOrder(t *testing.T) {
 				60:   {"a": 1},
 			},
 		}
-		acc.flush(store, "tenant1", "indexes")
+		acc.flush(store, "tenant1")
 
 		key := keyForColumn(t, store, "span:name")
 		meta, err := blockpack.VCNTParseFilenameV2(path.Base(key))

@@ -6,12 +6,18 @@ package blockpack
 // without importing internal packages directly.
 //
 // Key layout for .vcnt files (v1, still supported, unchanged):
-//   <tenant>/indexes/unique_values/<colHash>/<type>/L0-<id>.vcnt
+//   <tenant>/value_counts/<colHash>/<type>/L0-<id>.vcnt
 //
 // As of issue #494, a second, additive v2 key layout also exists, embedding the file's
 // wall-clock time range for O(1) input-side clustering during compaction:
-//   <tenant>/indexPrefix/unique_values/<colHash>/L<level>-<wallMinSec>-<wallMaxSec>-<id>.vcnt
+//   <tenant>/value_counts/<colHash>/L<level>-<wallMinSec>-<wallMaxSec>-<id>.vcnt
 // See VCNTObjectKeyV2/VCNTFormatFilenameV2/VCNTParseFilenameV2 below.
+//
+// value_counts is a direct child of tenant -- a sibling of the VI index prefix tree
+// and cube's own top-level prefix, not nested under either. This is a deliberate
+// structural change from the earlier <tenant>/<indexPrefix>/unique_values/ layout: it
+// eliminates the VI/VCNT directory-collision class of bug fixed by NOTE-VI-096, since
+// the two subsystems no longer share any directory tree at all.
 
 import (
 	"path"
@@ -93,11 +99,11 @@ func VCNTNewID() string {
 
 // VCNTObjectKey returns the full S3 object key for an L0 .vcnt file:
 //
-//	<tenant>/indexes/unique_values/<colHash>/L0-<id>.vcnt
-func VCNTObjectKey(tenant, indexPrefix, colName, id string) string {
+//	<tenant>/value_counts/<colHash>/L0-<id>.vcnt
+func VCNTObjectKey(tenant, colName, id string) string {
 	colHash := valuecounts.ColHash(colName)
 	filename := valuecounts.FormatFilename(0, id)
-	return path.Join(tenant, indexPrefix, "unique_values", colHash, filename)
+	return path.Join(tenant, "value_counts", colHash, filename)
 }
 
 // VCNTFormatFilenameV2 returns a .vcnt filename that embeds the file's wall-clock time range
@@ -123,11 +129,11 @@ func VCNTRecordTimeRange(records []VCNTRecord) (minSec, maxSec uint64) {
 // VCNTObjectKeyV2 returns the full S3 object key for a .vcnt file using the v2 filename
 // format, which embeds the file's wall-clock time range (issue #494):
 //
-//	<tenant>/indexPrefix/unique_values/<colHash>/L<level>-<wallMinSec>-<wallMaxSec>-<id>.vcnt
-func VCNTObjectKeyV2(tenant, indexPrefix, colName, id string, wallMinSec, wallMaxSec uint64) string {
+//	<tenant>/value_counts/<colHash>/L<level>-<wallMinSec>-<wallMaxSec>-<id>.vcnt
+func VCNTObjectKeyV2(tenant, colName, id string, wallMinSec, wallMaxSec uint64) string {
 	colHash := valuecounts.ColHash(colName)
 	filename := valuecounts.FormatFilenameV2(0, wallMinSec, wallMaxSec, id)
-	return path.Join(tenant, indexPrefix, "unique_values", colHash, filename)
+	return path.Join(tenant, "value_counts", colHash, filename)
 }
 
 // VCNTBuildSectionFromObjects decodes each raw .vcnt object (self-describing —

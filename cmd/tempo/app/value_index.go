@@ -106,7 +106,6 @@ func toVICCompactorCfg(cfg common.ValueIndexCompactorConfig) viccompactor.Config
 func toVCNTCompactorCfg(cfg common.ValueCountCompactorConfig) vcntcompactor.Config {
 	out := vcntcompactor.Config{
 		Enabled:               cfg.Enabled,
-		IndexPrefix:           cfg.IndexPrefix,
 		Tenants:               cfg.Tenants,
 		CompactInterval:       cfg.CompactInterval,
 		CompactThresholdFiles: cfg.CompactThresholdFiles,

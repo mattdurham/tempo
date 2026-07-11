@@ -1004,7 +1004,7 @@ func TestPollNotification(t *testing.T) {
 // delimiter, returning CommonPrefixes only) — neither ever returns a leaf-level file at the
 // queried keypath. Find recursively walks and reports every actual file (FindMatch.Key is the
 // full relative path), which is what enumerating `.vcnt` files under
-// `<tenant>/indexes/unique_values/<colHash>/` actually needs.
+// `<tenant>/value_counts/<colHash>/` actually needs.
 func TestReaderExposesRawReader(t *testing.T) {
 	tempDir := t.TempDir()
 	tracesPath := path.Join(tempDir, "traces")
@@ -1034,7 +1034,7 @@ func TestReaderExposesRawReader(t *testing.T) {
 	require.NotNil(t, rawR)
 
 	// Write an arbitrary object at a non-block key path (mirroring the VCNT key layout,
-	// <tenant>/indexes/unique_values/<colHash>/<file>.vcnt) directly against the SAME local
+	// <tenant>/value_counts/<colHash>/<file>.vcnt) directly against the SAME local
 	// backend directory New() configured this Reader with, via a separately-constructed raw
 	// writer (tempodb.Writer itself exposes no raw-write method). Then confirm the exposed
 	// RawReader can Find and Read it back — proving this is genuine generic key-path access,
@@ -1043,16 +1043,16 @@ func TestReaderExposesRawReader(t *testing.T) {
 	require.NoError(t, err)
 
 	ctx := t.Context()
-	dirPath := backend.KeyPath{"test-tenant", "indexes", "unique_values", "somehash"}
+	dirPath := backend.KeyPath{"test-tenant", "value_counts", "somehash"}
 	content := []byte("hello")
 	require.NoError(t, rawW.Write(ctx, "obj.vcnt", dirPath, bytes.NewReader(content), int64(len(content)), nil))
 
 	var found []backend.FindMatch
-	require.NoError(t, rawR.Find(ctx, backend.KeyPath{"test-tenant", "indexes", "unique_values"}, func(m backend.FindMatch) {
+	require.NoError(t, rawR.Find(ctx, backend.KeyPath{"test-tenant", "value_counts"}, func(m backend.FindMatch) {
 		found = append(found, m)
 	}))
 	require.Len(t, found, 1)
-	require.Equal(t, "test-tenant/indexes/unique_values/somehash/obj.vcnt", found[0].Key)
+	require.Equal(t, "test-tenant/value_counts/somehash/obj.vcnt", found[0].Key)
 
 	rc, size, err := rawR.Read(ctx, "obj.vcnt", dirPath, nil)
 	require.NoError(t, err)
@@ -1062,49 +1062,4 @@ func TestReaderExposesRawReader(t *testing.T) {
 	got, err := io.ReadAll(rc)
 	require.NoError(t, err)
 	require.Equal(t, content, got)
-}
-
-// TestReaderExposesIndexPrefix pins RawReaderProvider.IndexPrefix's two cases: it defaults to
-// "indexes" (matching vblockpack.ConfigureValueIndexQuery's own default) when
-// value_index_query.index_prefix is unset in YAML, and it returns the configured value
-// verbatim when set — so the frontend's VCNT fetch (issue #487) never has to duplicate or
-// drift from the default the querier's own index-driven query path already applies.
-func TestReaderExposesIndexPrefix(t *testing.T) {
-	newLocalCfg := func(t *testing.T, indexPrefix string) *Config {
-		tempDir := t.TempDir()
-		return &Config{
-			Backend: backend.Local,
-			Local:   &local.Config{Path: path.Join(tempDir, "traces")},
-			Block: &common.BlockConfig{
-				BloomFP:             .01,
-				BloomShardSizeBytes: 100_000,
-				Version:             encoding.DefaultEncoding().Version(),
-				Blockpack: common.BlockpackConfig{
-					ValueIndexQuery: common.ValueIndexQueryConfig{IndexPrefix: indexPrefix},
-				},
-			},
-			WAL:           &wal.Config{Filepath: path.Join(tempDir, "wal")},
-			BlocklistPoll: 0,
-			Search: &SearchConfig{
-				ChunkSizeBytes:  1_000_000,
-				ReadBufferCount: 8, ReadBufferSizeBytes: 4 * 1024 * 1024,
-			},
-		}
-	}
-
-	t.Run("defaults to indexes when unset", func(t *testing.T) {
-		r, _, _, err := New(newLocalCfg(t, ""), nil, log.NewNopLogger())
-		require.NoError(t, err)
-		rrp, ok := r.(RawReaderProvider)
-		require.True(t, ok)
-		require.Equal(t, "indexes", rrp.IndexPrefix())
-	})
-
-	t.Run("returns configured value verbatim", func(t *testing.T) {
-		r, _, _, err := New(newLocalCfg(t, "custom-prefix"), nil, log.NewNopLogger())
-		require.NoError(t, err)
-		rrp, ok := r.(RawReaderProvider)
-		require.True(t, ok)
-		require.Equal(t, "custom-prefix", rrp.IndexPrefix())
-	})
 }

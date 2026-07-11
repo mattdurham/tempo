@@ -54,29 +54,23 @@ type asyncSearchSharder struct {
 	logger                 log.Logger
 	jobsPerQuery           *prometheus.HistogramVec
 
-	// rawR/indexPrefix (issue #487) back the frontend-local VCNT fetch buildQueryPlan uses to
-	// build a real #487 QueryPlan at RoundTrip's backendRequests call site. Derived once, at
+	// rawR (issue #487) backs the frontend-local VCNT fetch buildQueryPlan uses to build a
+	// real #487 QueryPlan at RoundTrip's backendRequests call site. Derived once, at
 	// construction, from reader via the optional tempodb.RawReaderProvider capability — rawR
 	// is nil whenever reader doesn't implement it (e.g. a test fake), which buildQueryPlan
 	// treats as "no plan available", falling back to today's block-sharded dispatch.
 	//
 	// Captured once, at construction, deliberately — no live-config-reload support exists for
-	// these fields today (no race: both are set once and never mutated, so concurrent
-	// RoundTrip calls are safe). If tempo ever grows a live-config-reload story for
-	// storage/block settings, indexPrefix could then drift from IndexPrefix()'s current value
-	// independently of this sharder's captured snapshot — not actionable today, flagged so a
-	// future reload path treats this as an explicit gap to close, not an implicit oversight.
-	rawR        backend.RawReader
-	indexPrefix string
+	// this field today (no race: it is set once and never mutated, so concurrent RoundTrip
+	// calls are safe).
+	rawR backend.RawReader
 }
 
 // newAsyncSearchSharder creates a sharding middleware for search
 func newAsyncSearchSharder(reader tempodb.Reader, o overrides.Interface, cfg SearchSharderConfig, skipASTTransformations []string, jobsPerQuery *prometheus.HistogramVec, logger log.Logger) pipeline.AsyncMiddleware[combiner.PipelineResponse] {
 	var rawR backend.RawReader
-	var indexPrefix string
 	if rrp, ok := reader.(tempodb.RawReaderProvider); ok {
 		rawR = rrp.RawReader()
-		indexPrefix = rrp.IndexPrefix()
 	}
 	return pipeline.AsyncMiddlewareFunc[combiner.PipelineResponse](func(next pipeline.AsyncRoundTripper[combiner.PipelineResponse]) pipeline.AsyncRoundTripper[combiner.PipelineResponse] {
 		return asyncSearchSharder{
@@ -89,8 +83,7 @@ func newAsyncSearchSharder(reader tempodb.Reader, o overrides.Interface, cfg Sea
 			logger:                 logger,
 			jobsPerQuery:           jobsPerQuery,
 
-			rawR:        rawR,
-			indexPrefix: indexPrefix,
+			rawR: rawR,
 		}
 	})
 }
@@ -169,12 +162,12 @@ func (s asyncSearchSharder) RoundTrip(pipelineRequest pipeline.Request) (pipelin
 	hasLimit := searchReq.Limit > 0
 	if searchReq.Start != 0 && searchReq.End != 0 {
 		var planErr error
-		plan, planErr = buildQueryPlan(ctx, s.rawR, tenantID, s.indexPrefix, searchReq.Query, uint64(searchReq.Start), uint64(searchReq.End), s.cfg.ConcurrentRequests, hasLimit)
+		plan, planErr = buildQueryPlan(ctx, s.rawR, tenantID, searchReq.Query, uint64(searchReq.Start), uint64(searchReq.End), s.cfg.ConcurrentRequests, hasLimit)
 		if planErr != nil {
 			return pipeline.NewBadRequest(planErr), nil
 		}
 		if plan == nil {
-			plan, planErr = buildStructuralQueryPlan(ctx, s.rawR, tenantID, s.indexPrefix, searchReq.Query, uint64(searchReq.Start), uint64(searchReq.End), s.cfg.ConcurrentRequests, hasLimit)
+			plan, planErr = buildStructuralQueryPlan(ctx, s.rawR, tenantID, searchReq.Query, uint64(searchReq.Start), uint64(searchReq.End), s.cfg.ConcurrentRequests, hasLimit)
 			if planErr != nil {
 				return pipeline.NewBadRequest(planErr), nil
 			}

@@ -16,8 +16,8 @@ core-format/compactor-service pair for VCNT that `valueindex`/`valueindexcompact
 `valuecounts/NOTES.md` currently holds NOTE-VC-001 through NOTE-VC-006, NOTE-VC-008, and
 NOTE-VC-011 through NOTE-VC-017 (NOTE-VC-007 was left explicitly reserved for this file — see the
 inline note in `valuecounts/NOTES.md` at that point in the sequence). This file also holds
-NOTE-VC-009, NOTE-VC-010, and (as of 2026-07-10, issue #494) NOTE-VC-018. Next free ID:
-**NOTE-VC-019**.
+NOTE-VC-009, NOTE-VC-010, (as of 2026-07-10, issue #494) NOTE-VC-018, and (as of 2026-07-10)
+NOTE-VC-019. Next free ID: **NOTE-VC-020**.
 
 ---
 
@@ -302,3 +302,27 @@ Back-refs: `internal/modules/valuecountscompactor/cluster.go` (`clusterByTimeRan
 `DefaultMaxTimeSpanPerMerge`). `SPECS.md` SPEC-VC-3. `valuecounts/NOTES.md` NOTE-VC-017 (the
 filename-format side of this change). `.bob/state/plan.md` "Deployment Notes" section (full
 sequencing detail, out of this file's scope to duplicate).
+
+## NOTE-VC-019 — value_counts relocated to a direct child of tenant, out from under indexPrefix (2026-07-10)
+
+VCNT's on-disk key layout changed from `<tenant>/<indexPrefix>/unique_values/<colHash>/...`
+to `<tenant>/value_counts/<colHash>/...`: `value_counts` is now a direct child of tenant, a
+sibling of the VI compactor's `indexPrefix` tree (`<tenant>/indexes/...`) and cube's own
+top-level prefix (`<tenant>/cubes/...`), rather than nested inside VI's tree under the
+now-retired `unique_values` name. No backward-compat fallback was added — this is a breaking,
+forward-only key-layout change requiring a full data wipe in every environment (same
+deployment discipline as NOTE-VC-018's own wipe requirement, issue #494).
+
+This is a genuine structural fix, not just a rename: it retires the `Config.IndexPrefix` field
+entirely from this package (VCNT no longer has any prefix concept to configure) and, more
+importantly, it makes NOTE-VI-096's live data-loss incident (VI's compactor treating VCNT's
+`unique_values` directory as one of its own column directories) **structurally impossible**
+rather than merely guarded-against — the two subsystems no longer share any directory tree,
+so `valueindexcompactor`'s special-case exclusion for `unique_values` was removed as dead code
+(it could never fire again) along with its pinning regression test.
+
+Back-refs: `internal/modules/valuecountscompactor/service.go` (`buildWorkList`,
+`resolveTenants`), `internal/modules/valuecountscompactor/config.go` (removed
+`IndexPrefix`/`DefaultIndexPrefix`), `vcnt.go` (root package — `VCNTObjectKey`,
+`VCNTObjectKeyV2`, both lost their `indexPrefix` parameter). `valueindexcompactor/service.go`
+(removed the NOTE-VI-096 `unique_values` exclusion in `buildWorkList`).

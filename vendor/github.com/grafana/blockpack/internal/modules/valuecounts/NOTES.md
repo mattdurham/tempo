@@ -364,7 +364,7 @@ part 2).
 ### Consumer
 
 tempo `cube_backfill.go:buildVCNTSection` lists+downloads the `.vcnt` files under each dim's
-`unique_values/<colHash>/` prefix (through the shared `cachingStore`-wrapped `minioVIStore`, issue
+`value_counts/<colHash>/` prefix (through the shared `cachingStore`-wrapped `minioVIStore`, issue
 #478) and calls this to build the section `maybeCreateCube` hands to `TryCreate`. VCNT filenames carry
 no embedded time range (unlike VI files), so all of a column's files are fetched and the query window
 is applied at the record level by the gate's `ValuesInRange` decode. **[Superseded by NOTE-VC-017,

@@ -609,3 +609,18 @@ this note documents WHY it is sufficient.
 Back-refs: `internal/modules/valueindexcompactor/service.go:buildWorkList,compactTenant,
 compactColumn`, `internal/modules/valueindexcompactor/traceindex_dispatch.go:
 isTraceIndexColDir`. See `viusage/SPECS.md` SPEC-VIUSAGE-5, `valueindex/SPECS.md` SPEC-VI-11.
+
+## NOTE-VI-102 — NOTE-VI-096's `unique_values` exclusion guard removed: structurally obsolete, not just unnecessary (2026-07-10)
+
+VCNT's on-disk key layout moved from `<tenant>/indexes/unique_values/<colHash>/...` to
+`<tenant>/value_counts/<colHash>/...` (`valuecountscompactor/NOTES.md` NOTE-VC-019):
+`value_counts` is now a direct child of tenant, a sibling of this compactor's own
+`indexPrefix` tree, not nested inside it. `buildWorkList`'s `tenantPrefix := path.Join(tenant,
+s.cfg.IndexPrefix)` walk can therefore never again observe a `unique_values` (or any VCNT)
+directory at all — NOTE-VI-096's exclusion guard (`colName == "unique_values" { continue }`)
+became dead code, not merely redundant defense-in-depth, so it and its pinning regression test
+(`TestBuildWorkList_ExcludesUniqueValuesDirectory`, `worklist_test.go`) were removed rather
+than left in place. NOTE-VI-095 (`valueindex/NOTES.md`, the filename-suffix-validation fix)
+is unaffected and remains in place as its own independent defense-in-depth layer.
+
+Back-ref: `internal/modules/valueindexcompactor/service.go:buildWorkList`.

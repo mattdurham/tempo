@@ -57,7 +57,7 @@ Back-ref: `internal/modules/valuecountscompactor/config_test.go:TestConfig_AllTe
 shape VCNT's compactor relies on (no `<type>` segment, unlike VI's three-level walk).
 
 **Assertions:** Given two objects under distinct column-hash subdirectories,
-`ListDirs("t1/indexes/unique_values/")` returns exactly those two immediate child directory
+`ListDirs("t1/value_counts/")` returns exactly those two immediate child directory
 prefixes.
 
 Back-ref: `internal/modules/valuecountscompactor/store_test.go:TestFakeStore_ListDirsOneLevel`.
@@ -96,7 +96,7 @@ Back-ref: `internal/modules/valuecountscompactor/metrics_test.go:TestNewCompacto
 *Added: 2026-07-02*
 
 **Scenario:** `buildWorkList` discovers all `(tenant, colDir)` pairs via the one-level
-`unique_values/<colHash>/` walk.
+`value_counts/<colHash>/` walk.
 
 **Setup:** Two columns' worth of L0 files under one tenant.
 

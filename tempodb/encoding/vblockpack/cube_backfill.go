@@ -121,7 +121,7 @@ func buildVCNTSection(
 	var objects [][]byte
 	for _, dim := range dims {
 		colHash := blockpack.VCNTColHash(dim)
-		prefix := path.Join(tenant, defaultValueIndexPref, "unique_values", colHash) + "/"
+		prefix := path.Join(tenant, "value_counts", colHash) + "/"
 		keys, err := store.List(ctx, prefix)
 		if err != nil || len(keys) == 0 {
 			continue

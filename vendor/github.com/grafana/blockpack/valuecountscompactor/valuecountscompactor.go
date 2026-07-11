@@ -33,7 +33,6 @@ type Object = valuecountscompactor.Object
 
 // Default configuration values.
 const (
-	DefaultIndexPrefix           = valuecountscompactor.DefaultIndexPrefix
 	DefaultCompactInterval       = valuecountscompactor.DefaultCompactInterval
 	DefaultCompactThresholdFiles = valuecountscompactor.DefaultCompactThresholdFiles
 	DefaultCompactBatchBytes     = valuecountscompactor.DefaultCompactBatchBytes

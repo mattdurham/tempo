@@ -16,7 +16,7 @@ import (
 )
 
 // ColHash returns the per-column directory hash used in the .vcnt object key:
-// indexes/<tenant>/unique_values/<column_hash>/L<level>-<id>.vcnt (issue #400).
+// <tenant>/value_counts/<column_hash>/L<level>-<id>.vcnt (issue #400).
 func ColHash(colName string) string {
 	sum := sha256.Sum256([]byte(colName))
 	return hex.EncodeToString(sum[:16])

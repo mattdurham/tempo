@@ -482,7 +482,7 @@ const (
 
 	// ValueCountsFilenamePattern is fmt.Sprintf(ValueCountsFilenamePattern, level, id).
 	// Consolidated per-tenant count files live at
-	// indexes/<tenant>/unique_values/<column_hash>/L<level>-<id>.vcnt (issue #400).
+	// <tenant>/value_counts/<column_hash>/L<level>-<id>.vcnt (issue #400).
 	ValueCountsFilenamePattern = "L%d-%s.vcnt"
 
 	// ValueCountsFilenamePatternV2 embeds wall-clock time range for O(1) input-side

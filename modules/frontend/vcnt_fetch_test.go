@@ -46,12 +46,12 @@ func vcntObj(t *testing.T, column string, timeStart uint64, values map[string]in
 }
 
 // writeVCNTObject writes data at the exact key layout VCNTObjectKey documents:
-// tenant-a/<indexPrefix>/unique_values/<colHash>/<file>.vcnt.
+// tenant-a/value_counts/<colHash>/<file>.vcnt.
 func writeVCNTObject(t *testing.T, rawW backend.RawWriter, column string, data []byte) {
 	t.Helper()
 	colHash := blockpack.VCNTColHash(column)
 	name := blockpack.VCNTFormatFilename(0, blockpack.VCNTNewID())
-	keypath := backend.KeyPath{"tenant-a", testIndexPrefix, "unique_values", colHash}
+	keypath := backend.KeyPath{"tenant-a", "value_counts", colHash}
 	require.NoError(t, rawW.Write(t.Context(), name, keypath, bytes.NewReader(data), int64(len(data)), nil))
 }
 
@@ -62,7 +62,7 @@ func writeVCNTObjectV2(t *testing.T, rawW backend.RawWriter, column string, data
 	t.Helper()
 	colHash := blockpack.VCNTColHash(column)
 	name := blockpack.VCNTFormatFilenameV2(0, wallMinSec, wallMaxSec, blockpack.VCNTNewID())
-	keypath := backend.KeyPath{"tenant-a", testIndexPrefix, "unique_values", colHash}
+	keypath := backend.KeyPath{"tenant-a", "value_counts", colHash}
 	require.NoError(t, rawW.Write(t.Context(), name, keypath, bytes.NewReader(data), int64(len(data)), nil))
 }
 
@@ -78,7 +78,7 @@ func newLocalRawReadWriter(t *testing.T) (backend.RawReader, backend.RawWriter) 
 func TestFetchVCNTSection_NilRawReaderReturnsNil(t *testing.T) {
 	// A real, deliberately chosen window (not a leftover placeholder) — irrelevant here since
 	// a nil rawR short-circuits before the prune check is ever reached.
-	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), nil, "tenant-a", testIndexPrefix, []string{"resource.service.name"}, 0, 200)
+	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), nil, "tenant-a", []string{"resource.service.name"}, 0, 200)
 	require.Nil(t, data)
 	require.Nil(t, dir)
 	require.Zero(t, filesCount)
@@ -89,7 +89,7 @@ func TestFetchVCNTSection_NoDimsReturnsNil(t *testing.T) {
 	rawR, _ := newLocalRawReadWriter(t)
 	// A real, deliberately chosen window (not a leftover placeholder) — irrelevant here since
 	// no dims means the per-file loop never runs.
-	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), rawR, "tenant-a", testIndexPrefix, nil, 0, 200)
+	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), rawR, "tenant-a", nil, 0, 200)
 	require.Nil(t, data)
 	require.Nil(t, dir)
 	require.Zero(t, filesCount)
@@ -112,7 +112,7 @@ func TestFetchVCNTSection_MergesObjectsForRequestedDims(t *testing.T) {
 
 	// This test's fixtures are v1-shaped (writeVCNTObject), so the window below is inert by
 	// design — the new TestFetchVCNTSection_* pruning tests below are what actually exercises it.
-	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), rawR, tenant, testIndexPrefix, []string{"resource.service.name"}, 0, 200)
+	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), rawR, tenant, []string{"resource.service.name"}, 0, 200)
 	require.NotNil(t, data)
 	require.NotEmpty(t, dir)
 	// filesCount/bytesRead (issue #493 Task 4c): exactly the 2 resource.service.name objects
@@ -135,7 +135,7 @@ func TestFetchVCNTSection_MissingDimYieldsNoCoverageNotError(t *testing.T) {
 	rawR, _ := newLocalRawReadWriter(t)
 	// A real, deliberately chosen window (not a leftover placeholder) — irrelevant here since
 	// there is no coverage for this dim at all.
-	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), rawR, "tenant-a", testIndexPrefix, []string{"resource.service.name"}, 0, 200)
+	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), rawR, "tenant-a", []string{"resource.service.name"}, 0, 200)
 	require.Nil(t, data)
 	require.Nil(t, dir)
 	require.Zero(t, filesCount)
@@ -143,21 +143,21 @@ func TestFetchVCNTSection_MissingDimYieldsNoCoverageNotError(t *testing.T) {
 }
 
 func TestBuildQueryPlan_NilRawReaderReturnsNilPlan(t *testing.T) {
-	plan, err := buildQueryPlan(context.Background(), nil, "tenant-a", testIndexPrefix, `{ span.http.method = "GET" }`, 0, 200, 1000, false)
+	plan, err := buildQueryPlan(context.Background(), nil, "tenant-a", `{ span.http.method = "GET" }`, 0, 200, 1000, false)
 	require.NoError(t, err)
 	require.Nil(t, plan)
 }
 
 func TestBuildQueryPlan_CompileFailureReturnsNilPlan(t *testing.T) {
 	rawR, _ := newLocalRawReadWriter(t)
-	plan, err := buildQueryPlan(context.Background(), rawR, "tenant-a", testIndexPrefix, `{ not a valid traceql`, 0, 200, 1000, false)
+	plan, err := buildQueryPlan(context.Background(), rawR, "tenant-a", `{ not a valid traceql`, 0, 200, 1000, false)
 	require.NoError(t, err)
 	require.Nil(t, plan)
 }
 
 func TestBuildQueryPlan_EmptyQueryReturnsNilPlan(t *testing.T) {
 	rawR, _ := newLocalRawReadWriter(t)
-	plan, err := buildQueryPlan(context.Background(), rawR, "tenant-a", testIndexPrefix, "", 0, 200, 1000, false)
+	plan, err := buildQueryPlan(context.Background(), rawR, "tenant-a", "", 0, 200, 1000, false)
 	require.NoError(t, err)
 	require.Nil(t, plan)
 }
@@ -177,7 +177,7 @@ func TestBuildQueryPlan_UnresolvableQueryReturnsNilPlanWithoutFetching(t *testin
 		vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 9}))
 
 	counting := &countingRawReader{RawReader: rawR}
-	plan, err := buildQueryPlan(context.Background(), counting, tenant, testIndexPrefix, `{ span.http.method = "GET" }`, 0, 200, 1000, false)
+	plan, err := buildQueryPlan(context.Background(), counting, tenant, `{ span.http.method = "GET" }`, 0, 200, 1000, false)
 	require.NoError(t, err)
 	require.Nil(t, plan, "an unresolvable query (no value-index reader configured) must short-circuit to a nil plan")
 	require.Equal(t, 0, counting.findCalls, "CheckIndexCoverage must be checked before any VCNT fetch I/O — zero Find calls expected")
@@ -195,7 +195,7 @@ func TestFetchVCNTSection_OutOfRangeV2FileNeverFetched(t *testing.T) {
 		vcntObj(t, "span.http.method", 500, map[string]int64{"GET": 1}), 500, 600)
 
 	counting := &countingRawReader{RawReader: rawR}
-	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), counting, tenant, testIndexPrefix, []string{"span.http.method"}, 0, 100)
+	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), counting, tenant, []string{"span.http.method"}, 0, 100)
 	require.Nil(t, data)
 	require.Nil(t, dir)
 	require.Zero(t, filesCount)
@@ -212,7 +212,7 @@ func TestFetchVCNTSection_InRangeV2FileStillFetched(t *testing.T) {
 		vcntObj(t, "span.http.method", 500, map[string]int64{"GET": 1}), 500, 600)
 
 	counting := &countingRawReader{RawReader: rawR}
-	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), counting, tenant, testIndexPrefix, []string{"span.http.method"}, 100, 700)
+	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), counting, tenant, []string{"span.http.method"}, 100, 700)
 	require.NotNil(t, data)
 	require.NotEmpty(t, dir)
 	require.Equal(t, 1, filesCount)
@@ -229,7 +229,7 @@ func TestFetchVCNTSection_V1ShapedFileStillFetchedRegardlessOfWindow(t *testing.
 		vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 1}))
 
 	counting := &countingRawReader{RawReader: rawR}
-	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), counting, tenant, testIndexPrefix, []string{"span.http.method"}, 900, 1000)
+	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), counting, tenant, []string{"span.http.method"}, 900, 1000)
 	require.NotNil(t, data)
 	require.NotEmpty(t, dir)
 	require.Equal(t, 1, filesCount)
@@ -251,7 +251,7 @@ func TestFetchVCNTSection_BoundaryTouchingWindowsIncluded(t *testing.T) {
 			vcntObj(t, "span.http.method", 100, map[string]int64{"GET": 1}), 100, 200)
 
 		counting := &countingRawReader{RawReader: rawR}
-		data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), counting, tenant, testIndexPrefix, []string{"span.http.method"}, window.minTS, window.maxTS)
+		data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), counting, tenant, []string{"span.http.method"}, window.minTS, window.maxTS)
 		require.NotNil(t, data, "window [%d,%d]: expected boundary-touching file to be fetched", window.minTS, window.maxTS)
 		require.NotEmpty(t, dir)
 		require.Equal(t, 1, filesCount)
@@ -301,7 +301,7 @@ func TestBuildQueryPlanFromProgram_LowSelectivityWithLimit_SelectsBoundedRecentF
 	writeVCNTObject(t, rawW, "span.http.method",
 		vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 900, "POST": 100}))
 
-	plan, err := buildQueryPlan(context.Background(), rawR, tenant, testIndexPrefix,
+	plan, err := buildQueryPlan(context.Background(), rawR, tenant,
 		`{ span.http.method = "GET" }`, 0, 200, 1000, true /* hasLimit */)
 	require.NoError(t, err)
 	require.NotNil(t, plan)
@@ -322,7 +322,7 @@ func TestBuildMetricsQueryPlanFromProgram_LowSelectivityWithoutLimit_NeverBounde
 	writeVCNTObject(t, rawW, "span.http.method",
 		vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 900, "POST": 100}))
 
-	plan, err := buildMetricsQueryPlan(context.Background(), rawR, tenant, testIndexPrefix,
+	plan, err := buildMetricsQueryPlan(context.Background(), rawR, tenant,
 		`{ span.http.method = "GET" } | rate()`, 0, 200, 1000)
 	require.Error(t, err, "a resolvable, LowSelectivity metrics query must plan-time-decline, not dispatch")
 	require.True(t, errors.Is(err, ErrPlanTimeLowSelectivityNoLimit))
@@ -342,7 +342,7 @@ func TestBuildQueryPlanFromProgram_UnknownSelectivity_WithLimit_SelectsBoundedRe
 	tenant := "tenant-a"
 	// No VCNT object written at all for this column — ClassifyProgramVCNT must read UnknownSelectivity.
 
-	plan, err := buildQueryPlan(context.Background(), rawR, tenant, testIndexPrefix,
+	plan, err := buildQueryPlan(context.Background(), rawR, tenant,
 		`{ span.http.method = "GET" }`, 0, 200, 1000, true /* hasLimit */)
 	require.NoError(t, err)
 	require.NotNil(t, plan)
@@ -361,7 +361,7 @@ func TestBuildQueryPlanFromProgram_UnknownSelectivity_WithoutLimit_StaysIndexOnl
 	rawR, _ := newLocalRawReadWriter(t)
 	tenant := "tenant-a"
 
-	plan, err := buildQueryPlan(context.Background(), rawR, tenant, testIndexPrefix,
+	plan, err := buildQueryPlan(context.Background(), rawR, tenant,
 		`{ span.http.method = "GET" }`, 0, 200, 1000, false /* hasLimit */)
 	require.NoError(t, err)
 	require.NotNil(t, plan)
@@ -434,7 +434,7 @@ func TestBuildQueryPlanFromProgram_AttachesQualificationOutcome(t *testing.T) {
 		writeVCNTObject(t, rawW, "span.http.method", vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 9}))
 
 		span := runWithSpan(t, func(ctx context.Context) {
-			plan, err := buildQueryPlan(ctx, rawR, "tenant-a", testIndexPrefix, `{ span.http.method = "GET" }`, 0, 200, 1000, false)
+			plan, err := buildQueryPlan(ctx, rawR, "tenant-a", `{ span.http.method = "GET" }`, 0, 200, 1000, false)
 			require.NoError(t, err)
 			require.Nil(t, plan)
 		})
@@ -450,7 +450,7 @@ func TestBuildQueryPlanFromProgram_AttachesQualificationOutcome(t *testing.T) {
 		writeVCNTObject(t, rawW, "span.http.method", vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 900, "POST": 100}))
 
 		span := runWithSpan(t, func(ctx context.Context) {
-			plan, err := buildQueryPlan(ctx, rawR, "tenant-a", testIndexPrefix, `{ span.http.method = "GET" }`, 0, 200, 1000, false)
+			plan, err := buildQueryPlan(ctx, rawR, "tenant-a", `{ span.http.method = "GET" }`, 0, 200, 1000, false)
 			require.Error(t, err)
 			require.Nil(t, plan)
 		})
@@ -466,7 +466,7 @@ func TestBuildQueryPlanFromProgram_AttachesQualificationOutcome(t *testing.T) {
 		writeVCNTObject(t, rawW, "span.http.method", vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 900, "POST": 100}))
 
 		span := runWithSpan(t, func(ctx context.Context) {
-			plan, err := buildMetricsQueryPlan(ctx, rawR, "tenant-a", testIndexPrefix, `{ span.http.method = "GET" } | rate()`, 0, 200, 1000)
+			plan, err := buildMetricsQueryPlan(ctx, rawR, "tenant-a", `{ span.http.method = "GET" } | rate()`, 0, 200, 1000)
 			require.Error(t, err)
 			require.Nil(t, plan)
 		})
@@ -485,7 +485,7 @@ func TestBuildQueryPlanFromProgram_AttachesQualificationOutcome(t *testing.T) {
 
 		var capturedPlan *blockpack.QueryPlan
 		span := runWithSpan(t, func(ctx context.Context) {
-			plan, err := buildQueryPlan(ctx, rawR, "tenant-a", testIndexPrefix, `{ span.http.method = "POST" }`, 0, 200, 1000, false)
+			plan, err := buildQueryPlan(ctx, rawR, "tenant-a", `{ span.http.method = "POST" }`, 0, 200, 1000, false)
 			require.NoError(t, err)
 			require.NotNil(t, plan)
 			capturedPlan = plan
@@ -524,7 +524,7 @@ func TestBuildQueryPlanFromProgram_AttachesLeadDetail(t *testing.T) {
 	writeVCNTObject(t, rawW, "span.http.method", vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 900, "POST": 100}))
 
 	ctx, span := tracer.Start(context.Background(), "test.caller")
-	plan, err := buildQueryPlan(ctx, rawR, "tenant-a", testIndexPrefix, `{ span.http.method = "GET" }`, 0, 200, 1000, true)
+	plan, err := buildQueryPlan(ctx, rawR, "tenant-a", `{ span.http.method = "GET" }`, 0, 200, 1000, true)
 	require.NoError(t, err)
 	require.NotNil(t, plan)
 	span.End()
@@ -561,7 +561,7 @@ func TestFetchVCNTFetch_EmitsChildSpanWithFileStats(t *testing.T) {
 	writeVCNTObject(t, rawW, "span.http.method",
 		vcntObj(t, "span.http.method", 120, map[string]int64{"GET": 2}))
 
-	plan, err := buildQueryPlan(context.Background(), rawR, "tenant-a", testIndexPrefix, `{ span.http.method = "POST" }`, 0, 200, 1000, false)
+	plan, err := buildQueryPlan(context.Background(), rawR, "tenant-a", `{ span.http.method = "POST" }`, 0, 200, 1000, false)
 	require.NoError(t, err)
 	require.NotNil(t, plan)
 

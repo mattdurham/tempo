@@ -49,7 +49,7 @@ func NewService(cfg Config, store Store) (*Service, error) {
 // columnWork is a fully-resolved (tenant, colDir) work item.
 type columnWork struct {
 	tenant string
-	colDir string // "<tenant>/<indexPrefix>/unique_values/<colHash>"
+	colDir string // "<tenant>/value_counts/<colHash>"
 }
 
 // Run drives the compaction loop until ctx is canceled. See
@@ -136,7 +136,9 @@ func (s *Service) buildWorkList(ctx context.Context) []columnWork {
 	}
 	var work []columnWork
 	for _, tenant := range tenants {
-		prefix := path.Join(tenant, s.cfg.IndexPrefix, "unique_values") + "/"
+		// NOTE-VC-019: value_counts is a direct child of tenant, a sibling of the VI
+		// indexPrefix tree and cube's own top-level prefix -- not nested under either.
+		prefix := path.Join(tenant, "value_counts") + "/"
 		colDirs, err := s.store.ListDirs(ctx, prefix)
 		if err != nil {
 			s.metrics.incError(compactorOpList)
@@ -171,8 +173,8 @@ func (s *Service) ownsShard(colHash string) bool {
 }
 
 // resolveTenants returns the tenant IDs to compact. For an explicit list it returns the list
-// verbatim; for "*" it discovers tenants by listing the index prefix and extracting the first
-// path segment after the prefix.
+// verbatim; for "*" it discovers tenants by listing the bucket root and treating each top-level
+// directory as a tenant ID (VCNT's key layout is tenant-first: <tenant>/value_counts/<colHash>).
 func (s *Service) resolveTenants(ctx context.Context) ([]string, error) {
 	if !s.cfg.allTenants() {
 		return s.cfg.Tenants, nil
@@ -187,7 +189,7 @@ func (s *Service) resolveTenants(ctx context.Context) ([]string, error) {
 	var tenants []string
 	for _, dir := range topDirs {
 		seg := strings.TrimSuffix(dir, "/")
-		if seg == "" || seg == s.cfg.IndexPrefix {
+		if seg == "" {
 			continue
 		}
 		if _, dup := seen[seg]; dup {
