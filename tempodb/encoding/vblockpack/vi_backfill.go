@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"sort"
 	"time"
 
@@ -183,6 +184,11 @@ func runViBackfillCore(
 		Store:       putter,
 		Fetcher:     fetcher,
 		IndexPrefix: indexPrefix,
+		// WindowSeconds: full history, matching the cube backfill ruling (2026-07-11) --
+		// math.MaxUint64 trivially exceeds any real current unix time, so Run's minSec
+		// always resolves to 0. Bounded only by how far back real blocks exist, not by
+		// an artificial cap.
+		WindowSeconds: math.MaxUint64,
 	})
 	return eng.Run(ctx, func(prog blockpack.BackfillProgress) error {
 		if uwErr := registry.UpdateWatermark(

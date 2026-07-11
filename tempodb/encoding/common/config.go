@@ -212,11 +212,6 @@ type ViUsageConfig struct {
 	// second replica may re-acquire it. Default 30m.
 	LeaseTTL time.Duration `yaml:"lease_ttl"`
 
-	// BackfillWindow is R4's historical backfill window — narrower than
-	// cube's 7 days, since VI backfill reads raw historical blocks (full
-	// block I/O), not cheap pre-extracted VI files. Default 48h.
-	BackfillWindow time.Duration `yaml:"backfill_window"`
-
 	// WatermarkCacheTTL bounds how long the querier's in-process watermark
 	// cache (viWatermarkCache) reuses a loaded usage-registry snapshot before
 	// re-fetching, mirroring ValueIndexQueryConfig.CacheTTL/backfillListTTL's
@@ -237,9 +232,6 @@ func (cfg *ViUsageConfig) applyDefaults() {
 	}
 	if cfg.LeaseTTL == 0 {
 		cfg.LeaseTTL = 30 * time.Minute
-	}
-	if cfg.BackfillWindow == 0 {
-		cfg.BackfillWindow = 48 * time.Hour
 	}
 	if cfg.WatermarkCacheTTL == 0 {
 		cfg.WatermarkCacheTTL = 30 * time.Second
