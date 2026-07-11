@@ -206,6 +206,7 @@ func runViBackfillCore(
 			return uwErr
 		}
 		if prog.Done {
+			metricViBackfillCompleted.Inc()
 			level.Info(util_log.Logger).Log(
 				"msg", "vblockpack: VI backfill complete",
 				"tenant", entry.Tenant, "column", entry.ColumnName,
@@ -222,6 +223,7 @@ func RunViBackfill(ctx context.Context, entry blockpack.Entry, s3cfg *s3backend.
 	if s3cfg == nil {
 		return nil
 	}
+	metricViBackfillStarted.Inc()
 	client, err := newViBackfillMinioClient(s3cfg)
 	if err != nil {
 		level.Warn(util_log.Logger).Log("msg", "vblockpack: RunViBackfill: S3 client init failed", "err", err)
@@ -238,6 +240,7 @@ func RunViBackfill(ctx context.Context, entry blockpack.Entry, s3cfg *s3backend.
 
 	err = runViBackfillCore(ctx, entry, fetcher, objStore, putter, defaultValueIndexPref)
 	if err != nil && !isContextErr(ctx, err) {
+		metricViBackfillFailed.Inc()
 		level.Warn(util_log.Logger).Log(
 			"msg", "vblockpack: VI backfill error",
 			"tenant", entry.Tenant, "column", entry.ColumnName, "err", err,

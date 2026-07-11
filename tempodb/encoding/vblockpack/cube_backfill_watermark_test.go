@@ -16,6 +16,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -105,6 +106,8 @@ func TestRunCubeBackfillCore_CallsUpdateWatermarksOnEachProgress(t *testing.T) {
 		WindowMinutes: 3,
 	}
 
+	completedBefore := testutil.ToFloat64(metricCubeBackfillCompleted)
+
 	err := runCubeBackfillCore(context.Background(), entry, fakeEmptyCubeValueIndexSource{}, store, cfg)
 	require.NoError(t, err)
 
@@ -113,6 +116,9 @@ func TestRunCubeBackfillCore_CallsUpdateWatermarksOnEachProgress(t *testing.T) {
 	// happens on EVERY progress callback, not just the last.
 	assert.Equal(t, preSeedPutCalls+3, store.putCalls,
 		"expected 1 ConditionalPut per backfilled minute (3), proving per-callback persistence")
+
+	assert.Equal(t, completedBefore+1, testutil.ToFloat64(metricCubeBackfillCompleted),
+		"reaching prog.Watermark.Done must increment metricCubeBackfillCompleted exactly once")
 
 	registry := blockpack.NewCubeRegistry(store, entry.Tenant)
 	entries, _, loadErr := registry.Load(context.Background())

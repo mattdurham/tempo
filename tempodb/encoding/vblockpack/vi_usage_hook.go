@@ -87,10 +87,14 @@ func (r *realUsageRecorder) registryFor(tenant string) *blockpack.Registry {
 func (r *realUsageRecorder) RecordUse(
 	ctx context.Context, tenant, colName, colType string, now time.Time,
 ) (blockpack.TriggerResult, error) {
+	metricViUsageRecorded.Inc()
 	registry := r.registryFor(tenant)
 	result, err := blockpack.MaybeRecordUseAndMaybeTrigger(ctx, r.usageCfg, registry, tenant, colName, colType, now, r.triggerCfg)
-	if err == nil && result.ShouldBackfill && r.onShouldBackfill != nil {
-		r.onShouldBackfill(result.Entry)
+	if err == nil && result.ShouldBackfill {
+		metricViBackfillTriggered.Inc()
+		if r.onShouldBackfill != nil {
+			r.onShouldBackfill(result.Entry)
+		}
 	}
 	return result, err
 }

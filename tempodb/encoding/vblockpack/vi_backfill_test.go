@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	commonv1 "go.opentelemetry.io/proto/otlp/common/v1"
@@ -181,6 +182,8 @@ func TestRunViBackfillCore_CallsUpdateWatermarkOnEachProgress(t *testing.T) {
 	entry := seedTriggeredEntry(t, store, "tenant-a", "span.custom.attr", "string")
 	putter := newFakeViPutter()
 
+	completedBefore := testutil.ToFloat64(metricViBackfillCompleted)
+
 	err := runViBackfillCore(context.Background(), entry, fetcher, store, putter, "indexes")
 	require.NoError(t, err)
 
@@ -195,6 +198,9 @@ func TestRunViBackfillCore_CallsUpdateWatermarkOnEachProgress(t *testing.T) {
 	require.Len(t, entries, 1)
 	assert.True(t, entries[0].Backfill.Done, "the final progress callback must mark the entry Done")
 	assert.False(t, entries[0].Backfill.BackfillInProgress, "Done must release the lease in the same PUT")
+
+	assert.Equal(t, completedBefore+1, testutil.ToFloat64(metricViBackfillCompleted),
+		"reaching prog.Done must increment metricViBackfillCompleted exactly once")
 }
 
 // TestRunViBackfillCore_PersistFailureAbortsRun verifies a watermark-persist

@@ -19,6 +19,7 @@ import (
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/backend/local"
 	"github.com/grafana/tempo/tempodb/encoding/common"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -580,6 +581,9 @@ func TestRecordUsageIfNoIndexCoverage_NeverDownloadsFileContent(t *testing.T) {
 func TestRealUsageRecorder_ForwardsToRegistryAndTriggersOnShouldBackfill(t *testing.T) {
 	store := newFakeViObjectStore()
 
+	recordedBefore := testutil.ToFloat64(metricViUsageRecorded)
+	triggeredBefore := testutil.ToFloat64(metricViBackfillTriggered)
+
 	var backfilled []blockpack.Entry
 	rec := &realUsageRecorder{
 		store:      store,
@@ -600,6 +604,11 @@ func TestRealUsageRecorder_ForwardsToRegistryAndTriggersOnShouldBackfill(t *test
 	entries, _, err := registry.Load(context.Background())
 	require.NoError(t, err)
 	require.Len(t, entries, 1, "RecordUse must actually persist through to the registry")
+
+	assert.Equal(t, recordedBefore+1, testutil.ToFloat64(metricViUsageRecorded),
+		"RecordUse must increment metricViUsageRecorded exactly once")
+	assert.Equal(t, triggeredBefore+1, testutil.ToFloat64(metricViBackfillTriggered),
+		"a real ShouldBackfill=true outcome must increment metricViBackfillTriggered exactly once")
 }
 
 // TestRealUsageRecorder_DifferentTenantsUseSeparateRegistries is a genuine

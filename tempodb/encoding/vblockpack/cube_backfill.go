@@ -285,6 +285,7 @@ func runCubeBackfillCore(
 			}
 		}
 		if prog.Watermark.Done {
+			metricCubeBackfillCompleted.Inc()
 			level.Info(util_log.Logger).Log(
 				"msg", "vblockpack: cube backfill complete",
 				"tenant", entry.Tenant,
@@ -319,12 +320,14 @@ func launchBackfill(entry blockpack.CubeRegistryEntry) {
 	}
 
 	go func() {
+		metricCubeBackfillStarted.Inc()
 		level.Info(util_log.Logger).Log(
 			"msg", "vblockpack: cube backfill started",
 			"tenant", entry.Tenant,
 			"cube_id", entry.CubeID,
 		)
 		if err := runCubeBackfillCore(context.Background(), entry, src, objStore, cfg); err != nil {
+			metricCubeBackfillFailed.Inc()
 			level.Warn(util_log.Logger).Log(
 				"msg", "vblockpack: cube backfill error",
 				"tenant", entry.Tenant,
@@ -368,8 +371,10 @@ func RunCubeBackfill(ctx context.Context, entry blockpack.CubeRegistryEntry, s3c
 		// this job-queue-dispatched path must backfill the same range as the inline path.
 		WindowMinutes: math.MaxUint32,
 	}
+	metricCubeBackfillStarted.Inc()
 	err = runCubeBackfillCore(ctx, entry, src, objStore, cfg)
 	if err != nil && !errors.Is(err, ctx.Err()) {
+		metricCubeBackfillFailed.Inc()
 		level.Warn(util_log.Logger).Log("msg", "vblockpack: cube backfill error",
 			"tenant", entry.Tenant, "cube_id", entry.CubeID, "err", err)
 	}
