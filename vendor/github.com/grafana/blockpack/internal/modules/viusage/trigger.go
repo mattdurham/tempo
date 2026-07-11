@@ -16,14 +16,17 @@ import (
 	"github.com/grafana/blockpack/internal/modules/valueindex"
 )
 
-// TriggerConfig parameterises the repeated-use trigger (R4). Default values (Threshold=3,
-// WindowSeconds=3600, LeaseTTLSeconds=1800 — R4/R8's documented, unmeasured starting
-// defaults, plan.md Section 4.2) are wired in by A6's config plumbing (task #109), which
-// is this struct's actual construction site; no defaulting helper lives here since
+// TriggerConfig parameterises the repeated-use trigger (R4). Default values (Threshold=1,
+// WindowSeconds=3600, LeaseTTLSeconds=1800 — Threshold=1 per explicit team-lead ruling
+// 2026-07-11: any query against a non-dedicated column is worth indexing immediately, no
+// repeated-use gate; WindowSeconds/LeaseTTLSeconds remain R8's documented, unmeasured
+// starting defaults, plan.md Section 4.2) are wired in by A6's config plumbing (task #109),
+// which is this struct's actual construction site; no defaulting helper lives here since
 // nothing in this package would call it.
 type TriggerConfig struct {
 	// Threshold is the number of distinct uses within WindowSeconds required to fire a
-	// backfill. Default 3 (R4's documented, unmeasured starting default).
+	// backfill. Default 1 (fires on first use, per explicit team-lead ruling — any query
+	// against a non-dedicated column is worth indexing immediately).
 	Threshold int
 	// WindowSeconds is the rolling window uses are counted over. Default 3600 (1h).
 	WindowSeconds uint64

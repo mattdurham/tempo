@@ -198,9 +198,10 @@ type ViUsageConfig struct {
 
 	// TriggerThreshold is R4's repeated-use trigger: the number of distinct
 	// queries referencing the same non-dedicated column within TriggerWindow
-	// required to fire a backfill. Default 3 — documented as an unmeasured,
-	// provisional starting point (no production usage-log exists yet to
-	// calibrate against).
+	// required to fire a backfill. Default 1 (fires on first use) — any query
+	// against a non-dedicated column is worth indexing immediately, per
+	// explicit team-lead ruling; TriggerWindow/dedup logic still applies for
+	// preventing duplicate backfill launches from concurrent queriers.
 	TriggerThreshold int `yaml:"trigger_threshold"`
 
 	// TriggerWindow is the rolling window TriggerThreshold is evaluated over.
@@ -229,7 +230,7 @@ func (cfg *ViUsageConfig) applyDefaults() {
 		cfg.DedicatedColumnsEnabled = true
 	}
 	if cfg.TriggerThreshold == 0 {
-		cfg.TriggerThreshold = 3
+		cfg.TriggerThreshold = 1
 	}
 	if cfg.TriggerWindow == 0 {
 		cfg.TriggerWindow = time.Hour

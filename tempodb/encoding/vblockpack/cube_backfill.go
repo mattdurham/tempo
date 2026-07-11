@@ -10,6 +10,7 @@ package vblockpack
 import (
 	"context"
 	"errors"
+	"math"
 	"path"
 	"strings"
 	"time"
@@ -47,7 +48,7 @@ type viBackfillSource struct {
 // (tenant, column, type) prefix that a single backfill pass — or a burst of
 // cardinality-gate TryCreate attempts before a cube is actually created — issues.
 // 30s comfortably covers a single pass's re-list burst while keeping any
-// staleness window small relative to the 7-day backfill window.
+// staleness window small relative to the (now full-history) backfill window.
 const backfillListTTL = 30 * time.Second
 
 // backfillContentCacheBytes bounds the immutable VI/VCNT content cache shared by
@@ -308,9 +309,13 @@ func launchBackfill(entry blockpack.CubeRegistryEntry) {
 	store := &s3ObjectPutter{client: cqp.client, bucket: cqp.bucket}
 	objStore := &minioObjectStore{client: cqp.client, bucket: cqp.bucket}
 	cfg := blockpack.CubeBackfillConfig{
-		Store:         store,
-		Workers:       4,
-		WindowMinutes: 60 * 24 * 7, // 7 days
+		Store:   store,
+		Workers: 4,
+		// WindowMinutes: full history, not an artificial cap (2026-07-11 ruling) --
+		// math.MaxUint32 minutes trivially exceeds any real currentMinute, so
+		// Backfiller.Run's endMinute always resolves to 0. Bounded only by how far
+		// back the value index itself actually has data, not by this config.
+		WindowMinutes: math.MaxUint32,
 	}
 
 	go func() {
@@ -357,9 +362,11 @@ func RunCubeBackfill(ctx context.Context, entry blockpack.CubeRegistryEntry, s3c
 	store := &s3ObjectPutter{client: client, bucket: s3cfg.Bucket}
 	objStore := &minioObjectStore{client: client, bucket: s3cfg.Bucket}
 	cfg := blockpack.CubeBackfillConfig{
-		Store:         store,
-		Workers:       4,
-		WindowMinutes: 60 * 24 * 7,
+		Store:   store,
+		Workers: 4,
+		// WindowMinutes: full history, matching launchBackfill's own ruling above --
+		// this job-queue-dispatched path must backfill the same range as the inline path.
+		WindowMinutes: math.MaxUint32,
 	}
 	err = runCubeBackfillCore(ctx, entry, src, objStore, cfg)
 	if err != nil && !errors.Is(err, ctx.Err()) {
