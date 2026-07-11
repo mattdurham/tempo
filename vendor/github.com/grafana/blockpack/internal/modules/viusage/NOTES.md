@@ -225,6 +225,56 @@ identified in cube's own equivalent wiring, once B2 lands and calls it. Tested b
 `TestRegistry_UpdateWatermark_PersistsWatermarkSec`, `_DoneReleasesLeaseInSamePut`,
 `_NotFoundReturnsError` (`TESTS.md` TEST-VIUSAGE-35 through -37).
 
+**Fixed (2026-07-10, task #127, per direct user request to close the gap rather than leave
+it standing as a disclosed-but-unfixed finding):** cube's own backfill→registry
+watermark-persistence gap described above is no longer merely documented — it has been
+fixed, in tempo's own `tempodb/encoding/vblockpack/cube_backfill.go`. A new
+`runCubeBackfillCore` function (mirroring VI's own `runViBackfillCore` split) is now what
+`launchBackfill`/`RunCubeBackfill` call instead of running `blockpack.NewCubeBackfiller(...).
+Run()` inline; its `progressFn` calls `registry.UpdateWatermarks(ctx, entry.CubeID,
+blockpack.CubeRollupL0, wm.WatermarkMinute, wm.WatermarkMinute)` on every successful
+(`LastError == nil`) progress callback, not just on `Done` — the exact VI-side R9 pattern
+(`Registry.UpdateWatermark`, SPEC-VIUSAGE-4) mirrored back onto cube's own registry.
+
+**One deliberate, documented deviation from VI's own pattern:** the `LastError == nil` gate
+exists because cube's `Backfiller` and VI's `BackfillEngine` react to a per-unit failure
+differently. VI's engine (`valueindex_backfill.go:Run`) ABORTS the whole run on the first
+error — `processBlocks` returns the error immediately, so `progressFn` is never called again
+after a failure, and there is nothing for a caller-side `LastError` check to gate. Cube's
+`Backfiller`, by contrast, CONTINUES past a per-minute failure (a design choice predating
+#496, unrelated to and not modified by this fix) and reports it via
+`BackfillProgress.LastError` on that one call while still calling `progressFn` again on
+subsequent minutes. Persisting a watermark from a call whose `LastError != nil` would
+advance cube's registry state past a minute cube itself does not consider successfully
+processed — the exact "false complete" shape R7/R9 both exist to prevent, just for cube's
+own per-minute unit of work rather than VI's per-block unit. `runCubeBackfillCore`'s gate is
+therefore not an arbitrary implementation detail but the necessary adaptation of VI's
+"persist on every successful call" pattern to a backfill engine whose failure-handling
+semantics differ from VI's own (continue-past-failure vs. abort-on-failure) — mirroring the
+pattern, not the literal condition, was the correct choice here.
+
+No blockpack-side changes were needed: `cube.Registry.UpdateWatermarks` already existed and
+was already tested (confirmed above, "the mechanism itself is not missing from blockpack");
+this was purely tempo-side wiring, exactly as this note's own "Design consequence for VI"
+section anticipated it would need to be. Regression-pinned by
+`TestRunCubeBackfillCore_CallsUpdateWatermarksOnEachProgress`/
+`_PersistFailureAbortsRun` (tempo's new `cube_backfill_watermark_test.go`), mutation-checked
+(the persistence branch was forced off, both tests confirmed failing, then restored and
+confirmed passing again — the same mutation-check discipline this project's own R7 adversarial
+test used).
+
+**Consequence: the gap between "backfill completed" and "the registry reflects that" no
+longer exists for cube either.** A cube's L0-resolution watermark now advances per-minute
+during the backfill pass itself (via `UpdateWatermarks` on every progress callback), not only
+later via a subsequent compaction pass — the exact asymmetry this note originally identified
+(compare NOTE-VIUSAGE-11's own "closing VI's own instance of this gap pattern" phrasing,
+corrected below, now that BOTH sides — VI's own design AND cube's actual wiring — close it).
+This was genuinely out of #496's original scope (R9's own text: "do NOT attempt to fix it as
+part of #496") but was subsequently closed by direct user request rather than left open
+indefinitely as a standalone follow-up issue — recorded here so a future reader does not
+need to go hunting for whether the "standalone follow-up issue" this note originally
+recommended was ever filed or acted on: it was acted on, directly, in this same effort.
+
 ---
 
 ## NOTE-VIUSAGE-6 — R10: this module reopens NOTE-VI-027's history — why the new model is different in kind
@@ -541,7 +591,10 @@ the exact reported value on that final call is not itself safety-critical (kept 
 depends on it once `Done` is set).
 
 This still satisfies R9's own requirement ("the caller MUST actually call
-`Registry.UpdateWatermark` from `progressFn`," closing cube's own documented gap, Section
+`Registry.UpdateWatermark` from `progressFn`" — VI's own instance of the persistence-discipline
+NOTE-VIUSAGE-5 required VI to close for itself, independent of and not to be confused with
+cube's own SEPARATE, actual watermark-persistence gap, which NOTE-VIUSAGE-5's own later
+addendum records as fixed too, in tempo's `cube_backfill.go`, task #127 — Section
 1/NOTE-VIUSAGE-5) — the call happens on every block, unchanged — it just no longer lets an
 intermediate call make a coverage claim this loop cannot yet prove safe. The accepted,
 disclosed tradeoff: a long-running, many-block backfill no longer shows incrementally
