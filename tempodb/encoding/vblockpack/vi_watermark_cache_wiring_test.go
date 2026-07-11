@@ -60,7 +60,7 @@ func seedTriggeredWatermarkEntry(t *testing.T, store blockpack.ObjectStore, tena
 	registry := blockpack.NewRegistry(store, tenant)
 	result, err := blockpack.RecordUseAndMaybeTrigger(
 		context.Background(), registry, tenant, colName, colType, time.Now(),
-		blockpack.TriggerConfig{Threshold: 1, WindowSeconds: 3600, LeaseTTLSeconds: 1800},
+		blockpack.TriggerConfig{LeaseTTLSeconds: 1800},
 	)
 	require.NoError(t, err)
 	require.True(t, result.ShouldBackfill)

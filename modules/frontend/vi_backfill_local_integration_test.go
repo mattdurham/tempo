@@ -109,9 +109,11 @@ func writeViBackfillIntegrationBlock(ctx context.Context, t *testing.T, tempDir,
 func TestViBackfillLocalIntegration_QueryTriggersRealBackfill(t *testing.T) {
 	var blockCfg common.BlockConfig
 	blockCfg.RegisterFlagsAndApplyDefaults("test", flag.NewFlagSet("test", flag.ContinueOnError))
-	// Deliberately do NOT touch ViUsage.DedicatedColumnsEnabled/TriggerThreshold -- applyDefaults
-	// already sets both (true / 1), giving this test a single-query trigger for free, matching
-	// the existing S3-flavored precedent's own "zero explicit opt-in" framing.
+	// Deliberately do NOT touch ViUsage.DedicatedColumnsEnabled -- applyDefaults already sets it
+	// true, and the trigger itself is now unconditional on first use (Part 0, 2026-07-11: the
+	// old TriggerThreshold/TriggerWindow fields were removed), giving this test a single-query
+	// trigger for free, matching the existing S3-flavored precedent's own "zero explicit opt-in"
+	// framing.
 	blockCfg.Version = vblockpack.VersionString
 	// ValueIndexEnabled is NOT defaulted to true (verified against applyDefaults) -- this one
 	// field IS explicit.

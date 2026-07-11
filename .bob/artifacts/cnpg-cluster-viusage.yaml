@@ -1,0 +1,82 @@
+# cnpg-cluster-viusage.yaml — REVIEWED, READY-TO-APPLY ARTIFACT ONLY.
+#
+# Do NOT `kubectl apply` this against any real cluster as part of this task.
+# This file is written and reviewed only, per the standing infrastructure
+# checkpoint (plan.md Part 6/Part 9).
+#
+# Separate, larger prerequisite (NOT attempted by this artifact): the
+# CloudNativePG operator itself is confirmed ABSENT from tempo-dev-test-03 and
+# every other checked cluster. Installing the operator is a distinct
+# infrastructure task requiring its own go/no-go, sequenced strictly BEFORE
+# this Cluster manifest could ever be applied.
+#
+# Right-sizing rationale (deliberately NOT a copy of issue #467's file-catalog
+# sizing): #467's use case is a file-metadata catalog for EVERY value-index
+# file across EVERY tenant (potentially millions of rows, high-QPS range-scan
+# queries backing live search). This task's data volume is categorically
+# smaller: viusage_entries/cube_entries are bounded by (distinct
+# non-dedicated columns per tenant) x (tenant count) -- realistically low
+# thousands of rows fleet-wide, not millions; viusage_query_log is unbounded
+# but append-only, low-QPS-per-write (rate-limited to ~1 write per
+# (tenant,column) per 10s by tempo's existing viUsageRateLimit); file_catalog
+# is the largest table (one row per historical block, could reach low
+# millions fleet-wide over long retention windows) but is write-mostly from a
+# SINGLE lister process (backend-scheduler), not high-QPS from every querier.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: tempo-viusage-postgres
+  namespace: tempo-dev-test-03  # dev-test-03 ONLY per this task's scope — not fleet-wide
+spec:
+  instances: 3                  # unchanged from #467 — HA floor, not a sizing knob
+  # Right-sized DOWN from #467's ~1-2 cores/2-4GB (that sizing was for a
+  # file-metadata catalog backing live production search queries fleet-wide):
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+    limits:
+      cpu: "1"
+      memory: "1Gi"
+  storage:
+    size: 10Gi                  # down from #467's implied larger footprint; file_catalog
+                                 # is this plan's largest table and is still bounded by one
+                                 # tenant-set's historical block count on ONE dev cluster
+    storageClass: local-path    # local-PV, matching #467's own "durability comes from
+                                 # WAL replicas, not the underlying disk" rationale
+  affinity:
+    topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            cnpg.io/cluster: tempo-viusage-postgres
+  postgresql:
+    parameters:
+      max_connections: "100"    # small fleet (dev-test-03 only): a handful of
+                                 # queriers/frontends/workers × MaxConns=4 default (2.3)
+                                 # comfortably fits; revisit before any fleet-wide rollout
+  walStorage:
+    size: 5Gi
+  backup:
+    barmanObjectStore:
+      destinationPath: "s3://tempo-dev-test-03-pg-backup/viusage"
+      s3Credentials:
+        accessKeyId:
+          name: pg-backup-creds
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: pg-backup-creds
+          key: ACCESS_SECRET_KEY
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: tempo-viusage-postgres-pdb
+  namespace: tempo-dev-test-03
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      cnpg.io/cluster: tempo-viusage-postgres

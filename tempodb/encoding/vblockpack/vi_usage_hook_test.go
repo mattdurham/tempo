@@ -588,7 +588,7 @@ func TestRealUsageRecorder_ForwardsToRegistryAndTriggersOnShouldBackfill(t *test
 	rec := &realUsageRecorder{
 		store:      store,
 		usageCfg:   blockpack.Config{DedicatedColumnsEnabled: true},
-		triggerCfg: blockpack.TriggerConfig{Threshold: 1, WindowSeconds: 3600, LeaseTTLSeconds: 1800},
+		triggerCfg: blockpack.TriggerConfig{LeaseTTLSeconds: 1800},
 		onShouldBackfill: func(entry blockpack.Entry) {
 			backfilled = append(backfilled, entry)
 		},
@@ -624,7 +624,7 @@ func TestRealUsageRecorder_DifferentTenantsUseSeparateRegistries(t *testing.T) {
 	rec := &realUsageRecorder{
 		store:      store,
 		usageCfg:   blockpack.Config{DedicatedColumnsEnabled: true},
-		triggerCfg: blockpack.TriggerConfig{Threshold: 1, WindowSeconds: 3600, LeaseTTLSeconds: 1800},
+		triggerCfg: blockpack.TriggerConfig{LeaseTTLSeconds: 1800},
 	}
 
 	_, err := rec.RecordUse(context.Background(), "tenant-a", "span.custom.attr", "string", time.Now())
@@ -645,6 +645,45 @@ func TestRealUsageRecorder_DifferentTenantsUseSeparateRegistries(t *testing.T) {
 	assert.Equal(t, "span.other.attr", entriesB[0].ColumnName)
 }
 
+// TestRealUsageRecorder_DifferentTenantsUseSeparateRegistries_PostgresBacked is
+// the pgPool-backed counterpart to TestRealUsageRecorder_DifferentTenantsUseSeparateRegistries
+// (2026-07-11, task #178) -- the object-store test above regression-guards the
+// blob-backed path only; registryFor's pgPool branch (vi_usage_hook.go) had no
+// equivalent automated coverage, exactly the "singleton wraps a per-tenant
+// resource, one tenant baked in" regression class this session flagged
+// explicitly. Uses a real ephemeral Postgres (newTestPostgresPool) rather than
+// a fake, since the whole point is proving registryFor constructs a genuinely
+// separate *blockpack.Registry per tenant when pgPool != nil, not just that it
+// COMPILES to do so.
+func TestRealUsageRecorder_DifferentTenantsUseSeparateRegistries_PostgresBacked(t *testing.T) {
+	pool := newTestPostgresPool(t)
+	rec := &realUsageRecorder{
+		pgPool:     pool,
+		usageCfg:   blockpack.Config{DedicatedColumnsEnabled: true},
+		triggerCfg: blockpack.TriggerConfig{LeaseTTLSeconds: 1800},
+	}
+
+	_, err := rec.RecordUse(context.Background(), "tenant-a", "span.custom.attr", "string", time.Now())
+	require.NoError(t, err)
+	_, err = rec.RecordUse(context.Background(), "tenant-b", "span.other.attr", "string", time.Now())
+	require.NoError(t, err)
+
+	regA := rec.registryFor("tenant-a")
+	regB := rec.registryFor("tenant-b")
+	assert.NotSame(t, regA, regB, "registryFor must construct a SEPARATE Registry per tenant, never one baked in for all tenants")
+
+	store := newPgViUsageEntryStore(pool)
+	entriesA, err := store.Load(context.Background(), "tenant-a")
+	require.NoError(t, err)
+	require.Len(t, entriesA, 1, "tenant-a's own row set must contain exactly its own entry")
+	assert.Equal(t, "span.custom.attr", entriesA[0].ColumnName)
+
+	entriesB, err := store.Load(context.Background(), "tenant-b")
+	require.NoError(t, err)
+	require.Len(t, entriesB, 1, "tenant-b's own row set must contain exactly its own entry, not tenant-a's")
+	assert.Equal(t, "span.other.attr", entriesB[0].ColumnName)
+}
+
 // TestRealUsageRecorder_DisabledConfigSkipsRegistryAndBackfill: R12's safety valve,
 // threaded through realUsageRecorder, must produce zero registry I/O and never invoke
 // onShouldBackfill.
@@ -655,7 +694,7 @@ func TestRealUsageRecorder_DisabledConfigSkipsRegistryAndBackfill(t *testing.T) 
 	rec := &realUsageRecorder{
 		store:      store,
 		usageCfg:   blockpack.Config{DedicatedColumnsEnabled: false},
-		triggerCfg: blockpack.TriggerConfig{Threshold: 1, WindowSeconds: 3600, LeaseTTLSeconds: 1800},
+		triggerCfg: blockpack.TriggerConfig{LeaseTTLSeconds: 1800},
 		onShouldBackfill: func(entry blockpack.Entry) {
 			backfilled = append(backfilled, entry)
 		},

@@ -9,10 +9,8 @@ package cube
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"time"
 )
 
 // MaxCubesPerTenant is the default maximum number of active cubes per tenant.
@@ -58,42 +56,29 @@ type cubeIndex struct {
 // It is safe for concurrent read access but all mutations are serialized through
 // the conditional-PUT retry loop.
 type Registry struct {
-	store  ObjectStore
+	store  entryStore // was: store ObjectStore (2026-07-11 entryStore refactor)
 	tenant string
 	// maxCubes is the per-tenant active-cube limit.
 	maxCubes int
 }
 
-// NewRegistry creates a Registry for the given tenant backed by store.
+// NewRegistry creates a Registry for the given tenant backed by store. Public signature
+// unchanged by the 2026-07-11 entryStore refactor — internally wraps store in a
+// blobEntryStore (today's S3/Local/GCS/Azure conditional-PUT path, behavior-preserving).
 func NewRegistry(store ObjectStore, tenant string) *Registry {
-	return &Registry{store: store, tenant: tenant, maxCubes: MaxCubesPerTenant}
-}
-
-// indexPath returns the S3 key for this tenant's index.
-func (r *Registry) indexPath() string {
-	return r.tenant + "/cubes/index.json"
+	return &Registry{store: &blobEntryStore{store: store}, tenant: tenant, maxCubes: MaxCubesPerTenant}
 }
 
 // Load fetches and decodes the current index. Returns an empty index when the file does
-// not exist yet (ObjectStore.Get returned ErrNotFound). Any OTHER error propagates as a
-// real failure, regardless of the accompanying (data, etag) shape — see ObjectStore's own
-// doc comment for why shape-based inference is unsafe.
+// not exist yet. Any OTHER error propagates as a real failure. The etag return is always
+// "" post-refactor (confirmed via direct grep: every external caller in tempo discards
+// it with _; only this package's OWN Add/Remove/UpdateWatermarks retry loops ever used it
+// meaningfully, and those now go through blobEntryStore's own internal loadWithEtag,
+// never through this public Load) — a Postgres-backed entryStore has no etag concept at
+// all, so this keeps Load's public contract meaningful for either backend.
 func (r *Registry) Load(ctx context.Context) ([]RegistryEntry, string, error) {
-	data, etag, err := r.store.Get(ctx, r.indexPath())
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			return nil, "", nil
-		}
-		return nil, "", fmt.Errorf("cube registry: load: %w", err)
-	}
-	if len(data) == 0 {
-		return nil, etag, nil
-	}
-	var idx cubeIndex
-	if err := json.Unmarshal(data, &idx); err != nil {
-		return nil, etag, fmt.Errorf("cube registry: decode: %w", err)
-	}
-	return idx.Cubes, etag, nil
+	entries, err := r.store.load(ctx, r.tenant)
+	return entries, "", err
 }
 
 // IsActive reports whether a cube with the given ID is in the current index.
@@ -113,146 +98,28 @@ func (r *Registry) IsActive(ctx context.Context, cubeID string) (bool, error) {
 // Add appends def to the index using a conditional-PUT retry loop.
 // If def.CubeID is already present the call is a no-op and returns nil.
 // Returns ErrLimitReached when the per-tenant cube limit would be exceeded.
-// NOTE-CUBE-009: up to 5 retries with 50 ms base, doubling each time.
+// NOTE-CUBE-009: up to 5 retries with 50 ms base, doubling each time (now inside
+// blobEntryStore.addEntry — see entry_store.go's 2026-07-11 entryStore refactor).
 func (r *Registry) Add(ctx context.Context, def RegistryEntry) error {
-	const maxRetries = 5
-	backoff := 50 * time.Millisecond
-
-	for attempt := range maxRetries {
-		cubes, etag, err := r.Load(ctx)
-		if err != nil {
-			return err
-		}
-		// Idempotent: already present.
-		for _, c := range cubes {
-			if c.CubeID == def.CubeID {
-				return nil
-			}
-		}
-		// Per-tenant limit.
-		if len(cubes) >= r.maxCubes {
-			return &ErrLimitReached{Limit: r.maxCubes}
-		}
-		cubes = append(cubes, def)
-		data, err := json.Marshal(cubeIndex{Version: indexVersion, Cubes: cubes})
-		if err != nil {
-			return fmt.Errorf("cube registry: encode: %w", err)
-		}
-		if err := r.store.ConditionalPut(ctx, r.indexPath(), data, etag); err != nil {
-			if errors.Is(err, ErrConflict) {
-				// Another writer won; back off and retry.
-				if attempt < maxRetries-1 {
-					time.Sleep(backoff)
-					backoff *= 2
-				}
-				continue
-			}
-			return fmt.Errorf("cube registry: put: %w", err)
-		}
-		return nil // success
-	}
-	return fmt.Errorf("cube registry: add %q: exceeded %d retries on conflict", def.CubeID, maxRetries)
+	return r.store.addEntry(ctx, r.tenant, def, r.maxCubes)
 }
 
-// Remove deletes the cube with the given ID from the index using conditional-PUT retry.
+// Remove deletes the cube with the given ID from the index using conditional-PUT retry
+// (now inside blobEntryStore.removeEntry).
 func (r *Registry) Remove(ctx context.Context, cubeID string) error {
-	const maxRetries = 5
-	backoff := 50 * time.Millisecond
-
-	for attempt := range maxRetries {
-		cubes, etag, err := r.Load(ctx)
-		if err != nil {
-			return err
-		}
-		filtered := cubes[:0]
-		found := false
-		for _, c := range cubes {
-			if c.CubeID == cubeID {
-				found = true
-				continue
-			}
-			filtered = append(filtered, c)
-		}
-		if !found {
-			return nil // already absent
-		}
-		data, err := json.Marshal(cubeIndex{Version: indexVersion, Cubes: filtered})
-		if err != nil {
-			return fmt.Errorf("cube registry: encode: %w", err)
-		}
-		if err := r.store.ConditionalPut(ctx, r.indexPath(), data, etag); err != nil {
-			if errors.Is(err, ErrConflict) {
-				if attempt < maxRetries-1 {
-					time.Sleep(backoff)
-					backoff *= 2
-				}
-				continue
-			}
-			return fmt.Errorf("cube registry: put: %w", err)
-		}
-		return nil
-	}
-	return fmt.Errorf("cube registry: remove %q: exceeded %d retries on conflict", cubeID, maxRetries)
+	return r.store.removeEntry(ctx, r.tenant, cubeID)
 }
 
 // UpdateWatermarks records that cubeID's data is completely covered at the given resolution
 // level across [minMinute, maxMinute], using the same conditional-PUT retry discipline as
-// Add/Remove (E-12a). Expands the existing watermark's range (min of mins, max of maxes) rather
-// than replacing it outright — callers are expected to supply monotonically-extending, adjacent
-// windows (the compaction ladder processes fully-elapsed boundaries in order, E-12b), so a simple
-// min/max expansion is sufficient; gap detection within a level is the router's (E-6b) concern at
-// query time, not this write-time bookkeeping.
+// Add/Remove (E-12a, now inside blobEntryStore.updateWatermarksEntry). Expands the existing
+// watermark's range (min of mins, max of maxes) rather than replacing it outright — callers
+// are expected to supply monotonically-extending, adjacent windows (the compaction ladder
+// processes fully-elapsed boundaries in order, E-12b), so a simple min/max expansion is
+// sufficient; gap detection within a level is the router's (E-6b) concern at query time, not
+// this write-time bookkeeping.
 func (r *Registry) UpdateWatermarks(ctx context.Context, cubeID string, level, minMinute, maxMinute uint32) error {
-	const maxRetries = 5
-	backoff := 50 * time.Millisecond
-
-	for attempt := range maxRetries {
-		cubes, etag, err := r.Load(ctx)
-		if err != nil {
-			return err
-		}
-		idx := -1
-		for i, c := range cubes {
-			if c.CubeID == cubeID {
-				idx = i
-				break
-			}
-		}
-		if idx < 0 {
-			return fmt.Errorf("cube registry: update watermarks: cube %q not found", cubeID)
-		}
-
-		newWm := ResolutionWatermark{MinMinute: minMinute, MaxMinute: maxMinute}
-		if existing, ok := cubes[idx].Watermarks[level]; ok {
-			if existing.MinMinute < newWm.MinMinute {
-				newWm.MinMinute = existing.MinMinute
-			}
-			if existing.MaxMinute > newWm.MaxMinute {
-				newWm.MaxMinute = existing.MaxMinute
-			}
-		}
-		if cubes[idx].Watermarks == nil {
-			cubes[idx].Watermarks = make(map[uint32]ResolutionWatermark, 1)
-		}
-		cubes[idx].Watermarks[level] = newWm
-
-		data, err := json.Marshal(cubeIndex{Version: indexVersion, Cubes: cubes})
-		if err != nil {
-			return fmt.Errorf("cube registry: encode: %w", err)
-		}
-		if err := r.store.ConditionalPut(ctx, r.indexPath(), data, etag); err != nil {
-			if errors.Is(err, ErrConflict) {
-				if attempt < maxRetries-1 {
-					time.Sleep(backoff)
-					backoff *= 2
-				}
-				continue
-			}
-			return fmt.Errorf("cube registry: put: %w", err)
-		}
-		return nil
-	}
-	return fmt.Errorf("cube registry: update watermarks %q: exceeded %d retries on conflict", cubeID, maxRetries)
+	return r.store.updateWatermarksEntry(ctx, r.tenant, cubeID, level, minMinute, maxMinute)
 }
 
 // ErrLimitReached is returned when the per-tenant cube limit would be exceeded.

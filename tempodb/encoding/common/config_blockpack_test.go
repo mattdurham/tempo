@@ -32,8 +32,6 @@ func TestConfig_DedicatedColumnsEnabled_SafetyValveDefaultTrue(t *testing.T) {
 	cfg.applyDefaults()
 
 	assert.True(t, cfg.ViUsage.DedicatedColumnsEnabled, "R12's safety valve must default to enabled")
-	assert.Equal(t, 1, cfg.ViUsage.TriggerThreshold)
-	assert.Equal(t, time.Hour, cfg.ViUsage.TriggerWindow)
 	assert.Equal(t, 30*time.Minute, cfg.ViUsage.LeaseTTL)
 	assert.Equal(t, 30*time.Second, cfg.ViUsage.WatermarkCacheTTL)
 }

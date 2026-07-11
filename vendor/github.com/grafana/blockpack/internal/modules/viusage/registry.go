@@ -6,7 +6,10 @@ package viusage
 // implementation — real ETag/If-Match on S3, native generation-match on GCS,
 // content-hash+mutex emulation on Local/Azure — with exponential-backoff retry (up to 5
 // attempts), copying cube's registry.go retry PATTERN verbatim (R1) but implemented as an
-// independent, package-local type — no import of internal/modules/cube.
+// independent, package-local type — no import of internal/modules/cube. Registry itself
+// delegates all storage through the entryStore interface (entry_store.go, 2026-07-11) so
+// it can sit on top of either this blob-backed path or a row-oriented Postgres backend
+// without changing any of its own public methods.
 
 import (
 	"context"
@@ -14,8 +17,6 @@ import (
 	"errors"
 	"fmt"
 	"time"
-
-	"github.com/grafana/blockpack/internal/modules/valueindex"
 )
 
 // indexVersion is the current version of the index.json wire format.
@@ -25,10 +26,10 @@ const indexVersion = 1
 // raw bytes and the current ETag. A missing object MUST be signaled by returning
 // ErrNotFound (wrapped or bare) — NEVER by returning a nil error alongside empty
 // (data, etag): that shape is indistinguishable from a genuine transient failure (a real
-// implementation's SDK error can itself carry empty data/etag), and Registry.Load treats
-// ONLY errors.Is(err, ErrNotFound) as "empty index" (go-presubmit.md CRITICAL finding:
-// inferring not-found from value shape previously let a real Get error be silently
-// swallowed as an empty index, causing updateEntryWithRetry to persist an unconditional
+// implementation's SDK error can itself carry empty data/etag), and blobEntryStore.load
+// treats ONLY errors.Is(err, ErrNotFound) as "empty index" (go-presubmit.md CRITICAL
+// finding: inferring not-found from value shape previously let a real Get error be
+// silently swallowed as an empty index, causing upsertEntry to persist an unconditional
 // PUT that destroyed every other tracked column's state for the tenant). ConditionalPut
 // writes only when the stored ETag matches the supplied etag ("" for
 // create-if-not-exists). A 412-equivalent conflict is signaled by returning ErrConflict.
@@ -45,9 +46,9 @@ type ObjectStore interface {
 var ErrConflict = errors.New("viusage: conditional PUT conflict (412)")
 
 // ErrNotFound is returned by ObjectStore.Get when the requested object does not exist.
-// This is the ONLY signal Registry.Load treats as "empty index" — any other non-nil error
-// (even one with an empty-shaped data/etag return, exactly like a genuine 404) is a real
-// failure and propagates as one.
+// This is the ONLY signal blobEntryStore.load treats as "empty index" — any other
+// non-nil error (even one with an empty-shaped data/etag return, exactly like a genuine
+// 404) is a real failure and propagates as one.
 var ErrNotFound = errors.New("viusage: object not found")
 
 // usageIndex is the JSON structure stored in index.json.
@@ -56,30 +57,59 @@ type usageIndex struct {
 	Version int     `json:"version"`
 }
 
-// Registry loads and persists the per-tenant usage index from object storage. It is safe
-// for concurrent read access but all mutations are serialized through the conditional-PUT
-// retry loop.
+// Registry loads and persists the per-tenant usage index via its entryStore. It is safe
+// for concurrent read access but all mutations are serialized through store's own
+// conditional-write discipline (blobEntryStore: conditional-PUT retry loop; an external
+// Postgres-backed EntryStore: its own row-lock transaction).
 type Registry struct {
-	store  ObjectStore
+	store  entryStore
 	tenant string
 }
 
-// NewRegistry creates a Registry for the given tenant backed by store.
+// NewRegistry creates a Registry for the given tenant backed by store, wrapping it in
+// the blob-backed entryStore implementation.
 func NewRegistry(store ObjectStore, tenant string) *Registry {
-	return &Registry{store: store, tenant: tenant}
+	return &Registry{store: &blobEntryStore{store: store}, tenant: tenant}
 }
 
-// indexPath returns the object storage key for this tenant's index.
-func (r *Registry) indexPath() string {
-	return r.tenant + "/viusage/index.json"
+// Load fetches and decodes the current index. Registry.Load's public signature stays
+// ([]Entry, string, error) for backwards compatibility, but the etag return value is
+// always "" now — entryStore.load has no etag concept (meaningless for a Postgres
+// row-per-entry backend), and every external caller in tempo already discards this
+// return value with `_` (confirmed via direct grep; only blobEntryStore's OWN internal
+// retry loop ever used it meaningfully, and that loop is now entirely internal to
+// blobEntryStore.upsertEntry below).
+func (r *Registry) Load(ctx context.Context) ([]Entry, string, error) {
+	entries, err := r.store.load(ctx, r.tenant)
+	return entries, "", err
 }
 
-// Load fetches and decodes the current index. Returns an empty index when the file does
+// blobEntryStore adapts an ObjectStore into the entryStore interface Registry holds —
+// today's whole-blob JSON index + conditional-PUT-retry loop, behavior-preserving from
+// before entryStore existed (2026-07-11 refactor, Part 1.3).
+type blobEntryStore struct {
+	store ObjectStore
+}
+
+// indexPath returns the object storage key for tenant's index.
+func (s *blobEntryStore) indexPath(tenant string) string {
+	return tenant + "/viusage/index.json"
+}
+
+// load fetches and decodes the current index. Returns an empty index when the file does
 // not exist yet (ObjectStore.Get returned ErrNotFound). Any OTHER error propagates as a
 // real failure, regardless of the accompanying (data, etag) shape — see ObjectStore's own
 // doc comment for why shape-based inference is unsafe.
-func (r *Registry) Load(ctx context.Context) ([]Entry, string, error) {
-	data, etag, err := r.store.Get(ctx, r.indexPath())
+func (s *blobEntryStore) load(ctx context.Context, tenant string) ([]Entry, error) {
+	entries, _, err := s.loadWithETag(ctx, tenant)
+	return entries, err
+}
+
+// loadWithETag is load's ETag-preserving variant, used internally by upsertEntry's
+// conditional-PUT retry loop (the etag is meaningless to any entryStore caller outside
+// this file, per load's own doc comment).
+func (s *blobEntryStore) loadWithETag(ctx context.Context, tenant string) ([]Entry, string, error) {
+	data, etag, err := s.store.Get(ctx, s.indexPath(tenant))
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return nil, "", nil
@@ -96,17 +126,15 @@ func (r *Registry) Load(ctx context.Context) ([]Entry, string, error) {
 	return idx.Entries, etag, nil
 }
 
-// updateEntryWithRetry loads the index, locates the entry keyed by (colHash, colType) —
-// creating it via createIfMissing if absent and createIfMissing is non-nil, else
-// returning an error — invokes mutate to apply changes, and persists the whole index via
-// the conditional-PUT retry loop (5 attempts, 50ms doubling backoff), mirroring cube's
-// Add/Remove/UpdateWatermarks pattern (R1: pattern copied, not code shared). mutate may be
-// invoked once per retry attempt since a conflicting concurrent write requires
+// upsertEntry loads the index, locates the entry keyed by (colHash, colType) — creating
+// it via createIfMissing if absent and createIfMissing is non-nil, else returning an
+// error — invokes mutate to apply changes, and persists the whole index via the
+// conditional-PUT retry loop (5 attempts, 50ms doubling backoff), mirroring cube's
+// Add/Remove/UpdateWatermarks pattern (R1: pattern copied, not code shared). mutate may
+// be invoked once per retry attempt since a conflicting concurrent write requires
 // re-evaluating against freshly-loaded state — mutate must derive new state from entry's
-// CURRENT contents each call, not from closure-captured pre-computed values. Shared by
-// recordUse/RenewLease here (A2) and A3's RecordUseAndMaybeTrigger, per plan.md 4.2's
-// guidance to factor one private retry helper rather than duplicate the loop.
-func (r *Registry) updateEntryWithRetry(
+// CURRENT contents each call, not from closure-captured pre-computed values.
+func (s *blobEntryStore) upsertEntry(
 	ctx context.Context,
 	tenant, colHash, colType string,
 	createIfMissing func() Entry,
@@ -116,7 +144,7 @@ func (r *Registry) updateEntryWithRetry(
 	backoff := 50 * time.Millisecond
 
 	for attempt := range maxRetries {
-		entries, etag, err := r.Load(ctx)
+		entries, etag, err := s.loadWithETag(ctx, tenant)
 		if err != nil {
 			return Entry{}, err
 		}
@@ -143,7 +171,7 @@ func (r *Registry) updateEntryWithRetry(
 		if err != nil {
 			return Entry{}, fmt.Errorf("viusage registry: encode: %w", err)
 		}
-		if err := r.store.ConditionalPut(ctx, r.indexPath(), data, etag); err != nil {
+		if err := s.store.ConditionalPut(ctx, s.indexPath(tenant), data, etag); err != nil {
 			if errors.Is(err, ErrConflict) {
 				if attempt < maxRetries-1 {
 					time.Sleep(backoff)
@@ -161,44 +189,13 @@ func (r *Registry) updateEntryWithRetry(
 	)
 }
 
-// recordUse appends a use timestamp (unix seconds, from now) for (tenant, colName,
-// colType), creating the entry on first use, and truncates UseTimestamps to the most
-// recent MaxTrackedUses entries (R4/4.1). Internal helper shared by RecordUse (public
-// surface, once needed) and A3's RecordUseAndMaybeTrigger, which layers threshold
-// evaluation and lease acquisition on top via the same updateEntryWithRetry mutate shape.
-func (r *Registry) recordUse(ctx context.Context, tenant, colName, colType string, now time.Time) (Entry, error) {
-	colHash := valueindex.ColHash(colName)
-	nowSec := uint64(now.Unix()) //nolint:gosec // unix seconds fits uint64 for any realistic timestamp
-
-	return r.updateEntryWithRetry(
-		ctx, tenant, colHash, colType,
-		func() Entry {
-			return Entry{
-				Tenant:       tenant,
-				ColumnHash:   colHash,
-				ColumnName:   colName,
-				ColumnType:   colType,
-				FirstSeenSec: nowSec,
-				CreatedAt:    nowSec,
-			}
-		},
-		func(e *Entry) error {
-			e.UseTimestamps = append(e.UseTimestamps, nowSec)
-			if len(e.UseTimestamps) > MaxTrackedUses {
-				e.UseTimestamps = e.UseTimestamps[len(e.UseTimestamps)-MaxTrackedUses:]
-			}
-			return nil
-		},
-	)
-}
-
 // RenewLease pushes an existing entry's BackfillState.LeaseExpiresAt forward via the same
-// conditional-PUT retry discipline (4.4 step 2) — required because a real 48h backfill run
+// conditional-write discipline (4.4 step 2) — required because a real 48h backfill run
 // may legitimately outlast one LeaseTTLSeconds period. Errors if the entry does not exist
 // (mirrors cube's UpdateWatermarks "cube not found" behavior): renewing a lease implies
 // the entry was already created by a prior RecordUseAndMaybeTrigger trigger/acquire call.
 func (r *Registry) RenewLease(ctx context.Context, tenant, colHash, colType string, newExpiresAt uint64) error {
-	_, err := r.updateEntryWithRetry(
+	_, err := r.store.upsertEntry(
 		ctx, tenant, colHash, colType,
 		nil,
 		func(e *Entry) error {
@@ -210,15 +207,15 @@ func (r *Registry) RenewLease(ctx context.Context, tenant, colHash, colType stri
 }
 
 // UpdateWatermark persists one backfill progress update for (tenant, colHash,
-// colType)'s entry via the same conditional-PUT retry discipline (plan.md
+// colType)'s entry via the same conditional-write discipline (plan.md
 // Section 4.4/R7/R9): WatermarkSec and the window bounds are written on every
 // call (the caller passes the same window on every call within one run, so
 // re-writing WindowStartSec/WindowEndSec is a no-op once set — this is also
-// the ONLY place these fields are ever set, since neither the trigger step
-// (RecordUseAndMaybeTrigger) nor the registry's own recordUse sets them).
+// the ONLY place these fields are ever set, since the trigger step
+// (RecordUseAndMaybeTrigger) never sets them).
 //
 // done=true additionally sets Done=true AND releases the lease
-// (BackfillInProgress=false) in the SAME conditional-PUT — per plan.md
+// (BackfillInProgress=false) in the SAME write — per plan.md
 // Section 4.4 step 3, never a separate release step that could leave
 // Done=true with the lease still held.
 //
@@ -238,7 +235,7 @@ func (r *Registry) UpdateWatermark(
 	watermarkSec, windowStartSec, windowEndSec uint64,
 	done bool,
 ) error {
-	_, err := r.updateEntryWithRetry(
+	_, err := r.store.upsertEntry(
 		ctx, tenant, colHash, colType,
 		nil,
 		func(e *Entry) error {
@@ -248,6 +245,27 @@ func (r *Registry) UpdateWatermark(
 			if done {
 				e.Backfill.Done = true
 				e.Backfill.BackfillInProgress = false
+			}
+			return nil
+		},
+	)
+	return err
+}
+
+// SPEC-VIUSAGE-9: monotonic file-catalog cursor -- see entry.go's LastCatalogRowID.
+// UpdateCatalogCursor advances (tenant, colHash, colType)'s persisted file-catalog
+// cursor to rowID via the same conditional-write discipline as RenewLease/
+// UpdateWatermark. Monotonic: a rowID lower than or equal to the entry's current
+// LastCatalogRowID is a silent no-op (never regresses the cursor — a stale/replayed call
+// must not make a later run re-list already-processed catalog rows). Errors if the
+// entry does not exist (mirrors RenewLease's own contract).
+func (r *Registry) UpdateCatalogCursor(ctx context.Context, tenant, colHash, colType string, rowID uint64) error {
+	_, err := r.store.upsertEntry(
+		ctx, tenant, colHash, colType,
+		nil,
+		func(e *Entry) error {
+			if rowID > e.Backfill.LastCatalogRowID {
+				e.Backfill.LastCatalogRowID = rowID
 			}
 			return nil
 		},

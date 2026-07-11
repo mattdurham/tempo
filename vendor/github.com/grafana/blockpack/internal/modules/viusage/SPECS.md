@@ -28,12 +28,19 @@ file is the authoritative renumbering: `registry.go` keeps `002`; `backfill.go`'
 be corrected to `004` and `config.go`'s to `005` in a follow-up code comment fix (flagged to
 coder-1, not yet landed as of this writing — track until confirmed).
 
-Next free ID: **SPEC-VIUSAGE-7**.
+Next free ID: **SPEC-VIUSAGE-10**.
 
 ---
 
 ## SPEC-VIUSAGE-1: `Entry`/`BackfillState` schema — the tenant-level usage/backfill record
 *Added: 2026-07-10*
+
+**[PARTIALLY SUPERSEDED by SPEC-VIUSAGE-8, 2026-07-11]** — the `Entry.UseTimestamps`/
+`MaxTrackedUses` paragraph immediately below is retained for history but no longer reflects
+current code: both were removed (team-lead ruling 2026-07-11, R4's trigger is now
+unconditional on first use — see SPEC-VIUSAGE-8). `BackfillState` also gained a new field,
+`LastCatalogRowID` — see SPEC-VIUSAGE-9. The rest of this entry (the key schema, the
+`BackfillState` fields other than the removed ones) is still accurate.
 
 **Contract:** `Entry` is the full, stable description of one tracked `(Tenant, ColumnHash,
 ColumnType)` usage/backfill record, stored as one element of the tenant-level
@@ -45,13 +52,12 @@ trivially maps onto the same on-disk column directory VI writes to. The same col
 observed under two distinct types tracks as two independent `Entry` records (mirrors
 `valueindex_l0write.go`'s own `l0Group` keying).
 
-`Entry.UseTimestamps []uint64` is a bounded, newest-appended ring of recent distinct-use unix-
-second timestamps, truncated to the most recent `MaxTrackedUses` (32) entries whenever
-appended to — both on ordinary append (`Registry.recordUse`) and after window-pruning
-(`RecordUseAndMaybeTrigger`, SPEC-VIUSAGE-3). This bound is deliberately small: the only
-question ever asked of it is "how many uses fell within the last `WindowSeconds`," and a
-repeated-use threshold in the single digits never needs more than a few tens of samples to
-answer that, even under bursty query traffic.
+**[REMOVED, SPEC-VIUSAGE-8]** `Entry.UseTimestamps []uint64` was a bounded, newest-appended
+ring of recent distinct-use unix-second timestamps, truncated to the most recent
+`MaxTrackedUses` (32) entries whenever appended to — both on ordinary append (the
+since-removed `Registry.recordUse`) and after window-pruning (`RecordUseAndMaybeTrigger`).
+Removed entirely once the repeated-use threshold concept it existed to serve was removed —
+see SPEC-VIUSAGE-8.
 
 `BackfillState` is one column's backfill lifecycle sub-record, embedded in `Entry.Backfill`.
 Its zero value (`Triggered: false`) is the correct default for a freshly-created `Entry` that
@@ -72,8 +78,9 @@ exists only because a use was recorded — the threshold has not yet been crosse
   scoped to (the config value in effect when the backfill was triggered), so a later config
   change to the default window does not retroactively reinterpret an already-`Done` entry's
   coverage.
+- `LastCatalogRowID uint64` (added 2026-07-11) — see SPEC-VIUSAGE-9 for the full contract.
 
-Back-refs: `internal/modules/viusage/entry.go:Entry,BackfillState,MaxTrackedUses`.
+Back-refs: `internal/modules/viusage/entry.go:Entry,BackfillState`.
 
 ---
 
@@ -120,20 +127,29 @@ Back-ref: `internal/modules/viusage/entry.go:BackfillState.CoversRange`. Test:
 ## SPEC-VIUSAGE-3: `RecordUseAndMaybeTrigger`/`TriggerConfig` — record+evaluate+lease-acquire in one pass; R8 lease lifecycle
 *Added: 2026-07-10*
 
+**[PARTIALLY SUPERSEDED by SPEC-VIUSAGE-8, 2026-07-11]** — the decision table's threshold row
+below and the `TriggerConfig{Threshold, WindowSeconds}` fields it references no longer exist
+in current code (team-lead ruling 2026-07-11: R4's trigger is now unconditional on first use).
+The rest of this entry (the lease-lifecycle mechanics: acquire/renew/release/crash-self-heal,
+and the `Done`/active-lease/expired-lease rows) is UNCHANGED and still accurate — see
+SPEC-VIUSAGE-8 for the corrected decision table.
+
 **Contract:** `RecordUseAndMaybeTrigger(ctx, registry, tenant, colName, colType, now,
 cfg) (TriggerResult, error)` appends one usage timestamp for `(tenant, colName, colType)`
-and, in the SAME conditional-PUT retry pass (via `Registry.updateEntryWithRetry`, SPEC-
+and, in the SAME conditional-write pass (via `Registry.store.upsertEntry`, SPEC-
 VIUSAGE-4), evaluates the repeated-use threshold and, if crossed and no unexpired lease is
 already held, acquires the backfill lease and marks `Triggered=true`. Combining
 record+evaluate+lease-acquire into one PUT avoids a record-then-separately-check race between
 concurrent callers and halves registry round-trips relative to a naive two-phase design.
 
-`TriggerConfig{Threshold int, WindowSeconds uint64, LeaseTTLSeconds uint64}` — R4's
-documented, unmeasured starting defaults (`Threshold=3`, `WindowSeconds=3600`,
-`LeaseTTLSeconds=1800`) are wired in by the caller (A6/tempo's B3 config plumbing); this
-package defines no defaulting helper of its own since nothing internal calls one.
+**[REMOVED, SPEC-VIUSAGE-8]** `TriggerConfig{Threshold int, WindowSeconds uint64,
+LeaseTTLSeconds uint64}` — R4's documented, unmeasured starting defaults (`Threshold=3`,
+`WindowSeconds=3600`, `LeaseTTLSeconds=1800`) were wired in by the caller (A6/tempo's B3
+config plumbing). `Threshold`/`WindowSeconds` are removed; only `LeaseTTLSeconds` remains —
+see SPEC-VIUSAGE-8.
 
-**Decision table, per call (the `switch` inside the retry's `mutate` closure):**
+**[SUPERSEDED, SPEC-VIUSAGE-8] Decision table, per call (the `switch` inside the retry's
+`mutate` closure), as it existed before 2026-07-11:**
 | Current state | Action |
 |---|---|
 | `Backfill.Done` | no-op; `ShouldBackfill=false` (R5: fully backfilled, never re-trigger) |
@@ -142,12 +158,11 @@ package defines no defaulting helper of its own since nothing internal calls one
 | `!Backfill.Triggered && len(prunedUseTimestamps) >= cfg.Threshold` | set `Triggered=true`, acquire lease; `ShouldBackfill=true` (first-time crossing) |
 | else | no-op; `ShouldBackfill=false` (below threshold) |
 
-Usage timestamps are pruned to `[now-WindowSeconds, now]` (via `pruneUseTimestamps`) BEFORE
-the threshold count is taken, and further bounded to `MaxTrackedUses` — both the window prune
-and the count-against-threshold happen inside the SAME retry attempt as the append, so a
-concurrent conflict-retry re-derives the count from freshly-reloaded state each attempt (the
-`mutate` closure must not close over a pre-computed count from an earlier attempt — see
-SPEC-VIUSAGE-4's binding requirement on this point).
+**[REMOVED, SPEC-VIUSAGE-8]** Usage timestamps were pruned to `[now-WindowSeconds, now]` (via
+the since-removed `pruneUseTimestamps`) BEFORE the threshold count was taken, and further
+bounded to `MaxTrackedUses` — both the window prune and the count-against-threshold happened
+inside the SAME retry attempt as the append. This entire mechanism was removed alongside the
+threshold concept — see SPEC-VIUSAGE-8.
 
 **R8 lease lifecycle (explicit):**
 1. **Acquire** (`acquireLease`): sets `BackfillInProgress=true`,
@@ -177,12 +192,25 @@ exactly one caller's `ShouldBackfill` is `true` per crossing/re-acquisition, tha
 lease.
 
 Back-refs: `internal/modules/viusage/trigger.go:RecordUseAndMaybeTrigger,TriggerConfig,
-TriggerResult,acquireLease,pruneUseTimestamps`. Tests: `TESTS.md` TEST-VIUSAGE-5 through -11.
+TriggerResult,acquireLease`. Tests: `TESTS.md` TEST-VIUSAGE-5 through -11 (lease-lifecycle
+portions still accurate; threshold-specific assertions superseded — see TESTS.md's own
+2026-07-11 update).
 
 ---
 
 ## SPEC-VIUSAGE-4: `Registry` — conditional-PUT-with-retry object storage contract
 *Added: 2026-07-10*
+
+**[UPDATED, 2026-07-11 — Part 1.3 `entryStore` refactor, non-behavioral]** `Registry` no
+longer talks to `ObjectStore` directly: it holds a package-private `entryStore` interface
+(`load`/`upsertEntry`), and `blobEntryStore` (the same file) is the ONLY current
+implementation, wrapping `ObjectStore` exactly as described below — this entry's contract is
+unchanged from the caller's perspective, only the internal structure moved
+(`Registry.updateEntryWithRetry` no longer exists; its body is now `blobEntryStore.
+upsertEntry`, and every mutator below calls `r.store.upsertEntry` instead). This refactor
+exists so `Registry` can ALSO sit on top of a Postgres-backed `EntryStore` (exported,
+2026-07-11) without any change to `Registry`'s own public methods — see the new
+`entry_store.go` and `NOTES.md`'s corresponding entry for the "why."
 
 **Contract:** `Registry` loads and persists one tenant's usage index
 (`<tenant>/viusage/index.json`, `usageIndex{Version: 1, Entries []Entry}`) from an injected
@@ -253,8 +281,10 @@ just on `Done`** — the actual persistence mechanism R7/R9 require, now that it
 named, tested method rather than only a textual "the caller's job" description.
 
 Back-refs: `internal/modules/viusage/registry.go:Registry,ObjectStore,ErrConflict,ErrNotFound,
-updateEntryWithRetry,recordUse,RenewLease,UpdateWatermark,indexVersion,usageIndex`. Tests: `TESTS.md`
-TEST-VIUSAGE-12 through -18 (Load/recordUse/retry/RenewLease), TEST-VIUSAGE-35 through -37 (UpdateWatermark), TEST-VIUSAGE-38/39 (ErrNotFound/Load error-identity fix).
+blobEntryStore,RenewLease,UpdateWatermark,UpdateCatalogCursor,indexVersion,usageIndex`;
+`internal/modules/viusage/entry_store.go:entryStore,EntryStore,externalEntryStoreAdapter,
+NewRegistryFromEntryStore`. Tests: `TESTS.md`
+TEST-VIUSAGE-12 through -18 (Load/retry/RenewLease), TEST-VIUSAGE-35 through -37 (UpdateWatermark), TEST-VIUSAGE-38/39 (ErrNotFound/Load error-identity fix).
 
 ---
 
@@ -405,3 +435,69 @@ the tunable, provisional "index these unconditionally" allowlist a tenant may ov
 Back-ref: `internal/modules/viusage/dedicated_columns.go:DefaultDedicatedColumns`. See
 `NOTES.md`'s R2/A0 entry for the full evidence trail; `blockpack.HardExcludedColumns`
 (`valueindex/SPECS.md` SPEC-VI-11) for the orthogonal permanent-exclusion set.
+
+---
+
+## SPEC-VIUSAGE-8: `RecordUseAndMaybeTrigger` — unconditional first-use trigger (supersedes the threshold-based decision table in SPEC-VIUSAGE-3)
+*Added: 2026-07-11*
+
+**Contract (team-lead ruling 2026-07-11):** R4's repeated-use trigger is unconditional — the
+FIRST recorded use of a never-triggered, non-dedicated column always fires a backfill. There
+is no longer a distinct-use count or rolling time window to cross; `TriggerConfig` retains
+only `LeaseTTLSeconds uint64` (R8's lease-lifecycle bound). `Entry.UseTimestamps`,
+`MaxTrackedUses`, `TriggerConfig.Threshold`/`WindowSeconds`, `pruneUseTimestamps`, and the
+now-dead `Registry.recordUse` (whose only effect was appending to `UseTimestamps`) are all
+removed — see SPEC-VIUSAGE-1's corresponding update.
+
+**Decision table, per call (the `switch` inside the `upsertEntry` `mutate` closure), current:**
+| Current state | Action |
+|---|---|
+| `Backfill.Done` | no-op; `ShouldBackfill=false` (R5: fully backfilled, never re-trigger — UNCHANGED from SPEC-VIUSAGE-3) |
+| `Backfill.Triggered && BackfillInProgress && LeaseExpiresAt > now` | no-op; `ShouldBackfill=false` (another owner holds an active lease — UNCHANGED) |
+| `Backfill.Triggered && (!BackfillInProgress \|\| LeaseExpiresAt <= now)` | re-acquire lease; `ShouldBackfill=true` (R8 crash self-heal — UNCHANGED) |
+| `default` (not yet `Triggered`, and neither of the above two `Triggered` sub-cases apply — which is exactly "not yet triggered" since `Done`/`Triggered` are mutually exclusive with it) | set `Triggered=true`, acquire lease; `ShouldBackfill=true` (first-ever use, unconditional) |
+
+The Go implementation expresses the last row as a bare `default:` case (not an explicit
+condition) — SPEC-VIUSAGE-3's `Done`/`Triggered` cases already partition every other
+possibility, so `default` is the precise, exhaustive "first-ever use" case with no
+threshold-comparison logic needed at all.
+
+**Mutation-tested regression guard:** the test proving this (`TestRecordUseAndMaybeTrigger_
+FiresOnFirstUse_NoThresholdField`, `trigger_test.go`) was verified by temporarily reverting
+the `default` case to a no-op (simulating a regressed "never fires on first use" bug) and
+confirming 3 tests fail (`...FiresOnFirstUse...`, `...AlreadyTriggeredNeverReTriggers`,
+`...ConcurrentCallersOnlyOneWinsLease`) before reverting back — not merely diff-read.
+
+Back-refs: `internal/modules/viusage/trigger.go:RecordUseAndMaybeTrigger,TriggerConfig`.
+Tests: `TESTS.md`'s 2026-07-11 update (supersedes the threshold-specific portions of
+TEST-VIUSAGE-5 through -11; the lease-lifecycle tests in that range are unchanged).
+
+---
+
+## SPEC-VIUSAGE-9: `Registry.UpdateCatalogCursor`/`BackfillState.LastCatalogRowID` — monotonic file-catalog cursor
+*Added: 2026-07-11*
+
+**Contract:** `BackfillState.LastCatalogRowID uint64` is the highest tempo `file_catalog`
+row_id this column's backfill has fully processed (tempo's catalog-cursor-based
+`BlockFetcher`, part of the same 2026-07-11 Postgres-registry work). Zero means "never run
+against the catalog" — a catalog-backed fetcher then lists ALL rows for the tenant,
+equivalent to a full first listing.
+
+`Registry.UpdateCatalogCursor(ctx, tenant, colHash, colType, rowID) error` advances the
+cursor via the same conditional-write discipline as `RenewLease`/`UpdateWatermark`
+(SPEC-VIUSAGE-4). **Monotonic (binding):** a `rowID` less than or equal to the entry's
+current `LastCatalogRowID` is a silent no-op — the cursor NEVER regresses, since a
+stale/replayed call must not make a later backfill run re-list already-processed catalog
+rows. Errors if the entry does not exist (mirrors `RenewLease`'s own contract: advancing a
+catalog cursor implies the entry was already created by a prior
+`RecordUseAndMaybeTrigger` trigger/acquire call).
+
+**Not re-exported at blockpack root as of this writing** — called only from tempo's
+`vblockpack` package via the already-exported `*blockpack.Registry` (whose methods are
+automatically visible through the `Registry = viusage.Registry` alias, the same mechanism
+`RenewLease`/`UpdateWatermark` already use with zero separate re-export wrapper).
+
+Back-refs: `internal/modules/viusage/entry.go:BackfillState.LastCatalogRowID`;
+`internal/modules/viusage/registry.go:Registry.UpdateCatalogCursor`. Tests:
+`TESTS.md`'s 2026-07-11 update (`TestRegistry_UpdateCatalogCursor_MonotonicOnly`,
+`TestRegistry_UpdateCatalogCursor_NotFoundReturnsError`, `registry_test.go`).

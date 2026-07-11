@@ -29,6 +29,8 @@ import (
 
 	"github.com/go-kit/log/level"
 	blockpack "github.com/grafana/blockpack"
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	util_log "github.com/grafana/tempo/pkg/util/log"
 	"github.com/grafana/tempo/tempodb/backend"
 	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
@@ -165,12 +167,23 @@ func (f *viBlockFetcher) ListBlocksInRange(
 	return refs, nil
 }
 
-func (f *viBlockFetcher) FetchBlock(_ context.Context, sourceRef string) (*blockpack.Reader, error) {
+func (f *viBlockFetcher) FetchBlock(ctx context.Context, sourceRef string) (*blockpack.Reader, error) {
+	return fetchBlockViaReader(ctx, f.reader, sourceRef)
+}
+
+// fetchBlockViaReader opens sourceRef (a blockObjectKey-formatted string) as a
+// *blockpack.Reader via reader -- the shared fetch-by-ref logic used by both
+// viBlockFetcher (live S3/Local/GCS/Azure listing) and catalogBlockFetcher
+// (Postgres file_catalog-backed listing, vi_backfill_catalog.go). The ONE
+// piece of genuine code-sharing between the two fetchers: parsing sourceRef
+// and opening it via tempoReaderProvider is identical either way -- only
+// ListBlocksInRange's data source differs between them.
+func fetchBlockViaReader(_ context.Context, reader backend.Reader, sourceRef string) (*blockpack.Reader, error) {
 	tenantID, blockID, err := parseBlockObjectKey(sourceRef)
 	if err != nil {
 		return nil, err
 	}
-	provider := &tempoReaderProvider{reader: f.reader, tenantID: tenantID, blockID: blockID}
+	provider := &tempoReaderProvider{reader: reader, tenantID: tenantID, blockID: blockID}
 	return blockpack.NewReaderFromProvider(provider)
 }
 
@@ -201,7 +214,7 @@ func runViBackfillCore(
 		// an artificial cap.
 		WindowSeconds: math.MaxUint64,
 	})
-	return eng.Run(ctx, func(prog blockpack.BackfillProgress) error {
+	runErr := eng.Run(ctx, func(prog blockpack.BackfillProgress) error {
 		if uwErr := registry.UpdateWatermark(
 			ctx, entry.Tenant, entry.ColumnHash, entry.ColumnType,
 			prog.WatermarkSec, prog.WindowStartSec, prog.WindowEndSec, prog.Done,
@@ -225,6 +238,31 @@ func runViBackfillCore(
 		}
 		return nil
 	})
+	if runErr != nil {
+		// A partial/failed run never reaches the cursor-persist step below --
+		// the SAME candidate set is safely re-listed and re-processed on the
+		// next attempt (relying on FlushAndPutValueIndexColumn's existing
+		// idempotent-overwrite behavior for any block that was in fact already
+		// written), mirroring R7's "don't claim coverage until confirmed"
+		// philosophy applied to catalog discovery too.
+		return runErr
+	}
+	// Catalog-cursor persist (Part 3.4, 2026-07-11): only fires when a
+	// catalog-backed fetcher was used -- zero effect on the existing
+	// S3/Local/GCS/Azure viBlockFetcher path (the type assertion simply
+	// fails and this whole block is skipped).
+	if cf, ok := fetcher.(*catalogBlockFetcher); ok {
+		if cursorErr := registry.UpdateCatalogCursor(
+			ctx, entry.Tenant, entry.ColumnHash, entry.ColumnType, cf.MaxRowIDSeen(),
+		); cursorErr != nil {
+			level.Warn(util_log.Logger).Log(
+				"msg", "vblockpack: VI backfill: catalog cursor persist failed",
+				"tenant", entry.Tenant, "column", entry.ColumnName, "err", cursorErr,
+			)
+			return cursorErr
+		}
+	}
+	return nil
 }
 
 // RunViBackfillDeps bundles the three backend-specific dependencies
@@ -278,6 +316,27 @@ func NewViBackfillDepsRaw(rawR backend.RawReader, rawW backend.RawWriter) RunViB
 		ObjStore: newObjectStoreForBackend(rawR, rawW),
 		Putter:   newRawObjectPutter(rawW),
 	}
+}
+
+// NewViBackfillDepsCatalogOverride takes an ALREADY-BUILT deps (from
+// NewViBackfillDepsS3/Raw, unchanged) and returns a copy with .Fetcher
+// swapped to a *catalogBlockFetcher -- an orthogonal override, independent of
+// which object-store backend is otherwise active (ObjStore/Putter are left
+// untouched; only block LISTING moves from live S3/Local/GCS/Azure listing to
+// the Postgres file_catalog table). cursorRowID starts from
+// entry.Backfill.LastCatalogRowID (zero means "never run against the
+// catalog," which lists ALL rows for the tenant -- equivalent to a full first
+// listing). Called from ConfigureViUsage's onShouldBackfill closure only when
+// pgPool != nil.
+func NewViBackfillDepsCatalogOverride(
+	deps RunViBackfillDeps, pool *pgxpool.Pool, entry blockpack.Entry, reader backend.Reader,
+) RunViBackfillDeps {
+	deps.Fetcher = &catalogBlockFetcher{
+		pool:        pool,
+		reader:      reader,
+		cursorRowID: entry.Backfill.LastCatalogRowID,
+	}
+	return deps
 }
 
 // RunViBackfill runs entry's column backfill synchronously in the calling

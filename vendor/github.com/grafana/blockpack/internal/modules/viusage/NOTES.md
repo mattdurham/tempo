@@ -135,6 +135,14 @@ Back-refs: `internal/modules/viusage/trigger.go:TriggerConfig`,
 `valueindex_backfill.go:defaultBackfillWindowSeconds,defaultBackfillWorkers` (root package).
 See `SPECS.md` SPEC-VIUSAGE-3/5.
 
+**Addendum (2026-07-11, task #154): this decision is reversed — see NOTE-VIUSAGE-12.**
+The repeated-use threshold documented above (3 distinct queries / 1h window) no longer
+exists in code. Team-lead ruling 2026-07-11: any query against a non-dedicated column is
+worth indexing immediately, so the threshold's one-off-query filter was removed in favor
+of an unconditional first-use trigger. The 48h backfill-window default and the 30-minute
+lease TTL discussed above are UNCHANGED and still accurate -- only the trigger-threshold
+portion of this entry is superseded.
+
 ---
 
 ## NOTE-VIUSAGE-4 — R5: no eviction in v1, and why VI's asymmetry with cube is deliberate
@@ -622,3 +630,116 @@ depends on anymore.
 
 ---
 
+## NOTE-VIUSAGE-12 — R4 reopened: repeated-use threshold removed for an unconditional first-use trigger; new file-catalog cursor (task #154)
+
+Date: 2026-07-11
+
+**Team-lead ruling (2026-07-11):** NOTE-VIUSAGE-3's original R4 rationale for the repeated-use
+threshold — filtering one-off/exploratory queries out of triggering an expensive 48h
+raw-block backfill — is reversed. Any query against a non-dedicated column is now considered
+worth indexing immediately: the FIRST recorded use of a never-triggered column always fires a
+backfill, with no distinct-use count or rolling time window evaluated at all. The accepted
+tradeoff, disclosed explicitly rather than silently absorbed: a single one-off query now
+does trigger a full 48h historical backfill, exactly the cost NOTE-VIUSAGE-3's threshold
+existed to avoid — the team lead judged the added latency/complexity of tracking a
+rolling-window use count was not worth that protection, given #496's usage registry is
+itself the mechanism meant to surface real production usage patterns that could recalibrate
+this later.
+
+**What changed in code (task #154):**
+- `TriggerConfig{Threshold int, WindowSeconds uint64, LeaseTTLSeconds uint64}` shrank to
+  `TriggerConfig{LeaseTTLSeconds uint64}` — `Threshold`/`WindowSeconds` removed entirely; only
+  the R8 lease-TTL bound remains.
+- `Entry.UseTimestamps []uint64`, `MaxTrackedUses` (32), `Registry.recordUse`, and
+  `pruneUseTimestamps` are all removed — once there is no count left to answer, there is
+  nothing left for a bounded use-timestamp ring to support.
+- `RecordUseAndMaybeTrigger`'s decision table collapsed the
+  `!Triggered && len(prunedUseTimestamps) >= cfg.Threshold` branch into a bare
+  not-yet-`Triggered` → always-trigger case (`default:` in the Go `switch`). The R8 lease
+  acquire/renew/release/crash-self-heal lifecycle (NOTE-VIUSAGE-1's `BackfillState.Triggered`
+  "never reverts" rule, and the whole of SPEC-VIUSAGE-3's lease mechanics) is completely
+  unchanged — only "what causes a first-time trigger" changed, not what happens once
+  triggered.
+- **New, unrelated to the threshold removal but landed in the same task:**
+  `BackfillState.LastCatalogRowID uint64` + `Registry.UpdateCatalogCursor(ctx, tenant,
+  colHash, colType, rowID) error` — a monotonic cursor into tempo's Postgres-backed
+  `file_catalog` table (Part 3 of this same multi-repo effort; task #169's
+  `catalogBlockFetcher` is the intended caller). This lets a catalog-backed `BlockFetcher`
+  implementation persist how far it has listed catalog rows for a column between backfill
+  runs, so a re-run does not need to re-list already-processed rows. Deliberately independent
+  of R7/R9's watermark/lease machinery (`WatermarkSec`/`Done`/the lease fields) — a catalog
+  cursor tracks progress through a row-ID-ordered Postgres listing, not backfill time-window
+  coverage, and nothing else in this package reads or writes it.
+
+**Why the threshold's removal and the catalog cursor addition landed in the same task, despite
+being unrelated concerns:** both are part of the same broader Postgres-backed
+registry/backfill-state migration (this effort's `plan.md`, Part 0 and Part 3) — the threshold
+removal is Part 0's own simplification pass, and the catalog cursor is new state Part 3's
+catalog-based `BlockFetcher` needs; they happened to be implemented by the same task (#154)
+because both touch `Entry`/`TriggerConfig`/`Registry`'s core shape, not because one caused the
+other.
+
+Back-refs: `internal/modules/viusage/entry.go:BackfillState.LastCatalogRowID`,
+`internal/modules/viusage/trigger.go:TriggerConfig,RecordUseAndMaybeTrigger`,
+`internal/modules/viusage/registry.go:Registry.UpdateCatalogCursor`. See `SPECS.md`
+SPEC-VIUSAGE-8 (trigger contract) and SPEC-VIUSAGE-9 (catalog-cursor contract), and this
+entry's own addendum to NOTE-VIUSAGE-3 above.
+
+---
+
+## NOTE-VIUSAGE-13 — `entryStore`: introducing a private storage abstraction so `Registry` can sit on Postgres, not just S3/Local/GCS/Azure blobs (tasks #157/#159)
+
+Date: 2026-07-11
+
+**Motivation:** the opt-in Postgres-backed registry work (tempo cross-repo task) needed
+`Registry` to optionally persist through one Postgres row per `(tenant, colHash, colType)`
+instead of the existing whole-tenant-blob `<tenant>/viusage/index.json` + conditional-PUT
+pattern — without changing any of `Registry`'s existing public methods
+(`Load`/`RenewLease`/`UpdateWatermark`/`UpdateCatalogCursor`/`RecordUseAndMaybeTrigger`),
+since tempo's callers must not care which backend is active.
+
+**Design:** `Registry.store` changed type from `ObjectStore` directly to a new private
+`entryStore` interface (`load`/`upsertEntry`, `entry_store.go`) — `blobEntryStore` is the
+one current implementation, wrapping `ObjectStore` with the EXACT SAME whole-tenant-blob +
+conditional-PUT-retry body that used to live directly on `Registry`
+(`Registry.updateEntryWithRetry`'s body moved verbatim into `blobEntryStore.upsertEntry`;
+`Registry.Load`'s body moved into `blobEntryStore.loadWithETag`, with `Registry.Load`
+becoming a one-line delegator that always returns `""` for the etag — confirmed zero
+external callers ever consumed that return value meaningfully). This refactor is
+explicitly BEHAVIOR-PRESERVING: the full pre-refactor test suite (24 tests) passes
+UNMODIFIED in name and assertion after the refactor; only two test call sites needed a
+MECHANICAL target change (`r.updateEntryWithRetry(...)` → `r.store.upsertEntry(...)`,
+since the method moved and `registry_test.go` is in-package) — tracked and resolved as
+task #176, not treated as a sign the refactor broke anything.
+
+**The Go-visibility trap (why there are TWO interfaces, not one):** the natural next step
+— exporting `entryStore` directly so tempo's Postgres implementation could satisfy it —
+does not work: Go enforces unexported method names (`load`/`upsertEntry`) as
+package-private, and no type outside this package can structurally implement an interface
+whose method names are unexported, even via a `type EntryStore = entryStore` alias (the
+alias does not rename the methods). The fix: a SECOND, exported interface,
+`EntryStore{Load, UpsertEntry}` (capitalized method names), plus a tiny
+`externalEntryStoreAdapter` that embeds an `EntryStore` and forwards its capitalized
+methods to satisfy the unexported `entryStore` interface `Registry` actually holds.
+`NewRegistryFromEntryStore(store EntryStore, tenant string) *Registry` constructs a
+`Registry` over this adapter — mirrors exactly how `blobEntryStore` adapts `ObjectStore`,
+both being "adapt an external, differently-shaped interface into the one `Registry` itself
+depends on" instances of the same pattern.
+
+**Ownership split (blockpack defines the interface, tempo brings pgx):** this mirrors how
+`ObjectStore` already works — blockpack never imports a SQL driver; `EntryStore` is the
+narrow contract, and tempo's `pgViUsageEntryStore` (pgx-backed, tempo repo) is the concrete
+implementation. blockpack's `go.mod` gains zero new dependencies from this work.
+
+**New public API surface (flagged for sign-off, not silently shipped):** `EntryStore`
+(interface) and `NewRegistryFromEntryStore` (constructor), both re-exported at blockpack
+root via `valueindex_usage.go`.
+
+Back-ref: `entry_store.go:entryStore,EntryStore,externalEntryStoreAdapter,
+NewRegistryFromEntryStore`; `registry.go:blobEntryStore` (SPEC-VIUSAGE-4's update);
+`valueindex_usage.go` (root re-export). Tests:
+`TestNewRegistryFromEntryStore_DelegatesToProvidedStore`,
+`TestNewRegistryFromEntryStore_SameBehaviorAsObjectStoreBacked`
+(`valueindex_usage_test.go`).
+
+---

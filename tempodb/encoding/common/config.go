@@ -196,18 +196,6 @@ type ViUsageConfig struct {
 	// exists to justify it (R2's own "provisional, not final" framing).
 	DedicatedColumnsOverride []string `yaml:"dedicated_columns_override"`
 
-	// TriggerThreshold is R4's repeated-use trigger: the number of distinct
-	// queries referencing the same non-dedicated column within TriggerWindow
-	// required to fire a backfill. Default 1 (fires on first use) — any query
-	// against a non-dedicated column is worth indexing immediately, per
-	// explicit team-lead ruling; TriggerWindow/dedup logic still applies for
-	// preventing duplicate backfill launches from concurrent queriers.
-	TriggerThreshold int `yaml:"trigger_threshold"`
-
-	// TriggerWindow is the rolling window TriggerThreshold is evaluated over.
-	// Default 1h.
-	TriggerWindow time.Duration `yaml:"trigger_window"`
-
 	// LeaseTTL bounds how long a backfill lease (R8) is honored before a
 	// second replica may re-acquire it. Default 30m.
 	LeaseTTL time.Duration `yaml:"lease_ttl"`
@@ -223,12 +211,6 @@ func (cfg *ViUsageConfig) applyDefaults() {
 	// Booleans default to false, so set true explicitly (R12: enabled by default).
 	if !cfg.DedicatedColumnsEnabled {
 		cfg.DedicatedColumnsEnabled = true
-	}
-	if cfg.TriggerThreshold == 0 {
-		cfg.TriggerThreshold = 1
-	}
-	if cfg.TriggerWindow == 0 {
-		cfg.TriggerWindow = time.Hour
 	}
 	if cfg.LeaseTTL == 0 {
 		cfg.LeaseTTL = 30 * time.Minute

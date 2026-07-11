@@ -20,6 +20,8 @@ import (
 
 	"github.com/go-kit/log/level"
 	blockpack "github.com/grafana/blockpack"
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/grafana/tempo/pkg/tempopb"
 	commonpbv1 "github.com/grafana/tempo/pkg/tempopb/common/v1"
 	resourcepbv1 "github.com/grafana/tempo/pkg/tempopb/resource/v1"
@@ -45,6 +47,14 @@ type cubeManager struct {
 	store    blockpack.CubeObjectPutter // for writing .cube files
 	objStore blockpack.CubeObjectStore  // for registry Get/ConditionalPut
 	tenant   string
+
+	// pgPool is the opt-in Postgres backend for the cube registry (2026-07-11).
+	// Nil means "not configured" -- loadDefs falls back to objStore-backed
+	// (S3/Local/GCS/Azure) NewCubeRegistry unconditionally. Inherits this
+	// package's PRE-EXISTING single-tenant limitation (cubeManagerOnce below):
+	// this task does not fix that, only adds an orthogonal storage backend
+	// choice on top of it.
+	pgPool *pgxpool.Pool
 
 	mu          sync.Mutex
 	defs        []blockpack.CubeDefinition
@@ -120,7 +130,7 @@ var (
 // non-nil the S3 branch below is byte-identical to before (same minio client construction,
 // same *minioObjectStore/*s3ObjectPutter types); the generic branch (rawR/rawW) is new,
 // backing Local/GCS/Azure via newRawObjectPutter and newCubeObjectStoreForBackend.
-func ConfigureCubeManager(enabled bool, s3cfg *s3backend.Config, rawR backend.RawReader, rawW backend.RawWriter, tenant string) {
+func ConfigureCubeManager(enabled bool, s3cfg *s3backend.Config, rawR backend.RawReader, rawW backend.RawWriter, tenant string, pgPool *pgxpool.Pool) {
 	if !enabled || tenant == "" || (s3cfg == nil && (rawR == nil || rawW == nil)) {
 		return
 	}
@@ -144,12 +154,14 @@ func ConfigureCubeManager(enabled bool, s3cfg *s3backend.Config, rawR backend.Ra
 				store:    &s3ObjectPutter{client: client, bucket: s3cfg.Bucket},
 				objStore: &minioObjectStore{client: client, bucket: s3cfg.Bucket},
 				tenant:   tenant,
+				pgPool:   pgPool,
 			}
 		} else {
 			cm = &cubeManager{
 				store:    newRawObjectPutter(rawW),
 				objStore: newCubeObjectStoreForBackend(rawR, rawW),
 				tenant:   tenant,
+				pgPool:   pgPool,
 			}
 		}
 		if err := cm.loadDefs(context.Background()); err != nil {
@@ -188,7 +200,12 @@ func CubeObjectStoreRawWriterTypeForTest() string {
 
 // loadDefs reads the cube index.json and rebuilds defs + accs.
 func (cm *cubeManager) loadDefs(ctx context.Context) error {
-	reg := blockpack.NewCubeRegistry(cm.objStore, cm.tenant)
+	var reg *blockpack.CubeRegistry
+	if cm.pgPool != nil {
+		reg = blockpack.NewCubeRegistryFromEntryStore(newPgCubeEntryStore(cm.pgPool), cm.tenant)
+	} else {
+		reg = blockpack.NewCubeRegistry(cm.objStore, cm.tenant)
+	}
 	// CubeColumnFilterToFilter is the single source of truth (shared with blockpack's own
 	// backfill.go) for converting a RegistryEntry's baked-in filter into a runtime predicate
 	// (#491 Phase E fix pass, review.md Issue 2). Previously nil here, so def.Filters was always

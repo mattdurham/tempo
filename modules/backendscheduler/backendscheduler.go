@@ -16,9 +16,11 @@ import (
 	"github.com/google/uuid"
 	"github.com/grafana/dskit/services"
 	"github.com/grafana/dskit/user"
+	"github.com/grafana/tempo/modules/backendscheduler/filecatalog"
 	"github.com/grafana/tempo/modules/backendscheduler/provider"
 	"github.com/grafana/tempo/modules/backendscheduler/work"
 	"github.com/grafana/tempo/modules/overrides"
+	"github.com/grafana/tempo/modules/postgres"
 	"github.com/grafana/tempo/modules/storage"
 	"github.com/grafana/tempo/pkg/tempopb"
 	"github.com/grafana/tempo/pkg/util/log"
@@ -57,6 +59,11 @@ type BackendScheduler struct {
 	}
 
 	mergedJobs chan *work.Job
+
+	// catalogLister is nil when Postgres is not configured (cfg.Postgres ==
+	// nil) -- the same nil-means-disabled convention used everywhere else in
+	// this plan. Non-nil means running() ticks it on cfg.CatalogListInterval.
+	catalogLister *filecatalog.Lister
 }
 
 // ListJobs returns all jobs in the work cache
@@ -140,6 +147,19 @@ func New(cfg Config, s3cfg *s3backend.Config, store storage.Store, overrides ove
 		}
 	}
 
+	// File catalog lister (2026-07-11): opt-in, nil when cfg.Postgres is nil.
+	// No new binary -- piggybacks on this already-singleton process, reusing
+	// s.store.BlockMetas/Tenants (already-live, already-maintained state) on
+	// its own, independent tick.
+	if cfg.Postgres != nil {
+		pool, perr := postgres.NewPool(context.Background(), cfg.Postgres)
+		if perr != nil {
+			level.Warn(log.Logger).Log("msg", "file catalog lister disabled -- postgres pool init failed", "err", perr)
+		} else {
+			s.catalogLister = filecatalog.NewLister(pool, s.store.BlockMetas, s.store.Tenants)
+		}
+	}
+
 	s.Service = services.NewBasicService(s.starting, s.running, s.stopping)
 	return s, nil
 }
@@ -211,6 +231,9 @@ func (s *BackendScheduler) running(ctx context.Context) error {
 	backendFlushTicker := time.NewTicker(s.cfg.BackendFlushInterval)
 	defer backendFlushTicker.Stop()
 
+	catalogListTicker := time.NewTicker(s.cfg.CatalogListInterval)
+	defer catalogListTicker.Stop()
+
 	var err error
 
 	for {
@@ -228,7 +251,15 @@ func (s *BackendScheduler) running(ctx context.Context) error {
 				metricWorkFlushesFailed.Inc()
 				level.Error(log.Logger).Log("msg", "failed to flush work cache to backend", "error", err)
 			}
-
+		case <-catalogListTicker.C:
+			// s.catalogLister == nil (Postgres not configured) makes this a
+			// cheap no-op nil check per tick -- zero risk to this singleton's
+			// other responsibilities.
+			if s.catalogLister != nil {
+				if lerr := s.catalogLister.RunOnce(ctx); lerr != nil {
+					level.Warn(log.Logger).Log("msg", "file catalog list pass failed", "err", lerr)
+				}
+			}
 		}
 	}
 }
@@ -247,6 +278,12 @@ func (s *BackendScheduler) stopping(_ error) error {
 	if err != nil {
 		return fmt.Errorf("failed to flush work cache to backend on shutdown: %w", err)
 	}
+
+	// s.catalogLister.Close() is nil-safe (both on a nil *Lister and a nil
+	// pool) -- closes the file-catalog Postgres pool so it never leaks past
+	// this process's shutdown, mirroring tempodb.go's readerWriter.Shutdown()
+	// closing its own pgPool identically.
+	s.catalogLister.Close()
 
 	level.Info(log.Logger).Log("msg", "backend scheduler stopping")
 	return nil

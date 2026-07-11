@@ -7,6 +7,7 @@ import (
 
 	"github.com/grafana/tempo/modules/backendscheduler/provider"
 	"github.com/grafana/tempo/modules/backendscheduler/work"
+	"github.com/grafana/tempo/modules/postgres"
 	"github.com/grafana/tempo/pkg/util"
 )
 
@@ -20,6 +21,17 @@ type Config struct {
 	ProviderConfig provider.Config `yaml:"provider"`
 	JobTimeout     time.Duration   `yaml:"job_timeout"`
 	LocalWorkPath  string          `yaml:"local_work_path,omitempty"` // Path to store local work cache
+
+	// Postgres is the opt-in backend for the file catalog (2026-07-11). Nil
+	// means "not configured" -- the SAME *postgres.Config type as
+	// tempodb.Config.Postgres, reused (not a second copy), since both flow
+	// from the same top-level Postgres connection in a real deployment.
+	Postgres *postgres.Config `yaml:"postgres"`
+	// CatalogListInterval is how often the file-catalog lister reconciles
+	// backend-scheduler's in-memory blocklist into Postgres. Default 5m.
+	// Independent of BlocklistPoll -- see filecatalog package doc comment for
+	// the CompactedBlockRetention safety-margin dependency this interval has.
+	CatalogListInterval time.Duration `yaml:"catalog_list_interval"`
 }
 
 func (cfg *Config) RegisterFlagsAndApplyDefaults(prefix string, f *flag.FlagSet) {
@@ -28,6 +40,8 @@ func (cfg *Config) RegisterFlagsAndApplyDefaults(prefix string, f *flag.FlagSet)
 	f.DurationVar(&cfg.JobTimeout, prefix+"backend-scheduler.job-timeout", 15*time.Second, "Internal duration to wait for a job before telling the worker to try again")
 
 	f.StringVar(&cfg.LocalWorkPath, prefix+"backend-scheduler.local-work-path", "/var/tempo", "Path to store local work cache.")
+
+	f.DurationVar(&cfg.CatalogListInterval, prefix+"backend-scheduler.catalog-list-interval", 5*time.Minute, "Interval at which to reconcile the in-memory blocklist into the Postgres file catalog (only used when postgres is configured)")
 
 	cfg.Work.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "work"), f)
 

@@ -17,6 +17,7 @@ import (
 	"github.com/go-kit/log/level"
 	"github.com/google/uuid"
 	blockpack "github.com/grafana/blockpack"
+	"github.com/jackc/pgx/v5/pgxpool"
 	minio "github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/prometheus/client_golang/prometheus"
@@ -25,6 +26,7 @@ import (
 	"github.com/grafana/dskit/user"
 	"github.com/grafana/tempo/modules/cache/memcached"
 	"github.com/grafana/tempo/modules/cache/redis"
+	"github.com/grafana/tempo/modules/postgres"
 	"github.com/grafana/tempo/pkg/cache"
 	"github.com/grafana/tempo/pkg/tempopb"
 	"github.com/grafana/tempo/pkg/traceql"
@@ -181,6 +183,12 @@ type readerWriter struct {
 	wal  *wal.WAL
 	pool *pool.Pool
 
+	// pgPool is the opt-in Postgres connection pool backing the viusage/cube
+	// registries and file catalog (2026-07-11). Nil when cfg.Postgres is nil.
+	// Owned here: constructed in New(), closed in Shutdown() -- never leaks
+	// past process shutdown.
+	pgPool *pgxpool.Pool
+
 	logger gkLog.Logger
 	cfg    *Config
 
@@ -262,6 +270,17 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 		}
 	}
 
+	// pgPool backs the opt-in Postgres viusage/cube registries and file catalog
+	// (2026-07-11). Nil when cfg.Postgres is nil -- every consumer of this pool
+	// treats nil identically to "Postgres backend not configured."
+	var pgPool *pgxpool.Pool
+	if cfg.Postgres != nil {
+		pgPool, err = postgres.NewPool(context.Background(), cfg.Postgres)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("creating postgres pool: %w", err)
+		}
+	}
+
 	r := backend.NewReader(rawR)
 	w := backend.NewWriter(rawW)
 	rw := &readerWriter{
@@ -273,6 +292,7 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 		cfg:                     cfg,
 		logger:                  logger,
 		pool:                    pool.NewPool(cfg.Pool),
+		pgPool:                  pgPool,
 		blocklist:               blocklist.New(),
 		pollerNotificationFuncs: make([]func(), 0),
 	}
@@ -319,7 +339,7 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 		// The manager loads the cube registry at startup and accumulates per-minute
 		// span counts for every active cube definition.
 		for _, tenantID := range cfg.Block.Blockpack.CubeTenants {
-			vblockpack.ConfigureCubeManager(true, s3cfg, rawRUncached, rawWUncached, tenantID)
+			vblockpack.ConfigureCubeManager(true, s3cfg, rawRUncached, rawWUncached, tenantID, pgPool)
 		}
 		// Cube query path (querier-side reads + historical backfill sourcing) stays
 		// S3-only -- a deliberate scope cut (plan.md §4): neither is required by
@@ -374,11 +394,9 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 	vu := cfg.Block.Blockpack.ViUsage
 	usageCfg := blockpack.Config{DedicatedColumnsEnabled: vu.DedicatedColumnsEnabled}
 	triggerCfg := blockpack.TriggerConfig{
-		Threshold:       vu.TriggerThreshold,
-		WindowSeconds:   uint64(vu.TriggerWindow.Seconds()),
 		LeaseTTLSeconds: uint64(vu.LeaseTTL.Seconds()),
 	}
-	if uerr := vblockpack.ConfigureViUsage(s3cfg, rawRUncached, rawWUncached, usageCfg, triggerCfg); uerr != nil {
+	if uerr := vblockpack.ConfigureViUsage(s3cfg, rawRUncached, rawWUncached, usageCfg, triggerCfg, pgPool); uerr != nil {
 		level.Warn(logger).Log("msg", "vi usage: failed to configure; usage-recording hook disabled", "err", uerr)
 	}
 	// #496 B3 fix (go-presubmit.md CRITICAL finding): the R7 watermark gate is
@@ -774,6 +792,9 @@ func (rw *readerWriter) Shutdown() {
 	}
 	rw.pool.Shutdown()
 	rw.r.Shutdown()
+	if rw.pgPool != nil {
+		rw.pgPool.Close()
+	}
 }
 
 // RawReader implements RawReaderProvider: it returns the backend.RawReader this

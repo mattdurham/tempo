@@ -136,6 +136,12 @@ wait).
 
 **Back-ref:** `internal/modules/cube/registry.go:Registry.Add,Registry.Remove`
 
+**Addendum (2026-07-11, task #158): this retry loop now lives in `blobEntryStore.addEntry`/
+`removeEntry`/`updateWatermarksEntry` (`entry_store.go`), moved verbatim out of
+`Registry.Add`/`Remove`/`UpdateWatermarks`.** The 5-attempt/50ms-doubling shape described
+above is UNCHANGED — see NOTE-CUBE-025 for why the move happened and SPEC-CUBE-014's own
+`[UPDATED]` annotation for the resulting contract.
+
 ---
 
 ## NOTE-CUBE-010: Filter is part of the cube identity — root exports for external routing
@@ -642,3 +648,49 @@ works, and this class of gap is exactly what individual per-task review structur
 conversion function — pre-dating E-6/E-7 — was nobody's individual task).
 
 **Back-ref:** `cube_ingest.go:CubeRegistryEntryToDefinition,LoadCubeDefinitions`, `internal/modules/cube/definition.go:ColumnFilterToFilter`, `internal/modules/cube/backfill.go:AggAttrDefsFor,Backfiller.processMinute`
+
+---
+
+## NOTE-CUBE-025: entryStore refactor — why cube's storage abstraction has 4 narrow methods instead of viusage's 1 generic one (task #158/#160)
+
+**Date:** 2026-07-11
+
+**Decision:** `Registry` now holds a package-private `entryStore` interface
+(`load`/`addEntry`/`removeEntry`/`updateWatermarksEntry`) instead of talking to `ObjectStore`
+directly. `blobEntryStore` (`entry_store.go`) wraps today's `ObjectStore` + conditional-PUT-retry
+loops, behavior-preserving — every method body is `registry.go`'s pre-refactor `Add`/`Remove`/
+`UpdateWatermarks`/`Load` moved verbatim. An exported `EntryStore` counterpart (same 4 operations,
+exported method names) plus `externalEntryStoreAdapter` and `NewRegistryFromEntryStore` let an
+external caller (tempo) construct a `Registry` over a Postgres-backed implementation instead of
+an `ObjectStore`, with zero change to `Registry`'s own public methods.
+
+**Why now:** this is the cube-side mirror of `internal/modules/viusage`'s identical refactor
+(`viusage/NOTES.md`'s entryStore entries, `viusage/entry_store.go`) — both modules are migrating
+to a Postgres-backed registry backend as part of the same broader effort (this effort's `plan.md`
+Part 1/Part 2), and both needed the identical "let `Registry` sit on top of either backend without
+changing its own public surface" seam.
+
+**Why cube's `entryStore` has 4 narrow methods instead of viusage's 1 generic `upsertEntry`:**
+viusage's every registry write goes through the identical shape — load an entry by key, create it
+if missing, mutate it, persist — so one generic `upsertEntry(createIfMissing, mutate)` primitive
+covers `RecordUseAndMaybeTrigger`/`RenewLease`/`UpdateWatermark`/`UpdateCatalogCursor` all at once.
+Cube's three pre-existing `Registry` operations have genuinely different list-mutation semantics
+instead: `Add` appends-with-a-limit-check (and is a no-op if the entry already exists — no mutate
+step at all), `Remove` filters an entry out of the list, and `UpdateWatermarks` mutates one
+existing entry's map field. Forcing these three shapes through a single generic
+create-or-mutate-one-entry primitive would not actually simplify anything — R1's
+"mirror the pattern, don't force a shared abstraction that doesn't fit" precedent (already applied
+once for viusage vs. cube's own original registry, `NOTE-CUBE-009`'s cross-module relationship)
+applies again here, one level down: mirror the SHAPE of viusage's refactor (an `entryStore` seam
+`Registry` delegates through), not the literal generic-primitive DESIGN, since cube's own existing
+write operations don't share viusage's one shape to generalize over.
+
+**Behavior-preservation, verified:** every `blobEntryStore` method is `registry.go`'s pre-refactor
+method body moved verbatim (rename `Registry` receiver `r` → `blobEntryStore` receiver `s`,
+`r.store` → `s.store`) — no logic changed, only which type owns the code. `Registry`'s own public
+methods (`Load`/`Add`/`Remove`/`UpdateWatermarks`/`IsActive`) are unchanged one-line delegations to
+`r.store`'s corresponding method.
+
+**Back-ref:** `internal/modules/cube/entry_store.go:entryStore,blobEntryStore,EntryStore,
+externalEntryStoreAdapter,NewRegistryFromEntryStore`; `internal/modules/cube/registry.go:Registry`.
+See `SPECS.md` SPEC-CUBE-014's `[UPDATED]` annotation and `NOTE-CUBE-009`'s addendum above.

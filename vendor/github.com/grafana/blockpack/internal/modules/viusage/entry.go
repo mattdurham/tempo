@@ -28,14 +28,6 @@ type Entry struct {
 	// tracks as two independent entries, matching l0Group's own keying in
 	// valueindex_l0write.go.
 	ColumnType string `json:"column_type"`
-	// UseTimestamps is a bounded, newest-appended ring of recent distinct-query use
-	// timestamps (unix seconds), used to evaluate the rolling-window repeated-use
-	// threshold (R4). Bounded at MaxTrackedUses (default 32) entries — old entries are
-	// dropped from the front once the bound is hit; this is deliberately small since the
-	// only thing ever asked of it is "how many uses fell within the last WindowSeconds,"
-	// and a repeated-use threshold in the single digits never needs more than a few tens
-	// of samples to answer that, even under bursty query traffic.
-	UseTimestamps []uint64 `json:"use_timestamps,omitempty"`
 	// Backfill tracks the trigger/lease/watermark state for this column (see 4.4).
 	Backfill BackfillState `json:"backfill"`
 	// FirstSeenSec is the unix-second timestamp of the first recorded use.
@@ -43,9 +35,6 @@ type Entry struct {
 	// CreatedAt is unix seconds when the entry was first registered.
 	CreatedAt uint64 `json:"created_at"`
 }
-
-// MaxTrackedUses bounds Entry.UseTimestamps (R4/4.1).
-const MaxTrackedUses = 32
 
 // BackfillState is one column's backfill lifecycle state. Zero value means "never
 // triggered" (Triggered=false), which is the correct default for a freshly-created Entry
@@ -82,6 +71,13 @@ type BackfillState struct {
 	// FilesForTimeRange-based discovery is trusted without any watermark gating (R5:
 	// same upkeep as any dedicated column from this point forward).
 	Done bool `json:"done"`
+	// LastCatalogRowID is the highest file_catalog row_id this column's backfill has
+	// fully processed (tempo's catalog-cursor-based BlockFetcher, 2026-07-11). Zero
+	// means "never run against the catalog" — a catalog-backed fetcher then lists ALL
+	// rows for the tenant, equivalent to a full first listing. Only ever advances
+	// (monotonic) — see Registry.UpdateCatalogCursor.
+	// SPEC-VIUSAGE-9: monotonic file-catalog cursor.
+	LastCatalogRowID uint64 `json:"last_catalog_row_id,omitempty"`
 }
 
 // CoversRange reports whether bs's backfill state fully covers [minSec, maxSec] — the

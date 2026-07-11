@@ -264,12 +264,28 @@ still applies only at 2 dimensions.
 
 ## SPEC-CUBE-014: Registry (issue #444)
 
+**[UPDATED, 2026-07-11 — entryStore refactor, non-behavioral, task #158/#160]** `Registry`
+no longer talks to `ObjectStore` directly: it holds a package-private `entryStore` interface
+(`load`/`addEntry`/`removeEntry`/`updateWatermarksEntry`), and `blobEntryStore` (`entry_store.go`)
+is the ONLY current implementation, wrapping `ObjectStore` exactly as described below — this
+entry's contract is unchanged from the caller's perspective, only the internal structure moved
+(the conditional-PUT retry loops NOTE-CUBE-009 describes now live in `blobEntryStore.addEntry`/
+`removeEntry`/`updateWatermarksEntry`, moved verbatim from `Registry.Add`/`Remove`/
+`UpdateWatermarks`). This refactor exists so `Registry` can ALSO sit on top of a Postgres-backed
+`EntryStore` (exported, `entry_store.go`, task #160) via `NewRegistryFromEntryStore` without any
+change to `Registry`'s own public methods — mirrors `internal/modules/viusage`'s identical
+refactor (`viusage/SPECS.md` SPEC-VIUSAGE-4's own `[UPDATED]` annotation) exactly, except cube's
+`entryStore` has 4 narrow methods (one per Add/Remove/UpdateWatermarks operation) rather than
+viusage's single generic `upsertEntry(createIfMissing, mutate)` — see `entry_store.go`'s own doc
+comment for why cube's existing write operations don't share viusage's create-or-mutate-one-entry
+shape.
+
 `Registry` persists the per-tenant cube index in object storage with S3 conditional-PUT concurrency
 control. Concurrent writers compute the same deterministic CubeID; only one conditional PUT succeeds —
 the rest see a 412/ErrConflict and re-read. Up to 5 exponential-backoff retries (50ms base, doubling).
 `Add` is idempotent. `Remove` is idempotent. Per-tenant limit (default 1000) enforced before Add.
 
-**Back-ref:** `internal/modules/cube/registry.go:Registry`
+**Back-ref:** `internal/modules/cube/registry.go:Registry`; `internal/modules/cube/entry_store.go:entryStore,blobEntryStore,EntryStore,externalEntryStoreAdapter,NewRegistryFromEntryStore`.
 
 ---
 

@@ -8,6 +8,7 @@ import (
 
 	"github.com/grafana/tempo/modules/cache/memcached"
 	"github.com/grafana/tempo/modules/cache/redis"
+	"github.com/grafana/tempo/modules/postgres"
 
 	"github.com/grafana/tempo/pkg/cache"
 	"github.com/grafana/tempo/pkg/util"
@@ -74,6 +75,11 @@ type Config struct {
 	BackgroundCache *cache.BackgroundConfig `yaml:"background_cache"`
 	Memcached       *memcached.Config       `yaml:"memcached"`
 	Redis           *redis.Config           `yaml:"redis"`
+
+	// Postgres is the opt-in backend for the viusage/cube registries and the
+	// file catalog (2026-07-11). Nil means "not configured" -- the S3/Local/
+	// GCS/Azure blob-backed registry path stays the default, untouched.
+	Postgres *postgres.Config `yaml:"postgres"`
 
 	BloomCacheCfg backend_cache.BloomConfig `yaml:",inline"`
 }

@@ -29,7 +29,7 @@ func TestNewViUsageObjectStoreForBackend_GenericBackendUsesRawObjectStore(t *tes
 }
 
 func TestConfigureViUsage_NoBackendConfigured_ReturnsError(t *testing.T) {
-	err := ConfigureViUsage(nil, nil, nil, blockpack.Config{DedicatedColumnsEnabled: true}, blockpack.TriggerConfig{})
+	err := ConfigureViUsage(nil, nil, nil, blockpack.Config{DedicatedColumnsEnabled: true}, blockpack.TriggerConfig{}, nil)
 	assert.Error(t, err)
 }
 
@@ -37,7 +37,7 @@ func TestConfigureViUsage_DedicatedColumnsDisabled_NoopEvenWithNoBackend(t *test
 	prev := getViUsageRecorder()
 	t.Cleanup(func() { ConfigureViUsageRecorder(prev) })
 
-	err := ConfigureViUsage(nil, nil, nil, blockpack.Config{DedicatedColumnsEnabled: false}, blockpack.TriggerConfig{})
+	err := ConfigureViUsage(nil, nil, nil, blockpack.Config{DedicatedColumnsEnabled: false}, blockpack.TriggerConfig{}, nil)
 	require.NoError(t, err, "disabled config must not attempt backend construction at all")
 	assert.Nil(t, getViUsageRecorder())
 }

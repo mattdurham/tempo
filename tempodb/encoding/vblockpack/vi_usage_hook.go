@@ -26,6 +26,8 @@ import (
 	"time"
 
 	blockpack "github.com/grafana/blockpack"
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/grafana/tempo/tempodb/backend"
 	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
 )
@@ -65,13 +67,21 @@ type realUsageRecorder struct {
 	triggerCfg       blockpack.TriggerConfig
 	onShouldBackfill func(entry blockpack.Entry)
 
+	// pgPool is the opt-in Postgres backend for the viusage registry
+	// (2026-07-11). Nil means "not configured" -- registryFor falls back to
+	// the existing store-backed (S3/Local/GCS/Azure) path unconditionally.
+	pgPool *pgxpool.Pool
+
 	mu         sync.Mutex
 	registries map[string]*blockpack.Registry
 }
 
 // registryFor returns tenant's memoised Registry, constructing one lazily on
 // first use. Safe to call on a realUsageRecorder built as a bare struct
-// literal (registries starts nil).
+// literal (registries starts nil). Per-tenant, never baked in at
+// construction -- mirrors viQueryReader.cacheFor's identical pattern. The
+// pgPool branch below is evaluated per tenant too, not baked into a single
+// process-wide choice, though in practice pgPool is a single shared pool.
 func (r *realUsageRecorder) registryFor(tenant string) *blockpack.Registry {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -81,7 +91,12 @@ func (r *realUsageRecorder) registryFor(tenant string) *blockpack.Registry {
 	if reg, ok := r.registries[tenant]; ok {
 		return reg
 	}
-	reg := blockpack.NewRegistry(r.store, tenant)
+	var reg *blockpack.Registry
+	if r.pgPool != nil {
+		reg = blockpack.NewRegistryFromEntryStore(newPgViUsageEntryStore(r.pgPool), tenant)
+	} else {
+		reg = blockpack.NewRegistry(r.store, tenant)
+	}
 	r.registries[tenant] = reg
 	return reg
 }
@@ -129,9 +144,15 @@ func (r *realUsageRecorder) RecordUse(
 // zero-function-call no-op -- R12's "no usage-tracking/backfill machinery
 // engaged at all" requirement, satisfied the same way viQueryReaderPtr's own
 // nil disables its entire path.
+// pgPool is the opt-in Postgres backend for the viusage registry (2026-07-11,
+// part of the same opt-in Postgres backend as ConfigureCubeManager's new
+// param). Nil means "not configured" -- the existing S3/Local/GCS/Azure
+// object-store construction below is UNTOUCHED either way (it's simply
+// unused by registryFor when pgPool != nil, costing nothing extra since it
+// was already being built for the backfill deps regardless).
 func ConfigureViUsage(
 	s3cfg *s3backend.Config, rawR backend.RawReader, rawW backend.RawWriter,
-	usageCfg blockpack.Config, triggerCfg blockpack.TriggerConfig,
+	usageCfg blockpack.Config, triggerCfg blockpack.TriggerConfig, pgPool *pgxpool.Pool,
 ) error {
 	if !usageCfg.DedicatedColumnsEnabled {
 		ConfigureViUsageRecorder(nil)
@@ -154,8 +175,13 @@ func ConfigureViUsage(
 		store:      store,
 		usageCfg:   usageCfg,
 		triggerCfg: triggerCfg,
+		pgPool:     pgPool,
 		onShouldBackfill: func(entry blockpack.Entry) {
-			launchViBackfill(entry, backfillDeps)
+			deps := backfillDeps
+			if pgPool != nil {
+				deps = NewViBackfillDepsCatalogOverride(deps, pgPool, entry, backend.NewReader(rawR))
+			}
+			launchViBackfill(entry, deps)
 		},
 	}
 	ConfigureViUsageRecorder(rec)

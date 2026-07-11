@@ -16,7 +16,7 @@ Entries use the module-local, sequential prefix `TEST-VIUSAGE-N`, independent of
 TESTS.md files (see `SPECS.md`'s ID-convention section). IDs are assigned in ascending order
 and never reused or renumbered.
 
-Next free ID: **TEST-VIUSAGE-40**.
+Next free ID: **TEST-VIUSAGE-42**.
 
 ## TEST-VIUSAGE-1 through 4: `BackfillState.CoversRange` / `ColumnWatermark.CoversRange` boundary conditions, plus their cross-implementation parity test
 *Added: 2026-07-10. Updated: 2026-07-10 (task #117 landed the parity test flagged below as a recommended follow-up; the gap is now resolved.)*
@@ -65,48 +65,53 @@ coversrange_parity_test.go:TestCoversRange_Parity_BackfillStateAndColumnWatermar
 
 ---
 
-## TEST-VIUSAGE-5 through 11: `RecordUseAndMaybeTrigger` — threshold, window, R5/R8 lifecycle
-*Added: 2026-07-10*
+## TEST-VIUSAGE-5 through 8: `RecordUseAndMaybeTrigger` — unconditional first-use trigger, R5/R8 lifecycle
+*Added: 2026-07-10. Updated: 2026-07-11 (task #154 removed the repeated-use threshold in favor of
+an unconditional first-use trigger — see SPEC-VIUSAGE-8; the 3 threshold/window-specific tests this
+range originally described (`_BelowThresholdNoTrigger`, `_ExactlyAtThresholdTriggers`,
+`_UsesOutsideWindowNotCounted`) no longer exist, since there is no threshold or window left to test.
+This range now covers 4 tests, not the original 6.)*
 
-**Scenario:** the full decision table SPEC-VIUSAGE-3 documents: below-threshold no-op,
-exact-threshold trigger, window-pruning excludes stale uses, R5's never-re-trigger-once-
-triggered rule, R8's expired-lease re-acquire (crash self-heal), and R8's concurrent-caller
-mutual exclusion (exactly one winner).
+**Scenario:** the current decision table SPEC-VIUSAGE-8 documents: unconditional trigger on the
+first-ever recorded use, R5's never-re-trigger-once-triggered rule, R8's expired-lease re-acquire
+(crash self-heal), and R8's concurrent-caller mutual exclusion (exactly one winner).
 
 **Setup/Assertions:**
-- `TestRecordUseAndMaybeTrigger_BelowThresholdNoTrigger` — fewer than `Threshold` uses within
-  the window → `ShouldBackfill=false`.
-- `TestRecordUseAndMaybeTrigger_ExactlyAtThresholdTriggers` — exactly `Threshold` uses →
-  `ShouldBackfill=true`, `Entry.Backfill.Triggered=true`.
-- `TestRecordUseAndMaybeTrigger_UsesOutsideWindowNotCounted` — a use timestamp older than
-  `WindowSeconds` is pruned before the threshold count is taken; a config of
-  threshold=3/window=1h with only 2 uses in the last hour plus 1 use 2h ago must NOT trigger.
-- `TestRecordUseAndMaybeTrigger_AlreadyTriggeredNeverReTriggers` — R5: a second
-  threshold-crossing burst after `Triggered=true` is a no-op (`ShouldBackfill=false`), not a
-  second backfill.
-- `TestRecordUseAndMaybeTrigger_ExpiredLeaseAllowsReAcquire` — R8's crash-self-heal: a lease
-  with `LeaseExpiresAt` in the past (simulating a crashed backfill worker) allows a fresh call
-  to re-acquire the lease and return `ShouldBackfill=true` again for an already-`Triggered`,
+- `TestRecordUseAndMaybeTrigger_FiresOnFirstUse_NoThresholdField` — the first-ever recorded use of a
+  never-seen column always fires (`ShouldBackfill=true`, `Entry.Backfill.Triggered=true`), with no
+  `Threshold`/`WindowSeconds` field on `TriggerConfig` to gate it.
+- `TestRecordUseAndMaybeTrigger_AlreadyTriggeredNeverReTriggers` — R5: once `Triggered=true` with an
+  active, unexpired lease, further uses are a no-op (`ShouldBackfill=false`); `LeaseExpiresAt` does
+  not change across 5 subsequent calls.
+- `TestRecordUseAndMaybeTrigger_ExpiredLeaseAllowsReAcquire` — R8's crash-self-heal: a lease with
+  `LeaseExpiresAt` in the past (simulating a crashed backfill worker) allows a fresh call to
+  re-acquire the lease and return `ShouldBackfill=true` again for an already-`Triggered`,
   not-yet-`Done` column.
-- `TestRecordUseAndMaybeTrigger_ConcurrentCallersOnlyOneWinsLease` — 5 goroutines call
-  `RecordUseAndMaybeTrigger` concurrently against a shared in-memory `ObjectStore` with real
-  conditional-PUT-conflict semantics (`Threshold: 1`, so every caller crosses the threshold on
-  its own first use); asserts exactly 1 of the 5 gets `ShouldBackfill=true` and the registry
-  ends up with exactly 1 entry, `Triggered=true` — proving the lease genuinely serializes
-  concurrent triggering rather than each caller independently believing it won.
+- `TestRecordUseAndMaybeTrigger_ConcurrentCallersOnlyOneWinsLease` — 5 goroutines each individually
+  cross the (now unconditional) first-use trigger on their own first call, against a shared store
+  with real conditional-PUT-conflict semantics; asserts exactly 1 of the 5 gets
+  `ShouldBackfill=true` and the registry ends up with exactly 1 entry, `Triggered=true` — proving
+  the lease genuinely serializes concurrent triggering rather than each caller independently
+  believing it won.
 
-**Spec invariants tested:** SPEC-VIUSAGE-3.
+**Spec invariants tested:** SPEC-VIUSAGE-8 (supersedes SPEC-VIUSAGE-3 for the trigger-condition
+portion; the lease mechanics both spec entries describe are unchanged).
 
-Back-ref: `internal/modules/viusage/trigger_test.go` (all 6 tests above).
+Back-ref: `internal/modules/viusage/trigger_test.go` (all 4 tests above).
 
 ---
 
-## TEST-VIUSAGE-12 through 18: `Registry` — load/record/retry/lease-renewal contract
-*Added: 2026-07-10*
+## TEST-VIUSAGE-12 through 18: `Registry` — load/retry/lease-renewal contract
+*Added: 2026-07-10. Updated: 2026-07-11 (task #154: `TestRegistry_RecordUse_AppendsTimestamp` and
+`_BoundedTimestampWindow` were deleted along with `Registry.recordUse` itself, which no longer
+exists once `Entry.UseTimestamps` was removed — see SPEC-VIUSAGE-8. The distinct-column-types test
+was renamed from `TestRegistry_RecordUse_DistinctColumnTypesTrackedIndependently` to
+`TestRegistry_DistinctColumnTypesTrackedIndependently`, now exercised via a plain trigger call
+instead of the deleted `recordUse`. This range now covers 6 tests, not the original 7.)*
 
 **Scenario:** the conditional-PUT-with-retry discipline (SPEC-VIUSAGE-4): empty-index load,
-timestamp append + bounding, conflict-retry success and exhaustion, lease renewal, and
-independent per-`(name, colType)` tracking.
+conflict-retry success and exhaustion, lease renewal, and independent per-`(name, colType)`
+tracking.
 
 **Setup/Assertions:**
 - `TestRegistry_Load_EmptyWhenNotFound` — a missing index object (`ObjectStore.Get` returns
@@ -116,10 +121,6 @@ independent per-`(name, colType)` tracking.
   nil-error-with-empty-shape return — see TEST-VIUSAGE-38/39 below for the regression pair
   that pins the distinction between this legitimate case and a real error sharing the same
   `(nil, "")` shape.
-- `TestRegistry_RecordUse_AppendsTimestamp` — one `recordUse` call appends exactly one
-  timestamp to a freshly-created `Entry`.
-- `TestRegistry_RecordUse_BoundedTimestampWindow` — appending beyond `MaxTrackedUses` (32)
-  truncates from the front, keeping only the most recent 32.
 - `TestRegistry_ConditionalPutConflictRetries` — a store that returns `ErrConflict` N times
   (N < 5) then succeeds → the retry loop succeeds on the eventual non-conflicting attempt.
 - `TestRegistry_ConditionalPutExhaustsRetries` — a store that always conflicts → a typed
@@ -128,13 +129,12 @@ independent per-`(name, colType)` tracking.
   existing entry via the same retry discipline.
 - `TestRegistry_RenewLease_NotFoundReturnsError` — renewing a lease for a nonexistent entry
   errors (mirrors cube's `UpdateWatermarks` "not found" behavior — `createIfMissing=nil`).
-- `TestRegistry_RecordUse_DistinctColumnTypesTrackedIndependently` — the same column name
-  observed under two distinct `ColumnType`s tracks as two independent `Entry` records, never
-  collapsed into one.
+- `TestRegistry_DistinctColumnTypesTrackedIndependently` — the same column name observed under
+  two distinct `ColumnType`s tracks as two independent `Entry` records, never collapsed into one.
 
 **Spec invariants tested:** SPEC-VIUSAGE-4.
 
-Back-ref: `internal/modules/viusage/registry_test.go` (all 7 tests above; uses
+Back-ref: `internal/modules/viusage/registry_test.go` (all 6 tests above; uses
 `registryMemStore`, an in-memory `ObjectStore` mirroring `internal/modules/cube`'s own test
 store shape, independently written per R1).
 
@@ -403,3 +403,26 @@ error-identity-not-value-shape contract).
 Back-ref: `internal/modules/viusage/registry_test.go:TestRegistry_Load_
 RealErrorNotConflatedWithNotFound,_ErrNotFoundTreatedAsEmpty,realErrStore`. Root re-export
 parity: `valueindex_usage_test.go:TestErrNotFound_ForwardsSameSentinel`.
+
+---
+
+## TEST-VIUSAGE-40 and 41: `Registry.UpdateCatalogCursor` — monotonic file-catalog cursor (task #154)
+*Added: 2026-07-11*
+
+**Scenario:** SPEC-VIUSAGE-9's binding contract: the persisted cursor advances on a higher
+`rowID`, silently no-ops on a lower-or-equal `rowID` (never regresses), and errors on an
+unregistered entry (mirrors `RenewLease`/`UpdateWatermark`'s own not-found contract).
+
+**Setup/Assertions:**
+- `TestRegistry_UpdateCatalogCursor_MonotonicOnly` — seeds an entry, then calls
+  `UpdateCatalogCursor` with rowID 50 (`LastCatalogRowID` becomes 50), then rowID 10 (no-op,
+  stays 50 — proving the cursor never regresses), then rowID 75 (`LastCatalogRowID` becomes
+  75 — proving a genuinely higher rowID still advances it after a no-op attempt).
+- `TestRegistry_UpdateCatalogCursor_NotFoundReturnsError` — calling `UpdateCatalogCursor` for
+  an entry that was never `RecordUseAndMaybeTrigger`'d errors, rather than silently creating
+  one or no-oping.
+
+**Spec invariants tested:** SPEC-VIUSAGE-9.
+
+Back-ref: `internal/modules/viusage/registry_test.go:TestRegistry_UpdateCatalogCursor_
+MonotonicOnly,_NotFoundReturnsError`.

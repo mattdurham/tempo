@@ -208,7 +208,7 @@ func seedTriggeredEntry(t *testing.T, store blockpack.ObjectStore, tenant, colNa
 	registry := blockpack.NewRegistry(store, tenant)
 	result, err := blockpack.RecordUseAndMaybeTrigger(
 		context.Background(), registry, tenant, colName, colType, time.Unix(1000, 0),
-		blockpack.TriggerConfig{Threshold: 1, WindowSeconds: 3600, LeaseTTLSeconds: 1800},
+		blockpack.TriggerConfig{LeaseTTLSeconds: 1800},
 	)
 	require.NoError(t, err)
 	require.True(t, result.ShouldBackfill, "threshold=1 must trigger immediately on the first use")

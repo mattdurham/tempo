@@ -58,8 +58,8 @@ func DefaultConfig() Config {
 	return viusage.DefaultConfig()
 }
 
-// TriggerConfig parameterises #496's repeated-use trigger (R4): the distinct-use
-// threshold, its rolling time window, and the R8 backfill lease TTL.
+// TriggerConfig parameterises #496's repeated-use trigger (R4), now unconditional on
+// first use (team-lead ruling 2026-07-11) — only the R8 backfill lease TTL remains.
 type TriggerConfig = viusage.TriggerConfig
 
 // TriggerResult is RecordUseAndMaybeTrigger/MaybeRecordUseAndMaybeTrigger's outcome.
@@ -87,6 +87,22 @@ type Registry = viusage.Registry
 // NewRegistry creates a Registry for tenant backed by store.
 func NewRegistry(store ObjectStore, tenant string) *Registry {
 	return viusage.NewRegistry(store, tenant)
+}
+
+// EntryStore is the row-oriented storage interface an alternative Registry backend
+// implements (2026-07-11 Postgres support) — in place of ObjectStore's whole-blob
+// conditional-PUT shape, this is one row per (tenant, colHash, colType). tempo's
+// pgx-backed implementation lives entirely in tempo (this package never imports a SQL
+// driver) — mirrors ObjectStore's own "interface owned here, concrete backend owned by
+// the caller" split exactly.
+type EntryStore = viusage.EntryStore
+
+// NewRegistryFromEntryStore constructs a Registry over an externally-supplied
+// EntryStore (e.g. tempo's Postgres-backed implementation) instead of an ObjectStore.
+// Registry's own public methods (Load/RenewLease/UpdateWatermark/UpdateCatalogCursor)
+// are byte-identical regardless of which constructor built it.
+func NewRegistryFromEntryStore(store EntryStore, tenant string) *Registry {
+	return viusage.NewRegistryFromEntryStore(store, tenant)
 }
 
 // RecordUseAndMaybeTrigger appends one usage timestamp for (tenant, colName, colType)

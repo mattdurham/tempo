@@ -114,6 +114,22 @@ func NewCubeRegistry(store CubeObjectStore, tenant string) *CubeRegistry {
 	return cube.NewRegistry(store, tenant)
 }
 
+// CubeEntryStore is the row-oriented storage interface an alternative CubeRegistry
+// backend implements (2026-07-11 Postgres support) — in place of CubeObjectStore's
+// whole-blob conditional-PUT shape, this is one row per (tenant, cube_id). tempo's
+// pgx-backed implementation lives entirely in tempo (this package never imports a SQL
+// driver) — mirrors CubeObjectStore's own "interface owned here, concrete backend owned
+// by the caller" split exactly.
+type CubeEntryStore = cube.EntryStore
+
+// NewCubeRegistryFromEntryStore constructs a CubeRegistry over an externally-supplied
+// CubeEntryStore (e.g. tempo's Postgres-backed implementation) instead of a
+// CubeObjectStore. CubeRegistry's own public methods (Load/Add/Remove/UpdateWatermarks)
+// are byte-identical regardless of which constructor built it.
+func NewCubeRegistryFromEntryStore(store CubeEntryStore, tenant string) *CubeRegistry {
+	return cube.NewRegistryFromEntryStore(store, tenant)
+}
+
 // CubeReader reads cells from an in-memory cube file.
 type CubeReader = cube.Reader
 

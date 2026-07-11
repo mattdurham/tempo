@@ -94,6 +94,11 @@ var cli struct {
 	} `cmd:""`
 
 	Redact redactCmd `cmd:"" help:"Submit a redaction request to the backend scheduler"`
+
+	// ImportViusage is a reviewed, ready-to-use artifact only (2026-07-11) -- see
+	// cmd-import-viusage.go's own doc comment. Not run against any real Postgres
+	// or S3 bucket as part of this task.
+	ImportViusage importViusageCmd `cmd:"" help:"one-time import of S3 viusage/cube registry JSON into Postgres (reviewed artifact, see doc comment before running)"`
 }
 
 func main() {
@@ -108,6 +113,18 @@ func main() {
 }
 
 func loadBackend(b *backendOptions, g *globalOptions) (backend.Reader, backend.Writer, backend.Compactor, error) {
+	r, w, c, err := loadRawBackend(b, g)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return backend.NewReader(r), backend.NewWriter(w), c, nil
+}
+
+// loadRawBackend builds the same backend configuration as loadBackend but returns
+// the underlying RawReader/RawWriter, unwrapped by the block-metadata-oriented
+// Reader/Writer. Needed by commands (e.g. importViusageCmd) that read arbitrary
+// object paths rather than block-shaped (name, blockID, tenantID) triples.
+func loadRawBackend(b *backendOptions, g *globalOptions) (backend.RawReader, backend.RawWriter, backend.Compactor, error) {
 	// Defaults
 	cfg := app.Config{}
 	cfg.RegisterFlagsAndApplyDefaults("", &flag.FlagSet{})
@@ -174,5 +191,5 @@ func loadBackend(b *backendOptions, g *globalOptions) (backend.Reader, backend.W
 		return nil, nil, nil, err
 	}
 
-	return backend.NewReader(r), backend.NewWriter(w), c, nil
+	return r, w, c, nil
 }
