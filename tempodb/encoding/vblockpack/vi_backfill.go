@@ -216,29 +216,71 @@ func runViBackfillCore(
 	})
 }
 
-// RunViBackfill runs entry's column backfill synchronously in the calling
-// goroutine, constructing real S3-backed dependencies from s3cfg. Used by the
-// backend-worker job executor (B2's JOB_TYPE_VI_BACKFILL dispatch case).
-func RunViBackfill(ctx context.Context, entry blockpack.Entry, s3cfg *s3backend.Config) error {
+// RunViBackfillDeps bundles the three backend-specific dependencies
+// RunViBackfill/launchViBackfill need to run a column's backfill: fetching
+// raw historical blocks (Fetcher), the viusage registry's backing store
+// (ObjStore), and where finished VI files get written (Putter). Constructed
+// once per invocation via NewViBackfillDepsS3 (existing S3 path, byte-for-byte
+// unchanged) or NewViBackfillDepsRaw (new, generic Local/GCS/Azure path,
+// Track A/C) -- RunViBackfill/launchViBackfill themselves are pure
+// plumbing+metrics+error-handling with zero backend-specific construction
+// left inside them.
+type RunViBackfillDeps struct {
+	Fetcher  blockpack.BlockFetcher
+	ObjStore blockpack.ObjectStore
+	Putter   blockpack.ObjectPutter
+}
+
+// NewViBackfillDepsS3 builds RunViBackfillDeps from S3 config -- a pure code
+// move of RunViBackfill's own former S3-construction lines (unchanged logic,
+// just relocated), including its former "s3cfg == nil" no-op contract: a nil
+// s3cfg now returns a zero-value RunViBackfillDeps (RunViBackfill's own
+// zero-value check below is the new home for that no-op), not an error.
+func NewViBackfillDepsS3(s3cfg *s3backend.Config) (RunViBackfillDeps, error) {
 	if s3cfg == nil {
-		return nil
+		return RunViBackfillDeps{}, nil
 	}
-	metricViBackfillStarted.Inc()
 	client, err := newViBackfillMinioClient(s3cfg)
 	if err != nil {
-		level.Warn(util_log.Logger).Log("msg", "vblockpack: RunViBackfill: S3 client init failed", "err", err)
-		return err
+		return RunViBackfillDeps{}, err
 	}
 	rawR, _, _, err := s3backend.New(s3cfg)
 	if err != nil {
-		level.Warn(util_log.Logger).Log("msg", "vblockpack: RunViBackfill: backend reader init failed", "err", err)
-		return err
+		return RunViBackfillDeps{}, err
 	}
-	fetcher := &viBlockFetcher{reader: backend.NewReader(rawR)}
-	objStore := &viUsageObjectStore{client: client, bucket: s3cfg.Bucket}
-	putter := &s3ObjectPutter{client: client, bucket: s3cfg.Bucket}
+	return RunViBackfillDeps{
+		Fetcher:  &viBlockFetcher{reader: backend.NewReader(rawR)},
+		ObjStore: &viUsageObjectStore{client: client, bucket: s3cfg.Bucket},
+		Putter:   &s3ObjectPutter{client: client, bucket: s3cfg.Bucket},
+	}, nil
+}
 
-	err = runViBackfillCore(ctx, entry, fetcher, objStore, putter, defaultValueIndexPref)
+// NewViBackfillDepsRaw builds RunViBackfillDeps over an already-live
+// backend.RawReader/RawWriter (Local/GCS/Azure) -- rawR/rawW are the SAME
+// backend already serving trace blocks, so no separate client/backend
+// construction is needed the way S3's own minio client is: Track A's
+// newObjectStoreForBackend and Track C's newRawObjectPutter each probe for
+// their backend's native or emulated capability internally.
+func NewViBackfillDepsRaw(rawR backend.RawReader, rawW backend.RawWriter) RunViBackfillDeps {
+	return RunViBackfillDeps{
+		Fetcher:  &viBlockFetcher{reader: backend.NewReader(rawR)},
+		ObjStore: newObjectStoreForBackend(rawR, rawW),
+		Putter:   newRawObjectPutter(rawW),
+	}
+}
+
+// RunViBackfill runs entry's column backfill synchronously in the calling
+// goroutine, using the already-constructed deps (NewViBackfillDepsS3/Raw). A
+// zero-value deps (e.g. NewViBackfillDepsS3(nil)'s return) is a safe no-op --
+// the new home for RunViBackfill's former "s3cfg == nil" early return. Used
+// by the backend-worker job executor (B2's JOB_TYPE_VI_BACKFILL dispatch
+// case) and launchViBackfill's async wrapper below.
+func RunViBackfill(ctx context.Context, entry blockpack.Entry, deps RunViBackfillDeps) error {
+	if deps.Fetcher == nil || deps.ObjStore == nil || deps.Putter == nil {
+		return nil
+	}
+	metricViBackfillStarted.Inc()
+	err := runViBackfillCore(ctx, entry, deps.Fetcher, deps.ObjStore, deps.Putter, defaultValueIndexPref)
 	if err != nil && !isContextErr(ctx, err) {
 		metricViBackfillFailed.Inc()
 		level.Warn(util_log.Logger).Log(
@@ -252,13 +294,13 @@ func RunViBackfill(ctx context.Context, entry blockpack.Entry, s3cfg *s3backend.
 // launchViBackfill starts a background goroutine that runs entry's column
 // backfill (the async, querier-triggered path -- B1's hook calls this when
 // RecordUseAndMaybeTrigger returns ShouldBackfill=true).
-func launchViBackfill(entry blockpack.Entry, s3cfg *s3backend.Config) {
+func launchViBackfill(entry blockpack.Entry, deps RunViBackfillDeps) {
 	go func() {
 		level.Info(util_log.Logger).Log(
 			"msg", "vblockpack: VI backfill started",
 			"tenant", entry.Tenant, "column", entry.ColumnName,
 		)
-		_ = RunViBackfill(context.Background(), entry, s3cfg)
+		_ = RunViBackfill(context.Background(), entry, deps)
 	}()
 }
 

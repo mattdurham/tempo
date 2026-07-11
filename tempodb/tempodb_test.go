@@ -1124,3 +1124,61 @@ func TestValueIndexQueryWiring_NoExplicitConfigStillInstalled(t *testing.T) {
 	assert.True(t, vblockpack.ViUsageRecorderConfiguredForTest(),
 		"usage recorder must be installed even with zero explicit vi_usage config")
 }
+
+// TestNew_CacheProviderConfigured_RegistriesGetUnwrappedRawBackend is the CRITICAL-severity
+// regression test from review.md Issue 1: tempodb.New reassigns rawR/rawW to
+// backend_cache.readerWriter whenever cacheProvider != nil (true in essentially every real
+// deployment -- cmd/tempo/app/modules.go's CacheProvider module always constructs a non-nil
+// provider via cache.NewProvider, even with zero memcached/redis backends configured). That
+// wrapper implements only the base backend.RawReader/RawWriter methods, so it silently hides
+// local.Backend's WriteAtomic and GCS's WriteVersioned/ReadVersioned from the VI/cube registry
+// Configure* call sites -- both of vblockpack's optional-capability probes
+// (rawobjectstore.go's atomicWriter, rawobjectstore_gcs.go's isGCSBackend) always fail against
+// the wrapped type, silently downgrading Local's crash-safe atomic write to a plain,
+// non-atomic Write and permanently disabling GCS's genuinely atomic native conditional-write
+// path.
+//
+// This test proves the fix (tempodb.go passing the PRE-cache-wrap rawR/rawW to every VI/cube
+// Configure* call) by using a real, non-nil cache.Provider with zero cache backends configured
+// (newPerRoleMockProvider() with no roles -- retention_test.go's helper, same package -- is the
+// closest same-process equivalent of a real cache.NewProvider with no memcached/redis in YAML)
+// and asserting, via the TEST-ONLY accessors added alongside this fix, that the concrete
+// backend.RawWriter type reaching both the viusage and cube registries is the genuine
+// *local.Backend, never the cache-wrapping type.
+func TestNew_CacheProviderConfigured_RegistriesGetUnwrappedRawBackend(t *testing.T) {
+	var blockCfg common.BlockConfig
+	blockCfg.RegisterFlagsAndApplyDefaults("test", flag.NewFlagSet("test", flag.ContinueOnError))
+	blockCfg.Version = encoding.DefaultEncoding().Version()
+	blockCfg.Blockpack.ValueIndexEnabled = true
+	blockCfg.Blockpack.CubeTenants = []string{testTenantID}
+
+	tempDir := t.TempDir()
+	cfg := &Config{
+		Backend: backend.Local,
+		Local:   &local.Config{Path: path.Join(tempDir, "traces")},
+		Block:   &blockCfg,
+		WAL:     &wal.Config{Filepath: path.Join(tempDir, "wal")},
+		Search: &SearchConfig{
+			ChunkSizeBytes:  1_000_000,
+			ReadBufferCount: 8, ReadBufferSizeBytes: 4 * 1024 * 1024,
+		},
+	}
+
+	// A real, non-nil cache.Provider with zero roles configured -- mirrors a real deployment's
+	// cache.NewProvider when no memcached/redis backend is configured in YAML (still non-nil,
+	// per modules/cache/cache.go:29). This is the exact condition (cacheProvider != nil) that
+	// triggers tempodb.go's cache-rewrap.
+	cacheProvider := newPerRoleMockProvider()
+
+	_, _, _, err := New(cfg, cacheProvider, log.NewNopLogger())
+	require.NoError(t, err)
+
+	require.True(t, vblockpack.ViUsageRecorderConfiguredForTest(),
+		"usage recorder must be installed")
+	assert.Equal(t, "*local.Backend", vblockpack.ViUsageObjectStoreRawWriterTypeForTest(),
+		"viusage registry must receive the genuine *local.Backend, not the cache-wrapped RawWriter "+
+			"-- otherwise the atomicWriter capability probe silently fails and registry writes lose "+
+			"crash-safety")
+	assert.Equal(t, "*local.Backend", vblockpack.CubeObjectStoreRawWriterTypeForTest(),
+		"cube registry must receive the genuine *local.Backend, not the cache-wrapped RawWriter")
+}

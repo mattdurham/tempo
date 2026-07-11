@@ -20,6 +20,8 @@ package vblockpack
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -127,26 +129,67 @@ func (r *realUsageRecorder) RecordUse(
 // zero-function-call no-op -- R12's "no usage-tracking/backfill machinery
 // engaged at all" requirement, satisfied the same way viQueryReaderPtr's own
 // nil disables its entire path.
-func ConfigureViUsage(s3cfg *s3backend.Config, usageCfg blockpack.Config, triggerCfg blockpack.TriggerConfig) error {
-	if !usageCfg.DedicatedColumnsEnabled || s3cfg == nil {
+func ConfigureViUsage(
+	s3cfg *s3backend.Config, rawR backend.RawReader, rawW backend.RawWriter,
+	usageCfg blockpack.Config, triggerCfg blockpack.TriggerConfig,
+) error {
+	if !usageCfg.DedicatedColumnsEnabled {
 		ConfigureViUsageRecorder(nil)
 		return nil
 	}
-	client, err := newViBackfillMinioClient(s3cfg)
+	store, err := newViUsageObjectStoreForBackend(s3cfg, rawR, rawW)
 	if err != nil {
 		return err
 	}
-	store := &viUsageObjectStore{client: client, bucket: s3cfg.Bucket}
+	var backfillDeps RunViBackfillDeps
+	if s3cfg != nil {
+		backfillDeps, err = NewViBackfillDepsS3(s3cfg)
+		if err != nil {
+			return err
+		}
+	} else {
+		backfillDeps = NewViBackfillDepsRaw(rawR, rawW)
+	}
 	rec := &realUsageRecorder{
 		store:      store,
 		usageCfg:   usageCfg,
 		triggerCfg: triggerCfg,
 		onShouldBackfill: func(entry blockpack.Entry) {
-			launchViBackfill(entry, s3cfg)
+			launchViBackfill(entry, backfillDeps)
 		},
 	}
 	ConfigureViUsageRecorder(rec)
 	return nil
+}
+
+// newViUsageObjectStoreForBackend is the single construction point both
+// ConfigureViUsage and ConfigureViWatermarkCache call for the viusage
+// registry's backing store -- mirrors cubequerypath.go's existing
+// objectStore() single-construction-point pattern (two call sites must never
+// drift on which store they use). s3cfg != nil selects the existing,
+// untouched S3 construction (viUsageObjectStore); otherwise falls back to the
+// generic backend-dispatch factory (newObjectStoreForBackend,
+// rawobjectstore_gcs.go), which itself probes for GCS's native
+// conditional-write capability before falling back to the Local/Azure
+// content-hash+mutex emulation (rawobjectstore.go).
+func newViUsageObjectStoreForBackend(
+	s3cfg *s3backend.Config, rawR backend.RawReader, rawW backend.RawWriter,
+) (blockpack.ObjectStore, error) {
+	if s3cfg != nil {
+		client, err := newViBackfillMinioClient(s3cfg)
+		if err != nil {
+			return nil, err
+		}
+		return &viUsageObjectStore{client: client, bucket: s3cfg.Bucket}, nil
+	}
+	if rawR == nil || rawW == nil {
+		// Should be unreachable given tempodb.go's gates, which always supply either s3cfg or
+		// both rawR/rawW -- but a nil rawR/rawW here would otherwise silently construct a
+		// rawObjectStore wrapping nil fields, deferring the failure to a nil-pointer panic on
+		// its first real Get/ConditionalPut call. Fail fast and clearly instead (plan.md §17).
+		return nil, errors.New("vblockpack: newViUsageObjectStoreForBackend: no backend configured (s3cfg, rawR, and rawW are all nil)")
+	}
+	return newObjectStoreForBackend(rawR, rawW), nil
 }
 
 var (
@@ -175,6 +218,29 @@ func getViUsageRecorder() usageRecorder {
 // ValueIndexQueryConfiguredForTest's doc comment for why this exists.
 func ViUsageRecorderConfiguredForTest() bool {
 	return getViUsageRecorder() != nil
+}
+
+// ViUsageObjectStoreRawWriterTypeForTest reports the concrete Go type (via %T) of the
+// backend.RawWriter backing the installed viusage object store's Local/Azure/GCS-generic
+// path (rawObjectStore.core.rawW / gcsObjectStore.core.vrw), or "" when no recorder is
+// installed or the installed recorder is the S3 path (viUsageObjectStore, which never uses
+// rawR/rawW at all). TEST-ONLY: exists to prove, from outside this package (tempodb_test.go),
+// whether tempodb.go's New() passed a genuine backend.RawWriter (e.g. "*local.Backend") or a
+// cache-wrapped one (e.g. "*cache.readerWriter") into ConfigureViUsage -- the wrapper hides
+// the WriteAtomic/WriteVersioned capability probes this package's dispatch depends on.
+func ViUsageObjectStoreRawWriterTypeForTest() string {
+	rec, ok := getViUsageRecorder().(*realUsageRecorder)
+	if !ok || rec == nil {
+		return ""
+	}
+	switch s := rec.store.(type) {
+	case *rawObjectStore:
+		return fmt.Sprintf("%T", s.core.rawW)
+	case *gcsObjectStore:
+		return fmt.Sprintf("%T", s.core.vrw)
+	default:
+		return ""
+	}
 }
 
 // viUsageRateLimiter collapses a burst of concurrent identical (tenant, column)

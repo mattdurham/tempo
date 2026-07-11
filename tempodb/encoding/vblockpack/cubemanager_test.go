@@ -3,11 +3,12 @@ package vblockpack
 // cubemanager_test.go — coverage for cubemanager.go's filterValidCubeDefs, the lockstep
 // (activeDefs, accs) pairing loadDefs relies on, tempoSpanValues.Float64's dual OTLP-encoding
 // acceptance, and (as of #491 Phase E fix pass, go-presubmit.md #2) addTrace/flush/rotateLocked's
-// lock-release-before-S3-write behavior. loadDefs/maybeRefresh remain untestable here (their
-// cubeManager.objStore field is a concrete *minioObjectStore, not an interface, needing a real S3
-// backend) — but addTrace/flush/rotateLocked only touch cm.store, which IS already the
-// CubeObjectPutter interface, so they can be (and now are) exercised directly against a
-// constructed *cubeManager with a fake store, no minio required.
+// lock-release-before-S3-write behavior. addTrace/flush/rotateLocked only touch cm.store, which
+// IS already the CubeObjectPutter interface, so they can be exercised directly against a
+// constructed *cubeManager with a fake store, no minio required. loadDefs is exercised
+// end-to-end in cubemanager_configure_test.go via ConfigureCubeManager's generic backend path
+// (cm.objStore widened to the blockpack.CubeObjectStore interface, backend-agnostic VI/cube
+// task) against a real local.NewBackend — no minio needed there either now.
 
 import (
 	"sync"

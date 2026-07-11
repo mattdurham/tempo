@@ -1,9 +1,11 @@
 package cube
 
 // NOTE: SPEC-CUBE-014 — Registry maintains the tenant-level index of active cubes stored
-// at <tenant>/cubes/index.json in object storage. Concurrent writes use S3 conditional PUT
-// (If-Match ETag) with exponential-backoff retry (up to 5 attempts). The same deterministic
-// CubeID ensures concurrent creators converge on one entry rather than duplicating.
+// at <tenant>/cubes/index.json in object storage. Concurrent writes use conditional PUT via
+// the configured ObjectStore implementation — real ETag/If-Match on S3, native
+// generation-match on GCS, content-hash+mutex emulation on Local/Azure — with
+// exponential-backoff retry (up to 5 attempts). The same deterministic CubeID ensures
+// concurrent creators converge on one entry rather than duplicating.
 
 import (
 	"context"

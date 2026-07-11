@@ -128,6 +128,13 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 		return nil, fmt.Errorf("failed to rewind temp file: %w", err)
 	}
 
+	// meta.Version must be set here, not left to the caller: tempodb.go's real
+	// CompleteBlockWithBackend builds its inMeta as a bare struct literal that never copies a
+	// Version field, relying on VersionedEncoding.CreateBlock to set it on the returned meta
+	// (matching vparquet4's own CreateBlock, which constructs a fresh meta via
+	// backend.NewBlockMeta(tenantID, blockID, VersionString)) -- encoding.OpenBlock dispatches
+	// on meta.Version immediately after CreateBlock returns and fails outright on empty.
+	meta.Version = VersionString
 	meta.TotalObjects = int64(traceCount)
 	meta.Size_ = uint64(size)
 	meta.TotalRecords = 1

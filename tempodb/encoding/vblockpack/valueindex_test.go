@@ -132,9 +132,24 @@ func TestGetValueIndexSink_DisabledByDefault(t *testing.T) {
 func TestConfigureValueIndex_DisabledIsNoop(t *testing.T) {
 	withVISink(t, nil, "")
 	// enabled=false must not configure a sink even with a non-nil-looking config.
-	ConfigureValueIndex(false, nil, "indexes")
+	ConfigureValueIndex(false, nil, nil, "indexes")
 	store, _ := getValueIndexSink()
 	assert.Nil(t, store, "disabled config must leave the sink unset")
+}
+
+func TestConfigureValueIndex_GenericBackendUsesRawObjectPutter(t *testing.T) {
+	withVISink(t, nil, "")
+	valueIndexConfigOnce = sync.Once{}
+	_, rawW := newLocalRawBackend(t)
+
+	ConfigureValueIndex(true, nil, rawW, "indexes")
+
+	store, prefix := getValueIndexSink()
+	require.NotNil(t, store, "generic rawW path must configure a sink")
+	assert.Equal(t, "indexes", prefix)
+	_, ok := store.(*rawObjectPutter)
+	assert.True(t, ok, "expected the generic path to install a *rawObjectPutter, got %T", store)
+	assert.Same(t, store, getVCNTSink(), "valueIndexSink and vcntSink must share the same putter on the generic path")
 }
 
 func TestCreateBlock_WritesValueIndexL0(t *testing.T) {

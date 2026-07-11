@@ -163,6 +163,48 @@ func TestCreateBlock_MultipleTraces(t *testing.T) {
 	t.Logf("Block created successfully: %d traces, %d bytes", resultMeta.TotalObjects, resultMeta.Size_)
 }
 
+// TestCreateBlock_SetsMetaVersion_EvenWhenInputMetaHasNone is the regression test for a real
+// bug found by the backend-agnostic VI/cube integration test (modules/frontend/
+// vi_backfill_local_integration_test.go): tempodb.go's CompleteBlockWithBackend builds its
+// own inMeta as a bare &backend.BlockMeta{...} literal (TenantID/BlockID/TotalObjects/
+// StartTime/EndTime/DedicatedColumns only -- Version is NEVER copied, verified directly
+// against tempodb.go:430-438) before calling VersionedEncoding.CreateBlock, relying on
+// CreateBlock itself to set the returned meta's Version. vparquet4's CreateBlock honors this
+// contract (constructs a fresh meta via backend.NewBlockMeta(tenantID, blockID, VersionString),
+// vparquet4/create.go:143) but vblockpack's CreateBlock (this package) previously never set
+// meta.Version at all -- it mutates and returns the SAME meta pointer it was given, Version
+// field untouched. Every existing test above pre-populates meta.Version via
+// backend.NewBlockMeta(..., VersionString) before calling CreateBlock, masking the gap; this
+// test deliberately mirrors the REAL caller's bare-meta shape instead.
+func TestCreateBlock_SetsMetaVersion_EvenWhenInputMetaHasNone(t *testing.T) {
+	ctx := context.Background()
+	cfg := &common.BlockConfig{RowGroupSizeBytes: 100 * 1024 * 1024}
+
+	traceID := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	trace := createTestTrace(traceID, 1)
+	iter := &mockIterator{traces: []*tempopb.Trace{trace}, ids: [][]byte{traceID}}
+
+	tempDir := t.TempDir()
+	rawR, rawW, _, err := local.New(&local.Config{Path: tempDir})
+	require.NoError(t, err)
+	r := backend.NewReader(rawR)
+	w := backend.NewWriter(rawW)
+
+	// Bare meta literal -- NO Version set -- mirrors tempodb.go's real inMeta construction
+	// exactly (not backend.NewBlockMeta, which would set Version as a side effect and mask
+	// this bug).
+	meta := &backend.BlockMeta{BlockID: backend.NewUUID(), TenantID: "test-tenant"}
+
+	resultMeta, err := CreateBlock(ctx, cfg, meta, iter, r, w)
+	require.NoError(t, err)
+	require.NotNil(t, resultMeta)
+
+	require.Equal(t, VersionString, resultMeta.Version,
+		"CreateBlock must set meta.Version itself -- callers building a bare meta (exactly "+
+			"like tempodb.go's real CompleteBlockWithBackend inMeta) must not end up with an "+
+			"unopenable block (encoding.OpenBlock dispatches on meta.Version and fails on empty)")
+}
+
 func TestCreateBlock_EmptyIterator(t *testing.T) {
 	t.Log("Testing CreateBlock with empty iterator")
 

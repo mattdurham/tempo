@@ -2,9 +2,11 @@ package viusage
 
 // NOTE: SPEC-VIUSAGE-002 — Registry maintains the tenant-level index of tracked
 // (column, type) usage/backfill entries stored at <tenant>/viusage/index.json in object
-// storage. Concurrent writes use conditional PUT (If-Match ETag) with exponential-backoff
-// retry (up to 5 attempts), copying cube's registry.go retry PATTERN verbatim (R1) but
-// implemented as an independent, package-local type — no import of internal/modules/cube.
+// storage. Concurrent writes use conditional PUT via the configured ObjectStore
+// implementation — real ETag/If-Match on S3, native generation-match on GCS,
+// content-hash+mutex emulation on Local/Azure — with exponential-backoff retry (up to 5
+// attempts), copying cube's registry.go retry PATTERN verbatim (R1) but implemented as an
+// independent, package-local type — no import of internal/modules/cube.
 
 import (
 	"context"

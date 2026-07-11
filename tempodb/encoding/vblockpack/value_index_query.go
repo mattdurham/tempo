@@ -29,6 +29,7 @@ import (
 	"github.com/go-kit/log/level"
 	blockpack "github.com/grafana/blockpack"
 	util_log "github.com/grafana/tempo/pkg/util/log"
+	"github.com/grafana/tempo/tempodb/backend"
 	minio "github.com/minio/minio-go/v7"
 )
 
@@ -105,6 +106,38 @@ func ConfigureValueIndexQuery(client *minio.Client, bucket, indexPrefix string, 
 	// trace-by-ID Get path (blockpack issue #475). newCachingStore returns the raw
 	// store unwrapped when contentCacheBytes <= 0.
 	store := newCachingStore(&minioVIStore{client: client, bucket: bucket}, contentCacheBytes)
+	viQueryReaderPtr = &viQueryReader{
+		store:       store,
+		caches:      make(map[string]*blockpack.IndexFileCache),
+		indexPrefix: indexPrefix,
+		ttl:         ttl,
+	}
+}
+
+// ConfigureValueIndexQueryRaw installs the process-level index-driven query reader for any
+// non-S3 backend (Local/GCS/Azure), a sibling to ConfigureValueIndexQuery (which itself
+// remains untouched — S3 keeps constructing &minioVIStore{...} exactly as before). Backed by
+// rawFileStore instead of minioVIStore; otherwise identical construction (same nil/prefix/
+// content-cache defaulting rules) so the two entry points stay behaviorally in sync. A nil
+// rawR leaves the reader unset, mirroring ConfigureValueIndexQuery's own nil-client contract.
+func ConfigureValueIndexQueryRaw(rawR backend.RawReader, indexPrefix string, ttl time.Duration, contentCacheBytes int64) {
+	viQueryReaderMu.Lock()
+	defer viQueryReaderMu.Unlock()
+
+	if rawR == nil {
+		viQueryReaderPtr = nil
+		return
+	}
+	if indexPrefix == "" {
+		indexPrefix = "indexes"
+	}
+	switch {
+	case contentCacheBytes < 0:
+		contentCacheBytes = 0
+	case contentCacheBytes == 0:
+		contentCacheBytes = defaultContentCacheBytes
+	}
+	store := newCachingStore(newRawFileStore(rawR), contentCacheBytes)
 	viQueryReaderPtr = &viQueryReader{
 		store:       store,
 		caches:      make(map[string]*blockpack.IndexFileCache),

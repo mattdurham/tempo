@@ -19,6 +19,7 @@ import (
 
 	blockpack "github.com/grafana/blockpack"
 	util_log "github.com/grafana/tempo/pkg/util/log"
+	"github.com/grafana/tempo/tempodb/backend"
 	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
 	"github.com/grafana/tempo/tempodb/encoding/common"
 )
@@ -128,25 +129,28 @@ var (
 // and tested but never instantiated at startup or called from any real query
 // call site, making R7's gate dead code in production). Mirrors
 // ConfigureViUsageRecorder/ConfigureValueIndexQuery's exact singleton pattern
-// -- called from tempodb.go's NewV2Backend alongside ConfigureViUsage.
+// -- called from tempodb.go's NewV2Backend alongside ConfigureViUsage. Delegates
+// to newViUsageObjectStoreForBackend (vi_usage_hook.go) for the backing store --
+// the SAME single construction point ConfigureViUsage uses, so the usage-recording
+// hook and this query-time gate never drift on which store they read/write.
 //
-// R12: when enabled is false or s3cfg is nil, this installs a NIL cache (not
-// a cache that happens to return empty maps) so getViWatermarkCache() == nil
-// and every one of the 6 real call sites' watermarksForOrNil helper short-
-// circuits to nil without ever constructing an S3 client or touching the
-// registry -- "no usage-tracking/backfill machinery engaged at all" applies
-// to the query-time gate exactly as it already does to the B1 usage-recording
-// hook (ConfigureViUsage).
-func ConfigureViWatermarkCache(s3cfg *s3backend.Config, enabled bool, ttl time.Duration) error {
-	if !enabled || s3cfg == nil {
+// R12: when enabled is false, this installs a NIL cache (not a cache that happens
+// to return empty maps) so getViWatermarkCache() == nil and every one of the 6 real
+// call sites' watermarksForOrNil helper short-circuits to nil without ever
+// constructing a store or touching the registry -- "no usage-tracking/backfill
+// machinery engaged at all" applies to the query-time gate exactly as it already
+// does to the B1 usage-recording hook (ConfigureViUsage).
+func ConfigureViWatermarkCache(
+	s3cfg *s3backend.Config, rawR backend.RawReader, rawW backend.RawWriter, enabled bool, ttl time.Duration,
+) error {
+	if !enabled {
 		setViWatermarkCache(nil)
 		return nil
 	}
-	client, err := newViBackfillMinioClient(s3cfg)
+	store, err := newViUsageObjectStoreForBackend(s3cfg, rawR, rawW)
 	if err != nil {
 		return err
 	}
-	store := &viUsageObjectStore{client: client, bucket: s3cfg.Bucket}
 	setViWatermarkCache(newViWatermarkCache(store, ttl))
 	return nil
 }

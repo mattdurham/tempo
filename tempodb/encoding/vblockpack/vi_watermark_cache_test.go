@@ -156,3 +156,24 @@ func TestViWatermarkCache_RefreshesAfterTTLExpiry(t *testing.T) {
 	store.mu.Unlock()
 	assert.Equal(t, 2, secondGets, "a call after the TTL window must re-fetch from the registry")
 }
+
+func TestConfigureViWatermarkCache_DisabledIsNoop(t *testing.T) {
+	setViWatermarkCache(nil)
+	err := ConfigureViWatermarkCache(nil, nil, nil, false, time.Second)
+	require.NoError(t, err)
+	assert.Nil(t, getViWatermarkCache())
+}
+
+func TestConfigureViWatermarkCache_GenericBackendInstallsRawBackedCache(t *testing.T) {
+	setViWatermarkCache(nil)
+	t.Cleanup(func() { setViWatermarkCache(nil) })
+	rawR, rawW := newLocalRawBackend(t)
+
+	err := ConfigureViWatermarkCache(nil, rawR, rawW, true, time.Second)
+	require.NoError(t, err)
+
+	cache := getViWatermarkCache()
+	require.NotNil(t, cache, "generic rawR/rawW path must configure a cache")
+	_, ok := cache.store.(*rawObjectStore)
+	assert.True(t, ok, "expected the generic path to install a *rawObjectStore-backed cache, got %T", cache.store)
+}

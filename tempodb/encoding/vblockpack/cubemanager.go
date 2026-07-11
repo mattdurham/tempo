@@ -13,6 +13,7 @@ package vblockpack
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"sync"
 	"time"
@@ -24,6 +25,7 @@ import (
 	resourcepbv1 "github.com/grafana/tempo/pkg/tempopb/resource/v1"
 	tracepbv1 "github.com/grafana/tempo/pkg/tempopb/trace/v1"
 	util_log "github.com/grafana/tempo/pkg/util/log"
+	"github.com/grafana/tempo/tempodb/backend"
 	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
 	minio "github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -41,7 +43,7 @@ const (
 // cubeManager manages cube accumulators for one tenant.
 type cubeManager struct {
 	store    blockpack.CubeObjectPutter // for writing .cube files
-	objStore *minioObjectStore          // for registry Get/ConditionalPut
+	objStore blockpack.CubeObjectStore  // for registry Get/ConditionalPut
 	tenant   string
 
 	mu          sync.Mutex
@@ -107,30 +109,42 @@ var (
 )
 
 // ConfigureCubeManager installs the process-level cube ingest manager.
-// Called at startup alongside ConfigureValueIndex. No-op when not enabled.
-func ConfigureCubeManager(enabled bool, s3cfg *s3backend.Config, tenant string) {
-	if !enabled || s3cfg == nil || tenant == "" {
+// Called at startup alongside ConfigureValueIndex. No-op when not enabled, tenant is empty, or
+// neither an S3 config nor a generic (rawR, rawW) backend pair is supplied. When s3cfg is
+// non-nil the S3 branch below is byte-identical to before (same minio client construction,
+// same *minioObjectStore/*s3ObjectPutter types); the generic branch (rawR/rawW) is new,
+// backing Local/GCS/Azure via newRawObjectPutter and newCubeObjectStoreForBackend.
+func ConfigureCubeManager(enabled bool, s3cfg *s3backend.Config, rawR backend.RawReader, rawW backend.RawWriter, tenant string) {
+	if !enabled || tenant == "" || (s3cfg == nil && (rawR == nil || rawW == nil)) {
 		return
 	}
 	cubeManagerOnce.Do(func() {
-		endpoint := s3cfg.Endpoint
-		if endpoint == "" {
-			endpoint = "s3." + s3cfg.Region + ".amazonaws.com"
-		}
-		client, err := minio.New(endpoint, &minio.Options{
-			Creds:  credentials.NewEnvAWS(),
-			Secure: !s3cfg.Insecure,
-			Region: s3cfg.Region,
-		})
-		if err != nil {
-			level.Warn(util_log.Logger).Log("msg", "vblockpack: cube manager disabled — S3 client init failed", "err", err)
-			return
-		}
-		os := &minioObjectStore{client: client, bucket: s3cfg.Bucket}
-		cm := &cubeManager{
-			store:    &s3ObjectPutter{client: client, bucket: s3cfg.Bucket},
-			objStore: os,
-			tenant:   tenant,
+		var cm *cubeManager
+		if s3cfg != nil {
+			endpoint := s3cfg.Endpoint
+			if endpoint == "" {
+				endpoint = "s3." + s3cfg.Region + ".amazonaws.com"
+			}
+			client, err := minio.New(endpoint, &minio.Options{
+				Creds:  credentials.NewEnvAWS(),
+				Secure: !s3cfg.Insecure,
+				Region: s3cfg.Region,
+			})
+			if err != nil {
+				level.Warn(util_log.Logger).Log("msg", "vblockpack: cube manager disabled — S3 client init failed", "err", err)
+				return
+			}
+			cm = &cubeManager{
+				store:    &s3ObjectPutter{client: client, bucket: s3cfg.Bucket},
+				objStore: &minioObjectStore{client: client, bucket: s3cfg.Bucket},
+				tenant:   tenant,
+			}
+		} else {
+			cm = &cubeManager{
+				store:    newRawObjectPutter(rawW),
+				objStore: newCubeObjectStoreForBackend(rawR, rawW),
+				tenant:   tenant,
+			}
 		}
 		if err := cm.loadDefs(context.Background()); err != nil {
 			level.Warn(util_log.Logger).Log("msg", "vblockpack: cube manager: initial registry load failed (will retry)", "err", err)
@@ -146,6 +160,24 @@ func getCubeManager() *cubeManager {
 	processCubeManagerMu.RLock()
 	defer processCubeManagerMu.RUnlock()
 	return processCubeManager
+}
+
+// CubeObjectStoreRawWriterTypeForTest is the cube-registry counterpart to
+// ViUsageObjectStoreRawWriterTypeForTest (vi_usage_hook.go) -- see that function's doc
+// comment for the full rationale. TEST-ONLY.
+func CubeObjectStoreRawWriterTypeForTest() string {
+	cm := getCubeManager()
+	if cm == nil {
+		return ""
+	}
+	switch s := cm.objStore.(type) {
+	case *rawCubeObjectStore:
+		return fmt.Sprintf("%T", s.core.rawW)
+	case *gcsCubeObjectStore:
+		return fmt.Sprintf("%T", s.core.vrw)
+	default:
+		return ""
+	}
 }
 
 // loadDefs reads the cube index.json and rebuilds defs + accs.

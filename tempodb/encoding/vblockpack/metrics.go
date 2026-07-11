@@ -9,6 +9,7 @@ package vblockpack
 import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 var (
@@ -83,3 +84,23 @@ var (
 		Help:      "Total number of cube backfill runs that ended in error (excluding routine context cancellation).",
 	})
 )
+
+// MetricViBackfillTriggeredForTest and MetricViBackfillStartedForTest are TEST-ONLY
+// accessors for metricViBackfillTriggered/metricViBackfillStarted, exported so tests in
+// OTHER packages (e.g. modules/frontend's local-backend integration test) can observe
+// these package-level counters directly, mirroring how in-package tests
+// (vi_usage_hook_test.go/vi_backfill_test.go) already read them via
+// testutil.ToFloat64(metricViBackfillTriggered) — not meant for production use.
+func MetricViBackfillTriggeredForTest() float64 { return testutil.ToFloat64(metricViBackfillTriggered) }
+
+func MetricViBackfillStartedForTest() float64 { return testutil.ToFloat64(metricViBackfillStarted) }
+
+// MetricViBackfillCompletedForTest and MetricViBackfillFailedForTest are the terminal-state
+// counterparts to MetricViBackfillStartedForTest -- tests driving the real, async
+// launchViBackfill goroutine (e.g. modules/frontend's local-backend integration test) should
+// wait for one of these to increment before returning, so the background goroutine has
+// finished all its file I/O before t.TempDir()'s cleanup removes the directory out from under
+// it (a genuine async race, not a flake to paper over with a longer sleep).
+func MetricViBackfillCompletedForTest() float64 { return testutil.ToFloat64(metricViBackfillCompleted) }
+
+func MetricViBackfillFailedForTest() float64 { return testutil.ToFloat64(metricViBackfillFailed) }

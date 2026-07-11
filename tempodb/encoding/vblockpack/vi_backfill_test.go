@@ -25,6 +25,56 @@ import (
 	blockpack "github.com/grafana/blockpack"
 )
 
+// TestNewViBackfillDepsS3_NilConfigReturnsZeroValue preserves RunViBackfill's
+// pre-existing "s3cfg == nil -> no-op" contract at the deps-construction
+// level, now that the nil check has moved out of RunViBackfill itself (plan
+// §9 item 5).
+func TestNewViBackfillDepsS3_NilConfigReturnsZeroValue(t *testing.T) {
+	deps, err := NewViBackfillDepsS3(nil)
+	require.NoError(t, err)
+	assert.Nil(t, deps.Fetcher)
+	assert.Nil(t, deps.ObjStore)
+	assert.Nil(t, deps.Putter)
+}
+
+// TestNewViBackfillDepsRaw_ConstructsGenericDeps proves the generic
+// constructor wires up the exact Track A/B/C types this task introduces
+// (viBlockFetcher + Track A's newObjectStoreForBackend + Track C's
+// rawObjectPutter) against a real local.NewBackend -- no S3/minio required.
+func TestNewViBackfillDepsRaw_ConstructsGenericDeps(t *testing.T) {
+	rawR, rawW := newLocalRawBackend(t)
+	deps := NewViBackfillDepsRaw(rawR, rawW)
+
+	require.NotNil(t, deps.Fetcher)
+	require.NotNil(t, deps.ObjStore)
+	require.NotNil(t, deps.Putter)
+
+	_, ok := deps.Fetcher.(*viBlockFetcher)
+	assert.True(t, ok, "expected *viBlockFetcher, got %T", deps.Fetcher)
+	// local.Backend has no GCS versioned capability, so newObjectStoreForBackend
+	// must fall back to the generic rawObjectStore, not the GCS-native path.
+	_, ok = deps.ObjStore.(*rawObjectStore)
+	assert.True(t, ok, "expected *rawObjectStore, got %T", deps.ObjStore)
+	_, ok = deps.Putter.(*rawObjectPutter)
+	assert.True(t, ok, "expected *rawObjectPutter, got %T", deps.Putter)
+
+	// Round-trip the putter against the real backend to prove it is genuinely wired,
+	// not just the right type.
+	require.NoError(t, deps.Putter.Put("t/indexes/roundtrip.blockpack", []byte("hello")))
+}
+
+// TestRunViBackfill_ZeroValueDepsIsNoop mirrors the old RunViBackfill's
+// "s3cfg == nil" no-op contract: a zero-value RunViBackfillDeps (as returned
+// by NewViBackfillDepsS3(nil)) must return nil immediately without touching
+// metricViBackfillStarted.
+func TestRunViBackfill_ZeroValueDepsIsNoop(t *testing.T) {
+	before := testutil.ToFloat64(metricViBackfillStarted)
+	err := RunViBackfill(context.Background(), blockpack.Entry{Tenant: "t"}, RunViBackfillDeps{})
+	require.NoError(t, err)
+	assert.Equal(t, before, testutil.ToFloat64(metricViBackfillStarted),
+		"zero-value deps must not increment metricViBackfillStarted")
+}
+
 // fakeViObjectStore is an in-memory blockpack.ObjectStore for tests, mirroring
 // the same shape internal/modules/viusage's own registry tests use in
 // blockpack. Tracks every successful ConditionalPut so tests can assert how
@@ -239,13 +289,13 @@ func (s *alwaysConflictStore) ConditionalPut(context.Context, string, []byte, st
 
 // TestLaunchViBackfill_StartsGoroutine verifies launchViBackfill returns
 // immediately (async) rather than blocking the caller -- mirrors
-// launchBackfill's own fire-and-forget contract. A nil s3cfg is a safe no-op
-// (RunViBackfill's own contract), so this only pins the "does not block"
-// property, not real S3 I/O.
+// launchBackfill's own fire-and-forget contract. A zero-value
+// RunViBackfillDeps is a safe no-op (RunViBackfill's own contract), so this
+// only pins the "does not block" property, not real backfill I/O.
 func TestLaunchViBackfill_StartsGoroutine(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
-		launchViBackfill(blockpack.Entry{Tenant: "t", ColumnName: "span.x"}, nil)
+		launchViBackfill(blockpack.Entry{Tenant: "t", ColumnName: "span.x"}, RunViBackfillDeps{})
 		close(done)
 	}()
 	select {

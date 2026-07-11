@@ -25,6 +25,7 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 
 	blockpack "github.com/grafana/blockpack"
+	"github.com/grafana/tempo/tempodb/backend"
 	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
 )
 
@@ -83,30 +84,45 @@ var (
 
 // ConfigureValueIndex installs the process-level value-index write sink. Call once
 // at startup (tempodb.New) on writer targets (block-builder, backend-worker) when
-// value_index_enabled is true and the backend is S3.
+// value_index_enabled is true. s3cfg configures the S3 path (unchanged, byte-identical
+// s3ObjectPutter construction); rawW configures the generic (Local/GCS/Azure) path via
+// rawObjectPutter when s3cfg is nil. Exactly one of s3cfg/rawW is expected non-nil per
+// tempodb.go's own backend-gated construction (plan.md §10) — s3cfg takes priority if
+// both happen to be set, matching every other Configure* function's own S3-first branch
+// order in this package.
 //
 // A failure to build the S3 client leaves the sink unset and is logged — block
 // creation and compaction must never fail because the index sink could not be set
 // up. The index can always be rebuilt from the source block.
-func ConfigureValueIndex(enabled bool, s3cfg *s3backend.Config, indexPrefix string) {
-	if !enabled || s3cfg == nil {
+func ConfigureValueIndex(enabled bool, s3cfg *s3backend.Config, rawW backend.RawWriter, indexPrefix string) {
+	if !enabled || (s3cfg == nil && rawW == nil) {
 		return
 	}
 	valueIndexConfigOnce.Do(func() {
-		client, err := newMinioForValueIndex(s3cfg)
-		if err != nil {
-			level.Warn(util_log.Logger).Log("msg", "vblockpack: value-index write path disabled — S3 client init failed", "err", err)
-			return
-		}
 		if indexPrefix == "" {
 			indexPrefix = defaultValueIndexPref
 		}
+		if s3cfg != nil {
+			client, err := newMinioForValueIndex(s3cfg)
+			if err != nil {
+				level.Warn(util_log.Logger).Log("msg", "vblockpack: value-index write path disabled — S3 client init failed", "err", err)
+				return
+			}
+			valueIndexSinkMu.Lock()
+			valueIndexSink = &s3ObjectPutter{client: client, bucket: s3cfg.Bucket}
+			valueIndexPrefix = indexPrefix
+			vcntSink = &s3ObjectPutter{client: client, bucket: s3cfg.Bucket}
+			valueIndexSinkMu.Unlock()
+			level.Info(util_log.Logger).Log("msg", "vblockpack: value-index + vcnt write path configured", "bucket", s3cfg.Bucket, "prefix", indexPrefix)
+			return
+		}
+		putter := newRawObjectPutter(rawW)
 		valueIndexSinkMu.Lock()
-		valueIndexSink = &s3ObjectPutter{client: client, bucket: s3cfg.Bucket}
+		valueIndexSink = putter
 		valueIndexPrefix = indexPrefix
-		vcntSink = &s3ObjectPutter{client: client, bucket: s3cfg.Bucket}
+		vcntSink = putter
 		valueIndexSinkMu.Unlock()
-		level.Info(util_log.Logger).Log("msg", "vblockpack: value-index + vcnt write path configured", "bucket", s3cfg.Bucket, "prefix", indexPrefix)
+		level.Info(util_log.Logger).Log("msg", "vblockpack: value-index + vcnt write path configured (generic backend)", "prefix", indexPrefix)
 	})
 }
 

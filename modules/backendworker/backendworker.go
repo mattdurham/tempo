@@ -352,8 +352,13 @@ func (w *BackendWorker) processViBackfillJob(ctx context.Context, resp *tempopb.
 	level.Info(log.Logger).Log("msg", "processing vi backfill job",
 		"job_id", resp.JobId, "tenant", tenant, "column", entry.ColumnName)
 
+	deps, err := vblockpack.NewViBackfillDepsS3(w.s3Cfg)
+	if err != nil {
+		return w.failJob(ctx, resp.JobId, fmt.Sprintf("vi backfill: failed to construct deps: %v", err))
+	}
+
 	// Run backfill synchronously (the worker goroutine is already async).
-	if err := vblockpack.RunViBackfill(ctx, entry, w.s3Cfg); err != nil {
+	if err := vblockpack.RunViBackfill(ctx, entry, deps); err != nil {
 		return w.failJob(ctx, resp.JobId, fmt.Sprintf("vi backfill failed: %v", err))
 	}
 
