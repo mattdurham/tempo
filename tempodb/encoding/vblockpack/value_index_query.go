@@ -621,9 +621,24 @@ func (s *minioVIStore) Get(ctx context.Context, key string) ([]byte, error) {
 	return data, nil
 }
 
-// Size returns the byte length of the object at key.
+// Size returns the byte length of the object at key. Satisfies
+// blockpack.ValueIndexFileStore's fixed (ctx-less) Size(key) signature by delegating to
+// sizeCtx with context.Background() (task #199): every OTHER caller of the plain
+// interface method keeps its exact prior behavior, byte-identical.
 func (s *minioVIStore) Size(key string) (int64, error) {
-	info, err := s.client.StatObject(context.Background(), s.bucket, key, minio.StatObjectOptions{})
+	return s.sizeCtx(context.Background(), key)
+}
+
+// sizeCtx is Size's ctx-aware core (task #199, NOTE-VI-106 follow-up). Changing
+// blockpack.ValueIndexFileStore's Size(key) signature to accept a context would be a
+// breaking public-API change rippling through every implementer in both repos (out of
+// scope without explicit sign-off — see the task's own stop-and-report instruction), so
+// this ctx-aware variant lives as a package-private capability instead: ctxBoundVIStore
+// (below) type-asserts a valueIndexStore against ctxAwareStore to reach it when a real
+// per-query deadline is available, and every other caller (via the plain Size method)
+// is unaffected.
+func (s *minioVIStore) sizeCtx(ctx context.Context, key string) (int64, error) {
+	info, err := s.client.StatObject(ctx, s.bucket, key, minio.StatObjectOptions{})
 	if err != nil {
 		return 0, mapNotFound(err)
 	}
@@ -633,13 +648,20 @@ func (s *minioVIStore) Size(key string) (int64, error) {
 // ReadAt fills p from the object at key starting at off, following io.ReaderAt
 // semantics. Value-index files are small (one column directory's merged postings),
 // so a ranged GET per call is acceptable; the file-listing cache already removes
-// the per-query LIST cost (issue #462).
+// the per-query LIST cost (issue #462). Delegates to readAtCtx with
+// context.Background() (task #199) — see sizeCtx's doc comment for why the plain,
+// ctx-less signature is preserved unchanged.
 func (s *minioVIStore) ReadAt(key string, p []byte, off int64) (int, error) {
+	return s.readAtCtx(context.Background(), key, p, off)
+}
+
+// readAtCtx is ReadAt's ctx-aware core (task #199). See sizeCtx's doc comment.
+func (s *minioVIStore) readAtCtx(ctx context.Context, key string, p []byte, off int64) (int, error) {
 	opts := minio.GetObjectOptions{}
 	if err := opts.SetRange(off, off+int64(len(p))-1); err != nil {
 		return 0, err
 	}
-	obj, err := s.client.GetObject(context.Background(), s.bucket, key, opts)
+	obj, err := s.client.GetObject(ctx, s.bucket, key, opts)
 	if err != nil {
 		return 0, mapNotFound(err)
 	}

@@ -314,6 +314,25 @@ func (b *blockpackBlock) QueryRange(ctx context.Context, req *tempopb.QueryRange
 		if berr == nil && ok {
 			opts.ValueIndex = src
 			indexCovered = true
+		} else if berr == nil {
+			// task #198: vr is non-nil here — the value-index reader IS genuinely
+			// configured and reachable for this tenant/block — but
+			// BuildValueIndexSourceForMetrics declined (ok=false) because this exact
+			// query SHAPE has no resolvable coverage (e.g. `{} | rate()`'s match-all
+			// with no column list to enumerate, or every leaf predicate is
+			// unindexable). blockpack's own decline contract deliberately returns a
+			// nil src for both this case AND the "reader never configured" case
+			// (vibuilder.BuildSource's doc comment), so leaving opts.ValueIndex nil
+			// here would make ExecuteMetricsTraceQL take its zeroth/config-level
+			// decline branch and misattribute this as ErrMetricsValueIndexDisabled —
+			// exactly the live incident this task fixes. Passing a fresh, empty
+			// ValueIndexSource instead (still built entirely from blockpack's already-
+			// public API) routes ExecuteMetricsTraceQL into ExecuteTraceMetricsFromVI,
+			// whose own viMatchSpans/AllResults logic on an empty source correctly
+			// declines with the per-query-shape sentinel (ErrMetricsNoCoverage,
+			// ErrMetricsShapeNotAnswerable, etc.) instead. indexCovered intentionally
+			// stays false: no answer actually came from the index.
+			opts.ValueIndex = blockpack.NewSliceValueIndexSource()
 		}
 		// #496/B1: NOTE-VI-033's "Add even when empty" contract means BuildSource's ok
 		// (and a per-column LookupResults hit) is satisfied by ANY indexable-shaped
@@ -536,7 +555,13 @@ func (b *blockpackBlock) FindTraceByID(ctx context.Context, id common.ID, _ comm
 	var lister blockpack.LookupStore
 	indexPrefix := ""
 	if vr := getValueIndexQueryReader(); vr != nil {
-		lister = vr.store
+		// task #199: bind THIS call's own ctx to Size/ReadAt (bindQueryCtx,
+		// content_cache.go) instead of passing vr.store's raw context.Background()
+		// behavior straight through, so a real query deadline can actually cancel an
+		// in-flight candidate fetch. See minioVIStore.sizeCtx's doc comment
+		// (value_index_query.go) for why this doesn't change blockpack's LookupStore
+		// contract.
+		lister = bindQueryCtx(ctx, vr.store)
 		indexPrefix = vr.indexPrefix
 	}
 	// The lower bound must be floored to the same minute alignment as the write-side

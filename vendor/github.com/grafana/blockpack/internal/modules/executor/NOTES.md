@@ -5,6 +5,69 @@ This document captures the non-obvious design decisions, rationale, and invarian
 
 ---
 
+## NOTE-492: `topKScanBlocks` never signaled `errLimitReached` — group order + group-bound early stop (issue #197)
+
+*Added: 2026-07-12*
+
+**Why the bug was invisible in `fetched_blocks`/decode-time metrics but showed up as 355 GB /
+324 dispatch jobs against tempo-dev-test-03.** `topKSkipBlock` already keeps the per-block
+decode/CPU cost small — once the heap holds `Limit` provably-newer entries, individual blocks
+whose `BlockMeta` bounds can't beat the heap root are skipped without parsing. But that skip
+check runs on blocks *already sitting in memory*: `processGroup` receives a group's raw bytes
+fully fetched by `blockGroupPipeline` before `topKSkipBlock` ever runs. A dashboard watching
+"blocks processed" would look perfectly bounded while the underlying object-storage I/O
+(`fetchedGroups`/`bytesRead`) scaled with the whole file. This is the same shape of gap issue
+#192 fixed for `IsMatchAllProgram` match-all queries, but #192's zero-predicate-node check does
+not apply to a real comparison node like `duration > 1ms` (an intrinsic column with no
+attribute-leaf for the value index to prune on) — that query shape fell all the way through to
+this scan path.
+
+**Why `errLimitReached` alone (without reordering) would not have fixed anything.**
+`CoalesceBlocks`/`CoalescedGroups` always returns groups in ascending file-offset order,
+regardless of caller block order (this is deliberate and unchanged by this fix — see
+`reader/reader_test.go`'s `TestCoalescedGroups_PreservesCallerBlockOrder`, an earlier
+escalation from issue #481 that documents and locks in this exact behavior). For a `Backward`
+(MostRecent) query, ascending offset means oldest-first: the heap would fill with the file's
+OLDEST matches first and only reach its true, correct top-`Limit` state after the LAST
+(newest) group was fetched — by which point every group has already been paid for. Adding
+`errLimitReached` without also reversing the traversal direction would have been a no-op for
+the exact query shape this issue is about. Both halves of the fix are required together.
+
+**Why the group aggregate is computed from `BlockMeta`, not from an offset-order assumption.**
+`topKGroupBound`/`groupBoundFor` derive each group's direction-relevant timestamp extreme
+directly from its constituent blocks' already-resident `MinStart`/`MaxStart` fields — the same
+metadata `topKSkipBlock` already uses per block, just aggregated (max for backward, min for
+forward) across a group's block set, with an `unknown` flag that poisons the aggregate the
+moment any one block's bound field is unset (`0`), mirroring `topKSkipBlock`'s own
+"never skip on an unset bound" contract. This keeps the early-stop provably correct
+independent of whether a given file's block-offset order tracks wall-clock time exactly — the
+reversed traversal order (point 1 above) is what makes the check fire promptly in the common
+case, but a file that violated that assumption would simply see less aggressive skipping, never
+an incorrect result.
+
+**Why a suffix array, not a per-call scan of all remaining groups.** `topKScanBlocks`
+precomputes `suffixBound[i]` (the merged bound over every group from local index `i` to the
+end) once, right-to-left, in O(total selected blocks) time before dispatch begins. The
+after-each-group check is then an O(1) lookup (`suffixBound[groupIdx+1]`) rather than an
+O(remaining groups) rescan on every completed group, which would be O(G²) for a file with many
+small groups.
+
+**Why this lives in `stream_topk.go`, not `block_group_pipeline.go`.** The dispatch-cancellation
+mechanism itself (`errLimitReached` → cancel dispatch, drain in-flight, exclude drained groups
+from stats) already existed and needed no changes (SPEC-STREAM-11) — `scanBlocks`'
+`streamSortedRows` already exercises it correctly. The gap was entirely on the `topKScanBlocks`
+caller side: it never produced the signal, and the groups it iterated were never reordered for
+direction. Fixing this at the call site (rather than teaching `blockGroupPipeline` about
+timestamps or teaching `CoalesceBlocks` about caller order) keeps `blockGroupPipeline` and
+`CoalesceBlocks` generic and unaware of top-K/heap semantics, matching this package's existing
+layering (`blockio/reader` owns I/O coalescing; `executor` owns predicate/heap semantics).
+
+Back-ref: `internal/modules/executor/stream_topk.go:topKScanBlocks,topKGroupBound,
+groupBoundFor,mergeGroupBound,topKSkipGroupBound`. See SPEC-STREAM-14 for the formal contract.
+Tests: `stream_topk_intrinsic_unbounded_test.go`. Issue #197.
+
+---
+
 ## NOTE-352: exponent-keyed boundary indexing on the dense histogram paths
 
 The dense direct histogram accumulators — `accumulateHistogramDirect` (N=1 no-predicate),
@@ -7596,6 +7659,22 @@ Back-refs: `internal/modules/executor/structural_verify.go:verifyCandidateSpans,
 **Authoritative-index error contract preserved unchanged (NOTE-VI-071).** A fetch or decode failure on any candidate is index/data inconsistency and is returned as an ERROR — never silently skipped as "unreadable, try the next" (that behavior was only safe while a full scan could still produce the correct answer, which the authoritative-index contract retired).
 
 Back-refs: `internal/modules/executor/structural_tracegroup.go:FindTraceGroupInCandidates`, root `reader.go:findTraceGroupInCandidates` (thin delegate). See SPEC-VIS-5 (`SPECS.md`) for the "what" contract. Issue #489.
+
+---
+
+## NOTE-VI-106 — FindTraceGroupInCandidates: candidate fan-out made concurrent, bounded by candidateFetchConcurrency (task #199, 2026-07-12)
+
+**The bug.** Live dev-cluster testing found every trace-by-ID lookup failing after ~10-23s with `"GetTraceByID: FindTraceGroupInCandidates: partial lookup index candidate %q: context deadline exceeded"`, while the sibling search/metrics value-index path (SPEC-VI-1) read fine and fast in the same session. Root cause: `FindTraceGroupInCandidates` (NOTE-VI-091) resolved every `DiscoverIndexFiles` candidate with a plain `for _, key := range keys { valueindex.LookupTraceGroupPartial(...) }` loop — one candidate at a time, never more than one Size/ReadAt call in flight — unlike `vibuilder.queryKeysRanged`, which fans every key out CONCURRENTLY via `errgroup.SetLimit(downloadConcurrency)` for the search/metrics path. Wall-clock latency for trace-by-id therefore scaled linearly with the candidate count instead of being bounded by the slowest single one — exactly the shape of a ~10-23s hang once a query window has more than a couple of not-yet-compacted candidate files against real object-store per-call latency.
+
+**The fix.** `FindTraceGroupInCandidates` now fans every candidate's `valueindex.LookupTraceGroupPartial` call out concurrently via `errgroup.WithContext` + `SetLimit(candidateFetchConcurrency)` (a package-level constant = 4, `structural_tracegroup.go`), mirroring `vibuilder.queryKeysRanged`'s mechanism and value exactly. `executor` cannot import `vibuilder` directly (`vibuilder` itself imports `executor` — see `structural_index.go`'s "internal import" note — so importing the other way is a real Go import cycle), hence a duplicate package-level constant kept in lockstep rather than a shared import. A per-candidate goroutine panic is recovered and turned into a returned error (mirroring `MaterializeTraceGroupMultiFile`'s existing pattern, `structural_multifile.go`) so a caller bug can never crash the process.
+
+**Determinism preserved.** The "first occurrence wins" SpanID-dedup and minimum-`TimeSec` merge semantics (NOTE-VI-091) depend on processing candidates in a stable order. Concurrency here is fetch-only: each goroutine writes its `(group, ok)` result into a slice slot at its own candidate's ORIGINAL index in `keys`; the merge loop then walks that slice in the original `keys` order after every goroutine has finished, so the final `TraceGroup` is byte-identical to what the strictly-sequential loop would have produced, regardless of which goroutine happens to finish first. Candidates are still never short-circuited on the first match (NOTE-VI-091's DISJOINT-L0-files invariant is unaffected — every candidate is always awaited).
+
+**Reproduction test.** `gettracebyid_candidate_concurrency_test.go` (root package) builds 6 independent, non-matching candidate trace-by-id index files with an injected 20ms per-call latency wrapper around Size/ReadAt and asserts peak concurrent in-flight calls > 1. Before this fix: `maxInFlight=1`, elapsed ≈ the strict serial lower bound (`nCandidates * perCallDelay * callsPerCandidate`). After: `maxInFlight=candidateFetchConcurrency` (4), elapsed well under the serial bound.
+
+**Tempo-side secondary factor, fixed separately (out of blockpack's scope).** Even with this fix, tempo's `minioVIStore.Size`/`ReadAt` (`tempodb/encoding/vblockpack/value_index_query.go`) previously used `context.Background()` unconditionally, so an in-flight HTTP call could not be cancelled by the real query deadline. Fixed tempo-side via a package-private `ctxAwareStore` capability + `bindQueryCtx` wrapper (`content_cache.go`) that threads the caller's actual ctx down to `minioVIStore`/`rawFileStore` without changing `blockpack.LookupStore`/`ValueIndexFileStore`'s fixed, ctx-less `Size(key)`/`ReadAt(key,p,off)` signatures at all — those are shared, exported contracts used by the search/metrics path too, and widening them would be a breaking public-API change across both repos requiring separate explicit sign-off.
+
+Back-refs: `internal/modules/executor/structural_tracegroup.go:FindTraceGroupInCandidates`, `candidateFetchConcurrency`; root `gettracebyid_candidate_concurrency_test.go`. See SPEC-VIS-5 (`SPECS.md`) for the updated "what" contract. Task #199.
 
 ---
 

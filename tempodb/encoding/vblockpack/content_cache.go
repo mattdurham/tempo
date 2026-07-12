@@ -472,10 +472,169 @@ func (s *cachingStore) ReadAt(key string, p []byte, off int64) (int, error) {
 	return copy(p, v.([]byte)), nil
 }
 
+// sizeCtx serves the object length exactly like Size, threading ctx down to the inner
+// store's own ctx-aware path (task #199, NOTE-VI-106 follow-up) on a cache miss so a
+// real per-query deadline can actually cancel the in-flight StatObject call. A cache
+// hit needs no ctx at all (no network call), so it is identical to Size's hit path.
+func (s *cachingStore) sizeCtx(ctx context.Context, key string) (int64, error) {
+	if sz, ok := s.sizes.get(key); ok {
+		return sz, nil
+	}
+	sz, err := sizeWithCtx(ctx, s.inner, key)
+	if err != nil {
+		return 0, err
+	}
+	s.sizes.add(key, sz)
+	return sz, nil
+}
+
+// readAtCtx serves a ranged read exactly like ReadAt, threading ctx down to the inner
+// store's own ctx-aware path (task #199) on a cache miss. A cache hit needs no ctx
+// (no network call).
+//
+// Task #200: the flightKey below is shared with plain ReadAt's s.rangeGroup.Do call above,
+// and — more importantly — with every OTHER concurrent readAtCtx caller that happens to
+// request the exact same (key, off, len), which is the documented common case for
+// candidate index files (NOTE-VI-076). singleflight.Group.Do makes the first caller to
+// arrive for a given key the "leader": only the leader's function body actually runs: every
+// other caller just blocks until it completes and observes the SAME result/error. If the
+// leader's own ctx were used for the actual I/O (as a naive threading of ctx into the
+// flight body would do), one caller's own cancellation/deadline would abort the shared
+// operation and hand every unrelated concurrent waiter — including callers whose OWN ctx is
+// nowhere near expiring — that same spurious cancellation error. So the flight body below
+// deliberately uses context.Background() (via readAtWithCtx), detaching the shared,
+// singleflight-deduplicated I/O from any single waiter's cancellation, while this specific
+// call's own ctx is still honored: the select below lets THIS goroutine return ctx.Err()
+// immediately on its own cancellation without cancelling the in-flight work for any other
+// waiter sharing the same flight (DoChan, unlike Do, returns a channel immediately instead
+// of blocking, which is what makes the select possible).
+func (s *cachingStore) readAtCtx(ctx context.Context, key string, p []byte, off int64) (int, error) {
+	if s.ranges == nil {
+		return readAtWithCtx(ctx, s.inner, key, p, off)
+	}
+	rk := rangeKey{key: key, off: off, len: len(p)}
+	if data, ok := s.ranges.get(rk); ok {
+		return copy(p, data), nil
+	}
+	flightKey := key + "|" + strconv.FormatInt(off, 10) + "|" + strconv.Itoa(len(p))
+	ch := s.rangeGroup.DoChan(flightKey, func() (interface{}, error) {
+		if data, ok := s.ranges.get(rk); ok {
+			return data, nil
+		}
+		buf := make([]byte, len(p))
+		// Deliberately context.Background(), not ctx: this flight body may be run on
+		// behalf of an unrelated concurrent caller sharing the same flightKey (see the
+		// doc comment above) — it must not be tied to any single waiter's cancellation.
+		n, rerr := readAtWithCtx(context.Background(), s.inner, key, buf, off)
+		if rerr != nil {
+			return nil, rerr
+		}
+		if n != len(buf) {
+			return buf[:n], nil
+		}
+		s.ranges.add(rk, buf)
+		return buf, nil
+	})
+	select {
+	case res := <-ch:
+		if res.Err != nil {
+			return 0, res.Err
+		}
+		return copy(p, res.Val.([]byte)), nil
+	case <-ctx.Done():
+		// Only THIS caller gives up early; the flight itself (ch) keeps running to
+		// completion in the background for every other waiter (including a later
+		// s.ranges cache population that benefits everyone, us included, next time).
+		return 0, ctx.Err()
+	}
+}
+
 // Compile-time assertions that cachingStore still satisfies every interface the
 // trace-by-ID and search/metrics paths require of the store.
 var (
 	_ valueIndexStore               = (*cachingStore)(nil)
 	_ blockpack.LookupStore         = (*cachingStore)(nil)
 	_ blockpack.ValueIndexFileStore = (*cachingStore)(nil)
+	_ ctxAwareStore                 = (*cachingStore)(nil)
 )
+
+// ctxAwareStore is an OPTIONAL, package-private capability (task #199, NOTE-VI-106
+// follow-up): a store that can serve Size/ReadAt with a caller-supplied ctx instead of
+// always using context.Background() internally. blockpack.ValueIndexFileStore's fixed
+// Size(key)/ReadAt(key,p,off) signatures (shared across both the search/metrics and
+// trace-by-id paths, and implemented by every FileStore/LookupStore in both repos) are
+// deliberately left UNCHANGED — widening them to accept a context would be a breaking
+// public-API change requiring explicit cross-repo sign-off, which is out of scope here.
+// Every concrete store this package can construct (*minioVIStore, *cachingStore,
+// *rawFileStore) implements this so ctxBoundLookupStore below can always reach it; a
+// hypothetical store that does NOT (e.g. a test fake) is handled by sizeWithCtx/
+// readAtWithCtx falling back to the plain, ctx-less Size/ReadAt.
+type ctxAwareStore interface {
+	sizeCtx(ctx context.Context, key string) (int64, error)
+	readAtCtx(ctx context.Context, key string, p []byte, off int64) (int, error)
+}
+
+// sizeWithCtx calls store's ctx-aware sizeCtx when available, falling back to the plain
+// Size(key) (context.Background() semantics, byte-identical to before task #199) for a
+// store that does not implement ctxAwareStore — e.g. a test double.
+func sizeWithCtx(ctx context.Context, store valueIndexStore, key string) (int64, error) {
+	if cs, ok := store.(ctxAwareStore); ok {
+		return cs.sizeCtx(ctx, key)
+	}
+	return store.Size(key)
+}
+
+// readAtWithCtx calls store's ctx-aware readAtCtx when available, falling back to the
+// plain ReadAt(key,p,off) for a store that does not implement ctxAwareStore.
+func readAtWithCtx(ctx context.Context, store valueIndexStore, key string, p []byte, off int64) (int, error) {
+	if cs, ok := store.(ctxAwareStore); ok {
+		return cs.readAtCtx(ctx, key, p, off)
+	}
+	return store.ReadAt(key, p, off)
+}
+
+// ctxBoundLookupStore binds a single query's ctx to a valueIndexStore's Size/ReadAt
+// calls (task #199) without changing blockpack.LookupStore's signature at all: List and
+// Get already take ctx as their own parameter and pass straight through unchanged; only
+// Size/ReadAt — which the interface fixes at ctx-less — are rebound here to the query's
+// real ctx via the ctxAwareStore capability above, so an in-flight StatObject/GetObject
+// call can actually be cancelled by the caller's own deadline instead of running to
+// completion against context.Background() regardless of the query having already timed
+// out. Constructed FRESH per query (see bindQueryCtx) — never shared across queries — so
+// holding ctx as a plain field is race-free even under FindTraceGroupInCandidates'
+// concurrent candidate fan-out (NOTE-VI-106): every goroutine in that fan-out reads the
+// same immutable ctx field, never mutates it.
+type ctxBoundLookupStore struct {
+	inner valueIndexStore
+	ctx   context.Context
+}
+
+// bindQueryCtx returns store wrapped so its Size/ReadAt calls use ctx instead of
+// context.Background() (task #199). Call once per query with that query's own ctx —
+// never reuse across queries or hold beyond the query's lifetime.
+//
+// ctx is deliberately the first parameter (task #200 cleanup): this mirrors its own
+// sibling functions (sizeWithCtx/readAtWithCtx, both ctx-first) and satisfies this repo's
+// enforced revive context-as-argument lint rule, which the previous ctx-second signature
+// violated.
+func bindQueryCtx(ctx context.Context, store valueIndexStore) blockpack.LookupStore {
+	return &ctxBoundLookupStore{inner: store, ctx: ctx}
+}
+
+func (c *ctxBoundLookupStore) List(ctx context.Context, prefix string) ([]string, error) {
+	return c.inner.List(ctx, prefix)
+}
+
+func (c *ctxBoundLookupStore) Get(ctx context.Context, key string) ([]byte, error) {
+	return c.inner.Get(ctx, key)
+}
+
+func (c *ctxBoundLookupStore) Size(key string) (int64, error) {
+	return sizeWithCtx(c.ctx, c.inner, key)
+}
+
+func (c *ctxBoundLookupStore) ReadAt(key string, p []byte, off int64) (int, error) {
+	return readAtWithCtx(c.ctx, c.inner, key, p, off)
+}
+
+var _ blockpack.LookupStore = (*ctxBoundLookupStore)(nil)

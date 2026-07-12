@@ -3826,3 +3826,43 @@ Back-ref: `internal/modules/executor/structural_index.go:materializeConfirmedSpa
 **Assertion:** `QueryNegatedStructuralFromIndex` returns exactly one match, `leafYID` (no `svc-root` ancestor) — `leafXID` (has one, via `aID`) is correctly excluded. A second assertion in the same test confirms the `rightSource == nil` decline convention (`ok=false, err=nil`).
 
 Back-ref: root `structural.go:QueryNegatedStructuralFromIndex`, `structural_index_realvi_test.go:TestQueryNegatedStructuralFromIndex_RealWriteValueIndexL0_EndToEnd, writeRealVINegatedTrace`. See NOTE-VI-095 item 2, TEST-VI-22/EX-36 (the real-write-path test-class policy this satisfies for D6 at the ROOT layer specifically). Issue #489.
+
+## EX-41: `TestCollect_IntrinsicOnlyPredicate_MostRecentLimit_ScansEntireFile` — issue #197 reproduction (unbounded intrinsic-only top-K I/O)
+
+*Added: 2026-07-12 (task #200, tempo-side follow-up)*
+
+**Scenario:** an intrinsic-only predicate (`{ duration > 1ms }` — a real predicate node, so
+the #192 match-all bypass does not apply, but zero attribute leaf columns for the
+value-index path to use, since `span:duration` is resolved directly from block payload
+columns) combined with `Direction=Backward` (MostRecent) and a small `Limit` should let
+`Collect`'s top-K path (`shouldUseTopKPath` → `topKScanBlocks`, `stream_topk.go`) stop once
+the newest `limit` matches are found, fetching only a bounded prefix of the file's
+coalesced I/O groups. Reproduces a live production shape observed on tempo-dev-test-03: one
+query fetched 355 GB across 324 dispatch jobs for `limit=3`, ignoring the limit entirely.
+
+**Root cause originally reproduced by this test:** `topKScanBlocks`'s per-block skip
+(`topKSkipBlock`) only decides whether to decode/evaluate a block already sitting in
+memory; it runs *after* `blockGroupPipeline` has already fetched the enclosing coalesced
+I/O group's raw bytes. Pre-fix, `topKScanBlocks`'s `processGroup` closure never returned
+`errLimitReached` the way the plain-scan path's `streamSortedRows` does, so
+`blockGroupPipeline`'s dispatch-cancellation mechanism (SPEC-STREAM-11) never fired either —
+every coalesced group in the file was fetched regardless of `Limit`. This is now fixed
+(see `topKScanBlocks`/`topKGroupBound`/`groupBoundFor`/`mergeGroupBound`/
+`topKSkipGroupBound` in `stream_topk.go`, and SPECS.md's `topKScanBlocks` entry for the
+suffix-bound-based early-stop design), and this test now serves as the regression guard
+against the bound-fetch behavior regressing back to a full-file scan.
+
+**Setup:** a real end-to-end write (`blockio.Writer`, one span per internal block) and read
+(`executor.Collect`) round trip — not a hand-built fixture — sized so the encoded file spans
+more than one `shared.AggressiveCoalesceConfig.MaxReadBytes` (8 MB) coalesced group, so the
+test can distinguish "fetched a bounded prefix" from "fetched the whole file" at the I/O
+level (`block-scan` step's `IOOps`/`BytesRead`), not just at the per-block decode/skip level.
+
+**Assertion:** `block-scan`'s `IOOps` must be less than `totalGroups` (the file's total
+coalesced-group count) for a `Limit=3` MostRecent query — a bounded prefix of the file's
+groups, not every group in it regardless of `Limit`.
+
+Back-ref: `internal/modules/executor/stream_topk.go:topKScanBlocks,processGroup`,
+`internal/modules/executor/stream_topk_intrinsic_unbounded_test.go:TestCollect_IntrinsicOnlyPredicate_MostRecentLimit_ScansEntireFile`.
+See SPECS.md's back-ref under the `topKScanBlocks`/SPEC-STREAM-11 entry for the fix-side
+spec. Issue #197.

@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"slices"
 
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
@@ -84,6 +85,74 @@ func topKInsert(buf *topKHeap, limit int, backward bool, entry topKEntry) {
 	}
 }
 
+// topKGroupBound aggregates the direction-relevant timestamp extreme (MaxStart for
+// backward, MinStart for forward) across every block in one coalesced group, computed
+// purely from already-resident BlockMeta (no I/O). It mirrors topKSkipBlock's per-block
+// skip test at group granularity: a group is provably unable to improve a saturated heap
+// only when EVERY constituent block is individually unable to (topKSkipBlock's contract),
+// so `unknown` (a block whose bound field is unset, i.e. 0) poisons the whole group's
+// bound the same way an unset MinStart/MaxStart makes a single block non-skippable.
+//
+// SPEC-STREAM-14: used by topKScanBlocks to decide when no not-yet-fetched group can
+// possibly improve a saturated heap, so blockGroupPipeline dispatch can be canceled.
+type topKGroupBound struct {
+	value   uint64 // aggregate MaxStart (backward) or MinStart (forward)
+	unknown bool   // true when any constituent block's bound field is unset (0)
+}
+
+// groupBoundFor computes the direction-relevant aggregate bound for one group's blocks.
+func groupBoundFor(r *modules_reader.Reader, blockIDs []int, backward bool) topKGroupBound {
+	b := topKGroupBound{}
+	if !backward {
+		b.value = math.MaxUint64 // neutral element for min()
+	}
+	for _, bi := range blockIDs {
+		meta := r.BlockMeta(bi)
+		v := meta.MinStart
+		if backward {
+			v = meta.MaxStart
+		}
+		if v == 0 {
+			// A single block with no usable bound makes the whole group unable to be
+			// proven skippable, matching topKSkipBlock's per-block "never skip when the
+			// bound is unset" contract.
+			b.unknown = true
+			continue
+		}
+		if backward {
+			b.value = max(b.value, v)
+		} else {
+			b.value = min(b.value, v)
+		}
+	}
+	return b
+}
+
+// mergeGroupBound combines two disjoint groups' bounds into the bound of their union
+// (used to build the suffix aggregate covering "all not-yet-processed groups").
+func mergeGroupBound(a, b topKGroupBound, backward bool) topKGroupBound {
+	m := topKGroupBound{unknown: a.unknown || b.unknown}
+	if backward {
+		m.value = max(a.value, b.value)
+	} else {
+		m.value = min(a.value, b.value)
+	}
+	return m
+}
+
+// topKSkipGroupBound reports whether the aggregate bound of a (sub)set of groups proves
+// none of them can contain an entry better than the current heap root, mirroring
+// topKSkipBlock's per-block test.
+func topKSkipGroupBound(bound topKGroupBound, backward bool, worst uint64) bool {
+	if bound.unknown {
+		return false
+	}
+	if backward {
+		return bound.value <= worst
+	}
+	return bound.value >= worst
+}
+
 // topKScanRows iterates rowIndices from the given block, applying time filtering and
 // inserting qualifying rows into the heap.
 func topKScanRows(
@@ -131,6 +200,24 @@ func topKScanBlocks(
 	groups []shared.CoalescedRead,
 	backward bool,
 ) (int, int, int64, error) {
+	// SPEC-STREAM-14 / issue #197: CoalesceBlocks/CoalescedGroups always returns groups in
+	// ascending file-offset order regardless of the caller's block order (coalesce.go's
+	// internal offset sort — see reader/reader_test.go's
+	// TestCoalescedGroups_PreservesCallerBlockOrder, which locks this in). For Backward
+	// (MostRecent) queries the newest data lives in the highest-offset groups, so reverse
+	// the traversal order here: a pure re-slicing of the already-computed group list, no
+	// I/O and no change to CoalesceBlocks itself. Without this, the heap-saturation
+	// early-stop below could never trigger for a Backward query: groups would still be
+	// visited oldest-first, so the heap would only reach its final, correct state after
+	// the LAST (newest) group — by which point every group has already been fetched.
+	orderedGroups := groups
+	if backward {
+		orderedGroups = make([]shared.CoalescedRead, len(groups))
+		for i, g := range groups {
+			orderedGroups[len(groups)-1-i] = g
+		}
+	}
+
 	// Build group→selected-blocks index in plan.SelectedBlocks order within each group.
 	// This ensures processGroup iterates only the ~N/G blocks relevant to its group,
 	// matching the O(N) total-work guarantee of the scanBlocks pipeline path.
@@ -140,14 +227,14 @@ func topKScanBlocks(
 	for i := range blockToGroupSlice {
 		blockToGroupSlice[i] = -1
 	}
-	for gi, g := range groups {
+	for gi, g := range orderedGroups {
 		for _, bi := range g.BlockIDs {
 			if bi < blockCount {
 				blockToGroupSlice[bi] = gi
 			}
 		}
 	}
-	groupToBlocks := make([][]int, len(groups))
+	groupToBlocks := make([][]int, len(orderedGroups))
 	for _, bi := range plan.SelectedBlocks {
 		if bi >= blockCount {
 			continue
@@ -157,6 +244,22 @@ func topKScanBlocks(
 			continue
 		}
 		groupToBlocks[gi] = append(groupToBlocks[gi], bi)
+	}
+
+	// SPEC-STREAM-14: suffixBound[i] aggregates the direction-relevant timestamp bound
+	// across every group at local index >= i (i.e. every group not yet processed once
+	// group i-1 completes), computed purely from BlockMeta already resident in memory (no
+	// I/O). suffixBound[len(orderedGroups)] is the identity/empty bound. After finishing
+	// group i, checking suffixBound[i+1] against the heap's worst entry tells
+	// topKScanBlocks whether ANY not-yet-fetched group could still improve a saturated
+	// heap — if not, dispatch can be safely canceled via errLimitReached.
+	suffixBound := make([]topKGroupBound, len(orderedGroups)+1)
+	if !backward {
+		suffixBound[len(orderedGroups)].value = math.MaxUint64
+	}
+	for i := len(orderedGroups) - 1; i >= 0; i-- {
+		gb := groupBoundFor(r, orderedGroups[i].BlockIDs, backward)
+		suffixBound[i] = mergeGroupBound(gb, suffixBound[i+1], backward)
 	}
 
 	// processedBlocks is mutated only inside processGroup, which blockGroupPipeline calls
@@ -211,6 +314,16 @@ func topKScanBlocks(
 			}
 			releaseBlockColumnProvider(provider)
 		}
+
+		// SPEC-STREAM-14 / issue #197: once the heap holds Limit entries, check whether
+		// any group not yet fetched (suffixBound[groupIdx+1], aggregated across
+		// orderedGroups[groupIdx+1:]) could possibly contain an entry better than the
+		// current heap root. If not, signal errLimitReached so blockGroupPipeline cancels
+		// further dispatch instead of fetching the remainder of the file regardless of
+		// Limit (mirrors streamSortedRows' errLimitReached signal in stream.go).
+		if buf.Len() >= opts.Limit && topKSkipGroupBound(suffixBound[groupIdx+1], backward, buf.worstTS()) {
+			return errLimitReached
+		}
 		return nil
 	}
 
@@ -224,8 +337,10 @@ func topKScanBlocks(
 	for k := range secondPassCols {
 		allCols[k] = struct{}{}
 	}
+	// NOTE: blockGroupPipeline translates a processGroup errLimitReached return into a nil
+	// error (see block_group_pipeline.go) — no special-casing needed here.
 	fetchedGroups, _, bytesRead, err := blockGroupPipeline(
-		ctx, r, groups, defaultPipelineWorkers, allCols, processGroup,
+		ctx, r, orderedGroups, defaultPipelineWorkers, allCols, processGroup,
 	)
 	return fetchedGroups, processedBlocks, bytesRead, err
 }

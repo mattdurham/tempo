@@ -570,6 +570,65 @@ Back-ref (current): confirmed absent — `internal/modules/executor/recentfirst.
 
 ---
 
+## SPEC-STREAM-14: `topKScanBlocks` Group-Level Early Stop and Direction-Aware Group Order
+*Added: 2026-07-12 (issue #197)*
+
+**Problem this closes:** `topKScanBlocks` (the `shouldUseTopKPath` heap scan — SPEC-STREAM-7)
+previously fetched EVERY coalesced I/O group selected by the planner regardless of `Limit`,
+even once the heap was already provably saturated with unbeatable entries. Unlike
+`scanBlocks`' `streamSortedRows` (SPEC-STREAM-11's `errLimitReached` signal), `processGroup`
+inside `topKScanBlocks` never returned `errLimitReached`, so `blockGroupPipeline`'s
+dispatch-cancellation mechanism never engaged. A `Backward`+`Limit` query over an
+intrinsic-only predicate (no attribute-leaf column for the value index to prune on, e.g.
+`{ duration > 1ms }`) therefore paid for the full file's I/O regardless of `Limit`.
+
+**Fix has two required, cooperating parts — neither alone is sufficient:**
+
+1. **Direction-aware group traversal order.** `CoalesceBlocks`/`CoalescedGroups`
+   (`reader/coalesce.go`) always returns groups in ascending file-offset order, independent of
+   the caller's block order (see `reader/reader_test.go`'s
+   `TestCoalescedGroups_PreservesCallerBlockOrder`, which locks this in — `CoalesceBlocks`
+   itself is intentionally NOT changed by this fix). `topKScanBlocks` now re-slices (not
+   re-coalesces) the group list it was given: for `backward=true` it reverses the slice so the
+   highest-offset (newest) groups are dispatched and processed first. This is pure in-memory
+   re-slicing with no I/O and no change to `CoalesceBlocks`'/`CoalescedGroups`' contract.
+   Without this, the early-stop below could never fire for a Backward query, because the true
+   top-`Limit` answer is only known after the newest (in ascending order, LAST) group is fetched.
+2. **Heap-saturation early stop.** `topKGroupBound` aggregates the direction-relevant timestamp
+   extreme (`MaxStart` for backward, `MinStart` for forward) across every block in one coalesced
+   group, purely from already-resident `BlockMeta` (no I/O) — the group-granularity analogue of
+   `topKSkipBlock`'s per-block bound check (SPEC-STREAM-7). A block with an unset (`0`) bound
+   field poisons its whole group's bound (`unknown=true`), mirroring `topKSkipBlock`'s
+   contract that an unset bound is never skippable. `topKScanBlocks` precomputes a suffix
+   aggregate (`suffixBound[i]` = the merged bound of every group at local index `>= i`) once,
+   in O(groups) time, before dispatch begins. After each group finishes processing, if the heap
+   already holds `Limit` entries and `topKSkipGroupBound(suffixBound[groupIdx+1], backward,
+   heap.worstTS())` is true — i.e. no not-yet-fetched group can possibly improve the heap —
+   `processGroup` returns `errLimitReached`, which `blockGroupPipeline` (SPEC-STREAM-11)
+   translates into immediate dispatch cancellation (in-flight reads are drained, never
+   processed, and excluded from `fetchedGroups`/`fetchedBlocks`/`bytesRead` per SPEC-STREAM-11's
+   existing stats contract).
+
+**Result:** for a `Backward`+`Limit` query, `topKScanBlocks` fetches only the newest-offset
+prefix of coalesced groups needed to prove the heap can no longer improve — not the whole file.
+`StepStats.IOOps`/`BytesRead` on the `"block-scan"` step reflect this bounded prefix.
+
+**Correctness, not just performance.** The suffix-bound check is derived independently per
+remaining group from real `BlockMeta` bounds, not from an assumption that offset order exactly
+tracks timestamp order — a group is only ever proven "cannot improve" when its own aggregate
+bound (or an unset/`unknown` bound, conservatively) says so. The reversed traversal order is
+what makes this check useful in practice (SPEC-STREAM-8's existing "descending blockID order
+for time-sorted files" assumption is what makes it fire quickly), but even if that assumption
+were violated for some file, the fix would never incorrectly drop a result — it would simply
+stop skipping less aggressively.
+
+Back-ref: `internal/modules/executor/stream_topk.go:topKScanBlocks,topKGroupBound,
+groupBoundFor,mergeGroupBound,topKSkipGroupBound`. Tests:
+`stream_topk_intrinsic_unbounded_test.go:TestCollect_IntrinsicOnlyPredicate_MostRecentLimit_ScansEntireFile`
+(issue #197 reproduction). Issue #197.
+
+---
+
 ## SPEC-INTRINSIC-004: File-level bloom pre-check before intrinsic scan
 
 *Added: 2026-04-14*
@@ -1583,6 +1642,8 @@ Back-ref: `internal/modules/executor/structural_traceresolve.go:ResolveTraceGrou
 
 **Contract:** `FindTraceGroupInCandidates(ctx, lister valueindex.LookupStore, keys []string, traceID [16]byte, queryMinSec, queryMaxSec uint64) (valueindex.TraceGroup, bool, error)` (`internal/modules/executor/structural_tracegroup.go`) fetches and decodes every candidate trace-by-id index file in `keys`, merging every matching group found for `traceID` across all of them (SpanID-deduplicated, first occurrence wins; `TimeSec` is the minimum across matches). Candidates are never short-circuited on first match — disjoint-span L0 files for the same TraceID are a legitimate pre-compaction state. A fetch/decode failure on any candidate is index/data inconsistency and returns an ERROR (NOTE-VI-071's authoritative-index contract), never silently skipped.
 
+**Concurrency (task #199, NOTE-VI-106, 2026-07-12):** every candidate's `valueindex.LookupTraceGroupPartial` call is fanned out CONCURRENTLY via `errgroup`, bounded by `candidateFetchConcurrency` (4, mirroring `vibuilder.downloadConcurrency`'s convention and value) — wall-clock latency is bounded by the slowest single candidate instead of scaling linearly with the candidate count. The merge itself remains deterministic: results are collected into a slice indexed by each candidate's original position in `keys` and folded back in that same order once every candidate has resolved, so the SpanID-dedup/minimum-`TimeSec` merge semantics are byte-identical to the prior strictly-sequential loop regardless of goroutine completion order. A real (non-404-class) error on any candidate still fails the whole call, mirroring `vibuilder.queryKeysRanged`'s sibling-abort guard.
+
 Shared, canonical implementation for both `GetTraceByID`'s single-trace lookup (root `findTraceGroupInCandidates` is a thin delegate) and `ExecuteStructuralFromIndex`'s (SPEC-STRUCT-9) many-candidate-trace discovery loop.
 
-Back-ref: `internal/modules/executor/structural_tracegroup.go:FindTraceGroupInCandidates`, root `reader.go:findTraceGroupInCandidates` (thin delegate). See NOTE-VI-091 for full design rationale. Issue #489.
+Back-ref: `internal/modules/executor/structural_tracegroup.go:FindTraceGroupInCandidates`, root `reader.go:findTraceGroupInCandidates` (thin delegate). See NOTE-VI-091 for original design rationale and NOTE-VI-106 for the concurrency fix. Issue #489, task #199.

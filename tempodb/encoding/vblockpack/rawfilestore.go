@@ -72,10 +72,20 @@ func (s *rawFileStore) Get(ctx context.Context, key string) ([]byte, error) {
 	return data, nil
 }
 
-// Size returns the byte length of the object at key.
+// Size returns the byte length of the object at key. Satisfies
+// blockpack.ValueIndexFileStore's fixed (ctx-less) Size(key) signature by delegating to
+// sizeCtx with context.Background() (task #199) — see minioVIStore.sizeCtx's doc
+// comment (value_index_query.go) for why the plain, ctx-less signature is preserved.
 func (s *rawFileStore) Size(key string) (int64, error) {
+	return s.sizeCtx(context.Background(), key)
+}
+
+// sizeCtx is Size's ctx-aware core (task #199, NOTE-VI-106 follow-up), reached via the
+// package-private ctxAwareStore capability (content_cache.go) when a real per-query ctx
+// is available.
+func (s *rawFileStore) sizeCtx(ctx context.Context, key string) (int64, error) {
 	name, keypath := splitKeyForRaw(key)
-	rc, size, err := s.rawR.Read(context.Background(), name, keypath, nil)
+	rc, size, err := s.rawR.Read(ctx, name, keypath, nil)
 	if err != nil {
 		return 0, mapRawNotFound(err)
 	}
@@ -83,10 +93,16 @@ func (s *rawFileStore) Size(key string) (int64, error) {
 	return size, nil
 }
 
-// ReadAt fills p from the object at key starting at off, following io.ReaderAt semantics.
+// ReadAt fills p from the object at key starting at off, following io.ReaderAt
+// semantics. Delegates to readAtCtx with context.Background() (task #199).
 func (s *rawFileStore) ReadAt(key string, p []byte, off int64) (int, error) {
+	return s.readAtCtx(context.Background(), key, p, off)
+}
+
+// readAtCtx is ReadAt's ctx-aware core (task #199). See sizeCtx's doc comment.
+func (s *rawFileStore) readAtCtx(ctx context.Context, key string, p []byte, off int64) (int, error) {
 	name, keypath := splitKeyForRaw(key)
-	err := s.rawR.ReadRange(context.Background(), name, keypath, uint64(off), p, nil)
+	err := s.rawR.ReadRange(ctx, name, keypath, uint64(off), p, nil)
 	if err != nil {
 		return 0, mapRawNotFound(err)
 	}
