@@ -53,9 +53,8 @@ type QueryPlan = queryplan.QueryPlan
 
 // DispatchStrategy tells the caller (tempo's frontend) which job-construction path to use
 // for a query. DispatchBlockSharded (the zero value) is today's existing per-block job path,
-// unchanged. DispatchTimeSliced is the #487 opt-in narrowing. DispatchBoundedRecentFirst is
-// the #481 bounded-newest-first strategy — see queryplan.DispatchStrategy's own doc comment
-// for the full contract.
+// unchanged. DispatchTimeSliced is the #487 opt-in narrowing — see queryplan.DispatchStrategy's
+// own doc comment for the full contract.
 type DispatchStrategy = queryplan.DispatchStrategy
 
 const (
@@ -63,9 +62,6 @@ const (
 	DispatchBlockSharded = queryplan.DispatchBlockSharded
 	// DispatchTimeSliced is the #487 opt-in narrowing; see DispatchStrategy's doc comment.
 	DispatchTimeSliced = queryplan.DispatchTimeSliced
-	// DispatchBoundedRecentFirst is the #481 bounded-newest-first strategy; see
-	// DispatchStrategy's doc comment.
-	DispatchBoundedRecentFirst = queryplan.DispatchBoundedRecentFirst
 	// DefaultK is the recommended default for BuildTimeSlices/BuildQueryPlan's k parameter —
 	// see queryplan.DefaultK's own doc comment (SPEC-QP-2/NOTE-QP-008) for the full rationale.
 	DefaultK = queryplan.DefaultK

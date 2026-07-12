@@ -3,6 +3,7 @@ package vblockpack
 import (
 	"errors"
 	"io"
+	"sync"
 	"testing"
 	"time"
 
@@ -10,6 +11,33 @@ import (
 	minio "github.com/minio/minio-go/v7"
 	"github.com/stretchr/testify/assert"
 )
+
+// viExplicitlySetForTestMu guards viExplicitlySetForTest.
+var viExplicitlySetForTestMu sync.Mutex
+
+// viExplicitlySetForTest tracks whether the CURRENT test has itself explicitly called
+// withVIQueryReader/withVISink (markViExplicitlySetForTest, valueindex_test.go) with ANY
+// value, including nil. createFetchTestBlock (fetch_test.go) consults this to decide whether
+// to auto-install its own default working value-index fixture: Phase 0 removed the vr==nil
+// scan fallback, so every ordinary Fetch test now needs SOME index configured, but a test that
+// explicitly wants a different state (including nil, to simulate vr==nil) must never be
+// silently overridden.
+var viExplicitlySetForTest bool
+
+// markViExplicitlySetForTest records that the caller explicitly configured VI state for this
+// test and returns a restore function the caller's own t.Cleanup should chain after restoring
+// its own state, so nested/sequential test isolation stays correct.
+func markViExplicitlySetForTest() (restore func()) {
+	viExplicitlySetForTestMu.Lock()
+	prev := viExplicitlySetForTest
+	viExplicitlySetForTest = true
+	viExplicitlySetForTestMu.Unlock()
+	return func() {
+		viExplicitlySetForTestMu.Lock()
+		viExplicitlySetForTest = prev
+		viExplicitlySetForTestMu.Unlock()
+	}
+}
 
 // withVIQueryReader installs store as the process-level index-driven query reader for the
 // duration of the test and restores the prior state on cleanup, mirroring withVISink
@@ -19,8 +47,10 @@ import (
 // CreateBlock's real WriteValueIndexL0 write path populates the same store this reads from).
 func withVIQueryReader(t *testing.T, store valueIndexStore, indexPrefix string) {
 	t.Helper()
+	restoreExplicit := markViExplicitlySetForTest()
 	viQueryReaderMu.Lock()
 	prev := viQueryReaderPtr
+	stopViQueryReaderBackground(prev)
 	if store == nil {
 		viQueryReaderPtr = nil
 	} else {
@@ -34,8 +64,10 @@ func withVIQueryReader(t *testing.T, store valueIndexStore, indexPrefix string) 
 	viQueryReaderMu.Unlock()
 	t.Cleanup(func() {
 		viQueryReaderMu.Lock()
+		stopViQueryReaderBackground(viQueryReaderPtr)
 		viQueryReaderPtr = prev
 		viQueryReaderMu.Unlock()
+		restoreExplicit()
 	})
 }
 

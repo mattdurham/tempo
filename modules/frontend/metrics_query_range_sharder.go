@@ -319,10 +319,7 @@ func (s *queryRangeSharder) backendRequests(ctx context.Context, tenantID string
 		return
 	}
 
-	// No `case blockpack.DispatchBoundedRecentFirst` here, unlike search_sharder.go's equivalent
-	// switch: buildMetricsQueryPlan always passes boundedEligible=false (R2, vcnt_fetch.go) — a
-	// metrics plan can never resolve to DispatchBoundedRecentFirst in the first place, so this
-	// fallthrough only ever sees DispatchBlockSharded or nil here.
+	// This fallthrough only ever sees DispatchBlockSharded or a nil plan here.
 	blockIter := backendJobsFunc(blocks, targetBytesPerRequest, maxShards, uint32(time.Unix(0, int64(searchReq.End)).Unix()))
 	var advancementPoints []advancementPoint
 	blockIter(func(jobs int, sz uint64, completedThroughTime uint32) {

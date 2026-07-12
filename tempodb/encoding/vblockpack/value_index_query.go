@@ -2,23 +2,28 @@ package vblockpack
 
 // value_index_query.go — querier-side index-driven query wiring (blockpack issue
 // #461). When configured, blockpackBlock.Fetch / QueryRange build a value-index
-// source (discover + download + per-leaf predicate) and try the index path before
-// falling back to a full block scan.
+// source (discover + download + per-leaf predicate) and try the index path.
+// Routine declines either route to a bounded newest-first read (a limit is present)
+// or hard-error (ErrSearchNoCoverage / ErrMaterializedIndexBuilding) -- there is no
+// full-block-scan fallback anywhere in this path (issue #481's central anti-pattern
+// elimination, extended to the vr==nil case).
 //
 // Authoritative-index contract (SPEC-ROOT-019, NOTE-VI-047 / NOTE-VI-078): for a
 // query shape the index CAN answer, its result is complete and correct — there is
-// no speculative "index answered but a scan is cheaper" fallback. Fallback to a
-// full scan is reserved for ROUTINE DECLINES only (a query shape the index
-// architecturally cannot answer: an unindexable/negation leaf, a non-filter query,
-// or no coverage). An index/data INCONSISTENCY — the index had coverage and matched
-// spans but named a block/page the data file cannot resolve — is index corruption:
-// it now FAILS the query (NOTE-VI-078, issue #481) instead of being masked by a
-// silent scan, mirroring the trace-by-id path's NOTE-VI-071 posture.
+// no speculative "index answered but a scan is cheaper" fallback. A ROUTINE DECLINE
+// (a query shape the index architecturally cannot answer: an unindexable/negation
+// leaf, a non-filter query, or no coverage) hard-errors, never scans. An index/data
+// INCONSISTENCY — the index had coverage and matched spans but named a block/page
+// the data file cannot resolve — is index corruption: it also FAILS the query
+// (NOTE-VI-078, issue #481) instead of being masked by a silent scan, mirroring the
+// trace-by-id path's NOTE-VI-071 posture.
 //
 // The reader is a process-level singleton, configured once at querier startup via
 // ConfigureValueIndexQuery, mirroring the embedder/cache singletons. When it is
-// nil (the default, value_index_query.enabled=false) every query path is
-// byte-identical to before — the index path is simply skipped.
+// nil (the default, value_index_query.enabled=false) every search/metrics query
+// now hard-errors with ErrMaterializedIndexBuilding rather than silently scanning
+// (there is no full-block-scan fallback left for this case); trace-by-id has
+// required the index unconditionally since NOTE-VI-073.
 
 import (
 	"context"
@@ -54,6 +59,36 @@ type viQueryReader struct {
 	indexPrefix string
 	ttl         time.Duration
 	mu          sync.Mutex
+	// cancelBackground stops every per-tenant IndexFileCache's background refresh
+	// goroutine (cacheFor) started under this reader instance. Called whenever this
+	// reader is replaced (reconfiguration, or a test's withVIQueryReader/
+	// ConfigureValueIndexQueryForTest restoring prior state) so a superseded reader's
+	// goroutines exit promptly instead of refreshing an object store nobody queries
+	// through it anymore for the lifetime of the process.
+	cancelBackground context.CancelFunc
+}
+
+// newViQueryReaderBackgroundCtx returns a context bound to a fresh reader instance's
+// lifetime and its cancel func, so cacheFor's Background(ctx) call can be stopped when
+// the reader is superseded (see viQueryReader.cancelBackground).
+func newViQueryReaderBackgroundCtx() (context.Context, context.CancelFunc) {
+	return context.WithCancel(context.Background())
+}
+
+// stopViQueryReaderBackground cancels r's background refresh goroutines, if any were
+// started. Called by every site that replaces viQueryReaderPtr (production
+// reconfiguration and test helpers alike) so a superseded reader's per-tenant
+// IndexFileCache goroutines exit instead of leaking for the rest of the process.
+func stopViQueryReaderBackground(r *viQueryReader) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	cancel := r.cancelBackground
+	r.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 // cacheFor returns the per-tenant file-listing cache, creating (and starting the
@@ -65,7 +100,20 @@ func (vr *viQueryReader) cacheFor(tenant string) *blockpack.IndexFileCache {
 		return c
 	}
 	c := blockpack.NewIndexFileCache(vr.store, tenant, vr.indexPrefix, vr.ttl)
-	c.Background(context.Background())
+	ctx, cancel := newViQueryReaderBackgroundCtx()
+	if vr.cancelBackground != nil {
+		// A prior cacheFor call on this SAME reader already set one cancel func for an
+		// earlier tenant's cache; chain so replacing the reader cancels every tenant's
+		// goroutine, not just the last one created.
+		prevCancel := vr.cancelBackground
+		vr.cancelBackground = func() {
+			prevCancel()
+			cancel()
+		}
+	} else {
+		vr.cancelBackground = cancel
+	}
+	c.Background(ctx)
 	vr.caches[tenant] = c
 	return c
 }
@@ -77,13 +125,15 @@ var (
 
 // ConfigureValueIndexQuery installs the process-level index-driven query reader.
 // Call once at querier startup. A nil client or disabled config leaves the reader unset.
-// Search/metrics (tryIndexFetch) still fall back to a full block scan when unset; trace-by-id
-// (FindTraceByID) does not — it requires the index unconditionally (NOTE-VI-073).
+// Search/metrics (tryIndexFetch) now hard-error with ErrMaterializedIndexBuilding when unset
+// (no full-block-scan fallback); trace-by-id (FindTraceByID) has required the index
+// unconditionally since NOTE-VI-073.
 // contentCacheBytes bounds the trace-by-ID index-file content cache (blockpack
 // issue #475); zero disables it, leaving the raw store (byte-identical to before).
 func ConfigureValueIndexQuery(client *minio.Client, bucket, indexPrefix string, ttl time.Duration, contentCacheBytes int64) {
 	viQueryReaderMu.Lock()
 	defer viQueryReaderMu.Unlock()
+	stopViQueryReaderBackground(viQueryReaderPtr)
 
 	if client == nil {
 		viQueryReaderPtr = nil
@@ -123,6 +173,7 @@ func ConfigureValueIndexQuery(client *minio.Client, bucket, indexPrefix string, 
 func ConfigureValueIndexQueryRaw(rawR backend.RawReader, indexPrefix string, ttl time.Duration, contentCacheBytes int64) {
 	viQueryReaderMu.Lock()
 	defer viQueryReaderMu.Unlock()
+	stopViQueryReaderBackground(viQueryReaderPtr)
 
 	if rawR == nil {
 		viQueryReaderPtr = nil
@@ -163,6 +214,7 @@ func ConfigureValueIndexQueryForTest(store interface {
 }, indexPrefix string) (restore func()) {
 	viQueryReaderMu.Lock()
 	prev := viQueryReaderPtr
+	stopViQueryReaderBackground(prev)
 	if store == nil {
 		viQueryReaderPtr = nil
 	} else {
@@ -176,6 +228,7 @@ func ConfigureValueIndexQueryForTest(store interface {
 	viQueryReaderMu.Unlock()
 	return func() {
 		viQueryReaderMu.Lock()
+		stopViQueryReaderBackground(viQueryReaderPtr)
 		viQueryReaderPtr = prev
 		viQueryReaderMu.Unlock()
 	}
@@ -224,8 +277,9 @@ type indexFetchStats struct {
 //   - (nil, false, stats, nil) — a ROUTINE DECLINE: the index genuinely cannot
 //     answer this query shape (index disabled, no coverage for a leaf, an
 //     unindexable/negation predicate, a non-filter query, or a build-time
-//     coverage miss). The caller falls back to a correct full block scan. This is
-//     a documented, still-standing exception, not an error.
+//     coverage miss). The caller (Fetch) either routes to a bounded newest-first
+//     read (a limit is present) or hard-errors -- there is no full-block-scan
+//     fallback for this outcome anywhere in the call chain.
 //   - (nil, false, stats, err) — an INDEX/DATA INCONSISTENCY: the index HAD
 //     coverage and produced matches, but one names a block/page absent from the
 //     data file. Because the value index is authoritative for the columns it
@@ -237,12 +291,14 @@ type indexFetchStats struct {
 //     logging-and-scanning (NOTE-VI-078, issue #481).
 //
 // indexOnly (issue #487) narrows this contract for a time-slice job: a slice job's
-// narrowed [Start, End) window means a full block scan is not a safe fallback the
-// way it is for a normal query (a scan ignores the slice boundary at the per-span
-// level and can double-count or over-fetch across overlapping slice jobs). When
-// indexOnly is true, every ROUTINE DECLINE outcome above is converted into
-// (nil, false, stats, ErrSliceIndexCoverageGap) instead of (nil, false, stats, nil)
-// — the caller must fail the query, never fall through to a scan. This reuses the
+// narrowed [Start, End) window has no safe scan fallback at all (a scan would ignore
+// the slice boundary at the per-span level and could double-count or over-fetch
+// across overlapping slice jobs) -- distinct from a normal query's own routine
+// decline, which routes to a bounded read or hard-errors, never a scan either, but
+// for a different reason (no full-block-scan path exists in this codebase at all
+// anymore, slice job or not). When indexOnly is true, every ROUTINE DECLINE outcome
+// above is converted into (nil, false, stats, ErrSliceIndexCoverageGap) instead of
+// (nil, false, stats, nil) — the caller must fail the query. This reuses the
 // SAME outcome-3 (typed error) propagation shape NOTE-VI-078 already established;
 // no new error-return convention is introduced. indexOnly has no effect on the
 // other two outcomes: a full index answer is still used as-is, and a genuine
@@ -323,8 +379,10 @@ func (b *blockpackBlock) tryIndexFetch(
 	var stats indexFetchStats
 	vr := getValueIndexQueryReader()
 	if vr == nil {
-		// R8: the vr==nil zeroth category is UNCHANGED and untouched by boundedAuthorized —
-		// see declineOutcome's own doc comment.
+		// R8: the vr==nil zeroth category's OWN outcome (nil, false, stats, nil for !indexOnly)
+		// is untouched by boundedAuthorized -- but Fetch's caller now hard-errors with
+		// ErrMaterializedIndexBuilding for that outcome instead of falling back to a scan (Phase
+		// 0). See declineOutcome's own doc comment.
 		return declineOutcome(indexOnly, stats)
 	}
 
@@ -335,7 +393,24 @@ func (b *blockpackBlock) tryIndexFetch(
 
 	cache := vr.cacheFor(b.meta.TenantID)
 	watermarks := watermarksForOrNil(ctx, b.meta.TenantID)
-	src, ok, err := blockpack.BuildValueIndexSource(ctx, cache, vr.store, prog, minSec, maxSec, watermarks)
+	// Phase 2/3/4 (plan-scan-fallback.md): a limit-bearing query (boundedAuthorized) always
+	// calls BuildValueIndexSourceBounded instead of the unbounded BuildValueIndexSource --
+	// NOT gated on leaf count here, deliberately: BuildSourceBounded itself (blockpack-side)
+	// already decides internally, per query SHAPE, whether early-stopping applies (single
+	// leaf: Phase 2; flat OR of leaves: Phase 3; pure AND of leaves: Phase 4's anchor+confirm)
+	// or whether to safely fall through to the ordinary unbounded per-leaf resolution for any
+	// shape not yet covered. Gating on leaf count HERE too would just duplicate that same
+	// shape-detection logic a second time at this call site and risk drifting out of sync
+	// with it — exactly the kind of duplication this plan's own "no case is ever too
+	// expensive to serve via the index" story exists to avoid replicating per caller.
+	var src *blockpack.SliceValueIndexSource
+	var ok bool
+	var err error
+	if boundedAuthorized {
+		src, ok, err = blockpack.BuildValueIndexSourceBounded(ctx, cache, vr.store, prog, minSec, maxSec, watermarks, opts.Limit)
+	} else {
+		src, ok, err = blockpack.BuildValueIndexSource(ctx, cache, vr.store, prog, minSec, maxSec, watermarks)
+	}
 	if err != nil {
 		// A build-time error is an object-store/discovery failure (List error,
 		// corrupt-file decode). This is not the authoritative "index named a block
@@ -344,7 +419,7 @@ func (b *blockpackBlock) tryIndexFetch(
 		// unless boundedAuthorized, or ErrSliceIndexCoverageGap under indexOnly).
 		level.Warn(util_log.Logger).Log("msg", "vblockpack: index fetch: build source error",
 			"block", b.meta.BlockID, "err", err)
-		return declineOutcomeBounded(indexOnly, boundedAuthorized, stats)
+		return declineOutcomeBounded(indexOnly, stats)
 	}
 	if !ok {
 		level.Info(util_log.Logger).Log("msg", "vblockpack: index fetch: no coverage",
@@ -354,7 +429,7 @@ func (b *blockpackBlock) tryIndexFetch(
 		// this, but it is still called here for the OTHER, indexable-but-uncovered
 		// leaves that a mixed query might contain alongside the unindexable one.
 		recordUsageForDeclinedQuery(ctx, b.meta.TenantID, prog, dedicatedColumnSet(b.meta.DedicatedColumns), time.Now())
-		return declineOutcomeBounded(indexOnly, boundedAuthorized, stats)
+		return declineOutcomeBounded(indexOnly, stats)
 	}
 	level.Info(util_log.Logger).Log("msg", "vblockpack: index fetch: coverage found",
 		"block", b.meta.BlockID, "tenant", b.meta.TenantID, "files", src.Stats().FilesRead)
@@ -386,9 +461,10 @@ func (b *blockpackBlock) tryIndexFetch(
 	// Masking corruption behind a scan is exactly the anti-pattern the trace-by-id
 	// path eliminated in NOTE-VI-071 — an authoritative index that names data the
 	// file cannot resolve must be observable as an error, not quietly worked around.
-	// The remaining routine declines (indexOK=false, err=nil) still fall back to a
-	// correct scan below (or fail with ErrSliceIndexCoverageGap under indexOnly,
-	// issue #487); only genuine index/data skew becomes THIS hard error either way.
+	// The remaining routine declines (indexOK=false, err=nil) route to
+	// declineOutcomeBounded below (a bounded read, or a hard error -- never a scan;
+	// or ErrSliceIndexCoverageGap under indexOnly, issue #487); only genuine
+	// index/data skew becomes THIS hard error either way.
 	matches, indexOK, err := blockpack.QueryTraceQLFromIndex(
 		ctx, r, src, query, sourceRef, opts,
 	)
@@ -398,24 +474,26 @@ func (b *blockpackBlock) tryIndexFetch(
 		return nil, false, stats, err
 	}
 	if !indexOK {
-		return declineOutcomeBounded(indexOnly, boundedAuthorized, stats)
+		return declineOutcomeBounded(indexOnly, stats)
 	}
 	stats.Used = true
 	return matches, true, stats, nil
 }
 
-// declineOutcome returns tryIndexFetch's ROUTINE DECLINE outcome: today's
-// (nil, false, stats, nil) when indexOnly is false, or the #487 slice-mode
-// (nil, false, stats, ErrSliceIndexCoverageGap) when indexOnly is true — a slice
-// job must fail rather than let its caller fall through to an unsafe full scan.
+// declineOutcome returns tryIndexFetch's ROUTINE DECLINE outcome for the vr == nil
+// zeroth category: (nil, false, stats, nil) when indexOnly is false, or the #487
+// slice-mode (nil, false, stats, ErrSliceIndexCoverageGap) when indexOnly is true —
+// a slice job must fail rather than let its caller fall through to an unsafe read.
 //
-// R8 (issue #481 part 3): this is the UNCHANGED, UNCONDITIONAL decline path reserved for the
-// vr == nil zeroth category ONLY (value_index_query.enabled=false — the index-driven path is
-// disabled entirely for this querier, mirroring trace-by-id's already-settled "no index
-// provided → scan is the only correct path, KEPT" category). It is deliberately NOT threaded
-// through declineOutcomeBounded's boundedAuthorized gate below — vr==nil is a config-level
-// absence of any index signal, never a per-query/per-block routine decline, so it is exempt from
-// R7's backstop by design (F-8 keeps calling this same path for vr==nil, unchanged).
+// R8 (issue #481 part 3): this is the decline path reserved for the vr == nil zeroth
+// category ONLY (value_index_query.enabled=false — the index-driven path is disabled
+// entirely for this querier). The caller (Fetch) now hard-errors with
+// ErrMaterializedIndexBuilding for this outcome when !indexOnly — there is no scan
+// fallback for this category anymore, unlike before this task. It is deliberately NOT
+// threaded through declineOutcomeBounded's boundedAuthorized gate below — vr==nil is a
+// config-level absence of any index signal, never a per-query/per-block routine
+// decline, so it is exempt from R7's backstop by design (F-8 keeps calling this same
+// path for vr==nil, unchanged).
 func declineOutcome(indexOnly bool, stats indexFetchStats) ([]blockpack.SpanMatch, bool, indexFetchStats, error) {
 	if indexOnly {
 		return nil, false, stats, ErrSliceIndexCoverageGap
@@ -424,31 +502,26 @@ func declineOutcome(indexOnly bool, stats indexFetchStats) ([]blockpack.SpanMatc
 }
 
 // declineOutcomeBounded is tryIndexFetch's ROUTINE DECLINE outcome for every decline site EXCEPT
-// the vr==nil zeroth category (issue #481 part 3, F-7, team-lead rulings R7/R17): boundedAuthorized
-// is Fetch's LOCAL derivation (R17) from whether this query carries a limit — the frontend's
-// plan-time gate (buildQueryPlanFromProgram, R6) is authoritative for query-SHAPE-driven
-// rejection, but per-block declines a coarse, tenant-level VCNT classification couldn't predict
-// (a query classified Selective at plan time can still decline on an individual block) are this
-// function's concern, independent of the frontend's Strategy choice.
+// the vr==nil zeroth category (issue #481 part 3, F-7, team-lead rulings R7/R17, simplified by
+// Phase 6 of plan-scan-fallback.md, then Phase 7 dropped the by-then-unused boundedAuthorized
+// parameter entirely).
 //
 //   - indexOnly (unchanged, takes priority): ErrSliceIndexCoverageGap — a #487 slice job's
-//     narrowed window has no safe scan fallback either way, regardless of boundedAuthorized.
-//   - !indexOnly && boundedAuthorized (a limit is present on this query): (nil, false, stats,
-//     nil) — relayed unchanged so Fetch's caller (F-8) routes to the bounded path instead of a
-//     scan. Bounded-with-a-limit is an honest, budgeted answer by construction (R2), never a
-//     wrong one, regardless of what selectivity class the frontend assigned this query.
-//   - !indexOnly && !boundedAuthorized (no limit present): the search decline hard-errors
-//     DIRECTLY — never an implicit scan. Absent a limit, there is no safe way to bound the read,
-//     matching R6's framing that an unauthorized decline must never silently fall back to
-//     "silently scan," the #481 anti-pattern this phase eliminates.
-func declineOutcomeBounded(indexOnly, boundedAuthorized bool, stats indexFetchStats) ([]blockpack.SpanMatch, bool, indexFetchStats, error) {
+//     narrowed window has no safe scan fallback either way.
+//   - !indexOnly: ErrSearchNoCoverage, UNCONDITIONALLY. Once Phases 2-4 landed real
+//     early-stopping index resolution, boundedAuthorized (still a parameter of tryIndexFetch,
+//     NOT this function — see the call site above) selects WHICH blockpack entry point
+//     tryIndexFetch itself calls (BuildValueIndexSourceBounded vs BuildValueIndexSource) BEFORE
+//     this function is ever reached — a decline reaching HERE means the bounded, early-stopping
+//     index resolution was already attempted and still found no coverage, so there is nothing
+//     left to route to. The retired #481-part-2 RecentFirstBudget raw-block-scan path this
+//     function used to conditionally relay to (Phase 6) is gone entirely — Phase 7 removed
+//     backend_block.go's needsBoundedRead/RecentFirstBudget plumbing for the FILTER case.
+func declineOutcomeBounded(indexOnly bool, stats indexFetchStats) ([]blockpack.SpanMatch, bool, indexFetchStats, error) {
 	if indexOnly {
 		return nil, false, stats, ErrSliceIndexCoverageGap
 	}
-	if !boundedAuthorized {
-		return nil, false, stats, ErrSearchNoCoverage
-	}
-	return nil, false, stats, nil
+	return nil, false, stats, ErrSearchNoCoverage
 }
 
 // floorToMinuteSec floors sec down to the same 60-second (minute) alignment as
@@ -513,7 +586,8 @@ func (s *minioVIStore) List(ctx context.Context, prefix string) ([]string, error
 // retention/compaction race (a file the listing cache still names but object
 // storage has already deleted) and skip the file instead of failing the index
 // build (blockpack issue #399 point 5). All other errors pass through unchanged so
-// transient failures still abort and fall back to a correct full scan.
+// a transient failure still aborts the index build -- the caller then hard-errors
+// rather than scanning (there is no full-block-scan fallback anymore).
 func mapNotFound(err error) error {
 	if err == nil {
 		return nil

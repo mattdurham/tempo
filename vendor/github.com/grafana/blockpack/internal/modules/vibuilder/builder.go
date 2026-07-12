@@ -101,6 +101,26 @@ type FileDiscoverer interface {
 	FilesForTimeRange(ctx context.Context, colHash, colTypeName string, minSec, maxSec uint64) ([]string, error)
 }
 
+// FileDiscovererNewestFirst is FileDiscoverer's newest-first sibling: returns the same
+// column's file keys but ordered by valueindex.SortFileMetasNewestFirst instead of
+// SortFileMetas (Phase 1.4), letting an early-stopping consumer ask for newest-first
+// candidates directly instead of discovering ascending and re-sorting itself. Kept as a
+// SEPARATE interface (not a new method appended to FileDiscoverer) so
+// *valueindex.IndexFileCache -- which now satisfies BOTH FilesForTimeRange and
+// FilesForTimeRangeNewestFirst -- continues to satisfy the existing FileDiscoverer
+// contract with no breaking signature change for its many other callers.
+// BuildSourceBounded type-asserts a FileDiscoverer parameter against this interface and
+// only takes the early-stopping path when it succeeds, falling back to the ordinary
+// unbounded resolution otherwise (never a correctness violation, just no early-stop
+// optimization for a discoverer that doesn't support it).
+type FileDiscovererNewestFirst interface {
+	FilesForTimeRangeNewestFirst(
+		ctx context.Context,
+		colHash, colTypeName string,
+		minSec, maxSec uint64,
+	) ([]string, error)
+}
+
 // BuildSource assembles an executor.ValueIndexSource for prog over [minSec, maxSec]
 // using disc for file discovery and store for downloads.
 //
@@ -248,10 +268,294 @@ func BuildSource(
 	return src, true, nil
 }
 
+// BuildSourceBounded mirrors BuildSource but threads limit through to an early-stopping,
+// newest-first resolution for the SINGLE-LEAF case (Phase 2 scope, plan-scan-fallback.md).
+// When the query has more than one leaf (collectLeaves flattens both AND and OR
+// combinators, so this also covers multi-leaf OR), early-stopping is not yet implemented
+// for that shape (Phase 3/4 replace this fallback) -- BuildSourceBounded falls through to
+// the ordinary unbounded lookupColumn per leaf instead of silently under-reporting, so a
+// multi-leaf query still gets a CORRECT, just not yet early-stopped, answer.
+//
+// limit <= 0 is treated as unbounded and delegates to BuildSource directly (identical
+// behavior, no early-stopping code path exercised at all).
+//
+// disc is type-asserted against FileDiscovererNewestFirst; a discoverer that doesn't
+// support newest-first discovery falls back to the unbounded path too (never a
+// correctness violation, just no early-stop optimization).
+//
+// Watermark gating (#496 R7) and the match-all path are unchanged from BuildSource --
+// neither is in scope for early-stopping (a match-all query has no selectivity concept to
+// bound; watermarks describe backfill coverage, not recency).
+func BuildSourceBounded(
+	ctx context.Context,
+	disc FileDiscoverer,
+	store FileStore,
+	prog *vm.Program,
+	minSec, maxSec uint64,
+	watermarks map[string]ColumnWatermark,
+	limit int,
+) (*modules_executor.SliceValueIndexSource, bool, error) {
+	if limit <= 0 {
+		return BuildSource(ctx, disc, store, prog, minSec, maxSec, watermarks)
+	}
+	if prog == nil || disc == nil || store == nil {
+		return nil, false, nil
+	}
+	preds := prog.Predicates
+	src := modules_executor.NewSliceValueIndexSource()
+	timeRange := &[2]uint64{minSec, maxSec}
+
+	if preds == nil || (len(preds.Nodes) == 0 && len(preds.Columns) == 0) {
+		return nil, false, nil
+	}
+
+	added := false
+
+	leaves := collectLeaves(preds.Nodes)
+	var work []leafWork
+	for i := range leaves {
+		pred, colType, ok := buildPredicate(&leaves[i])
+		if !ok {
+			continue
+		}
+		work = append(work, leafWork{col: leaves[i].col, colType: colType, pred: pred})
+	}
+
+	discNewestFirst, canEarlyStop := disc.(FileDiscovererNewestFirst)
+	// Phase 2 scope: only a genuine single leaf gets the newest-first, early-stopping
+	// resolution below.
+	singleLeaf := len(work) == 1 && canEarlyStop
+	// Phase 4 scope: a multi-leaf query with NO OR anywhere in the predicate tree (a pure
+	// AND of 2+ leaves) gets the anchor+confirm early-stopping resolution instead of falling
+	// through to the unbounded per-leaf path. A query containing any OR (whether pure OR or
+	// a mixed AND-of-ORs shape) is not yet handled here -- Phase 3 covers the pure-OR case
+	// separately; a mixed shape still falls through to the safe, unbounded stopgap below.
+	multiLeafAND := len(work) > 1 && canEarlyStop && !hasORNode(preds.Nodes)
+	// Phase 3 scope: a genuine flat OR of leaves (isFlatORQuery) gets the newest-first
+	// per-leaf lookup too -- unlike Phase 4's AND case, OR needs NO special merge routing
+	// here: the executor's viEvalNodes/viEvalOR (metrics_trace.go) already merges each
+	// leaf's newest-first results via ViUnionNewestFirst at query-evaluation time, so
+	// using lookupColumnNewestFirst per leaf (same call the singleLeaf branch below
+	// already makes) is the ONLY change this shape needs.
+	flatOR := len(work) > 1 && canEarlyStop && isFlatORQuery(preds.Nodes)
+
+	if multiLeafAND {
+		andAdded, err := buildSourceBoundedMultiLeafAND(
+			ctx,
+			discNewestFirst,
+			disc,
+			store,
+			work,
+			timeRange,
+			minSec,
+			maxSec,
+			watermarks,
+			limit,
+			src,
+		)
+		if err != nil {
+			return nil, false, err
+		}
+		if andAdded {
+			added = true
+			// Reviewer-2-6 MEDIUM fix: mark the source only when a genuine early-stopping
+			// path was actually taken for EVERY leaf in this query (see SliceValueIndexSource
+			// .MarkNewestFirst's own doc comment for why this must be all-or-nothing) -- lets
+			// viMatchSpans opt this source into viEvalAND/viEvalOR's order-preserving merge at
+			// query-eval time instead of the default key-sorted chain.
+			src.MarkNewestFirst()
+		}
+	} else if len(work) > 0 {
+		perLeafAdded, err := buildSourceBoundedPerLeaf(
+			ctx, discNewestFirst, disc, store, work, timeRange, minSec, maxSec, watermarks, limit, singleLeaf || flatOR, src,
+		)
+		if err != nil {
+			return nil, false, err
+		}
+		if perLeafAdded {
+			added = true
+			if singleLeaf || flatOR {
+				src.MarkNewestFirst()
+			}
+		}
+	}
+
+	if len(preds.Nodes) == 0 && len(preds.Columns) > 0 {
+		colsAdded, err := buildSourceBoundedColumnsOnly(
+			ctx,
+			disc,
+			store,
+			preds.Columns,
+			timeRange,
+			minSec,
+			maxSec,
+			watermarks,
+			src,
+		)
+		if err != nil {
+			return nil, false, err
+		}
+		if colsAdded {
+			added = true
+		}
+	}
+
+	if !added {
+		return nil, false, nil
+	}
+	return src, true, nil
+}
+
+// buildSourceBoundedColumnsOnly resolves every listed column with no leaf predicate at all (a
+// match-all-with-column-list shape) via the ordinary unbounded lookupColumnAll -- watermark
+// gating (#496 R7) and the match-all path are unchanged and out of scope for early-stopping.
+// Extracted from BuildSourceBounded (pure refactor, byte-identical behavior) to keep that
+// function's cyclomatic complexity under the repo's limit.
+func buildSourceBoundedColumnsOnly(
+	ctx context.Context,
+	disc FileDiscoverer,
+	store FileStore,
+	columns []string,
+	timeRange *[2]uint64,
+	minSec, maxSec uint64,
+	watermarks map[string]ColumnWatermark,
+	src *modules_executor.SliceValueIndexSource,
+) (added bool, err error) {
+	for _, col := range columns {
+		results, colType, filesRead, bytesRead, lerr := lookupColumnAll(ctx, disc, store, col, timeRange)
+		if lerr != nil {
+			return false, lerr
+		}
+		src.RecordFileIO(filesRead, bytesRead)
+		if wm, ok := watermarks[col]; ok && !wm.CoversRange(minSec, maxSec) {
+			continue
+		}
+		src.Add(col, colType, results)
+		added = true
+	}
+	return added, nil
+}
+
+// buildSourceBoundedPerLeaf resolves each leaf in work independently and concurrently
+// (mirrors BuildSource's own leaf loop shape), choosing newestFirst's resolution path per
+// leaf: lookupColumnNewestFirst when true (Phase 2's single-leaf case, or Phase 3's flat-OR
+// case -- the executor's own viEvalOR/ViUnionNewestFirst merges the per-leaf newest-first
+// results at query-eval time, so no special merge routing is needed here), or the ordinary
+// unbounded lookupColumn otherwise (the safe stopgap for any shape not yet covered by an
+// early-stopping design -- a mixed AND-of-ORs, or a discoverer without newest-first support).
+func buildSourceBoundedPerLeaf(
+	ctx context.Context,
+	discNewestFirst FileDiscovererNewestFirst,
+	disc FileDiscoverer,
+	store FileStore,
+	work []leafWork,
+	timeRange *[2]uint64,
+	minSec, maxSec uint64,
+	watermarks map[string]ColumnWatermark,
+	limit int,
+	newestFirst bool,
+	src *modules_executor.SliceValueIndexSource,
+) (added bool, err error) {
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(leafConcurrency)
+	var anyLeafAdded atomic.Bool
+	for _, w := range work {
+		g.Go(func() error {
+			var results []modules_executor.VILookupResult
+			var filesRead int
+			var bytesRead int64
+			var lerr error
+			if newestFirst {
+				results, filesRead, bytesRead, lerr = lookupColumnNewestFirst(
+					gctx, discNewestFirst, store, w.col, w.colType, w.pred, timeRange, limit,
+				)
+			} else {
+				results, filesRead, bytesRead, lerr = lookupColumn(
+					gctx, disc, store, w.col, w.colType, w.pred, timeRange,
+				)
+			}
+			if lerr != nil {
+				return lerr
+			}
+			src.RecordFileIO(filesRead, bytesRead)
+			if wm, ok := watermarks[w.col]; ok && !wm.CoversRange(minSec, maxSec) {
+				return nil
+			}
+			src.Add(w.col, w.colType, results)
+			anyLeafAdded.Store(true)
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return false, err
+	}
+	return anyLeafAdded.Load(), nil
+}
+
 // leaf is a flattened leaf RangeNode: a column plus its predicate description.
 type leaf struct {
 	node *vm.RangeNode
 	col  string
+}
+
+// leafWork is one leaf's resolved (column, type, predicate) triple, ready to pass to
+// lookupColumn/lookupColumnNewestFirst. Package-level (not BuildSourceBounded-local) so
+// Phase 4's buildSourceBoundedMultiLeafAND can share the exact same shape.
+type leafWork struct {
+	pred    valueindex.Predicate
+	col     string
+	colType modules_shared.ColumnType
+}
+
+// hasORNode reports whether nodes (or anything nested under it) contains an OR composite
+// (IsOR=true, len(Children) > 0) anywhere in the tree. Used by BuildSourceBounded to detect
+// the "pure AND, no nested OR" shape Phase 4's anchor+confirm design requires -- a query
+// with ANY OR anywhere (a pure OR, or a mixed AND-of-ORs) is not this phase's scope and
+// falls through to the existing unbounded stopgap instead.
+func hasORNode(nodes []vm.RangeNode) bool {
+	for i := range nodes {
+		n := &nodes[i]
+		if len(n.Children) == 0 {
+			continue
+		}
+		if n.IsOR {
+			return true
+		}
+		if hasORNode(n.Children) {
+			return true
+		}
+	}
+	return false
+}
+
+// isFlatORQuery reports whether nodes is a GENUINE flat OR of leaves (Phase 3,
+// plan-scan-fallback.md): exactly one top-level node, itself an OR composite
+// (IsOR=true) with 2+ children, every one of which is itself a leaf (no further
+// Children — "absence of nested AND", per the plan's own scope note). This is
+// stricter than hasORNode's "any OR anywhere" check above: a query like
+// `a OR (b AND c)` has an OR node but is NOT a flat OR of leaves (one child is
+// itself a composite) and correctly falls through to the unbounded stopgap, same
+// as today, until a future phase extends this. Early-stopping for this shape does
+// not actually need vibuilder to route it specially beyond using the newest-first
+// per-leaf lookup below (see BuildSourceBounded's own call site) — the executor's
+// viEvalNodes/viEvalOR (metrics_trace.go) already merges per-leaf newest-first
+// results via ViUnionNewestFirst at query-evaluation time, so this check exists
+// purely to decide which lookup function (newest-first vs. ordinary) to call per
+// leaf here.
+func isFlatORQuery(nodes []vm.RangeNode) bool {
+	if len(nodes) != 1 || !nodes[0].IsOR {
+		return false
+	}
+	children := nodes[0].Children
+	if len(children) < 2 {
+		return false
+	}
+	for i := range children {
+		if len(children[i].Children) > 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // collectLeaves flattens the predicate tree to its leaf nodes (those naming a
@@ -514,6 +818,38 @@ func lookupColumn(
 	return toVILookupResults(lrs), filesRead, bytesRead, nil
 }
 
+// lookupColumnNewestFirst mirrors lookupColumn but discovers via
+// FileDiscovererNewestFirst.FilesForTimeRangeNewestFirst and resolves via
+// queryKeysRangedNewestFirst instead of the ascending pair, so the returned entries are an
+// early-stopped, newest-first prefix instead of the full ascending set (Phase 2,
+// plan-scan-fallback.md). limit <= 0 means unbounded (identical result to lookupColumn,
+// modulo ordering).
+func lookupColumnNewestFirst(
+	ctx context.Context,
+	disc FileDiscovererNewestFirst,
+	store FileStore,
+	col string,
+	colType modules_shared.ColumnType,
+	pred valueindex.Predicate,
+	timeRange *[2]uint64,
+	limit int,
+) ([]modules_executor.VILookupResult, int, int64, error) {
+	colHash := valueindex.ColHash(col)
+	colTypeName := valueindex.ColTypeName(colType)
+	if colTypeName == "" {
+		return nil, 0, 0, nil
+	}
+	keys, err := disc.FilesForTimeRangeNewestFirst(ctx, colHash, colTypeName, timeRange[0], timeRange[1])
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("vibuilder: discover %s: %w", col, err)
+	}
+	lrs, filesRead, bytesRead, err := queryKeysRangedNewestFirst(ctx, store, keys, pred, timeRange, limit)
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("vibuilder: query %s: %w", col, err)
+	}
+	return toVILookupResults(lrs), filesRead, bytesRead, nil
+}
+
 // SPEC-VB-2: lookupColumnAll discovers and ranged-queries every value-index file for a column
 // (across all of its candidate type buckets) and returns all entries — used by the
 // match-all path. It tries each plausible type bucket because a column name can
@@ -720,6 +1056,99 @@ func queryKeysRanged(
 		filesRead++
 		bytesRead += s.size
 		out = append(out, s.results...)
+	}
+	return out, filesRead, bytesRead, nil
+}
+
+// queryKeysRangedNewestFirst mirrors queryKeysRanged but processes keys (already
+// newest-first ordered by the caller, via FileDiscovererNewestFirst) in newest-first
+// BATCHES of downloadConcurrency instead of one all-at-once fan-out. Within a batch, keys
+// are queried concurrently exactly as queryKeysRanged does today (preserving its existing
+// latency-hiding benefit); only the BETWEEN-batch behavior is new: sequential, and
+// early-stoppable once len(out) >= limit after a batch completes. limit is also threaded
+// per-key into valueindex.QueryBucketFileRangedNewestFirst, so a single wide file can
+// itself satisfy the whole limit without waiting for its batch siblings to finish
+// downloading (each key still gets the FULL limit, an intentional over-fetch-safe MVP
+// choice per plan-scan-fallback.md Phase 2 -- tightening this to the REMAINING limit
+// across a batch's siblings is a documented follow-up optimization, not required for
+// correctness: it can only return MORE matches per key than strictly needed, never fewer
+// or wrong ones).
+//
+// limit <= 0 means unbounded: every key is queried across every batch, and the
+// early-stop check below never fires (byte-identical exhaustive resolution to
+// queryKeysRanged, modulo the newest-first per-key ordering already established by the
+// caller's key discovery order).
+func queryKeysRangedNewestFirst(
+	ctx context.Context,
+	store FileStore,
+	keys []string,
+	pred valueindex.Predicate,
+	timeRange *[2]uint64,
+	limit int,
+) ([]valueindex.LookupResult, int, int64, error) {
+	if len(keys) == 0 {
+		return nil, 0, 0, nil
+	}
+
+	var out []valueindex.LookupResult
+	var filesRead int
+	var bytesRead int64
+
+	for batchStart := 0; batchStart < len(keys); batchStart += downloadConcurrency {
+		batchEnd := batchStart + downloadConcurrency
+		if batchEnd > len(keys) {
+			batchEnd = len(keys)
+		}
+		batch := keys[batchStart:batchEnd]
+
+		type keySlot struct {
+			results []valueindex.LookupResult
+			size    int64
+			keep    bool
+		}
+		slots := make([]keySlot, len(batch))
+		g, gctx := errgroup.WithContext(ctx)
+		g.SetLimit(downloadConcurrency)
+		for i, key := range batch {
+			g.Go(func() error {
+				if gctx.Err() != nil {
+					return nil //nolint:nilerr // intentional: gctx.Err() belongs to a sibling goroutine's failure, not this one's
+				}
+				src := &storeRangedSource{store: store, key: key}
+				results, err := valueindex.QueryBucketFileRangedNewestFirst(gctx, src, pred, timeRange, limit)
+				if err != nil {
+					if errors.Is(err, ErrFileNotFound) {
+						// Retention/compaction deleted this file out from under a
+						// stale listing — treat as an empty miss and skip it.
+						return nil
+					}
+					return fmt.Errorf("vibuilder: query %s: %w", key, err)
+				}
+				size, serr := src.Size()
+				if serr != nil {
+					if errors.Is(serr, ErrFileNotFound) {
+						return nil
+					}
+					return fmt.Errorf("vibuilder: size %s: %w", key, serr)
+				}
+				slots[i] = keySlot{results: results, size: size, keep: true}
+				return nil
+			})
+		}
+		if err := g.Wait(); err != nil {
+			return nil, 0, 0, err
+		}
+		for _, s := range slots {
+			if !s.keep {
+				continue
+			}
+			filesRead++
+			bytesRead += s.size
+			out = append(out, s.results...)
+		}
+		if limit > 0 && len(out) >= limit {
+			return out, filesRead, bytesRead, nil
+		}
 	}
 	return out, filesRead, bytesRead, nil
 }

@@ -47,8 +47,8 @@ func attachDispatchSpanInfo(ctx context.Context, jobsDispatched, totalCandidateP
 
 // attachDispatchSpanInfoNoOverlapFilter is attachDispatchSpanInfo's sibling for dispatch models
 // with NO overlap-filtering concept at all — today, exactly backendJobsFunc (the
-// DispatchBlockSharded/DispatchBoundedRecentFirst/nil-plan fallback, the most common dispatch
-// path in production). backendJobsFunc's only "skip" is a block whose own pagesPerRequest
+// DispatchBlockSharded/nil-plan fallback, the most common dispatch path in production).
+// backendJobsFunc's only "skip" is a block whose own pagesPerRequest
 // returns 0 (contributing zero jobs), and — critically — a block that DOES produce jobs can
 // produce MANY of them via page-splitting (jobsInBlock = ceil(TotalRecords/pages)), so there is
 // no fixed 1-job-per-candidate relationship a subtraction against len(blocks) could validly

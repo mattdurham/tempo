@@ -325,33 +325,8 @@ func Collect(
 		return nil, qs, nil
 	}
 
-	// SPEC-STREAM-13: Issue #481 part 2 (team-lead ruling R14) — RecentFirstBudget's MaxBlocks
-	// is enforced EXACTLY by truncating the already-reversed (newest-first, via
-	// Direction=Backward's PlanWithOptions reversal) SelectedBlocks list BEFORE coalescing —
-	// this must happen before CoalescedGroups so a block never enters a coalesced group it
-	// wouldn't otherwise be part of. Truncating the FRONT of the list keeps exactly the newest
-	// MaxBlocks blocks.
-	if opts.RecentFirstBudget != nil && opts.RecentFirstBudget.MaxBlocks > 0 &&
-		len(plan.SelectedBlocks) > opts.RecentFirstBudget.MaxBlocks {
-		plan.SelectedBlocks = plan.SelectedBlocks[:opts.RecentFirstBudget.MaxBlocks]
-	}
-
 	// SPEC-STREAM-2: Partition selected blocks into ~8 MB coalesced groups for lazy batched I/O.
 	groups := r.CoalescedGroups(plan.SelectedBlocks)
-
-	// SPEC-STREAM-13: Issue #481 part 2 (R14) — CoalesceBlocks always sorts extents by ascending
-	// file offset internally regardless of caller order (TestCoalescedGroups_PreservesCallerBlockOrder
-	// proved a single upfront call cannot preserve newest-first order) — so for the bounded
-	// path, reverse the RETURNED group slice here. blockGroupPipeline's dispatcher issues
-	// ReadGroup calls in ascending slice-index order, so this reversal is what makes the
-	// newest coalesced group's I/O get dispatched first. Within a group, block order is
-	// irrelevant: blocks that coalesce together are chronologically adjacent by construction
-	// (close enough in file offset to coalesce), block_group_pipeline processes a group's
-	// blocks atomically, and Direction's decode-side reversal (streamSortedRows) already
-	// handles per-row output ordering independent of I/O dispatch order.
-	if opts.RecentFirstBudget != nil {
-		slices.Reverse(groups)
-	}
 
 	// --- Block-scan step ---
 	scanStart := time.Now()
@@ -476,12 +451,6 @@ func scanBlocks(
 		groupToBlocks[gi] = append(groupToBlocks[gi], bi)
 	}
 
-	// SPEC-STREAM-13: Issue #481 part 2 (R14) — scanStart/bytesSoFar back RecentFirstBudget's
-	// MaxDuration/MaxBytes runtime caps below. Cheap to compute unconditionally; a no-op read
-	// when opts.RecentFirstBudget is nil (the normal, unbounded path).
-	scanStart := time.Now()
-	var bytesSoFar int64
-
 	// processGroup is called sequentially (never concurrently) by blockGroupPipeline.
 	// It iterates groupToBlocks[groupIdx] — blocks in selectedBlocks order for this group only.
 	// This preserves block-then-row traversal order (SPEC-STREAM-2, §4.2 match ordering).
@@ -491,9 +460,6 @@ func scanBlocks(
 			if !ok {
 				continue
 			}
-			// Issue #481 part 2: track cumulative bytes read for RecentFirstBudget.MaxBytes,
-			// before raw is deleted from groupRaw below.
-			bytesSoFar += int64(len(raw))
 			// NOTE-449: per-block OTel span. Uses a local closure so defer span.End() fires
 			// at the end of each iteration, not when processGroup returns (as defer would in a loop).
 			if blockErr := func() error {
@@ -593,20 +559,6 @@ func scanBlocks(
 				return nil
 			}(); blockErr != nil {
 				return blockErr
-			}
-		}
-		// SPEC-STREAM-13: Issue #481 part 2 (R14) — RecentFirstBudget's MaxBytes/MaxDuration are
-		// checked once per coalesced GROUP (this point — after all of this group's blocks are
-		// processed), not per block or per row. MaxBlocks is enforced exactly upstream (Collect
-		// truncates SelectedBlocks before coalescing), so no MaxBlocks check is needed here. A
-		// trip stops blockGroupPipeline from dispatching further groups; results already
-		// collected are the honest, bounded (not exhaustive) answer — never an error (Edge Case 1).
-		if b := opts.RecentFirstBudget; b != nil {
-			if b.MaxBytes > 0 && bytesSoFar >= b.MaxBytes {
-				return errLimitReached
-			}
-			if b.MaxDuration > 0 && time.Since(scanStart) >= b.MaxDuration {
-				return errLimitReached
 			}
 		}
 		return nil

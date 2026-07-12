@@ -2,6 +2,7 @@ package vblockpack
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/grafana/blockpack"
 	"github.com/grafana/tempo/pkg/tempopb"
 	tempotrace "github.com/grafana/tempo/pkg/tempopb/trace/v1"
 	"github.com/grafana/tempo/pkg/traceql"
@@ -430,6 +432,9 @@ func TestBlockpackBlock_FindTraceByID_ErrorsWithoutIndexWiring(t *testing.T) {
 	}
 	if response != nil {
 		t.Fatalf("expected a nil response alongside the error, got %v", response)
+	}
+	if !errors.Is(err, blockpack.ErrTraceByIDIndexNotConfigured) {
+		t.Fatalf("err = %v, want blockpack.ErrTraceByIDIndexNotConfigured", err)
 	}
 }
 

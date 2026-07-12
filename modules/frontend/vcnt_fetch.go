@@ -219,7 +219,7 @@ func buildMetricsQueryPlan(
 //
 // hasLimit is meaningful ONLY when boundedEligible is true (search/structural); metrics callers
 // pass it as false and it is never read on the boundedEligible=false branch, since R2 already
-// forecloses metrics ever reaching DispatchBoundedRecentFirst regardless of a limit.
+// forecloses metrics from ever being bounded-served regardless of a limit.
 func buildQueryPlanFromProgram(
 	ctx context.Context, rawR backend.RawReader, tenant string, dedicated backend.DedicatedColumns,
 	prog *blockpack.Program, minTS, maxTS uint64, concurrentRequests int, boundedEligible, hasLimit bool,
@@ -297,27 +297,20 @@ func buildQueryPlanFromProgram(
 	}
 
 	if boundedEligible {
-		strategy, planTimeDecline := blockpack.SelectSearchStrategy(sel, hasLimit)
+		_, planTimeDecline := blockpack.SelectSearchStrategy(sel, hasLimit)
 		if planTimeDecline {
 			if span.IsRecording() {
 				span.SetAttributes(attribute.String("plan.qualification_outcome", "low_selectivity_no_limit_search"))
 			}
 			return nil, fmt.Errorf("plan-time decline for tenant %s: %w", tenant, ErrPlanTimeLowSelectivityNoLimit)
 		}
-		if strategy == blockpack.DispatchBoundedRecentFirst {
-			if span.IsRecording() {
-				span.SetAttributes(attribute.String("plan.qualification_outcome", "qualified"))
-			}
-			// R9/R10 (Option B, ratified): QueryPlan carries ONLY the Strategy signal — no
-			// budget fields. The querier (backend_block.go) applies its own budget policy
-			// when it sees this Strategy value.
-			return &blockpack.QueryPlan{Strategy: blockpack.DispatchBoundedRecentFirst}, nil
-		}
-		// strategy == DispatchBlockSharded here means SelectSearchStrategy's Selective or
-		// UnknownSelectivity-without-limit row — fall through to the existing cost/
-		// perMinuteForLead/BuildQueryPlan flow below exactly as before this phase (it decides
-		// DispatchTimeSliced vs. DispatchBlockSharded on its own, unrelated, resolvability-only
-		// gate).
+		// SelectSearchStrategy's only other outcome is DispatchBlockSharded (Phase 7,
+		// plan-scan-fallback.md, removed the DispatchBoundedRecentFirst strategy entirely — the
+		// querier's own per-block bounded-index path now handles a limit-bearing low/unknown-
+		// selectivity query directly, without any plan-time signal) — fall through to the
+		// existing cost/perMinuteForLead/BuildQueryPlan flow below exactly as before this phase
+		// (it decides DispatchTimeSliced vs. DispatchBlockSharded on its own, unrelated,
+		// resolvability-only gate).
 	} else if sel == blockpack.LowSelectivity {
 		// Metrics (boundedEligible=false, R2): a resolvable-but-low-selectivity metrics query
 		// has no safe answer — SUM/AVG/HISTOGRAM/etc. need the aggregate over the FULL matching
@@ -364,8 +357,6 @@ func dispatchStrategyString(s blockpack.DispatchStrategy) string {
 	switch s {
 	case blockpack.DispatchTimeSliced:
 		return "time_sliced"
-	case blockpack.DispatchBoundedRecentFirst:
-		return "bounded_recent_first"
 	default:
 		return "block_sharded"
 	}

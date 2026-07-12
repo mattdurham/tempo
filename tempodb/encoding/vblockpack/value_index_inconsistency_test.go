@@ -7,9 +7,10 @@ package vblockpack
 // mask it with a silent full scan. This mirrors the trace-by-id path's NOTE-VI-071
 // posture (a matched span the reader cannot resolve is an error, not a fallback).
 //
-// It also pins the still-standing exception: a query the index genuinely CANNOT
-// answer (no reader configured / no coverage — a routine decline) still falls back
-// to a correct full scan and returns results, unchanged by NOTE-VI-078.
+// It also pins Phase 0's closure of the last remaining exception: a query the index
+// genuinely CANNOT answer (no reader configured at all, a deployment-level absence)
+// now hard-errors with ErrMaterializedIndexBuilding rather than falling back to a
+// scan — see TestFetch_NoIndexReaderHardErrors below.
 
 import (
 	"context"
@@ -161,15 +162,18 @@ func TestFetch_IndexDataInconsistencyFailsQuery(t *testing.T) {
 	require.Contains(t, err.Error(), "value index inconsistency")
 }
 
-// TestFetch_NoIndexReaderFallsBackToScan pins the still-standing exception: with no
-// value-index query reader configured, tryIndexFetch is a routine decline (not an
-// error), so Fetch falls back to a correct full scan and returns the match.
-// NOTE-VI-078 changes ONLY the index/data-inconsistency case, not routine "the
-// index cannot answer" declines.
-func TestFetch_NoIndexReaderFallsBackToScan(t *testing.T) {
+// TestFetch_NoIndexReaderHardErrors pins Phase 0's removal of the unconditional
+// vr==nil scan fallback: with no value-index query reader configured at all (a
+// deployment-level absence, distinct from a configured-but-declining index),
+// Fetch now hard-errors with ErrMaterializedIndexBuilding instead of falling back
+// to a full scan. NOTE-VI-078 already established that an index/data
+// INCONSISTENCY fails the query rather than being masked by a scan; this test
+// pins that the same "no scan fallback" posture now also applies to the
+// config-level vr==nil case, closing the last remaining unconditional scan site.
+func TestFetch_NoIndexReaderHardErrors(t *testing.T) {
 	dir := t.TempDir()
 	withVISink(t, nil, "")
-	withVIQueryReader(t, nil, "") // index path disabled ⇒ must scan
+	withVIQueryReader(t, nil, "") // index path disabled entirely
 
 	tenant := "test-tenant"
 	metaA, _ := writeSvcBlock(t, dir, &fakeVISink{}, tenant, uuid.New(), "svc-alpha", 3)
@@ -179,18 +183,7 @@ func TestFetch_NoIndexReaderFallsBackToScan(t *testing.T) {
 	block := newBackendBlock(metaA, backend.NewReader(rawR))
 
 	ctx, req := svcAlphaFetchReq()
-	resp, err := block.Fetch(ctx, req, common.SearchOptions{})
-	require.NoError(t, err, "with no index reader, Fetch must fall back to a correct scan, not error")
-	defer resp.Results.Close()
-
-	var spansets []*traceql.Spanset
-	for {
-		ss, err := resp.Results.Next(ctx)
-		require.NoError(t, err)
-		if ss == nil {
-			break
-		}
-		spansets = append(spansets, ss)
-	}
-	require.NotEmpty(t, spansets, "scan fallback must still find the matching trace")
+	_, err = block.Fetch(ctx, req, common.SearchOptions{})
+	require.Error(t, err, "with no index reader configured, Fetch must hard-error, not fall back to a scan")
+	require.ErrorIs(t, err, ErrMaterializedIndexBuilding)
 }

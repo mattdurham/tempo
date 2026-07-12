@@ -109,6 +109,7 @@ func (f *fakeVISink) ReadAt(key string, p []byte, off int64) (int, error) {
 // bypassed by setting the package vars directly (same-package test).
 func withVISink(t *testing.T, sink blockpack.ObjectPutter, prefix string) {
 	t.Helper()
+	restoreExplicit := markViExplicitlySetForTest()
 	valueIndexSinkMu.Lock()
 	prevSink, prevPrefix := valueIndexSink, valueIndexPrefix
 	valueIndexSink, valueIndexPrefix = sink, prefix
@@ -117,6 +118,7 @@ func withVISink(t *testing.T, sink blockpack.ObjectPutter, prefix string) {
 		valueIndexSinkMu.Lock()
 		valueIndexSink, valueIndexPrefix = prevSink, prevPrefix
 		valueIndexSinkMu.Unlock()
+		restoreExplicit()
 	})
 }
 

@@ -68,22 +68,6 @@ func streamFilterProgram(
 		// NOTE-472 (issue #393): WantSort decouples the sort request from TimestampColumn.
 		collectOpts.WantSort = true
 	}
-	// Issue #481 part 2: RecentFirstBudget activates the bounded newest-first path — Backward
-	// direction (same primitive MostRecent uses) but WantSort explicitly stays false, so this
-	// NEVER routes through shouldUseTopKPath's globally-correct-but-exhaustive heap scan (that
-	// path reads ALL selected blocks regardless of budget — see RecentFirstBudget's own doc
-	// comment). validateQueryOptions already rejects RecentFirstBudget+MostRecent set together,
-	// so these branches are mutually exclusive in practice; the explicit WantSort=false here
-	// is a second, structural line of defense against ever falling through to the topK path.
-	if opts.RecentFirstBudget != nil {
-		collectOpts.Direction = modules_queryplanner.Backward
-		collectOpts.WantSort = false
-		collectOpts.RecentFirstBudget = &modules_executor.RecentFirstBudget{
-			MaxBlocks:   opts.RecentFirstBudget.MaxBlocks,
-			MaxBytes:    opts.RecentFirstBudget.MaxBytes,
-			MaxDuration: opts.RecentFirstBudget.MaxDuration,
-		}
-	}
 	rows, stats, err := modules_executor.Collect(ctx, r, program, collectOpts)
 	if err != nil {
 		return stats, err
@@ -158,14 +142,10 @@ func streamPipelineQuery(
 		return fmt.Errorf("compile pipeline filter: %w", compileErr)
 	}
 
-	// Run with no limit — we need all matching spans to compute aggregates.
+	// Run with no limit — a pipeline aggregate needs the COMPLETE matching span set, or the
+	// computed aggregate/threshold verdict would silently be wrong.
 	filterOpts := opts
 	filterOpts.Limit = 0
-	// SPEC-STREAM-13 / R2: a pipeline aggregate needs the COMPLETE matching span set —
-	// the bounded newest-first budget must never truncate the aggregation input, or the
-	// computed aggregate/threshold verdict would silently be wrong (R2's "truncated
-	// aggregate is a silently wrong answer" class). See NOTE-VI-099 addendum.
-	filterOpts.RecentFirstBudget = nil
 
 	var allSpans []SpanMatch
 	_, streamErr := streamFilterProgram(ctx, r, program, filterOpts, func(match *SpanMatch, more bool) bool {
@@ -298,12 +278,9 @@ func streamPipelineQueryCount(
 		return fmt.Errorf("compile pipeline filter: %w", err)
 	}
 	filterOpts := opts
+	// Run with no limit — a pipeline aggregate needs the COMPLETE matching span set, or the
+	// computed aggregate/threshold verdict would silently be wrong.
 	filterOpts.Limit = 0
-	// SPEC-STREAM-13 / R2: a pipeline aggregate needs the COMPLETE matching span set —
-	// the bounded newest-first budget must never truncate the aggregation input, or the
-	// computed aggregate/threshold verdict would silently be wrong (R2's "truncated
-	// aggregate is a silently wrong answer" class). See NOTE-VI-099 addendum.
-	filterOpts.RecentFirstBudget = nil
 
 	// Pass 1: count spans per trace.
 	counts := make(map[string]int)

@@ -7,6 +7,7 @@ package blockpack
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 
@@ -398,6 +399,22 @@ func NewReaderForProgram(
 // filter, that is an authoritative "not found in this block" (nil, nil), NOT skew. A span
 // that DOES claim this sourceRef but still fails to resolve remains genuine skew (error).
 // An empty sourceRef disables the filter (v1 back-compat / callers with no per-block key).
+
+// ErrTraceByIDIndexNotConfigured is returned by GetTraceByID when no lister/tenant was
+// supplied — a caller error, not a coverage gap (NOTE-VI-073: there is no scan fallback).
+var ErrTraceByIDIndexNotConfigured = errors.New(
+	"blockpack: GetTraceByID: lister and tenant are required, there is no scan fallback",
+)
+
+// ErrTraceByIDCoverageGap is returned when zero trace-by-ID index files cover a window
+// GetTraceByID's caller knows is non-empty — an indexing coverage gap, not an
+// authoritative not-found (NOTE-VI-072).
+var ErrTraceByIDCoverageGap = errors.New(
+	"blockpack: GetTraceByID: no trace-by-ID index files cover the query window, index coverage gap",
+)
+
+// GetTraceByID looks up spans for a trace ID via the trace-by-ID value index; see the
+// doc comment above this declaration for full semantics.
 func GetTraceByID(
 	ctx context.Context,
 	r *Reader,
@@ -429,9 +446,7 @@ func GetTraceByID(
 	}
 
 	if lister == nil || tenant == "" {
-		return nil, fmt.Errorf(
-			"GetTraceByID: lister and tenant are required (NOTE-VI-073) -- there is no scan fallback",
-		)
+		return nil, fmt.Errorf("GetTraceByID: %w", ErrTraceByIDIndexNotConfigured)
 	}
 
 	traceIDBytes, decErr := hex.DecodeString(traceIDHex)
@@ -485,10 +500,11 @@ func getTraceByIDViaIndex(
 		// non-empty. That's an indexing coverage gap, not an authoritative absence --
 		// surface it as an error so it doesn't get silently misread as "not found."
 		return nil, fmt.Errorf(
-			"GetTraceByID: no trace-by-ID index files cover window [%d,%d] for tenant %q -- index coverage gap, not an authoritative not-found",
+			"GetTraceByID: no trace-by-ID index files cover window [%d,%d] for tenant %q: %w",
 			queryMinSec,
 			queryMaxSec,
 			tenant,
+			ErrTraceByIDCoverageGap,
 		)
 	}
 
@@ -539,7 +555,14 @@ func findTraceGroupInCandidates(
 	traceID [16]byte,
 	queryMinSec, queryMaxSec uint64,
 ) (valueindex.TraceGroup, bool, error) {
-	group, found, err := modules_executor.FindTraceGroupInCandidates(ctx, lister, keys, traceID, queryMinSec, queryMaxSec)
+	group, found, err := modules_executor.FindTraceGroupInCandidates(
+		ctx,
+		lister,
+		keys,
+		traceID,
+		queryMinSec,
+		queryMaxSec,
+	)
 	if err != nil {
 		return valueindex.TraceGroup{}, false, fmt.Errorf("GetTraceByID: %w", err)
 	}

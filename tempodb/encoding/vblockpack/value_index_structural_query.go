@@ -17,13 +17,15 @@ package vblockpack
 // own metadata combiner, traceql.anyCombiner.AddMetadata, merges by TraceID rather than
 // discarding a "duplicate" job response — so this is a real correctness/cost defect, not silently
 // absorbed). tryStructuralIndexFetch therefore ONLY ever attempts the index-driven answer when
-// indexOnly is true (a genuine #487 slice job) as an interim safety gate — until the duplication
-// question above is resolved (either a per-block ownership restriction added to
-// ExecuteStructuralFromIndex, or the frontend's sharder stops fanning structural jobs out
-// per-block), this keeps the new code path reachable ONLY through the narrow, currently-dormant
-// #487 slice-job entry point (nothing in the frontend builds a DispatchTimeSliced plan for a
-// structural query yet, so indexOnly is never true for one in production today) rather than the
-// default block-sharded dispatch, where the duplication would be unconditional.
+// indexOnly is true (a genuine #487 slice job) — this is now a PERMANENT, correctness-required
+// boundary, not an interim gate pending a future fix: structural per-block dispatch can never
+// safely answer from the index, with or without early-stopping (a future early-stopping
+// resolution change would make duplicate per-block jobs non-deterministic at the limit boundary,
+// strictly worse than today's wasteful-but-deterministic duplication). `structural_sharder.go`'s
+// `structuralTimeSlicedJobsFunc` already builds `DispatchTimeSliced` plans for coverage-eligible
+// structural queries today (plan-d.md Option B, shipped) — indexOnly is true for those, so the
+// index-driven path IS reachable in production, just never through the default block-sharded
+// dispatch, where the duplication would remain unconditional.
 //
 // indexOnly's OTHER role (mirrors #487's own IndexOnly/ErrSliceIndexCoverageGap contract, plan-d.md
 // DT2): a slice job has no safe scan fallback across its narrowed window, so EVERY decline reason
@@ -53,7 +55,9 @@ func (b *blockpackBlock) tryStructuralIndexFetch(
 	if !indexOnly {
 		// See this file's package doc comment: the index-driven structural path is only safe to
 		// attempt under a genuine #487 slice job today. A plain (non-slice) Fetch call always
-		// falls back to the existing string-based scan path unchanged.
+		// routes this routine decline through Fetch's own vr==nil hard-error /
+		// IsStructuralQuery-and-boundedAuthorized bounded-read / hard-error switch — never an
+		// unconditional string-based scan.
 		return nil, false, stats, nil
 	}
 

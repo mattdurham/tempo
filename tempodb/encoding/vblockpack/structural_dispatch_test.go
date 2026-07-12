@@ -161,22 +161,18 @@ func TestFetch_StructuralQuery_TriesIndexPathBeforeScanFallback(t *testing.T) {
 }
 
 // TestFetch_StructuralQuery_DeclineRouting (DT1, renamed from
-// TestFetch_StructuralQuery_FallsBackToScanOnDecline per F-9, issue #481 parts 2/3) pins the NEW
+// TestFetch_StructuralQuery_FallsBackToScanOnDecline per F-9, issue #481 parts 2/3) pins the
 // decline-routing contract that replaced the old unconditional scan fallback: under the default
 // (non-slice) dispatch, IndexOnly=false, tryStructuralIndexFetch's own !indexOnly guard
 // (value_index_structural_query.go) declines immediately and unconditionally — this branch never
 // even inspects whether a value-index reader is configured. structQuery (this file's fixture) is
 // a 2-node chain; blockpack.IsStructuralQuery returns true for ANY structural query regardless of
-// node count, so this 2-node case is routed identically to a 3+-node chain at Fetch's layer — the
-// old test's implicit premise that a 2-node query's decline is somehow special (and therefore
-// always falls back to a scan) was already inaccurate to the underlying tryStructuralIndexFetch
-// contract, it simply didn't matter before F-8 since EVERY decline scanned regardless of reason.
+// node count, so this 2-node case is routed identically to a 3+-node chain at Fetch's layer.
 //
-//   - WithLimit_UsesBoundedPath: a limit present authorizes F-3's bounded newest-first structural
-//     path (blockpack-side) instead of a scan — same correct answer, no scan fallback exists for
-//     this category anymore.
-//   - WithoutLimit_HardErrors_NeverScans: with no limit, the SAME decline hard-errors with
-//     ErrSearchNoCoverage — confirming there is no remaining silent-scan escape hatch.
+// Phase 7 (plan-scan-fallback.md) removed the #481-part-2 bounded-scan mechanism entirely — a
+// limit present no longer changes the outcome at all: WithLimit and WithoutLimit both hard-error
+// identically with ErrSearchNoCoverage now, confirming a structural decline never gets ANY
+// bounded path under per-block dispatch, index or scan (Phase 6's asymmetry finding).
 func TestFetch_StructuralQuery_DeclineRouting(t *testing.T) {
 	setup := func(t *testing.T) *blockpackBlock {
 		t.Helper()
@@ -192,17 +188,15 @@ func TestFetch_StructuralQuery_DeclineRouting(t *testing.T) {
 		return newBackendBlock(meta, backend.NewReader(rawR))
 	}
 
-	t.Run("WithLimit_UsesBoundedPath", func(t *testing.T) {
+	t.Run("WithLimit_HardErrors", func(t *testing.T) {
 		block := setup(t)
 		ctx := structuralFetchReq()
 		req := traceql.FetchSpansRequest{}
-		resp, err := block.Fetch(ctx, req, common.SearchOptions{IndexOnly: false, MaxTraces: 5})
-		require.NoError(t, err, "a decline with a limit present must route to the bounded "+
-			"structural path and succeed, not hard-error")
-
-		spansets := drainSpansets(ctx, t, resp)
-		require.Len(t, spansets, 1, "the bounded path must still find the matching trace")
-		require.NotEmpty(t, spansets[0].Spans)
+		_, err := block.Fetch(ctx, req, common.SearchOptions{IndexOnly: false, MaxTraces: 5})
+		require.Error(t, err, "a decline with a limit present must hard-error now — there is no "+
+			"bounded path left for this category, index or scan")
+		require.True(t, errors.Is(err, ErrSearchNoCoverage),
+			"err = %v, want ErrSearchNoCoverage", err)
 	})
 
 	t.Run("WithoutLimit_HardErrors_NeverScans", func(t *testing.T) {
@@ -225,15 +219,13 @@ func TestFetch_StructuralQuery_DeclineRouting(t *testing.T) {
 // confirmed to FAIL (spy.called becomes true) against a mutated tryStructuralIndexFetch with the
 // `if !indexOnly { return ... }` guard removed, before being left in its correct, passing state.
 //
-// F-9 (issue #481 parts 2/3): this invariant itself is untouched by Phase F's decline-routing
-// rewrite — orthogonal to F-8, per plan-f.md Task 9. The ONLY change is a fixture-level
-// MaxTraces: 5 addition to common.SearchOptions, forced by F-8: structQuery is a 2-node
-// structural chain with no VI coverage question at all under !indexOnly (tryStructuralIndexFetch
-// unconditionally declines here regardless of vr's state), so without a limit this decline now
-// hard-errors (ErrSearchNoCoverage) before ever reaching this test's own assertions. Adding the
-// limit keeps the SAME scan-path answer (routes through F-3's bounded structural path instead of
-// an unconditional scan) while leaving every assertion below — spy.called must stay false,
-// exactly 1 spanset found — completely unchanged.
+// Phase 7 (plan-scan-fallback.md) removed the #481-part-2 bounded-scan mechanism this test used
+// to route through with a limit present (MaxTraces: 5) — a structural decline under per-block
+// dispatch now ALWAYS hard-errors, regardless of limit (Phase 6's asymmetry finding, made
+// permanent). The invariant this test actually pins — the index-driven structural path is never
+// even ATTEMPTED for a default block-sharded (IndexOnly=false) Fetch call — still holds and is
+// still asserted below via spy.called, now alongside the hard-error outcome instead of a
+// scan-path answer.
 func TestFetch_StructuralQuery_NeverDispatchedAsBlockSharded(t *testing.T) {
 	dir := t.TempDir()
 	viStore := &fakeVISink{}
@@ -249,10 +241,9 @@ func TestFetch_StructuralQuery_NeverDispatchedAsBlockSharded(t *testing.T) {
 
 	ctx := structuralFetchReq()
 	req := traceql.FetchSpansRequest{}
-	resp, err := block.Fetch(ctx, req, common.SearchOptions{IndexOnly: false, MaxTraces: 5})
-	require.NoError(t, err)
-	spansets := drainSpansets(ctx, t, resp)
-	require.Len(t, spansets, 1, "correctness must be preserved via the scan path")
+	_, err = block.Fetch(ctx, req, common.SearchOptions{IndexOnly: false, MaxTraces: 5})
+	require.Error(t, err, "a structural decline under per-block dispatch must hard-error now, even with a limit present")
+	require.True(t, errors.Is(err, ErrSearchNoCoverage), "err = %v, want ErrSearchNoCoverage", err)
 
 	require.False(t, spy.called.Load(),
 		"a default block-sharded (IndexOnly=false) Fetch call must never attempt the structural index path")
@@ -289,12 +280,9 @@ func TestFetch_StructuralIndexOnly_ReturnsTypedErrorOnCoverageGap(t *testing.T) 
 // present on the request — indexOnly takes ABSOLUTE priority over boundedAuthorized, mirroring
 // the filter path's R11-AMENDED invariant. This invariant holds today by construction:
 // structuralDeclineOutcome(indexOnly=true, ...) unconditionally returns
-// ErrStructuralIndexCoverageGap before Fetch's `boundedAuthorized`-consuming
-// `else if !opts.IndexOnly` branch (backend_block.go) can ever be reached — but that is exactly
-// the kind of provably-safe-today, structurally-fragile invariant a future refactor of that
-// chain could silently break. Mutation-verified: forcing `boundedAuthorized` to true
-// unconditionally for the slice-job path in backend_block.go's structural branch turns this test
-// red (byte-for-byte sha256-verified restore of the mutated line afterward).
+// ErrStructuralIndexCoverageGap before Fetch's `!opts.IndexOnly` structural-decline branch
+// (backend_block.go, which now ALWAYS hard-errors regardless of limit, Phase 7) can ever be
+// reached.
 func TestFetch_IndexOnlySliceJob_DecliningStructuralQuery_HardErrors_NeverBounded(t *testing.T) {
 	dir := t.TempDir()
 	withVISink(t, nil, "")
@@ -311,30 +299,19 @@ func TestFetch_IndexOnlySliceJob_DecliningStructuralQuery_HardErrors_NeverBounde
 	_, err = block.Fetch(ctx, req, common.SearchOptions{IndexOnly: true, MaxTraces: 5})
 	require.Error(t, err, "a structural slice job's routine decline must hard-error even with a limit present")
 	require.True(t, errors.Is(err, blockpack.ErrStructuralIndexCoverageGap),
-		"err = %v, want blockpack.ErrStructuralIndexCoverageGap (IndexOnly must win over boundedAuthorized)", err)
+		"err = %v, want blockpack.ErrStructuralIndexCoverageGap (a limit must never authorize a bounded path for a slice job)", err)
 }
 
-// TestFetch_StructuralIndexOnlyFalse_VIDisabled_StillFullScans (DT2, renamed from
-// TestFetch_StructuralIndexOnlyFalse_StillFallsBackToScan per F-9, issue #481 parts 2/3, and
-// CORRECTED per team-lead ruling R18/issue #481-CRITICAL-2): an earlier revision of this test
-// (briefly named TestFetch_StructuralIndexOnlyFalse_DeclineRoutingUnaffectedByVIConfig) asserted
-// that vr == nil's WithoutLimit case should hard-error — that assertion was itself PINNING A BUG:
-// tryStructuralIndexFetch's own `if !indexOnly { return nil, false, stats, nil }` guard
-// (value_index_structural_query.go) declines unconditionally under !indexOnly WITHOUT checking vr
-// at all, so Fetch's structural branch could not previously distinguish "vr == nil, must always
-// scan" from "vr configured, this specific chain declined" — collapsing R8's zeroth, config-level
-// VI-DISABLED category into the SAME bounded/hard-error routing a genuine per-chain decline gets.
-// R18 ruled this REJECTED: R8's "keep the unconditional scan unchanged" zeroth category covers ALL
-// search, structural included, exactly like the filter path's own dedicated, early vr == nil
-// branch (tryIndexFetch's declineOutcome, never declineOutcomeBounded). Fetch now checks
-// getValueIndexQueryReader() == nil directly, before the IsStructuralQuery/boundedAuthorized
-// routing, mirroring TestFetch_VIDisabled_StillFullScans_Unchanged's filter-path precedent
-// (fetch_bounded_dispatch_test.go). This is the F-8/#77-required VIDisabled_Structural_StillFullScans
-// pinning test: BOTH with and without a limit present, vr == nil must succeed via the
-// unconditional full scan, never bound and never hard-error.
-func TestFetch_StructuralIndexOnlyFalse_VIDisabled_StillFullScans(t *testing.T) {
-	setup := func(t *testing.T) *blockpackBlock {
-		t.Helper()
+// TestFetch_StructuralIndexOnlyFalse_VIDisabled_HardErrors (Phase 0, renamed from
+// TestFetch_StructuralIndexOnlyFalse_VIDisabled_StillFullScans, which pinned the OPPOSITE, now-
+// removed unconditional-scan behavior): with NO value-index reader configured at all (vr == nil,
+// a deployment-level absence), Fetch's structural branch must hard-error with
+// ErrMaterializedIndexBuilding — mirroring the filter path's TestFetch_VIDisabled_HardErrors
+// (fetch_bounded_dispatch_test.go) — BOTH with and without a limit present, since there is no
+// index to have declined against in the first place, and no supported deployment scans as a
+// fallback anymore.
+func TestFetch_StructuralIndexOnlyFalse_VIDisabled_HardErrors(t *testing.T) {
+	t.Run("WithLimit_HardErrors", func(t *testing.T) {
 		dir := t.TempDir()
 		withVISink(t, nil, "")
 		withVIQueryReader(t, nil, "")
@@ -343,48 +320,33 @@ func TestFetch_StructuralIndexOnlyFalse_VIDisabled_StillFullScans(t *testing.T) 
 
 		rawR, _, _, err := local.New(&local.Config{Path: dir})
 		require.NoError(t, err)
-		return newBackendBlock(meta, backend.NewReader(rawR))
-	}
-
-	// WithLimit_StillFullScans is strengthened per #78 (issue #481-FOLLOWUP-1): a single 2-span
-	// chain (setup's writeParentChildBlock fixture) cannot diverge observably from a bounded read
-	// at the PRODUCTION budget default (MaxBlocks=50) — mutation-verify confirmed a version using
-	// that fixture stayed green even with the vr==nil check removed. This version injects a
-	// DELIBERATELY TIGHT budget (MaxBlocks=2) against a REAL 10-independent-chain, 20-internal-
-	// block fixture (writeRecentFirstMultiBlockChainFixture) and asserts ALL 10 chains match: if
-	// the vr==nil check were ever removed, a bounded read (with a limit present, authorizing F-3's
-	// budget) would complete only the newest chain or two within the 2-block cap, wholesale-
-	// excluding the rest (R15) — genuinely observable truncation, not merely inferred.
-	t.Run("WithLimit_StillFullScans", func(t *testing.T) {
-		withVISink(t, nil, "")
-		withVIQueryReader(t, nil, "")
-		setBoundedRecentFirstPolicyForTest(t, blockpack.RecentFirstBudget{
-			MaxBlocks: 2, MaxBytes: 64 << 20, MaxDuration: 2 * time.Second,
-		})
-		block := writeRecentFirstMultiBlockChainFixture(t, 10)
+		block := newBackendBlock(meta, backend.NewReader(rawR))
 
 		ctx := structuralFetchReq()
 		req := traceql.FetchSpansRequest{}
-		resp, err := block.Fetch(ctx, req, common.SearchOptions{IndexOnly: false, MaxTraces: 20})
-		require.NoError(t, err, "vr == nil must keep the unconditional scan unchanged, "+
-			"regardless of any limit present (R8/R18)")
-
-		spansets := drainSpansets(ctx, t, resp)
-		require.Len(t, spansets, 10, "vr == nil must complete ALL 10 chains despite the "+
-			"injected MaxBlocks=2 budget — a bounded read would wholesale-exclude most of them")
+		_, err = block.Fetch(ctx, req, common.SearchOptions{IndexOnly: false, MaxTraces: 20})
+		require.Error(t, err, "vr == nil must hard-error even with a limit present (R8/R18-superseded)")
+		require.True(t, errors.Is(err, ErrMaterializedIndexBuilding),
+			"err = %v, want ErrMaterializedIndexBuilding", err)
 	})
 
-	t.Run("WithoutLimit_StillFullScans", func(t *testing.T) {
-		block := setup(t)
+	t.Run("WithoutLimit_HardErrors", func(t *testing.T) {
+		dir := t.TempDir()
+		withVISink(t, nil, "")
+		withVIQueryReader(t, nil, "")
+
+		meta, _ := writeParentChildBlock(t, dir, uuid.New())
+
+		rawR, _, _, err := local.New(&local.Config{Path: dir})
+		require.NoError(t, err)
+		block := newBackendBlock(meta, backend.NewReader(rawR))
+
 		ctx := structuralFetchReq()
 		req := traceql.FetchSpansRequest{}
-		resp, err := block.Fetch(ctx, req, common.SearchOptions{IndexOnly: false})
-		require.NoError(t, err, "vr == nil must keep the unconditional scan unchanged, "+
-			"even with no limit at all (R8/R18) — never hard-error")
-
-		spansets := drainSpansets(ctx, t, resp)
-		require.Len(t, spansets, 1)
-		require.NotEmpty(t, spansets[0].Spans)
+		_, err = block.Fetch(ctx, req, common.SearchOptions{IndexOnly: false})
+		require.Error(t, err, "vr == nil must hard-error even with no limit at all")
+		require.True(t, errors.Is(err, ErrMaterializedIndexBuilding),
+			"err = %v, want ErrMaterializedIndexBuilding", err)
 	})
 }
 

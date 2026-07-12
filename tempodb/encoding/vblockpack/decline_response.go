@@ -69,8 +69,10 @@ func DeclineErrorToHTTPResponse(err error) (status int, message string, matched 
 		// issue (the value index isn't reachable on this querier at all — no S3 backend
 		// configured, or the S3 client failed to build), not a property of the query
 		// itself — per coder-f1's #70 fix, this must not be lumped with the per-shape
-		// sentinels. There is no longer an explicit opt-out setting (2026-07-11, the
-		// index-driven query path is unconditional on any S3-backed target).
+		// sentinels. There is no longer an explicit operator opt-out setting for a
+		// CONFIGURED backend (2026-07-11, the index-driven query path is unconditional on
+		// any S3-backed target) -- this case fires only when no backend at all is
+		// configured for this querier, or the S3 client failed to initialize.
 		return http.StatusUnprocessableEntity,
 			"metrics query requires the value index, which is not reachable on this querier (no S3 backend configured, or the S3 client failed to initialize)",
 			true
@@ -82,9 +84,14 @@ func DeclineErrorToHTTPResponse(err error) (status int, message string, matched 
 			"cube not yet backfilled for this query shape/window; cube creation was triggered, retry shortly",
 			true
 
+	case errors.Is(err, ErrMaterializedIndexBuilding):
+		return http.StatusUnprocessableEntity,
+			"search requires the materialized value index, which is not configured on this querier",
+			true
+
 	case errors.Is(err, ErrSearchNoCoverage):
 		return http.StatusUnprocessableEntity,
-			"search index has no coverage for this query and no bounded-recent-first path was authorized",
+			"search index has no coverage yet (materialized index still building for this window)",
 			true
 
 	case errors.Is(err, ErrSliceIndexCoverageGap):
@@ -95,6 +102,23 @@ func DeclineErrorToHTTPResponse(err error) (status int, message string, matched 
 	case errors.Is(err, blockpack.ErrStructuralIndexCoverageGap):
 		return http.StatusUnprocessableEntity,
 			"structural query's index coverage gap has no safe fallback for this job",
+			true
+
+	case errors.Is(err, blockpack.ErrTraceByIDIndexNotConfigured):
+		// Mirrors ErrMaterializedIndexBuilding's text/reason (a deployment-level absence, not a
+		// per-trace coverage gap, NOTE-VI-073: there is no scan fallback) but names "trace
+		// lookup" specifically, so the message stays distinct and actionable for an operator
+		// diagnosing which of the two paths (search vs. trace-by-id) actually failed.
+		return http.StatusUnprocessableEntity,
+			"trace lookup requires the materialized value index, which is not configured on this querier",
+			true
+
+	case errors.Is(err, blockpack.ErrTraceByIDCoverageGap):
+		// Mirrors ErrSearchNoCoverage's text/reason (the index is configured, but this specific
+		// window lacks coverage, NOTE-VI-072) but names "trace lookup" specifically, for the
+		// same distinct-message reason as ErrTraceByIDIndexNotConfigured above.
+		return http.StatusUnprocessableEntity,
+			"trace lookup index has no coverage yet (materialized index still building for this window)",
 			true
 
 	default:

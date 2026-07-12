@@ -4,10 +4,6 @@ import "github.com/grafana/blockpack/internal/modules/queryplanner"
 
 // CollectOptions is a blockpack data type.
 type CollectOptions struct {
-	// RecentFirstBudget activates the bounded, pointed newest-first execution strategy
-	// (issue #481 part 2) — see RecentFirstBudget's own doc comment for the full contract.
-	// nil (the zero value) means the normal, unbounded scan behavior — no change.
-	RecentFirstBudget *RecentFirstBudget
 	// TimestampColumn is the intrinsic column used to order results when WantSort is
 	// true, and the column whose refs the match-all fast paths read. It may be set even
 	// when WantSort is false (e.g. always "span:start" for trace search) to enable the

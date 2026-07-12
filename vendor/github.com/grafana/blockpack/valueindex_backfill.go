@@ -153,7 +153,7 @@ func (e *BackfillEngine) Run(ctx context.Context, progressFn func(BackfillProgre
 	// Small operator-facing addition (2026-07-11): a <colHash>/metadata.json naming
 	// this column and when its Entry was first registered, so "are we seeing these
 	// columns come through?" is answerable by reading one small object per column,
-	// instead of log archaeology or the viusage registry's own less-discoverable path.
+	// instead of log archeology or the viusage registry's own less-discoverable path.
 	if err := writeColumnMetadata(
 		e.cfg.Store, e.entry.Tenant, e.cfg.IndexPrefix, e.entry.ColumnName, e.entry.ColumnType, e.entry.CreatedAt,
 	); err != nil {

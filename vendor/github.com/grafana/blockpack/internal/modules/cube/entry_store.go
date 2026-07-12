@@ -242,21 +242,26 @@ type EntryStore interface {
 type externalEntryStoreAdapter struct{ EntryStore }
 
 func (a *externalEntryStoreAdapter) load(ctx context.Context, tenant string) ([]RegistryEntry, error) {
-	return a.EntryStore.Load(ctx, tenant)
+	return a.Load(ctx, tenant)
 }
 
-func (a *externalEntryStoreAdapter) addEntry(ctx context.Context, tenant string, entry RegistryEntry, maxCubes int) error {
-	return a.EntryStore.AddEntry(ctx, tenant, entry, maxCubes)
+func (a *externalEntryStoreAdapter) addEntry(
+	ctx context.Context,
+	tenant string,
+	entry RegistryEntry,
+	maxCubes int,
+) error {
+	return a.AddEntry(ctx, tenant, entry, maxCubes)
 }
 
 func (a *externalEntryStoreAdapter) removeEntry(ctx context.Context, tenant, cubeID string) error {
-	return a.EntryStore.RemoveEntry(ctx, tenant, cubeID)
+	return a.RemoveEntry(ctx, tenant, cubeID)
 }
 
 func (a *externalEntryStoreAdapter) updateWatermarksEntry(
 	ctx context.Context, tenant, cubeID string, level, minMinute, maxMinute uint32,
 ) error {
-	return a.EntryStore.UpdateWatermarksEntry(ctx, tenant, cubeID, level, minMinute, maxMinute)
+	return a.UpdateWatermarksEntry(ctx, tenant, cubeID, level, minMinute, maxMinute)
 }
 
 // NewRegistryFromEntryStore constructs a Registry over an externally-supplied

@@ -187,7 +187,16 @@ func ExecuteStructuralFromIndex(
 
 	colHash := valueindex.ColHash(modules_shared.TraceIDColumnName)
 	colTypeName := valueindex.ColTypeName(modules_shared.ColumnTypeUUID)
-	keys, discoverErr := valueindex.DiscoverIndexFiles(ctx, traceGroupStore, tenant, indexPrefix, colHash, colTypeName, minTS, maxTS)
+	keys, discoverErr := valueindex.DiscoverIndexFiles(
+		ctx,
+		traceGroupStore,
+		tenant,
+		indexPrefix,
+		colHash,
+		colTypeName,
+		minTS,
+		maxTS,
+	)
 	if discoverErr != nil {
 		return nil, false, fmt.Errorf("ExecuteStructuralFromIndex: discover index files: %w", discoverErr)
 	}
@@ -205,7 +214,7 @@ func ExecuteStructuralFromIndex(
 		}
 		done, err := evalOneStructuralCandidateTrace(
 			ctx, traceID, keys, traceGroupStore, readerFor, minTS, maxTS,
-			leftSpansByTrace[traceID], op, rightProg, opts, result, stats,
+			leftSpansByTrace[traceID].spans, op, rightProg, opts, result, stats,
 		)
 		if err != nil {
 			return nil, false, err
@@ -279,7 +288,7 @@ func evalOneStructuralCandidateTrace(
 	}
 
 	recs := resolvedSpansToStructuralRecs(resolvedSpans, leftMatchAddrs)
-	resolved, _ := resolveStructuralParentIndices([][]structuralSpanRec{recs}, nil, false)
+	resolved := resolveStructuralParentIndices([][]structuralSpanRec{recs}, nil)
 	if len(resolved) == 0 {
 		return false, nil
 	}
@@ -326,32 +335,57 @@ func evalOneStructuralCandidateTrace(
 	return false, nil
 }
 
-// groupVILookupResultsByTrace groups a ValueIndexSource lookup's results by TraceID, keeping only
-// the set of matching span addresses per trace (identity only — no field materialization needed
-// for the structural walk). Keyed by structuralSpanAddr (SourceRef, BlockPage, RowIdx), NOT
-// SpanID — see structuralSpanAddr's own doc comment (task #12, FIX-D4-CRITICAL) for why SpanID is
-// not a valid join key for ordinary attribute-column VI entries.
-func groupVILookupResultsByTrace(results []VILookupResult) map[[16]byte]map[structuralSpanAddr]struct{} {
-	byTrace := make(map[[16]byte]map[structuralSpanAddr]struct{}, len(results))
+// traceSpanSet wraps a trace's matching span-address set alongside its max recency (the highest
+// TimeSec among that trace's matching spans on this side), keeping the two pieces of per-trace
+// state from drifting apart across the call chain (Phase 5, plan-scan-fallback.md — recommended
+// wrapped-struct approach over a second parallel map).
+type traceSpanSet struct {
+	spans      map[structuralSpanAddr]struct{}
+	maxTimeSec uint64
+}
+
+// groupVILookupResultsByTrace groups a ValueIndexSource lookup's results by TraceID, keeping the
+// set of matching span addresses per trace (identity only — no field materialization needed for
+// the structural walk) ALONGSIDE that trace's max recency (Phase 5: chooseDiscoverySeed below
+// needs this to order candidates newest-first instead of lexicographically). Keyed by
+// structuralSpanAddr (SourceRef, BlockPage, RowIdx), NOT SpanID — see structuralSpanAddr's own doc
+// comment (task #12, FIX-D4-CRITICAL) for why SpanID is not a valid join key for ordinary
+// attribute-column VI entries.
+func groupVILookupResultsByTrace(results []VILookupResult) map[[16]byte]traceSpanSet {
+	byTrace := make(map[[16]byte]traceSpanSet, len(results))
 	for _, r := range results {
 		set, ok := byTrace[r.TraceID]
 		if !ok {
-			set = make(map[structuralSpanAddr]struct{})
-			byTrace[r.TraceID] = set
+			set = traceSpanSet{spans: make(map[structuralSpanAddr]struct{})}
 		}
-		set[structuralSpanAddr{sourceRef: r.SourceRef, blockPage: r.BlockPage, rowIdx: r.RowIdx}] = struct{}{}
+		set.spans[structuralSpanAddr{sourceRef: r.SourceRef, blockPage: r.BlockPage, rowIdx: r.RowIdx}] = struct{}{}
+		if r.TimeSec > set.maxTimeSec {
+			set.maxTimeSec = r.TimeSec
+		}
+		byTrace[r.TraceID] = set
 	}
 	return byTrace
 }
 
-// chooseDiscoverySeed returns the sorted candidate TraceID list from spansByTrace (either side's
-// grouped VI matches — see chooseCandidateTraceIDs, which decides WHICH side to pass here).
-func chooseDiscoverySeed(spansByTrace map[[16]byte]map[structuralSpanAddr]struct{}) [][16]byte {
+// chooseDiscoverySeed returns the candidate TraceID list from spansByTrace (either side's grouped
+// VI matches — see chooseCandidateTraceIDs, which decides WHICH side to pass here), ordered by
+// max recency DESCENDING (newest first, Phase 5) so evalOneStructuralCandidateTrace's existing
+// early-stopping (opts.Limit) returns the newest matches rather than an arbitrary subset of the
+// right size. Falls back to lexicographic-by-TraceID-bytes ONLY as a tiebreaker, for reproducible
+// test fixtures and stable pagination — never for correctness, since two traces sharing the exact
+// same max recency have no meaningful "more recent" relationship to preserve.
+func chooseDiscoverySeed(spansByTrace map[[16]byte]traceSpanSet) [][16]byte {
 	ids := make([][16]byte, 0, len(spansByTrace))
 	for traceID := range spansByTrace {
 		ids = append(ids, traceID)
 	}
-	sort.Slice(ids, func(i, j int) bool { return bytes.Compare(ids[i][:], ids[j][:]) < 0 })
+	sort.Slice(ids, func(i, j int) bool {
+		si, sj := spansByTrace[ids[i]], spansByTrace[ids[j]]
+		if si.maxTimeSec != sj.maxTimeSec {
+			return si.maxTimeSec > sj.maxTimeSec
+		}
+		return bytes.Compare(ids[i][:], ids[j][:]) < 0
+	})
 	return ids
 }
 
@@ -376,14 +410,14 @@ func chooseCandidateTraceIDs(
 	rightProg *vm.Program,
 	isSelective StructuralSelectivityClassifier,
 	leftProg *vm.Program,
-	leftSpansByTrace map[[16]byte]map[structuralSpanAddr]struct{},
+	leftSpansByTrace map[[16]byte]traceSpanSet,
 ) [][16]byte {
 	leftSelective := isSelective != nil && isSelective(leftProg)
 	rightSelective := isSelective != nil && rightSource != nil && isSelective(rightProg)
 
-	var rightSpansByTrace map[[16]byte]map[structuralSpanAddr]struct{}
+	var rightSpansByTrace map[[16]byte]traceSpanSet
 	rightAttempted := false
-	resolveRight := func() map[[16]byte]map[structuralSpanAddr]struct{} {
+	resolveRight := func() map[[16]byte]traceSpanSet {
 		if !rightAttempted {
 			rightAttempted = true
 			if rightResults, rightOK := viMatchSpans(rightSource, rightProg); rightOK {
@@ -415,7 +449,7 @@ func chooseCandidateTraceIDs(
 
 // intersectTraceIDSets keeps only the TraceIDs in ids that also appear in other — the step-4
 // prefilter (both sides Selective). Order is preserved from ids.
-func intersectTraceIDSets(ids [][16]byte, other map[[16]byte]map[structuralSpanAddr]struct{}) [][16]byte {
+func intersectTraceIDSets(ids [][16]byte, other map[[16]byte]traceSpanSet) [][16]byte {
 	out := ids[:0:0]
 	for _, id := range ids {
 		if _, ok := other[id]; ok {
@@ -463,7 +497,11 @@ func materializeConfirmedSpanBlocks(confirmed []ResolvedSpan) (map[verifyBlockKe
 		if !ok {
 			return nil, fmt.Errorf("index/data skew: block %d missing from read result", key.blockIdx)
 		}
-		bwb, parseErr := key.reader.ParseBlockFromBytes(raw, modules_reader.WantAll(), key.reader.BlockMeta(key.blockIdx))
+		bwb, parseErr := key.reader.ParseBlockFromBytes(
+			raw,
+			modules_reader.WantAll(),
+			key.reader.BlockMeta(key.blockIdx),
+		)
 		if parseErr != nil {
 			return nil, fmt.Errorf("parse block %d: %w", key.blockIdx, parseErr)
 		}
@@ -482,7 +520,10 @@ func materializeConfirmedSpanBlocks(confirmed []ResolvedSpan) (map[verifyBlockKe
 // attribute VI entries in production); bit1 (0x02) is set for EVERY span (R is provisionally
 // treated as match-all, mirroring compileStructuralPair's own nil-filter convention) — D3B's
 // verifyCandidateSpans confirms R's real filter afterward against exactly the walk's survivors.
-func resolvedSpansToStructuralRecs(spans []ResolvedSpan, leftMatchAddrs map[structuralSpanAddr]struct{}) []structuralSpanRec {
+func resolvedSpansToStructuralRecs(
+	spans []ResolvedSpan,
+	leftMatchAddrs map[structuralSpanAddr]struct{},
+) []structuralSpanRec {
 	recs := make([]structuralSpanRec, len(spans))
 	for i, sp := range spans {
 		rec := structuralSpanRec{

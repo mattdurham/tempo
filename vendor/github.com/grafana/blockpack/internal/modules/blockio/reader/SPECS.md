@@ -516,3 +516,50 @@ The block cache methods used in `ReadGroup` are `r.cache.GetBlockColumns` and
 typed implementations reconstruct it internally.
 
 Back-ref: `internal/modules/blockio/reader/reader.go:Reader.ReadGroup`
+
+---
+
+## SPEC-RDR-013: `BlockIndicesNewestFirst` — Newest-First Block Ordering by minTS Descending
+*Added: 2026-07-12 (plan-scan-fallback.md Phase 6b)*
+
+**Contract:** `(r *Reader) BlockIndicesNewestFirst(minNano, maxNano uint64) []int` mirrors
+`BlocksInTimeRange`'s own overlap rule (a block overlaps when `maxTS >= minNano && minTS <=
+maxNano`, with `minTS==0 && maxTS==0` blocks — unknown time — always included) but returns the
+overlapping block indices sorted by **`minTS` DESCENDING** instead of `BlocksInTimeRange`'s
+ascending-`blockID` order. This is a pure in-memory reorder of the same overlap set — no
+additional I/O, no block-body decode — using the resident TS-index entries (or, on the fallback
+path below, the resident `BlockMeta` list); zero-copy scanning of the raw 20-byte-per-entry TS
+buffer, same as `BlocksInTimeRange`.
+
+**No documented tie-break for equal `minTS` values.** Unlike `chooseDiscoverySeed`
+(`executor/structural_index.go`, plan-scan-fallback.md Phase 5), which explicitly falls back to a
+lexicographic tiebreak for determinism, `BlockIndicesNewestFirst`'s `slices.SortFunc` comparator
+returns `0` for equal `minTS` with no secondary key — the relative order of two blocks with
+identical `minTS` is whatever the underlying sort algorithm produces, not an API-level guarantee.
+This is accepted, not a bug: blocks with identical `minTS` are equally "newest" for this
+function's purpose (bounding how many blocks a caller visits before reaching its own stopping
+condition), and no caller of this function (`QueryNewestFirstMatchAll`, root `SPEC-ROOT-024`)
+depends on a specific tie-break order for correctness.
+
+**Fallback for legacy files with no TS-index section (`blockIndicesNewestFirstFromBlockMeta`):**
+when `r.tsCount == 0`, sorts the already-resident `[]BlockMeta` by `MaxStart` DESCENDING instead
+— zero body I/O, since `BlockMeta` is already in memory. Note the fallback sorts by `MaxStart`
+(a block's latest span) while the TS-index path sorts by `minTS` (a block's earliest span) — both
+are read as "this block's own newest-first key," but they are not the same field; a caller should
+not assume identical tie-break/ordering behavior between the TS-index and fallback paths for
+files whose blocks have wide internal time spans. This mirrors `BlocksInTimeRange`'s own
+documented "callers fall back to a full `BlockMeta` scan" contract, except the fallback lives
+inside this method so every caller gets one complete, consistent answer without re-deriving it.
+
+**Explicitly NOT a per-row/per-span time filter.** This function prunes and orders at BLOCK
+granularity only (an entire block is included or excluded based on its own `[minTS, maxTS]`
+range overlapping the query window) — it makes no claim about, and performs no check on,
+individual span timestamps within an included block. A block can overlap `[minNano, maxNano]`
+while containing some spans outside that exact window. Any caller needing exact per-span window
+correctness must obtain it downstream — see root `SPEC.md` `SPEC-ROOT-024` for the one current
+consumer (`QueryNewestFirstMatchAll`) and how it satisfies this requirement via the ordinary
+`Collect` path's existing per-row filtering (`internal/modules/executor/SPECS.md` `SPEC-STREAM-4`),
+not via any window-awareness added to this function or its caller.
+
+Back-refs: `internal/modules/blockio/reader/ts_index.go:BlockIndicesNewestFirst,
+blockIndicesNewestFirstFromBlockMeta,tsEntryMinTSDesc`. See root `SPEC.md` `SPEC-ROOT-024`.

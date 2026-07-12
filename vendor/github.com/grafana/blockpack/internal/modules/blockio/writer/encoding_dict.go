@@ -526,8 +526,8 @@ buildBytesDict(values [][]byte, present []bool) (entries [][]byte, indexes []uin
 		}
 		v := []byte{}
 		if i < len(values) {
-			v = // Sort entries lexicographically and rebuild index map.
-			values[i]
+			// Sort entries lexicographically and rebuild index map.
+			v = values[i]
 		}
 		indexes = append(indexes, seen[string(v)])
 	}

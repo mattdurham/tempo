@@ -4,6 +4,7 @@ package executor
 
 import (
 	"bytes"
+	"container/heap"
 	"context"
 	"encoding/binary"
 	"slices"
@@ -216,7 +217,17 @@ func viMatchSpans(source ValueIndexSource, prog *vm.Program) ([]VILookupResult, 
 		// Columns referenced but no evaluable nodes — cannot resolve from the index.
 		return nil, false
 	}
-	return viEvalNodes(source, preds.Nodes, false)
+	// Explicit opt-in (reviewer-2-6 MEDIUM fix): only a source vibuilder.BuildSourceBounded
+	// itself marked (via MarkNewestFirst) may route through viEvalAND/viEvalOR below. Every
+	// other caller — ExecuteTraceMetricsFromVI, the structural path, and QueryTraceQLFromIndex
+	// when the source came from the ordinary unbounded BuildSource — gets newestFirst=false
+	// here and stays on the pre-Phase-3/4 key-sorted merge-join chain, byte-identical to
+	// before those phases existed. sl==nil (a test fake ValueIndexSource) also defaults false.
+	newestFirst := false
+	if sl, ok := source.(*SliceValueIndexSource); ok {
+		newestFirst = sl.isNewestFirst()
+	}
+	return viEvalNodes(source, preds.Nodes, false, newestFirst)
 }
 
 // viEvalNodes evaluates a slice of sibling RangeNodes combined by AND, returning the
@@ -231,11 +242,113 @@ func viMatchSpans(source ValueIndexSource, prog *vm.Program) ([]VILookupResult, 
 // allocation. This bounds intersect/union to O(n+m) time and O(1) extra space
 // beyond the output, matching the spec's "merge-join on sorted span ID sets to
 // avoid materializing large sets in memory".
-func viEvalNodes(source ValueIndexSource, nodes []vm.RangeNode, isOR bool) ([]VILookupResult, bool) {
+//
+// Phase 2 (plan-scan-fallback.md): a GENUINE single leaf (exactly one top-level node,
+// itself a leaf with no children — nothing to intersect/union with) skips the sort-by-
+// span-key step entirely and returns viEvalNode's own result unchanged. Sorting was never
+// load-bearing for a lone leaf's correctness (there is no second set to merge-join
+// against); it was only ever a precondition for the multi-node merge-join below. Skipping
+// it here lets the caller's own result order survive unchanged — specifically,
+// BuildSourceBounded's newest-first early-stopping order — which the multi-node path
+// still destroys today (Phase 3/4's own job to fix, not this one: viUnionSorted/
+// viIntersectSorted are both key-sorted, not time-sorted, exactly per this file's own
+// existing doc comments on those functions). A genuine duplicate within a single leaf's
+// own results is still safely collapsed downstream by QueryTraceQLFromIndex's own
+// identity map (search_trace_vi.go), so this is not a correctness regression for that
+// case either.
+// Phase 3 (plan-scan-fallback.md): a GENUINE flat OR of leaves (isOR, every sibling itself
+// a leaf with no children -- "absence of nested AND") resolves via ViUnionNewestFirst
+// instead of the sort-by-span-key merge-join above. This applies at ANY nesting depth
+// (viEvalNode recurses into a composite's own Children with the SAME isOR flag, so a
+// nested `(B OR C)` sub-clause of leaves gets this treatment too, not just a top-level
+// OR). limit=0 (unbounded) is used here: correctness (WHICH spans end up in the union,
+// deduplicated by the same viSpanCmp identity rule viUnionSorted uses) does not depend on
+// input order -- a k-way merge visits every element of every set exactly once regardless
+// of whether each set happens to be newest-first-sorted. Only the OUTPUT order depends on
+// that: when the source was built via BuildSourceBounded's early-stopping path (Phase 2),
+// each leaf's own results already arrive newest-first, so the merged output is genuinely
+// newest-first end to end; when built via the ordinary unbounded BuildSource, this is
+// simply a harmless reordering with zero effect on an unbounded query's correctness.
+func viEvalOR(source ValueIndexSource, nodes []vm.RangeNode) ([]VILookupResult, bool) {
+	sets := make([][]VILookupResult, len(nodes))
+	for i := range nodes {
+		// nodes are all leaves here (viNodesAreAllLeaves already checked by the caller), so
+		// viEvalNode never recurses into viEvalNodes for these -- newestFirst=true is passed
+		// for semantic consistency (we are already inside a confirmed newest-first context)
+		// but has no observable effect since len(node.Children)==0 for every node here.
+		set, ok := viEvalNode(source, &nodes[i], true)
+		if !ok {
+			return nil, false
+		}
+		sets[i] = set
+	}
+	return ViUnionNewestFirst(sets, 0), true
+}
+
+// viEvalAND is viEvalOR's AND-side twin (Phase 4, plan-scan-fallback.md): a GENUINE flat
+// AND of leaves (every sibling itself a leaf with no children) resolves via
+// viIntersectOrdered instead of the key-sorted viSortDedup/viIntersectSorted merge-join
+// below, preserving whatever order the per-leaf sets already carry (newest-first, when the
+// source was built via BuildSourceBounded's Phase 4 anchor+confirm path; unchanged content
+// either way when built via the ordinary unbounded BuildSource). Correctness never depends
+// on WHICH leaf's order is preserved or on how the per-leaf sets were produced -- each set
+// is already independently correct for its own leaf's predicate regardless of source, so
+// narrowing to their intersection is safe by construction (viIntersectOrdered only ever
+// removes elements, never adds any).
+func viEvalAND(source ValueIndexSource, nodes []vm.RangeNode) ([]VILookupResult, bool) {
+	sets := make([][]VILookupResult, len(nodes))
+	for i := range nodes {
+		// nodes are all leaves here (viNodesAreAllLeaves already checked by the caller), so
+		// viEvalNode never recurses into viEvalNodes for these -- newestFirst=true is passed
+		// for semantic consistency (we are already inside a confirmed newest-first context)
+		// but has no observable effect since len(node.Children)==0 for every node here.
+		set, ok := viEvalNode(source, &nodes[i], true)
+		if !ok {
+			return nil, false
+		}
+		sets[i] = set
+	}
+	return viIntersectOrdered(sets), true
+}
+
+// viNodesAreAllLeaves reports whether every node in nodes is itself a leaf (no children) --
+// the precondition for viEvalOR's flat-OR optimization above.
+func viNodesAreAllLeaves(nodes []vm.RangeNode) bool {
+	for i := range nodes {
+		if len(nodes[i].Children) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// newestFirst is the explicit opt-in reviewer-2-6's MEDIUM finding required (see
+// viMatchSpans's own doc comment): only true when the caller's source was built via
+// vibuilder.BuildSourceBounded's genuine early-stopping path. False routes every flat-
+// leaves AND/OR shape through the ORIGINAL key-sorted viSortDedup/viUnionSorted/
+// viIntersectSorted chain below, byte-identical to pre-Phase-3/4 behavior -- this is the
+// default for every existing (non-bounded) caller.
+func viEvalNodes(source ValueIndexSource, nodes []vm.RangeNode, isOR, newestFirst bool) ([]VILookupResult, bool) {
+	if len(nodes) == 1 {
+		// A single top-level/sibling node has nothing else to merge-join against at THIS
+		// level, whether it is a leaf (nothing to combine, full stop) or itself a composite
+		// (viEvalNode recurses into it and that recursive call already performs its own
+		// correct dedup/combination internally -- wrapping the result in another
+		// viSortDedup here would be redundant at best and, for a composite child resolved
+		// via viEvalOR's newest-first merge below, actively destructive: it would re-sort
+		// away the exact order Phase 2/3's early-stopping worked to establish.
+		return viEvalNode(source, &nodes[0], newestFirst)
+	}
+	if newestFirst && isOR && viNodesAreAllLeaves(nodes) {
+		return viEvalOR(source, nodes)
+	}
+	if newestFirst && !isOR && viNodesAreAllLeaves(nodes) {
+		return viEvalAND(source, nodes)
+	}
 	var acc []VILookupResult
 	first := true
 	for i := range nodes {
-		set, ok := viEvalNode(source, &nodes[i])
+		set, ok := viEvalNode(source, &nodes[i], newestFirst)
 		if !ok {
 			return nil, false
 		}
@@ -257,9 +370,11 @@ func viEvalNodes(source ValueIndexSource, nodes []vm.RangeNode, isOR bool) ([]VI
 
 // viEvalNode evaluates a single node. A node with children is an internal AND/OR
 // combiner; a leaf node carries a Column and is resolved via the value index.
-func viEvalNode(source ValueIndexSource, node *vm.RangeNode) ([]VILookupResult, bool) {
+// newestFirst is forwarded unchanged into any recursive viEvalNodes call — see that
+// function's own doc comment for the explicit-opt-in contract.
+func viEvalNode(source ValueIndexSource, node *vm.RangeNode, newestFirst bool) ([]VILookupResult, bool) {
 	if len(node.Children) > 0 {
-		return viEvalNodes(source, node.Children, node.IsOR)
+		return viEvalNodes(source, node.Children, node.IsOR, newestFirst)
 	}
 	if node.Column == "" {
 		return nil, false
@@ -291,6 +406,100 @@ func viSortDedup(set []VILookupResult) []VILookupResult {
 		out = append(out, s)
 	}
 	return out
+}
+
+// ViUnionNewestFirst merges N per-leaf newest-first-ordered VILookupResult slices
+// (Phase 2's BuildSourceBounded output per leaf, plan-scan-fallback.md Phase 3) into a
+// single newest-first stream, deduplicating by the SAME (SourceRef, span key) identity
+// rule viSpanCmp/viSortDedup/viUnionSorted use, stopping once the deduplicated output
+// reaches limit. A k-way heap merge (container/heap) over N per-leaf streams, not a
+// repeated pairwise viUnionSorted (which is key-sorted, not time-sorted, and would defeat
+// early-stopping).
+//
+// limit<=0 means unbounded: every element of every set is eventually visited and
+// deduplicated. Exported (capitalized) so vibuilder — a different package, mirroring how
+// it already consumes VILookupResult/SliceValueIndexSource — can call it directly for
+// Phase 3's multi-leaf-OR routing, per this file's own "boolean combination logic lives in
+// executor, callers never re-implement it" convention (viEvalNodes itself).
+//
+// Correctness does not depend on the input sets actually being sorted newest-first: the
+// heap visits every element of every set exactly once regardless of order, so the returned
+// UNION (which elements are included) is correct even over arbitrarily-ordered inputs.
+// Only the OUTPUT's own order depends on the inputs' order — when every input set is
+// genuinely newest-first (as BuildSourceBounded's early-stopping resolution produces), the
+// merged output is too, and early-stopping at limit then represents the true newest-limit
+// union rather than an arbitrary same-size subset.
+func ViUnionNewestFirst(sets [][]VILookupResult, limit int) []VILookupResult {
+	h := &viNewestFirstHeap{sets: sets}
+	for si, set := range sets {
+		if len(set) > 0 {
+			h.items = append(h.items, viNewestFirstHeapItem{setIdx: si, elemIdx: 0})
+		}
+	}
+	heap.Init(h)
+
+	type seenKey struct {
+		sourceRef string
+		key       [22]byte
+	}
+	seen := make(map[seenKey]struct{})
+	var out []VILookupResult
+	for h.Len() > 0 {
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+		it := heap.Pop(h).(viNewestFirstHeapItem) //nolint:forcetypeassert // heap.Interface contract, this package's own type
+		e := sets[it.setIdx][it.elemIdx]
+		sk := seenKey{sourceRef: e.SourceRef, key: viSpanKey(e)}
+		if _, dup := seen[sk]; !dup {
+			seen[sk] = struct{}{}
+			out = append(out, e)
+		}
+		if it.elemIdx+1 < len(sets[it.setIdx]) {
+			heap.Push(h, viNewestFirstHeapItem{setIdx: it.setIdx, elemIdx: it.elemIdx + 1})
+		}
+	}
+	return out
+}
+
+// viNewestFirstHeapItem identifies one candidate element (the current head of one input
+// set) in viNewestFirstHeap's k-way merge.
+type viNewestFirstHeapItem struct {
+	setIdx, elemIdx int
+}
+
+// viNewestFirstHeap is a container/heap.Interface max-heap over the CURRENT head element of
+// each input set, ordered by TimeSec descending (newest first) — ViUnionNewestFirst's k-way
+// merge primitive.
+type viNewestFirstHeap struct {
+	sets  [][]VILookupResult
+	items []viNewestFirstHeapItem
+}
+
+func (h *viNewestFirstHeap) Len() int { return len(h.items) }
+
+func (h *viNewestFirstHeap) Less(i, j int) bool {
+	a := h.sets[h.items[i].setIdx][h.items[i].elemIdx]
+	b := h.sets[h.items[j].setIdx][h.items[j].elemIdx]
+	return a.TimeSec > b.TimeSec // max-heap by TimeSec: newest first
+}
+
+func (h *viNewestFirstHeap) Swap(i, j int) { h.items[i], h.items[j] = h.items[j], h.items[i] }
+
+func (h *viNewestFirstHeap) Push(x any) {
+	item, ok := x.(viNewestFirstHeapItem)
+	if !ok {
+		return
+	}
+	h.items = append(h.items, item)
+}
+
+func (h *viNewestFirstHeap) Pop() any {
+	old := h.items
+	n := len(old)
+	item := old[n-1]
+	h.items = old[:n-1]
+	return item
 }
 
 // viUnionSorted returns the union of two key-sorted, key-deduplicated span sets
@@ -397,6 +606,18 @@ type SliceValueIndexSource struct {
 	// stats records the build-time I/O so the querier can report it (issue #465).
 	stats ValueIndexBuildStats
 	mu    sync.Mutex
+	// newestFirst is true only when EVERY leaf Added to this source was resolved via a
+	// genuine newest-first early-stopping path (vibuilder.BuildSourceBounded's Phase
+	// 2/3/4 codepaths — single leaf, flat OR, or pure AND anchor+confirm), never when any
+	// leaf fell through to the ordinary unbounded lookupColumn. Set once via
+	// MarkNewestFirst by the builder; read by viMatchSpans to decide whether viEvalNodes
+	// may route through viEvalAND/viEvalOR's order-preserving merge instead of the
+	// default key-sorted viSortDedup/viUnionSorted/viIntersectSorted chain. Defaults
+	// false, so every existing (non-bounded) caller is byte-identical to pre-Phase-3/4
+	// behavior — the fix for reviewer-2-6's MEDIUM finding (isolate the new routing
+	// behind an explicit opt-in instead of firing for any flat-leaves shape regardless of
+	// caller).
+	newestFirst bool
 }
 
 // NewSliceValueIndexSource builds an empty source. Use Add to populate per-column
@@ -405,6 +626,32 @@ func NewSliceValueIndexSource() *SliceValueIndexSource {
 	return &SliceValueIndexSource{
 		data: make(map[string]map[modules_shared.ColumnType][]VILookupResult),
 	}
+}
+
+// MarkNewestFirst records that every leaf this source will have (or already has) Added
+// was resolved via a genuine newest-first early-stopping path — see the newestFirst
+// field's own doc comment for the exact contract. The caller (vibuilder.BuildSourceBounded)
+// must call this ONLY when true for the WHOLE source, never per-leaf: viEvalAND/viEvalOR
+// combine leaves from the same source together, so a partially-bounded source (some
+// leaves early-stopped, others not) must NOT be marked -- BuildSourceBounded's own
+// single-leaf/flat-OR/pure-AND branches are each all-or-nothing across every leaf in the
+// query today, so this is always safe to call unconditionally when one of those branches
+// was taken.
+func (s *SliceValueIndexSource) MarkNewestFirst() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.newestFirst = true
+}
+
+// isNewestFirst reports whether MarkNewestFirst was called on this source. Unexported:
+// only viMatchSpans (same package) needs to read this, via a type assertion against the
+// ValueIndexSource interface parameter it receives -- deliberately NOT part of the
+// ValueIndexSource interface itself, so test fakes implementing that interface elsewhere
+// in this package need no changes and implicitly behave as newestFirst=false.
+func (s *SliceValueIndexSource) isNewestFirst() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.newestFirst
 }
 
 // RecordFileIO accumulates the builder's per-column download I/O into the source's

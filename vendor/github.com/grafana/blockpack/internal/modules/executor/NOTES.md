@@ -7085,6 +7085,25 @@ is unaffected — it does not pass through the merge-join and returns source-ord
 Back-ref: `metrics_trace.go:viEvalNodes/viSortDedup/viUnionSorted/viIntersectSorted`,
 tests `vi_mergejoin_internal_test.go` (incl. a randomized cross-check against naive map sets).
 
+**Addendum (2026-07-12, task #194, reviewer-1-5/reviewer-2-6 finding).** The unconditional framing
+above ("AND intersect and OR union are streaming merge-joins... `viEvalNodes` keeps the
+accumulator sorted ascending by the 24-byte span key") is accurate only for the DEFAULT path —
+it is no longer true unconditionally. `viEvalNodes(source, nodes, isOR, newestFirst bool)` gained
+an explicit `newestFirst` opt-in parameter: when `newestFirst && viNodesAreAllLeaves(nodes)`, a
+flat all-leaves AND/OR shape routes through `viEvalAND`/`viEvalOR` instead — a heap-merge/
+membership-set combine that preserves NEWEST-FIRST order (for Phase 3/4's bounded early-stopping,
+`SPEC-VI-12`), NOT the ascending-span-key order this note describes. `newestFirst` defaults
+`false` for every existing (non-bounded) caller and is set `true` only when the query's
+`SliceValueIndexSource` was marked via `MarkNewestFirst()` — which happens only when every leaf
+Added to that source was resolved through `vibuilder.BuildSourceBounded`'s genuine early-stopping
+path (Phases 2-4). For that default/unmarked case, `viEvalNodes`' behavior is byte-identical to
+what this note already describes — the merge-join and its sorted-accumulator invariant are
+unchanged for every caller this note was originally written about.
+
+Back-ref (addendum): `metrics_trace.go:viEvalNodes,viEvalAND,viEvalOR,
+SliceValueIndexSource.MarkNewestFirst,isNewestFirst`. See `internal/modules/valueindex/SPECS.md`
+`SPEC-VI-12` for the early-stopping contract this exception exists to serve.
+
 **Coverage vs emptiness — critical distinction.** TraceQL expands an unscoped attribute (`.env`)
 into one leaf per scope (`resource.env`, `span.env`) under OR nodes. A scope with zero indexed
 files is **definitively empty**, not unindexed. The caller (issue #461) therefore `Add`s an
@@ -7731,6 +7750,15 @@ actual bytes/blocks read, never the configured cap) I/O-cost tradeoff, never a c
 
 Back-refs: `internal/modules/executor/stream.go` (`SPEC-STREAM-13`'s formal contract),
 `internal/modules/executor/recentfirst.go:RecentFirstBudget`. Issue #481.
+
+**Retired (2026-07-12, plan-scan-fallback.md Phase 7, task #190).** `RecentFirstBudget` and the
+`stream.go` mechanism this note documents (truncate-before-coalesce, the per-group budget checks)
+have been removed outright — `internal/modules/executor/recentfirst.go` no longer exists. See
+root `SPEC.md` `SPEC-ROOT-023`'s retirement note for the full rationale (superseded by
+`SPEC-VI-12`'s early-stopping index resolution) and `executor/SPECS.md` `SPEC-STREAM-13`'s own
+matching retirement note. This note's design rationale (why truncate-before-coalesce gives an
+exact bound; why the concurrent-prefetch overshoot was an accepted tradeoff) is retained verbatim
+for history — it no longer describes a reachable code path.
 
 ## NOTE-479: StructuralFunnelStats design decisions — nil-means-skip, TraceGroupPartial as bool, VerifiedSurvivors' divergent semantics (issue #493, Task 6)
 

@@ -16,8 +16,8 @@ import (
 
 // StructuralFunnelStats carries per-stage candidate counts for the index-driven structural
 // funnel (ExecuteStructuralFromIndex / ExecuteNegatedStructuralFromIndex). Threaded ALONGSIDE
-// *StructuralResult, never added to it -- StructuralResult is SPEC-STRUCT-13/14-tagged for the
-// orthogonal RecentFirstBudget concern, and growing it here would muddy that contract.
+// *StructuralResult, never added to it -- StructuralResult is the scan-path's own result type,
+// and growing it here would muddy that contract.
 //
 // nil means "span not recording, skip all counting work" -- mirrors PlannerSpanStats' nil-means-
 // skip convention (otel_spans.go). Every increment site in both engines must be guarded by a

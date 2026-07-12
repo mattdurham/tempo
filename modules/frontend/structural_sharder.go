@@ -44,9 +44,13 @@ func buildStructuralQueryPlan(
 	if err != nil || !ok || leftProg == nil {
 		return nil, nil
 	}
-	// boundedEligible=true (issue #481 part 2, 1e/1f): structural chains that flatten to other
-	// than exactly 2 nodes are bounded-eligible the same as plain search — F-3's bounded
-	// structural path in blockpack is the consumer once the querier sees DispatchBoundedRecentFirst.
+	// boundedEligible=true: structural chains that flatten to other than exactly 2 nodes go
+	// through the same plan-time classification as plain search (LowSelectivity+no-limit still
+	// plan-time-declines; every other outcome falls through to the same resolvability-only
+	// DispatchTimeSliced/DispatchBlockSharded gate). A structural query itself never gets ANY
+	// bounded path querier-side, with or without a limit (Phase 6's asymmetry finding, made
+	// permanent by Phase 7's removal of the #481-part-2 bounded-scan mechanism) — this
+	// classification's only remaining effect on a structural query is the plan-time decline gate.
 	return buildQueryPlanFromProgram(ctx, rawR, tenant, dedicated, leftProg, minTS, maxTS, concurrentRequests, true, hasLimit)
 }
 

@@ -252,13 +252,13 @@ func (r *Registry) UpdateWatermark(
 	return err
 }
 
-// SPEC-VIUSAGE-9: monotonic file-catalog cursor -- see entry.go's LastCatalogRowID.
 // UpdateCatalogCursor advances (tenant, colHash, colType)'s persisted file-catalog
 // cursor to rowID via the same conditional-write discipline as RenewLease/
 // UpdateWatermark. Monotonic: a rowID lower than or equal to the entry's current
 // LastCatalogRowID is a silent no-op (never regresses the cursor — a stale/replayed call
 // must not make a later run re-list already-processed catalog rows). Errors if the
 // entry does not exist (mirrors RenewLease's own contract).
+// SPEC-VIUSAGE-9: monotonic file-catalog cursor -- see entry.go's LastCatalogRowID.
 func (r *Registry) UpdateCatalogCursor(ctx context.Context, tenant, colHash, colType string, rowID uint64) error {
 	_, err := r.store.upsertEntry(
 		ctx, tenant, colHash, colType,

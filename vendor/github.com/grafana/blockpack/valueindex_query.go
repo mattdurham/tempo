@@ -155,6 +155,41 @@ func BuildValueIndexSource(
 	return vibuilder.BuildSource(ctx, disc, store, prog, minSec, maxSec, watermarks)
 }
 
+// BuildValueIndexSourceBounded mirrors BuildValueIndexSource but threads limit through to
+// an early-stopping, newest-first resolution (Phase 2, plan-scan-fallback.md) -- FILTER
+// (search) path only; there is no structural-path equivalent of this wrapper (structural
+// queries never get a bounded-index answer under per-block dispatch, a permanent,
+// correctness-required boundary unrelated to this wrapper's own scope).
+//
+// For a genuine single-leaf query, the returned source's LookupResults for that leaf are
+// the exact newest-limit entries by recency a full, unbounded BuildValueIndexSource call
+// would have produced, truncated to AT LEAST limit (never fewer, may overshoot within the
+// block/batch that first satisfies it -- never a wrong answer, only a performance
+// characteristic). A multi-leaf query (AND or OR) falls through to the ordinary unbounded
+// per-leaf resolution today (Phase 3/4 replace this fallback with real multi-leaf
+// early-stopping) -- still a correct answer, just not yet early-stopped.
+//
+// limit <= 0 is treated as unbounded and delegates to BuildValueIndexSource directly.
+// disc, store, watermarks, and the (source, ok, err) return contract are identical to
+// BuildValueIndexSource's.
+func BuildValueIndexSourceBounded(
+	ctx context.Context,
+	disc *IndexFileCache,
+	store ValueIndexFileStore,
+	prog *Program,
+	minSec, maxSec uint64,
+	watermarks map[string]ColumnWatermark,
+	limit int,
+) (*SliceValueIndexSource, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if disc == nil {
+		return nil, false, nil
+	}
+	return vibuilder.BuildSourceBounded(ctx, disc, store, prog, minSec, maxSec, watermarks, limit)
+}
+
 // BuildValueIndexSourceForMetrics is the metrics analog of BuildValueIndexSource:
 // it compiles the metrics query's filter prefix and assembles a source so the
 // querier can pass it via TraceMetricOptions.ValueIndex to ExecuteMetricsTraceQL.

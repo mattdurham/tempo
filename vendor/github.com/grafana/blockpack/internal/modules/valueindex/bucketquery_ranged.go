@@ -108,6 +108,74 @@ func QueryBucketFileRanged(
 	return out, nil
 }
 
+// QueryBucketFileRangedNewestFirst mirrors QueryBucketFileRanged but iterates dir in REVERSE
+// (newest block first -- SplitIntoBlocks/sortBucketBlock guarantee ascending on-disk order,
+// SPEC-VI-1 amended) and stops once len(out) >= limit (limit <= 0 means unbounded, identical to
+// the non-limited sibling). matchGroupsInBlockReverse consumes each surviving block's own
+// group-level order in reverse too, so the combined result is globally newest-first, not merely
+// block-level. The limit check happens once per BLOCK (after that block's own matches are fully
+// appended), not per entry, so the returned slice is always an exact PREFIX of the full
+// newest-first ordering with length >= limit -- it may overshoot within the block that first
+// satisfies the limit, but never returns out-of-order or wrong-identity results. Added as a
+// SIBLING function -- QueryBucketFileRanged itself is never modified, since every existing
+// non-early-stopping caller must remain byte-identical.
+func QueryBucketFileRangedNewestFirst(
+	ctx context.Context, src RangedSource, pred Predicate, timeRange *[2]uint64, limit int,
+) ([]LookupResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("valueindex: QueryBucketFileRangedNewestFirst: %w", err)
+	}
+
+	minTS, maxTS := uint64(0), ^uint64(0)
+	if timeRange != nil {
+		minTS, maxTS = timeRange[0], timeRange[1]
+	}
+
+	size, footer, err := readBucketFileFooter(src)
+	if err != nil {
+		if errors.Is(err, ErrNotBucketFile) {
+			return nil, nil //nolint:nilnil // explicit skip signal, documented above
+		}
+		return nil, fmt.Errorf("valueindex: QueryBucketFileRangedNewestFirst: footer: %w", err)
+	}
+
+	if !footer.OverlapsTimeRange(minTS, maxTS) {
+		return nil, nil
+	}
+
+	dir, table, err := readBucketFileTail(src, footer, size)
+	if err != nil {
+		return nil, fmt.Errorf("valueindex: QueryBucketFileRangedNewestFirst: metadata: %w", err)
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("valueindex: QueryBucketFileRangedNewestFirst: %w", err)
+	}
+
+	var out []LookupResult
+	for i := len(dir) - 1; i >= 0; i-- {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("valueindex: QueryBucketFileRangedNewestFirst: %w", ctx.Err())
+		}
+		d := &dir[i]
+		if d.MaxTimeSec < minTS || d.MinTimeSec > maxTS {
+			continue
+		}
+		if pred != nil && blockExcludedByValue(pred, d.MinValue, d.MaxValue) {
+			continue
+		}
+		blk, berr := readAndDecodeBlockRanged(src, d)
+		if berr != nil {
+			return nil, fmt.Errorf("valueindex: QueryBucketFileRangedNewestFirst: block %d: %w", i, berr)
+		}
+		out = append(out, matchGroupsInBlockReverse(blk, table, pred, minTS, maxTS)...)
+		if limit > 0 && len(out) >= limit {
+			return out, nil
+		}
+	}
+	return out, nil
+}
+
 // SPEC-VI-10: readAndDecodeBlockRanged reads d's compressed body from src and decodes it into
 // a *BucketBlock. Unlike QueryBucketFiles (which decodes every block from an already-fully-
 // in-memory file), this issues exactly one ReadAt for d's byte range — the whole point of the

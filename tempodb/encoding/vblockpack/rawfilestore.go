@@ -109,8 +109,8 @@ func splitPrefixForRaw(prefix string) backend.KeyPath {
 // so the builder's downloadAll can recognise a retention/compaction race (a file the listing
 // cache still names but the backend has already deleted) and skip the file instead of failing
 // the index build (blockpack issue #399 point 5), mirroring minioVIStore's existing
-// mapNotFound. All other errors pass through unchanged so transient failures still abort and
-// fall back to a correct full scan.
+// mapNotFound. All other errors pass through unchanged so transient failures still abort the
+// build — this is the existing 404-skip contract, not a scan fallback.
 func mapRawNotFound(err error) error {
 	if err == nil {
 		return nil

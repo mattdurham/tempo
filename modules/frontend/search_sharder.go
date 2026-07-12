@@ -288,19 +288,11 @@ func (s *asyncSearchSharder) backendRequests(ctx context.Context, tenantID strin
 		return
 	}
 
-	// DispatchBoundedRecentFirst (issue #481 part 3, F-5/F-6) falls through to here identically
-	// to DispatchBlockSharded and a nil plan — this switch deliberately has no
-	// `case blockpack.DispatchBoundedRecentFirst` branch. Per R17, the bounded-recent-first
-	// decision NEVER crosses the frontend/querier wire: there is no QueryPlan field a per-block
-	// backend request could carry it in (adding one needs protobuf generator surgery, unavailable
-	// in this environment and rejected by R17), so the querier's blockpackBlock.Fetch derives
-	// boundedAuthorized itself, locally, from the same hasLimit predicate this file already
-	// computed to select DispatchBoundedRecentFirst in the first place (see hasLimit above and
-	// tempodb/encoding/vblockpack/value_index_query.go's tryIndexFetch doc comment). The dispatch
-	// shape for a DispatchBoundedRecentFirst plan is therefore ordinary block-sharded fanout —
-	// only each block's own per-block decline handling changes, querier-side. A future phase
-	// (tracked informally as Phase G) may want a tracing attribute or job count hint surfaced here
-	// for observability, but no wire field is required for correctness.
+	// DispatchBlockSharded and a nil plan both fall through to here — ordinary block-sharded
+	// fanout, the querier's own blockpackBlock.Fetch deriving boundedAuthorized itself, locally,
+	// from whether the query carries a limit (tempodb/encoding/vblockpack/value_index_query.go's
+	// tryIndexFetch doc comment) to select its own per-block entry point. This is unrelated to
+	// dispatch shape — only each block's own per-block decline handling changes, querier-side.
 	blockIter := backendJobsFunc(blocks, s.cfg.TargetBytesPerRequest, s.cfg.MostRecentShards, searchReq.End)
 	var advancementPoints []advancementPoint
 	blockIter(func(jobs int, sz uint64, completedThroughTime uint32) {
@@ -311,10 +303,10 @@ func (s *asyncSearchSharder) backendRequests(ctx context.Context, tenantID strin
 			TotalJobs:               uint32(jobs),
 			CompletedThroughSeconds: completedThroughTime,
 		})
-		// issue #493 Task 5 (reviewer-2 finding): this fallback path -- DispatchBlockSharded,
-		// DispatchBoundedRecentFirst, and nil plan all land here -- is the MOST COMMON dispatch
-		// model in production (every ordinary, non-time-sliced query), so it needs the same
-		// observability as the two DispatchTimeSliced branches above, not just the new #487 path.
+		// issue #493 Task 5 (reviewer-2 finding): this fallback path -- DispatchBlockSharded and a
+		// nil plan both land here -- is the MOST COMMON dispatch model in production (every
+		// ordinary, non-time-sliced query), so it needs the same observability as the two
+		// DispatchTimeSliced branches above, not just the new #487 path.
 		advancementPoints = append(advancementPoints, advancementPoint{jobs: jobs, bytes: sz, completedThroughSeconds: completedThroughTime})
 	}, nil)
 	// backendJobsFunc has no overlap-filtering concept and no fixed 1-job-per-block relationship

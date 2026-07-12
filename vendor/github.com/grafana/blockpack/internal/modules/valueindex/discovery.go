@@ -39,6 +39,53 @@ func DiscoverIndexFiles(
 	tenant, indexPrefix, colHash, colTypeName string,
 	queryMinSec, queryMaxSec uint64,
 ) ([]string, error) {
+	return discoverIndexFiles(
+		ctx,
+		lister,
+		tenant,
+		indexPrefix,
+		colHash,
+		colTypeName,
+		queryMinSec,
+		queryMaxSec,
+		SortFileMetas,
+	)
+}
+
+// DiscoverIndexFilesNewestFirst mirrors DiscoverIndexFiles but returns keys sorted by
+// SortFileMetasNewestFirst instead of SortFileMetas -- lowest compaction level (freshest) still
+// takes priority, but within a level, newest wall-clock time first. Added as a SIBLING function
+// -- DiscoverIndexFiles itself is never modified, since every existing non-early-stopping caller
+// must keep today's ascending order unchanged.
+func DiscoverIndexFilesNewestFirst(
+	ctx context.Context,
+	lister Lister,
+	tenant, indexPrefix, colHash, colTypeName string,
+	queryMinSec, queryMaxSec uint64,
+) ([]string, error) {
+	return discoverIndexFiles(
+		ctx,
+		lister,
+		tenant,
+		indexPrefix,
+		colHash,
+		colTypeName,
+		queryMinSec,
+		queryMaxSec,
+		SortFileMetasNewestFirst,
+	)
+}
+
+// discoverIndexFiles is the shared implementation behind DiscoverIndexFiles and
+// DiscoverIndexFilesNewestFirst -- identical List/parse/filter logic, differing only in which
+// sort function orders the final key list.
+func discoverIndexFiles(
+	ctx context.Context,
+	lister Lister,
+	tenant, indexPrefix, colHash, colTypeName string,
+	queryMinSec, queryMaxSec uint64,
+	sortFunc func([]FileMeta),
+) ([]string, error) {
 	prefix := path.Join(tenant, indexPrefix, colHash, colTypeName) + "/"
 	keys, err := lister.List(ctx, prefix)
 	if err != nil {
@@ -66,7 +113,7 @@ func DiscoverIndexFiles(
 		return nil, nil
 	}
 
-	SortFileMetas(matches)
+	sortFunc(matches)
 
 	out := make([]string, len(matches))
 	for i := range matches {

@@ -75,6 +75,45 @@ func TestRunViBackfill_ZeroValueDepsIsNoop(t *testing.T) {
 		"zero-value deps must not increment metricViBackfillStarted")
 }
 
+// TestRunViBackfill_UsesProvidedRegistry_NotFreshFromObjStore is the direct
+// regression guard for a live bug found 2026-07-11 (tenant 11638,
+// tempo-dev-test-03): RunViBackfill used to always build a FRESH registry
+// from deps.ObjStore inside runViBackfillCore, ignoring any registry the
+// caller already used to create/trigger the entry (e.g. ConfigureViUsage's
+// Postgres-backed registryFor(tenant)). That meant the watermark-persist call
+// could never find the entry the trigger had just created in a DIFFERENT
+// (Postgres) registry, failing every real backfill run on its very first
+// progress callback with "entry ... not found".
+func TestRunViBackfill_UsesProvidedRegistry_NotFreshFromObjStore(t *testing.T) {
+	block := writeViBackfillTestBlock(t, 1_000_000_000, "a")
+	fetcher := &fakeViBlockFetcher{refs: []string{"ref-a"}, blocks: map[string][]byte{"ref-a": block}}
+	putter := newFakeViPutter()
+
+	// entryStore has the triggered entry -- this is the one that must be used.
+	entryStore := newFakeViObjectStore()
+	entry := seedTriggeredEntry(t, entryStore, "tenant-a", "span.custom.attr", "string")
+	providedRegistry := blockpack.NewRegistry(entryStore, entry.Tenant)
+
+	// staleObjStore is a SEPARATE, empty store -- if RunViBackfill ever falls
+	// back to building a fresh registry from ObjStore instead of using
+	// deps.Registry, the watermark-persist call finds nothing here and fails
+	// with "entry ... not found", exactly reproducing the live bug.
+	staleObjStore := newFakeViObjectStore()
+
+	deps := RunViBackfillDeps{
+		Fetcher:  fetcher,
+		ObjStore: staleObjStore,
+		Putter:   putter,
+		Registry: providedRegistry,
+	}
+
+	err := RunViBackfill(context.Background(), entry, deps)
+	require.NoError(t, err, "must use deps.Registry, not rebuild one from the stale ObjStore")
+
+	assert.Equal(t, 0, staleObjStore.putCalls, "the stale ObjStore must never be touched when Registry is provided")
+	assert.Greater(t, entryStore.putCalls, 1, "the provided registry's own store must receive the watermark persist")
+}
+
 // fakeViObjectStore is an in-memory blockpack.ObjectStore for tests, mirroring
 // the same shape internal/modules/viusage's own registry tests use in
 // blockpack. Tracks every successful ConditionalPut so tests can assert how
@@ -231,18 +270,17 @@ func TestRunViBackfillCore_CallsUpdateWatermarkOnEachProgress(t *testing.T) {
 	store := newFakeViObjectStore()
 	entry := seedTriggeredEntry(t, store, "tenant-a", "span.custom.attr", "string")
 	putter := newFakeViPutter()
+	registry := blockpack.NewRegistry(store, entry.Tenant)
 
 	completedBefore := testutil.ToFloat64(metricViBackfillCompleted)
 
-	err := runViBackfillCore(context.Background(), entry, fetcher, store, putter, "indexes")
+	err := runViBackfillCore(context.Background(), entry, fetcher, registry, putter, "indexes")
 	require.NoError(t, err)
 
 	// One ConditionalPut for the initial seedTriggeredEntry call, plus one per
 	// fetched block's progress callback (2 blocks) -- i.e. strictly more than
 	// one, proving persistence happens on EVERY callback, not just the last.
 	assert.Equal(t, 3, store.putCalls, "expected 1 (seed) + 2 (one per block) ConditionalPut calls")
-
-	registry := blockpack.NewRegistry(store, entry.Tenant)
 	entries, _, loadErr := registry.Load(context.Background())
 	require.NoError(t, loadErr)
 	require.Len(t, entries, 1)
@@ -270,8 +308,9 @@ func TestRunViBackfillCore_PersistFailureAbortsRun(t *testing.T) {
 	// A store that always conflicts makes every UpdateWatermark call exhaust
 	// its retries and fail.
 	failing := &alwaysConflictStore{inner: store}
+	failingRegistry := blockpack.NewRegistry(failing, entry.Tenant)
 
-	err := runViBackfillCore(context.Background(), entry, fetcher, failing, putter, "indexes")
+	err := runViBackfillCore(context.Background(), entry, fetcher, failingRegistry, putter, "indexes")
 	require.Error(t, err)
 }
 

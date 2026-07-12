@@ -110,8 +110,8 @@ func TestBackendRequests_TimeSliced_AttachesDispatchSpanInfo(t *testing.T) {
 
 // TestBackendRequests_BlockSharded_AttachesDispatchSpanInfo (reviewer-2 finding, issue #493 Task
 // 5) drives the REAL asyncSearchSharder.backendRequests entry point (R7) down the
-// backendJobsFunc FALLBACK path (nil plan / DispatchBlockSharded / DispatchBoundedRecentFirst) —
-// the most common dispatch model in production, and the one Task 5's first pass left
+// backendJobsFunc FALLBACK path (nil plan / DispatchBlockSharded) — the most common dispatch
+// model in production, and the one Task 5's first pass left
 // uninstrumented entirely. Asserts dispatch.jobs_total and the position_min/max attributes are
 // attached exactly like the DispatchTimeSliced path's own test above, using the SAME >20-block
 // fixture so the event cap is exercised on this path too.

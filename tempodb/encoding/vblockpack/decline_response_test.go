@@ -6,12 +6,14 @@ package vblockpack
 // index/data inconsistency or unrecognized → 5xx via matched=false).
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"testing"
 
 	"github.com/grafana/blockpack"
+	"github.com/grafana/tempo/tempodb/encoding/common"
 	"github.com/stretchr/testify/require"
 )
 
@@ -28,9 +30,12 @@ func TestDeclineErrorToHTTPResponse_ShapeNotAnswerable_Returns4xxWithActionableM
 		{"MetricsLegacyTimeSecZero", blockpack.ErrMetricsLegacyTimeSecZero},
 		{"MetricsValueIndexDisabled", blockpack.ErrMetricsValueIndexDisabled},
 		{"CubeWarming", ErrCubeWarming},
+		{"MaterializedIndexBuilding", ErrMaterializedIndexBuilding},
 		{"SearchNoCoverage", ErrSearchNoCoverage},
 		{"SliceIndexCoverageGap", ErrSliceIndexCoverageGap},
 		{"StructuralIndexCoverageGap", blockpack.ErrStructuralIndexCoverageGap},
+		{"TraceByIDIndexNotConfigured", blockpack.ErrTraceByIDIndexNotConfigured},
+		{"TraceByIDCoverageGap", blockpack.ErrTraceByIDCoverageGap},
 	}
 	seenMessages := make(map[string]bool, len(cases))
 	for _, tc := range cases {
@@ -80,4 +85,30 @@ func TestDeclineErrorToHTTPResponse_UsesStatusUnprocessableEntity(t *testing.T) 
 	status, _, matched := DeclineErrorToHTTPResponse(blockpack.ErrMetricsShapeNotAnswerable)
 	require.True(t, matched)
 	require.Equal(t, http.StatusUnprocessableEntity, status)
+}
+
+// TestFindTraceByID_VIDisabled_SentinelPropagatesToHTTPResponse is the Phase 0 required
+// end-to-end regression guard: a REAL blockpackBlock.FindTraceByID call (via the actual write
+// path, no hand-built fixtures) with no value-index reader configured at all (vr == nil) must
+// surface blockpack.ErrTraceByIDIndexNotConfigured, wrapped exactly as the production call site
+// wraps it (backend_block.go's "GetTraceByID: %w"), and that wrapped error must still be
+// recognized by DeclineErrorToHTTPResponse end to end -- proving the two new sentinels this
+// phase added to blockpack's public API actually propagate through tempo's decline mapper, not
+// just that the mapper's switch statement compiles.
+func TestFindTraceByID_VIDisabled_SentinelPropagatesToHTTPResponse(t *testing.T) {
+	withVIQueryReader(t, nil, "") // vr == nil: index-driven path disabled entirely
+
+	block, meta := createFetchTestBlock(t)
+	traceIDA := []byte{1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
+	require.NotNil(t, meta)
+
+	_, err := block.FindTraceByID(context.Background(), traceIDA, common.SearchOptions{})
+	require.Error(t, err, "vr == nil must hard-error, there is no scan fallback (NOTE-VI-073)")
+	require.True(t, errors.Is(err, blockpack.ErrTraceByIDIndexNotConfigured),
+		"err = %v, want ErrTraceByIDIndexNotConfigured", err)
+
+	status, message, matched := DeclineErrorToHTTPResponse(err)
+	require.True(t, matched, "the wrapped sentinel must still be recognized end to end")
+	require.Equal(t, http.StatusUnprocessableEntity, status)
+	require.NotEmpty(t, message)
 }

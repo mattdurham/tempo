@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"slices"
 	"sync"
-	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 
@@ -106,7 +105,7 @@ func ExecuteStructural(
 
 	// SPEC-OBS-002, NOTE-478 (issue #493, Task 1): explainEnabled is querySpan.IsRecording(),
 	// checked once here and threaded down explicitly rather than polled per structural node.
-	traceSpans, parsedBlocks, budgetStopped, blocksRead, err := collectAllStructuralSpans(
+	traceSpans, parsedBlocks, blocksRead, err := collectAllStructuralSpans(
 		ctx,
 		r,
 		querySpan.IsRecording(),
@@ -118,30 +117,17 @@ func ExecuteStructural(
 		return nil, err
 	}
 
-	// F-3 (issue #481 part 2, R15): under RecentFirstBudget, a trace is INCOMPLETE — and must be
-	// excluded wholesale, never partially evaluated — when any assembled span carries a non-empty
-	// parent reference that did not resolve within the read block set. See resolveStructuralParentIndices'
-	// doc comment for the false-positive risk this prevents on negated operators.
-	budgetMode := opts.RecentFirstBudget != nil
-	traceSpans, incompleteCount := resolveStructuralParentIndices(traceSpans, ops, budgetMode)
+	traceSpans = resolveStructuralParentIndices(traceSpans, ops)
 
 	result := &StructuralResult{
-		BudgetStopped:        budgetStopped,
-		IncompleteTraceCount: incompleteCount,
-		BlocksRead:           blocksRead,
+		BlocksRead: blocksRead,
 	}
 	if err := evalStructuralMatches(traceSpans, parsedBlocks, ops, opts, result); err != nil {
 		return nil, err
 	}
-	// SPEC-STRUCT-13, SPEC-STRUCT-14, NOTE-480 (issue #493, Task 3): connects the #481-era
-	// tracing-ready hooks (BudgetStopped/BlocksRead/IncompleteTraceCount) to the blockpack.query
-	// span; the fields themselves are unchanged, only their visibility is new. All three are
-	// already-computed scalars in local scope (result), zero extra allocation to attach.
 	if querySpan.IsRecording() {
 		querySpan.SetAttributes(
-			attribute.Bool("blockpack.structural.budget_stopped", result.BudgetStopped),
 			attribute.Int("blockpack.structural.blocks_read", result.BlocksRead),
-			attribute.Int("blockpack.structural.incomplete_trace_count", result.IncompleteTraceCount),
 		)
 	}
 	return result, nil
@@ -188,8 +174,7 @@ func isNegationOp(op traceqlparser.StructuralOp) bool {
 }
 
 // collectAllStructuralSpans fetches blocks (optionally filtered by time range and sub-file
-// sharding) and accumulates per-trace span records. Returns a map keyed by [16]byte trace ID,
-// plus (issue #481 part 2, F-3) whether a RecentFirstBudget cap stopped block collection early
+// sharding) and accumulates per-trace span records. Returns a map keyed by [16]byte trace ID
 // and how many blocks were actually fetched.
 //
 // SPEC-OBS-002, NOTE-478 (issue #493, Task 1): explainEnabled gates queryplanner.PlanOptions.
@@ -203,7 +188,7 @@ func collectAllStructuralSpans(
 	programs []*vm.Program,
 	ops []traceqlparser.StructuralOp,
 	opts Options,
-) (traceSpans [][]structuralSpanRec, parsedBlocks map[int]*modules_reader.Block, budgetStopped bool, blocksRead int, err error) {
+) (traceSpans [][]structuralSpanRec, parsedBlocks map[int]*modules_reader.Block, blocksRead int, err error) {
 	tr := opts.TimeRange
 	startBlock, blockCount := opts.StartBlock, opts.BlockCount
 	// NOTE-091: Each structural node is a regular filter program with an added relationship
@@ -241,7 +226,7 @@ func collectAllStructuralSpans(
 		if len(p.SelectedBlocks) == 0 && gated {
 			// planBlocks rejected the file entirely for this non-negation program —
 			// no structural match is possible (the node cannot match any span in this file).
-			return nil, nil, false, 0, nil
+			return nil, nil, 0, nil
 		}
 		// Only a gated (predicate-pruned) node has a block set that bounds where it can match.
 		// A negation-LHS node's time-range-only plan does not, so leave its set nil.
@@ -261,30 +246,9 @@ func collectAllStructuralSpans(
 	for bi := range unionSet {
 		selectedBlocks = append(selectedBlocks, bi)
 	}
-	if opts.Direction == queryplanner.Backward {
-		// F-3 (issue #481 part 2): raw block INDEX is file-offset/write order, NOT chronological
-		// order — verified empirically (a debug probe on a real multi-trace fixture showed
-		// scrambled BlockMeta.MinStart values across ascending indices; the "blocks are already
-		// time-sorted" invariant queryplanner.PlanWithOptions relies on holds only AFTER its own
-		// setToSortedByTime pass, never for raw index alone). "Read newest first" requires sorting
-		// by actual BlockMeta.MinStart before reversing — mirrors setToSortedByTime's exact
-		// approach (planner.go), index as a stable tiebreaker.
-		slices.SortFunc(selectedBlocks, func(a, b int) int {
-			ma, mb := r.BlockMeta(a), r.BlockMeta(b)
-			if ma.MinStart != mb.MinStart {
-				if ma.MinStart < mb.MinStart {
-					return -1
-				}
-				return 1
-			}
-			return a - b
-		})
-		slices.Reverse(selectedBlocks)
-	} else {
-		// Unbounded/default path: order doesn't affect correctness (every selected block is
-		// eventually read), so keep the cheap raw-index sort — unchanged from pre-F-3 behavior.
-		slices.Sort(selectedBlocks)
-	}
+	// Order doesn't affect correctness (every selected block is eventually read), so keep the
+	// cheap raw-index sort.
+	slices.Sort(selectedBlocks)
 
 	plan := &queryplanner.Plan{SelectedBlocks: selectedBlocks}
 
@@ -301,39 +265,15 @@ func collectAllStructuralSpans(
 	}
 
 	if len(plan.SelectedBlocks) == 0 {
-		return nil, nil, false, 0, nil
+		return nil, nil, 0, nil
 	}
 
 	fetcher := queryplanner.NewPlanner(r)
-	var rawBlocks map[int][]byte
-	if opts.RecentFirstBudget != nil {
-		// F-3/R15: fetch newest-first blocks ONE AT A TIME, stopping at the FIRST cap reached
-		// (MaxBlocks/MaxBytes checked before each fetch via BlockMeta, no extra I/O; MaxDuration
-		// checked after each fetch via elapsed wall time). Restrict plan.SelectedBlocks to the
-		// fetched prefix so every later step below (totalSpans sizing, the per-block collection
-		// loop) only ever touches blocks actually read.
-		var ferr error
-		rawBlocks, budgetStopped, blocksRead, ferr = fetchStructuralBlocksBounded(
-			r, fetcher, plan.SelectedBlocks, opts.RecentFirstBudget,
-		)
-		if ferr != nil {
-			return nil, nil, false, 0, fmt.Errorf("structural bounded FetchBlocks: %w", ferr)
-		}
-		fetched := make([]int, 0, len(rawBlocks))
-		for _, bi := range plan.SelectedBlocks {
-			if _, ok := rawBlocks[bi]; ok {
-				fetched = append(fetched, bi)
-			}
-		}
-		plan.SelectedBlocks = fetched
-	} else {
-		var ferr error
-		rawBlocks, ferr = fetcher.FetchBlocks(plan)
-		if ferr != nil {
-			return nil, nil, false, 0, fmt.Errorf("structural FetchBlocks: %w", ferr)
-		}
-		blocksRead = len(rawBlocks)
+	rawBlocks, ferr := fetcher.FetchBlocks(plan)
+	if ferr != nil {
+		return nil, nil, 0, fmt.Errorf("structural FetchBlocks: %w", ferr)
 	}
+	blocksRead = len(rawBlocks)
 
 	// NOTE-373: the per-block fetch/eval plan (wantColumns, the user-attr program set, and
 	// is identical for every selected block — it derives only from `programs`, not from
@@ -385,7 +325,7 @@ func collectAllStructuralSpans(
 		if cerr != nil {
 			// NOTE-436: flat holds the latest (possibly reallocated) pooled backing — release it.
 			releaseStructuralSpanRecs(flat)
-			return nil, parsedBlocks, budgetStopped, blocksRead, cerr
+			return nil, parsedBlocks, blocksRead, cerr
 		}
 	}
 
@@ -400,20 +340,12 @@ func collectAllStructuralSpans(
 	// block those traces occupy via TraceEntries, and fetch/scan any blocks not yet seen.
 	// Only intermediate-span blocks are missing — the predicate-matching blocks are already
 	// in rawBlocks — so the expansion set is small (one or two extra blocks per trace).
-	//
-	// F-3/R15 (issue #481 part 2): SKIPPED ENTIRELY under RecentFirstBudget. This step
-	// unconditionally fetches every remaining block in the reader (the TraceID index it once
-	// used to target specific blocks was removed under #438) — running it under a budget would
-	// silently defeat the budget's whole purpose (bounded I/O). Traces whose true ancestor spans
-	// live in an unread block are instead detected and excluded wholesale by
-	// resolveStructuralParentIndices' budget-mode incompleteness check, never partially
-	// evaluated. See team-lead ruling R15.
-	if len(flat) > 0 && opts.RecentFirstBudget == nil {
+	if len(flat) > 0 {
 		var eerr error
 		flat, eerr = expandStructuralBlocksForTraces(r, flat, rawBlocks, &bp, parsedBlocks, fetcher)
 		if eerr != nil {
 			releaseStructuralSpanRecs(flat)
-			return nil, parsedBlocks, budgetStopped, blocksRead, eerr
+			return nil, parsedBlocks, blocksRead, eerr
 		}
 	}
 
@@ -437,66 +369,7 @@ func collectAllStructuralSpans(
 	// NOTE-436: flat is fully consumed by groupMatchingStructuralTraces (result aliases a fresh
 	// backing array, never flat) — release the pooled accumulator for reuse by the next query.
 	releaseStructuralSpanRecs(flat)
-	return result, parsedBlocks, budgetStopped, blocksRead, nil
-}
-
-// fetchStructuralBlocksBounded fetches selectedBlocks (already Direction-ordered by the caller)
-// ONE BLOCK AT A TIME, stopping at the FIRST RecentFirstBudget cap reached (SPEC-STRUCT-13, issue
-// #481 part 2, F-3, R15): MaxBlocks and MaxBytes are checked BEFORE each fetch (zero-I/O, from BlockMeta.Length
-// — no need to guess), MaxDuration is checked AFTER each fetch (the only way to bound wall-clock
-// I/O time actually spent). A zero budget field means no cap on that dimension.
-//
-// Returns the raw bytes fetched (a subset of selectedBlocks — always a PREFIX in caller order,
-// since collection stops and never resumes), whether a cap stopped collection before the full
-// list was read, and the count of blocks actually fetched. Deliberately issues one FetchBlocks
-// call per block rather than the single coalesced batch call the unbounded path uses — trading
-// coalescing efficiency for a genuine, checkable stop condition is the explicit tradeoff this
-// strategy makes (see queryoptions.go's RecentFirstBudget doc comment).
-func fetchStructuralBlocksBounded(
-	r *modules_reader.Reader,
-	fetcher *queryplanner.Planner,
-	selectedBlocks []int,
-	budget *RecentFirstBudget,
-) (rawBlocks map[int][]byte, budgetStopped bool, blocksRead int, err error) {
-	rawBlocks = make(map[int][]byte, len(selectedBlocks))
-	start := time.Now()
-	// bytesRead/maxBytesUint accumulate and compare in uint64 (BlockMeta.Length's own type) —
-	// gosec G115: avoids the uint64->int64 narrowing conversion entirely rather than suppressing
-	// it, since budget.MaxBytes (int64) is only ever compared here after budget.MaxBytes > 0 is
-	// already confirmed, making the int64->uint64 widening below provably safe.
-	var bytesRead uint64
-	var maxBytesUint uint64
-	if budget.MaxBytes > 0 {
-		maxBytesUint = uint64(budget.MaxBytes)
-	}
-	for _, blockIdx := range selectedBlocks {
-		if budget.MaxBlocks > 0 && blocksRead+1 > budget.MaxBlocks {
-			budgetStopped = true
-			break
-		}
-		meta := r.BlockMeta(blockIdx)
-		if maxBytesUint > 0 && bytesRead+meta.Length > maxBytesUint {
-			budgetStopped = true
-			break
-		}
-		one, ferr := fetcher.FetchBlocks(&queryplanner.Plan{SelectedBlocks: []int{blockIdx}})
-		if ferr != nil {
-			return nil, false, blocksRead, fmt.Errorf("block %d: %w", blockIdx, ferr)
-		}
-		if raw, ok := one[blockIdx]; ok {
-			rawBlocks[blockIdx] = raw
-		}
-		blocksRead++
-		bytesRead += meta.Length
-		if budget.MaxDuration > 0 && time.Since(start) >= budget.MaxDuration {
-			budgetStopped = true
-			break
-		}
-	}
-	if blocksRead < len(selectedBlocks) {
-		budgetStopped = true
-	}
-	return rawBlocks, budgetStopped, blocksRead, nil
+	return result, parsedBlocks, blocksRead, nil
 }
 
 // groupMatchingStructuralTraces drops records belonging to traces that have no matched span
@@ -888,29 +761,14 @@ func (a *allMatchSet) ToSlice() []int {
 // backing array (no allocation). When ops == nil (resolution-only unit tests) the skip is
 // disabled and the input is resolved and returned unchanged.
 //
-// SPEC-STRUCT-14 / NOTE-VI-098: budgetMode (issue #481 part 2, F-3, team-lead ruling R15,
-// R15-AMENDED's SPEC-STRUCT-8 correction history) additionally excludes
-// a trace WHOLESALE — never partially evaluated — when any of its spans carries a non-empty parent
-// reference (structuralParentIDPresent bit set, i.e. the original span's ParentSpanId was
-// non-empty) that fails to resolve within THIS trace's assembled span set. Under the unbounded
-// path (budgetMode==false), an unresolved-but-present parent reference is a genuine orphan — the
-// caller already fetched every block in the file (expandStructuralBlocksForTraces), so "not
-// found" means "does not exist" and the existing parentIdx=-1 root-like treatment is correct and
-// UNCHANGED. Under RecentFirstBudget, that expansion is skipped (fetchStructuralBlocksBounded
-// stops early), so "not found" is genuinely ambiguous — the ancestor may exist in a block that
-// was never read. R15 requires resolving that ambiguity conservatively: treat it as "may exist,
-// unread" rather than "confirmed absent," because a wrongly-confirmed absence would flip a
-// negated operator (!>>, !>, !~) into a false positive (a genuinely different failure mode than
-// the "honest partial answer" that a false negative on a positive operator represents — see
-// Edge Case 1's already-accepted principle, which does NOT extend to false positives). Excluding
-// the whole trace, uniformly for both polarities, is R15's explicit "no polarity special-casing"
-// requirement: a positive-op false negative from omission is the same honest degradation either
-// way, so one rule safely covers both.
+// An unresolved-but-present parent reference (structuralParentIDPresent bit set, i.e. the
+// original span's ParentSpanId was non-empty) is a genuine orphan — the caller already fetched
+// every block in the file (expandStructuralBlocksForTraces), so "not found" means "does not
+// exist" and parentIdx=-1 is treated as root.
 func resolveStructuralParentIndices(
 	traceSpans [][]structuralSpanRec,
 	ops []traceqlparser.StructuralOp,
-	budgetMode bool,
-) (result [][]structuralSpanRec, incompleteTraceCount int) {
+) [][]structuralSpanRec {
 	// NOTE-384: pre-size byID to the largest per-trace window. The map is allocated ONCE and
 	// clear()'d per trace (NOTE-271), but with no capacity hint Go's map grew incrementally on
 	// the first trace it filled, rehashing as it crossed each load-factor threshold. Sizing it
@@ -939,19 +797,12 @@ func resolveStructuralParentIndices(
 				byID[sp.spanID] = i
 			}
 		}
-		incomplete := false
 		for i := range spans {
 			if spans[i].present&structuralParentIDPresent != 0 {
 				if idx, ok := byID[spans[i].parentID]; ok {
 					spans[i].parentIdx = int32(idx) //nolint:gosec // idx is a per-trace span index, well within int32
 				} else {
 					spans[i].parentIdx = -1
-					if budgetMode {
-						// R15: non-empty parent reference, unresolved within the (budget-limited)
-						// assembled span set — the ancestor may live in an unread block. Mark the
-						// whole trace incomplete; do not trust parentIdx=-1 as "confirmed root."
-						incomplete = true
-					}
 				}
 			} else {
 				spans[i].parentIdx = -1
@@ -959,14 +810,10 @@ func resolveStructuralParentIndices(
 			spans[i].parentID = [8]byte{}
 			spans[i].present &^= structuralParentIDPresent
 		}
-		if incomplete {
-			incompleteTraceCount++
-			continue
-		}
 		traceSpans[w] = spans
 		w++
 	}
-	return traceSpans[:w], incompleteTraceCount
+	return traceSpans[:w]
 }
 
 // evalStructuralMatches evaluates the structural operator(s) for each trace and
@@ -1136,8 +983,8 @@ func hasNode0AncestorMemo(spans []structuralSpanRec, ri int, memo []uint8) bool 
 
 // evalOpDescendantStruct: R is a descendant of L (>>) — true when R has a node-0 ancestor.
 func evalOpDescendantStruct(spans []structuralSpanRec, dst []int) []int {
-	memo := // NOTE-392: memoized ancestor-existence walk; see hasNode0AncestorMemo.
-	acquireCompactUint8(len(spans))
+	// NOTE-392: memoized ancestor-existence walk; see hasNode0AncestorMemo.
+	memo := acquireCompactUint8(len(spans))
 	defer releaseCompactUint8(memo)
 
 	result := dst
@@ -1273,10 +1120,10 @@ func evalOpNotSiblingStruct(spans []structuralSpanRec, dst []int) []int {
 // none of its ancestors has the node 0 bit set (nodeMatch&0x01) (!>>).
 // Walk the span's ancestor chain; if no ancestor carries node 0, emit the span.
 func evalOpNotDescendantStruct(spans []structuralSpanRec, dst []int) []int {
-	memo := // NOTE-392: same memoized ancestor-existence walk as the positive descendant op (the node-0
+	// NOTE-392: same memoized ancestor-existence walk as the positive descendant op (the node-0
 	// membership is already encoded by nodeMatch&0x01, so the prior per-span leftSet map was
 	// redundant and is dropped). !>> emits RHS spans with NO node-0 ancestor.
-	acquireCompactUint8(len(spans))
+	memo := acquireCompactUint8(len(spans))
 	defer releaseCompactUint8(memo)
 
 	result := dst

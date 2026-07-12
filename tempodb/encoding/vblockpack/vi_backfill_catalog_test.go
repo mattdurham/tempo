@@ -140,15 +140,15 @@ func TestRunViBackfillCore_CursorNotAdvancedOnPartialFailure(t *testing.T) {
 	// make this test pass, but for the wrong reason (never actually exercising
 	// the "genuinely partial run" scenario the test's own name claims to cover).
 	seedRegistryEntry(t, objStore, entry)
+	registry := blockpack.NewRegistry(objStore, entry.Tenant)
 
-	runErr := runViBackfillCore(ctx, entry, fetcher, objStore, newFakeViPutter(), defaultValueIndexPref)
+	runErr := runViBackfillCore(ctx, entry, fetcher, registry, newFakeViPutter(), defaultValueIndexPref)
 	require.Error(t, runErr, "the run must fail overall -- block 2 has no data")
 	require.Contains(t, runErr.Error(), "fetch block", "the failure must genuinely occur at FetchBlock, not earlier (e.g. a missing registry entry) -- otherwise this test doesn't exercise the partial-run scenario it claims to")
 
 	// The cursor must be unchanged (still zero) -- confirming
 	// UpdateCatalogCursor was never called, despite block 1 having
 	// successfully advanced the watermark via its own progressFn call.
-	registry := blockpack.NewRegistry(objStore, tenant)
 	loadedEntries, _, loadErr := registry.Load(ctx)
 	require.NoError(t, loadErr)
 	require.Len(t, loadedEntries, 1)

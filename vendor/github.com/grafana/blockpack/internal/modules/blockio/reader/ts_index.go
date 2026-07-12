@@ -121,3 +121,94 @@ func (r *Reader) BlocksInTimeRange(minNano, maxNano uint64) []int {
 	slices.Sort(result)
 	return result
 }
+
+// tsEntryMinTSDesc pairs one TS-index entry's minTS with its blockID, for
+// BlockIndicesNewestFirst's own sort (by minTS descending) -- distinct from
+// BlocksInTimeRange's ascending blockID output.
+type tsEntryMinTSDesc struct {
+	minTS   uint64
+	blockID int
+}
+
+// BlockIndicesNewestFirst mirrors BlocksInTimeRange but returns overlapping block
+// indices in DESCENDING minTS order (newest first) instead of ascending blockID order
+// -- the ordering plan-scan-fallback.md's Phase 6b match-all materializer needs to walk
+// blocks newest-first without ever decoding block bodies to determine order. Falls back
+// to sorting BlockMeta by MaxStart DESCENDING (zero body I/O -- BlockMeta is already
+// resident in memory) when no TS index section exists (legacy files predating the
+// TS-index format), mirroring BlocksInTimeRange's own documented "callers fall back to a
+// full BlockMeta scan" contract, except the fallback lives HERE so every caller of this
+// specific method gets a consistent, complete answer without re-deriving the fallback
+// itself.
+func (r *Reader) BlockIndicesNewestFirst(minNano, maxNano uint64) []int {
+	_ = r.ensureV14TSSection()
+	if r.tsCount == 0 {
+		return r.blockIndicesNewestFirstFromBlockMeta(minNano, maxNano)
+	}
+
+	const stride = 20
+	entries := make([]tsEntryMinTSDesc, 0, r.tsCount)
+	for i := 0; i < r.tsCount; i++ {
+		base := i * stride
+		minTS := binary.LittleEndian.Uint64(r.tsRaw[base:])
+		maxTS := binary.LittleEndian.Uint64(r.tsRaw[base+tsEntryMaxTSOff:])
+		blockID := binary.LittleEndian.Uint32(r.tsRaw[base+tsEntryBlockIDOff:])
+		// Same overlap rule as BlocksInTimeRange (zero-time blocks always included;
+		// others only when both bounds overlap) -- this function cannot reuse
+		// BlocksInTimeRange's own binary-search-prefix shortcut since it needs every
+		// overlapping entry re-sorted by minTS descending, not just an ascending-blockID
+		// prefix.
+		if (minTS == 0 && maxTS == 0) || (maxTS >= minNano && minTS <= maxNano) {
+			entries = append(
+				entries,
+				tsEntryMinTSDesc{minTS: minTS, blockID: int(blockID)},
+			) //nolint:gosec // safe: blockID bounded by MaxBlocks fits int
+		}
+	}
+	slices.SortFunc(entries, func(a, b tsEntryMinTSDesc) int {
+		switch {
+		case a.minTS > b.minTS:
+			return -1
+		case a.minTS < b.minTS:
+			return 1
+		default:
+			return 0
+		}
+	})
+	result := make([]int, len(entries))
+	for i, e := range entries {
+		result[i] = e.blockID
+	}
+	return result
+}
+
+// blockIndicesNewestFirstFromBlockMeta is BlockIndicesNewestFirst's fallback for files
+// with no TS index section: sorts the already-resident BlockMeta list by MaxStart
+// descending, at zero body-I/O cost. Mirrors BlockIndicesNewestFirst's own overlap rule.
+func (r *Reader) blockIndicesNewestFirstFromBlockMeta(minNano, maxNano uint64) []int {
+	type metaIdx struct {
+		maxStart uint64
+		idx      int
+	}
+	candidates := make([]metaIdx, 0, len(r.blockMetas))
+	for i, m := range r.blockMetas {
+		if (m.MinStart == 0 && m.MaxStart == 0) || (m.MaxStart >= minNano && m.MinStart <= maxNano) {
+			candidates = append(candidates, metaIdx{maxStart: m.MaxStart, idx: i})
+		}
+	}
+	slices.SortFunc(candidates, func(a, b metaIdx) int {
+		switch {
+		case a.maxStart > b.maxStart:
+			return -1
+		case a.maxStart < b.maxStart:
+			return 1
+		default:
+			return 0
+		}
+	})
+	result := make([]int, len(candidates))
+	for i, c := range candidates {
+		result[i] = c.idx
+	}
+	return result
+}

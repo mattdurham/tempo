@@ -32,4 +32,10 @@ var ErrSliceIndexCoverageGap = errors.New("vblockpack: slice-mode index coverage
 // #481's central anti-pattern elimination. Joins F-10's declineErrorToHTTPResponse mapper switch
 // (unlike the frontend's plan-time sentinel, this one fires querier-side and travels through the
 // combiner) as a 4xx-class, actionable-message case.
-var ErrSearchNoCoverage = errors.New("vblockpack: search index has no coverage and no bounded-recent-first path was authorized")
+var ErrSearchNoCoverage = errors.New("vblockpack: search index has no coverage")
+
+// ErrMaterializedIndexBuilding is returned when the value-index query path is not
+// configured on this querier at all (vr == nil) — a deployment-level absence, distinct
+// from ErrSearchNoCoverage (configured, but this specific column/window lacks coverage).
+// No supported deployment scans as a fallback for either case.
+var ErrMaterializedIndexBuilding = errors.New("vblockpack: materialized index is not configured on this querier")

@@ -95,19 +95,6 @@ func validateQueryOptions(opts QueryOptions) error {
 	if opts.StartNano > 0 && opts.EndNano > 0 && opts.StartNano > opts.EndNano {
 		return fmt.Errorf("invalid time range: StartNano (%d) > EndNano (%d)", opts.StartNano, opts.EndNano)
 	}
-	if opts.RecentFirstBudget != nil {
-		b := opts.RecentFirstBudget
-		if opts.Limit <= 0 && b.MaxBlocks <= 0 && b.MaxBytes <= 0 && b.MaxDuration <= 0 {
-			return fmt.Errorf(
-				"invalid RecentFirstBudget: at least one of Limit/MaxBlocks/MaxBytes/MaxDuration must be positive, or the bounded strategy has no way to ever stop",
-			)
-		}
-		if opts.MostRecent {
-			return fmt.Errorf(
-				"invalid QueryOptions: RecentFirstBudget and MostRecent are mutually exclusive (RecentFirstBudget is a strategy-engine signal, MostRecent is a user-facing hint)",
-			)
-		}
-	}
 	return nil
 }
 
@@ -365,20 +352,6 @@ func QueryTraceQL(
 			TimeRange:  normalizeTimeRange(opts.StartNano, opts.EndNano),
 			StartBlock: opts.StartBlock,
 			BlockCount: opts.BlockCount,
-		}
-		// F-3 (issue #481 part 2): RecentFirstBudget activates the bounded newest-first
-		// structural path for 1e/1f decline categories (chains that flatten to other than
-		// exactly 2 nodes). executor.Options can't reference the root RecentFirstBudget type
-		// directly (executor is a lower-level package root already imports — that would be a
-		// cycle), so copy the three cap fields across; Direction is always Backward when the
-		// budget is set, per queryoptions.go's RecentFirstBudget doc comment.
-		if opts.RecentFirstBudget != nil {
-			execOpts.RecentFirstBudget = &modules_executor.RecentFirstBudget{
-				MaxBlocks:   opts.RecentFirstBudget.MaxBlocks,
-				MaxBytes:    opts.RecentFirstBudget.MaxBytes,
-				MaxDuration: opts.RecentFirstBudget.MaxDuration,
-			}
-			execOpts.Direction = modules_queryplanner.Backward
 		}
 		var execResult *modules_executor.StructuralResult
 		execResult, err = modules_executor.ExecuteStructural(ctx, r, q, execOpts)

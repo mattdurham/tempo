@@ -180,3 +180,40 @@ func matchGroupsInBlock(b *BucketBlock, table *StringTable, pred Predicate, minT
 	}
 	return out
 }
+
+// matchGroupsInBlockReverse mirrors matchGroupsInBlock but walks b.Groups newest-first (from
+// len(Groups)-1 down to 0) instead of ascending -- a pure in-memory reversal, zero re-encode and
+// zero extra I/O, since Groups is already sorted (TimeSec ASC, CanonicalValue ASC) at write time
+// (SPEC-VI-1). Added as a SIBLING function -- matchGroupsInBlock itself is never modified, since
+// every existing non-early-stopping caller must remain byte-identical. Callers wanting a bounded
+// count should apply their own limit against len(out) after each call; this function itself
+// applies no limit (mirrors matchGroupsInBlock's own unbounded contract).
+func matchGroupsInBlockReverse(b *BucketBlock, table *StringTable, pred Predicate, minTS, maxTS uint64) []LookupResult {
+	var out []LookupResult
+	for gi := len(b.Groups) - 1; gi >= 0; gi-- {
+		g := &b.Groups[gi]
+		if g.TimeSec < minTS || g.TimeSec > maxTS {
+			continue
+		}
+		if pred != nil && !pred.Match(g.CanonicalValue) {
+			continue
+		}
+		for ri := range g.Refs {
+			r := &g.Refs[ri]
+			src := table.Lookup(r.SourceID)
+			for si := range r.Spans {
+				s := &r.Spans[si]
+				for _, idx := range s.SpanIndexes {
+					out = append(out, LookupResult{
+						SourceRef: src,
+						TimeSec:   g.TimeSec,
+						BlockRef:  r.Ref,
+						TraceID:   s.TraceID,
+						RowIdx:    idx,
+					})
+				}
+			}
+		}
+	}
+	return out
+}

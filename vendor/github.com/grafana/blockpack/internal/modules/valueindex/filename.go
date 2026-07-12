@@ -134,3 +134,27 @@ func lessFileMeta(a, b FileMeta) bool {
 	}
 	return a.WallMaxSec < b.WallMaxSec
 }
+
+// SortFileMetasNewestFirst sorts by (Level ASC, WallMaxSec DESC, WallMinSec DESC) -- the lowest
+// compaction level (freshest) still takes priority (matching SortFileMetas), but within a level,
+// newest wall-clock time first. Added as a SIBLING sort, not a parameter on SortFileMetas --
+// existing callers (DiscoverIndexFiles, filecache.go's listColumn/cache-insert paths) must keep
+// today's ascending order unchanged. A pure comparator change over the same already-parsed
+// FileMeta slice; zero additional I/O versus SortFileMetas.
+func SortFileMetasNewestFirst(metas []FileMeta) {
+	for i := 1; i < len(metas); i++ {
+		for j := i; j > 0 && lessFileMetaNewestFirst(metas[j], metas[j-1]); j-- {
+			metas[j], metas[j-1] = metas[j-1], metas[j]
+		}
+	}
+}
+
+func lessFileMetaNewestFirst(a, b FileMeta) bool {
+	if a.Level != b.Level {
+		return a.Level < b.Level
+	}
+	if a.WallMaxSec != b.WallMaxSec {
+		return a.WallMaxSec > b.WallMaxSec
+	}
+	return a.WallMinSec > b.WallMinSec
+}

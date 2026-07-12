@@ -14,7 +14,7 @@ across the whole value-index pipeline's NOTES.md files by established convention
 assigned in ascending order and never reused or renumbered; superseded entries are marked
 `[SUPERSEDED by SPEC-VI-N]` rather than deleted.
 
-Next free ID: **SPEC-VI-12**.
+Next free ID: **SPEC-VI-13**.
 
 ---
 
@@ -44,8 +44,43 @@ originally named is deleted (see `NOTES.md` NOTE-VI-053 addendum) — zero remai
 callers. It is not verified against untrusted or
 hand-corrupted input.
 
+**Addendum (2026-07-12, scan-fallback removal plan, Phase 1): promoted to a decode-time-asserted
+invariant.** The preceding Caveat's "not independently enforced/validated... does not assert
+group ordering on read" no longer holds. `decodeBlockIndex` (the shared choke point both
+`DecodeBucketFile` and `ReadBucketFileMetadata`/`readBucketFileTail`, SPEC-VI-8, route through)
+now calls `validateBlockDirectoryOrder(dir []BlockDirEntry) error`, which asserts
+`dir[i].MinTimeSec` is non-decreasing across `i` and returns an error satisfying
+`errors.Is(err, ErrBlockDirectoryOutOfOrder)` on violation — a decode error, never a panic, on
+both the in-memory and ranged read paths alike since they share this one choke point.
+
+This promotion is not cosmetic: it is the load-bearing correctness precondition for the
+newest-first early-stopping resolution introduced in the same phase
+(`QueryBucketFileRangedNewestFirst`, `matchGroupsInBlockReverse`, `bucketquery_ranged.go`/
+`bucketquery.go`) — early-stopping walks blocks in reverse and stops once enough matches are
+found, so a corrupted or hand-built file that violates this ordering would previously have
+caused early-stopping to silently return the wrong (non-newest) top-N results rather than an
+error. Every future newest-first/early-stopping consumer may now depend on this ordering as a
+validated guarantee rather than re-verifying it independently.
+
+**Exemption (binding):** a block encoded with `MinTimeSec == 0 && MaxTimeSec == 0`
+(`ComputeBlockMeta`'s explicit empty-block encoding — e.g. `filterDeadRefs` dropping every ref
+in one block but not its neighbors) carries no real chronological position and is exempt from
+this check in both directions; `EncodeBucketFile` supports such a block appearing anywhere in
+the block list without corrupting the file, so the invariant is "MinTimeSec is non-decreasing
+across all non-exempt blocks," not "strictly non-decreasing, no exceptions."
+
+Pinned by `TestDecodeBucketFile_RejectsOutOfOrderBlockDirectory` (`bucketfile_test.go`), which
+builds a real file via `SplitIntoBlocks` then performs a targeted byte-level swap of two on-disk
+block-directory entries to produce a genuine out-of-order file and asserts decode fails with
+`errors.Is(err, ErrBlockDirectoryOutOfOrder)`. Mutation-verified (temporarily disabling
+`validateBlockDirectoryOrder`'s check reproduces a red run of this test; restoring it goes green
+again).
+
 Back-refs: `internal/modules/valueindex/bucketmerge.go:SplitIntoBlocks`,
-`internal/modules/valueindex/stream_compaction.go:BucketFileIterator`.
+`internal/modules/valueindex/stream_compaction.go:BucketFileIterator`,
+`internal/modules/valueindex/bucketfile.go:decodeBlockIndex,validateBlockDirectoryOrder,
+ErrBlockDirectoryOutOfOrder` (the decode-time assertion), `bucketfile_test.go:
+TestDecodeBucketFile_RejectsOutOfOrderBlockDirectory` (the regression test).
 
 ---
 
@@ -583,3 +618,171 @@ ExtractValueIndexEntriesForColumns` (root package), `valueindex_l0write.go:Write
 (root package). See `NOTES.md`'s #496 cross-reference entry, `viusage/SPECS.md`
 SPEC-VIUSAGE-6/7, and `valueindexconsumer/SPECS.md` SPEC-VI-4 (the `trace:id` exclusion
 precedent this generalizes).
+
+---
+
+## SPEC-VI-12: Early-stopping top-N-by-recency parity contract (plan-scan-fallback.md Phase 8)
+*Added: 2026-07-12*
+
+**Status: drafted incrementally, per plan-scan-fallback.md Phase 8's explicit sequencing** — this
+entry was opened once Phase 2's `BuildSourceBounded` existed to back-reference, and is amended
+(new back-refs added, never existing text weakened) as each phase lands its own early-stopping
+function. As of this update, Phases 2-6/6b have landed and are back-referenced below; Phase 7
+(removal of `RecentFirstBudget`/`DispatchBoundedRecentFirst`, task #190) is still in progress and
+does not affect this entry's own claims — Phase 8's final sign-off (task #191, including the
+mutation sweep and the "`MostRecent`'s existing topK path is unaffected" check) still awaits it.
+
+**Contract:** for any query shape early-stopping resolution supports, the BOUNDED
+(`limit`-threaded, early-stopping) resolution's returned result set is **exactly** the top-`limit`
+entries by recency (newest-first) that an UNBOUNDED resolution over the same inputs would have
+produced — never a same-size-but-silently-wrong subset. This is a genuinely new correctness claim,
+distinct from SPEC-VI-1: SPEC-VI-1 governs only the on-disk chronological block-directory ordering
+that every early-stopping consumer depends on as a *precondition*; SPEC-VI-12 is the correctness
+claim about the *resolution algorithms* built on top of that precondition (the union/merge/anchor
+logic deciding which entries survive into the bounded output, and in what order).
+
+**Explicit scope exclusion (binding, confirmed against the landed Phase 6 mechanism):** this
+contract does **not** cover structural index-driven query answering under tempo's default
+per-block (block-sharded) dispatch. This is stronger than "no bounded answer" — per tempo's
+`tempodb/encoding/vblockpack/value_index_structural_query.go` (external, cross-repo, confirmed by
+direct read, 2026-07-12), `blockpack.ExecuteStructuralFromIndex` has no per-block
+ownership/sourceRef restriction at all (Option A's multi-file trace materialization means a
+structural match's spans can legitimately live in a different block than "this" one), so under
+per-block dispatch N blocks overlapping one time slice would each independently return the SAME
+complete answer rather than a partition of it — a correctness/cost defect that exists regardless
+of early-stopping. `tryStructuralIndexFetch` (tempo-side) therefore only ever attempts the
+index-driven answer when `indexOnly` is true — i.e. only inside a genuine `DispatchTimeSliced` job
+(`structural_sharder.go`'s `structuralTimeSlicedJobsFunc`) — and tempo's own comment there states
+this is now "a PERMANENT, correctness-required boundary, not an interim gate pending a future fix,"
+explicitly because "a future early-stopping resolution change would make duplicate per-block jobs
+non-deterministic at the limit boundary, strictly worse than today's wasteful-but-deterministic
+duplication." Phase 5's `chooseDiscoverySeed` recency-ordering fix makes structural's OWN existing
+early-stopping mechanism (`evalOneStructuralCandidateTrace`'s limit check) newest-first-correct
+*when reached via `DispatchTimeSliced`* — SPEC-VI-12's parity contract DOES apply there — but
+per-block dispatch itself is out of scope permanently, not pending a future extension.
+
+**Back-refs (current):**
+- `internal/modules/vibuilder/builder.go:BuildSourceBounded` (Phase 2, single-leaf early-stopping
+  index resolution). Mirrors `BuildSource` but threads `limit` through to an early-stopping,
+  newest-first resolution for the single-leaf case; a multi-leaf query (AND or OR — `collectLeaves`
+  flattens both) falls through to the ordinary unbounded `lookupColumn` per leaf rather than
+  silently under-reporting, so a not-yet-early-stopped shape still gets a correct answer.
+  `limit <= 0` delegates to `BuildSource` directly (no early-stopping code path exercised). `disc`
+  is type-asserted against `FileDiscovererNewestFirst`; a discoverer without newest-first support
+  falls back to the unbounded path too — never a correctness violation, only a missed optimization.
+  Watermark gating (#496 R7) and the match-all path are unchanged and out of scope for
+  early-stopping (a match-all query has no selectivity concept to bound).
+- `internal/modules/executor/metrics_trace.go:ViUnionNewestFirst` (Phase 3, multi-leaf OR
+  early-stopping). A k-way heap merge (`container/heap`) over N per-leaf newest-first-ordered
+  `VILookupResult` slices (Phase 2's `BuildSourceBounded` output per leaf), deduplicating by the
+  same `(SourceRef, span key)` identity rule `viSpanCmp`/`viSortDedup`/`viUnionSorted` use, stopping
+  once the deduplicated output reaches `limit`. Deliberately NOT a repeated pairwise
+  `viUnionSorted` (which is key-sorted, not time-sorted, and would defeat early-stopping).
+  Correctness of WHICH elements are included does not depend on the input sets actually being
+  sorted newest-first — the heap visits every element of every set exactly once regardless of
+  order — but this contract's top-limit-by-recency guarantee specifically DOES depend on it: only
+  when every input set is genuinely newest-first (as `BuildSourceBounded`'s output is) does the
+  merged output represent the true newest-limit union rather than an arbitrary same-size subset.
+  `limit <= 0` means unbounded (every element of every set is eventually visited).
+- `internal/modules/executor/metrics_trace_bounded.go:ViIntersectNewestFirstAnchored` (Phase 4,
+  multi-leaf AND early-stopping, "anchor+confirm" design — the hardest phase, per this file's own
+  package doc comment naming the landmine it avoids: independently early-stopping each AND leaf to
+  its own newest-N and then intersecting can silently under-report, because a true intersection
+  match can lie outside one leaf's own truncated top-N when that leaf is materially less selective
+  than the intersection as a whole). Resolves ONE leaf (the anchor, chosen by the caller —
+  `vibuilder.BuildSourceBounded` — for being cheap to over-fetch) newest-first and confirms each
+  candidate against the remaining leaf(s) via a caller-supplied `confirmFn`, collecting up to
+  `limit` confirmed matches and stopping `confirmFn` calls entirely once `limit` is reached. Returns
+  `needMore=true` when `anchorResults` was exhausted before `limit` confirmed matches were found —
+  the caller's signal to pull a wider anchor batch and retry; this function has no I/O of its own
+  and cannot pull more data itself. Supporting primitives sharing this file/back-ref:
+  `ViSpanIdentityKey`/`ViMembershipSet`/`ViConfirmAllSets` (the O(1) confirm-membership mechanism,
+  reusing the SAME `(SourceRef, span key)` identity rule as `ViUnionNewestFirst`) and
+  `viIntersectOrdered` (the eval-time, order-preserving multi-set intersection counterpart to
+  `ViUnionNewestFirst`, for a flat multi-leaf AND already resolved into independently-correct
+  per-leaf sets — preserves `sets[0]`'s own order rather than destroying it via a key-sorted
+  merge-join).
+- `internal/modules/executor/structural_index.go:chooseDiscoverySeed,groupVILookupResultsByTrace`
+  (Phase 5, structural candidate ordering). `groupVILookupResultsByTrace` returns
+  `map[[16]byte]traceSpanSet` — `traceSpanSet` wraps the existing per-trace span-address set
+  together with a new per-trace max-recency (`maxTimeSec`) field so the two pieces of state cannot
+  drift apart. `chooseDiscoverySeed` sorts candidate TraceIDs by `maxTimeSec` DESCENDING (was
+  lexicographic-by-TraceID-bytes only), with lexicographic kept as a same-recency tiebreaker for
+  determinism only. Structural's OWN early-stopping mechanism was already correct before this phase
+  (`evalOneStructuralCandidateTrace` already checked `limit` and signaled done, the caller already
+  broke on it) — the ONLY defect this phase fixes is feeding candidates in the WRONG order, so a
+  limited query could stop after confirming lexicographically-early (not most-recent) matches.
+  `intersectTraceIDSets`/`chooseCandidateTraceIDs` needed no change (already order-preserving /
+  already call `chooseDiscoverySeed`). Per this entry's scope-exclusion clause above, this fix's
+  benefit is reachable only via `DispatchTimeSliced` (`indexOnly=true`), never per-block dispatch.
+
+Back-ref: `plan-scan-fallback.md` Phase 8 section (the mutation-sweep list and end-to-end oracle
+test design — single-leaf, multi-leaf OR, multi-leaf AND, structural 2-node, each run through both
+the old unbounded path as oracle and the new bounded path, exact top-limit equality required —
+this entry formalizes). External cross-repo back-ref (informational, tempo-side, not enforced by
+this repo's own tests): `tempo/tempodb/encoding/vblockpack/value_index_structural_query.go` (the
+per-block-dispatch permanent-exclusion mechanism this entry's scope clause cites) and
+`backend_block.go` (formerly the querier-owned `RecentFirstBudget` policy variable — confirmed
+retired by Phase 7, see this entry's own Sign-off section below).
+
+**Sign-off (Phase 8 final integration pass, 2026-07-12).** Confirmed directly, not merely
+reported:
+
+- **Phase 7 (task #190) landed cleanly in both repos.** `RecentFirstBudget` and
+  `DispatchBoundedRecentFirst` have zero remaining live-code references in either
+  `blockpack` or `tempo/tempodb` — every remaining hit (`matchall_query.go`,
+  `structural_parity_golden_test.go`, `queryplan_test.go`, tempo's `backend_block.go`/
+  `slice_errors.go`/`value_index_query.go`) is a comment describing the retired mechanism
+  historically, not live code. `queryplan.DispatchStrategy` is now a genuine 2-value enum
+  (`DispatchBlockSharded`, `DispatchTimeSliced` only); `SelectSearchStrategy`'s
+  `LowSelectivity`/`UnknownSelectivity`-with-limit cases now report `DispatchBlockSharded`
+  (early-stopping index resolution, Phases 2-5, now serves the case the third dispatch value
+  used to exist for). Pinned by `queryplan_test.go:
+  TestSelectSearchStrategy_NoLongerReturnsDispatchBoundedRecentFirst`. `go build ./...` is clean.
+- **Full four-shape top-N-parity coverage exists, assembled from multiple test files rather
+  than one single combined oracle (an accurate correction to this entry's earlier Back-ref
+  paragraph, which described the design intent, not literally one file):**
+  - Single-leaf + multi-leaf OR: tempo's `tempodb/encoding/vblockpack/phase8_oracle_test.go:
+    TestPhase8_ExactOracleParity_SingleLeafAndOR` — a real `tempodb`-level `Fetch` call chain,
+    a deliberately 3-way-partitioned fixture (so OR's union genuinely excludes a non-trivial
+    "neither" subset), asserting exact top-N-by-recency trace-identity equality between the
+    unbounded oracle path (`MaxTraces=0`) and the bounded path (`MaxTraces=N`). This file's own
+    doc comment explicitly scoped itself to "non-AND... AND and structural added during the
+    final Phase 8 integration pass" — the two bullets below are that addition, confirmed to
+    already exist rather than still pending.
+  - Multi-leaf AND: `internal/modules/vibuilder/builder_bounded_and_test.go` —
+    `TestBuildSourceBoundedMultiLeafAND_AnchorConfirm_DoesNotUnderReport` (reproduces the
+    landmine this whole phase exists to avoid: independently early-stopping each AND leaf and
+    intersecting can silently under-report), `TestBuildSourceBoundedMultiLeafAND_ExactOracleMatch`,
+    `TestBuildSourceBoundedMultiLeafAND_WrongAnchorStillCorrect` (robustness: correctness must not
+    depend on the caller picking the "right" anchor leaf). Real end-to-end coverage in tempo:
+    `tempodb/encoding/vblockpack/fetch_bounded_and_integration_test.go:TestFetch_MultiLeafAND_WithLimit_ExactNewestLimitAnswer_EndToEnd`.
+  - Structural: `internal/modules/executor/structural_index_seed_ordering_internal_test.go:
+    TestChooseDiscoverySeed_NewestFirst_ExactOracleMatch` (Phase 5, real write-path fixture,
+    mutation-verified) plus tempo's `structural_indexonly_guard_test.go:
+    TestTryStructuralIndexFetch_NeverAnswersUnderPerBlockDispatch` (pins this entry's own
+    permanent per-block-dispatch scope exclusion — confirming the exclusion is enforced, not
+    merely documented).
+- **`MostRecent`'s existing topK path (`SPEC-STREAM-7`/`SPEC-STREAM-8`, unrelated to and
+  explicitly not touched by any phase of this plan) confirmed still passes unchanged** — pinned
+  by `api_test.go:TestQueryTraceQL_MostRecent` (run directly, `go test -run
+  'TestQueryTraceQL_MostRecent' -v .`, confirmed passing), replacing this bullet's earlier
+  "corroborated by the clean build" phrasing, which cited no specific test.
+- **Clarification (binding, requested by team-lead): `boundedAuthorized` was NOT removed by
+  Phase 7 and is NOT the same thing as `RecentFirstBudget`.** tempo's `tryIndexFetch` (`tempodb/
+  encoding/vblockpack/value_index_query.go:377`) still carries its own `boundedAuthorized bool`
+  parameter, UNCHANGED by Phase 7 — it is the real gate `SPEC-VI-12`'s early-stopping resolution
+  depends on: `boundedAuthorized` selects whether `tryIndexFetch` calls
+  `BuildValueIndexSourceBounded` (the early-stopping path, Phases 2-4) or the ordinary
+  `BuildValueIndexSource`. What Phase 7 actually removed is a DIFFERENT, similarly-named
+  parameter: `declineOutcomeBounded` (a separate, downstream function) USED TO carry its own
+  `boundedAuthorized` parameter, which it used to conditionally relay a routine decline to the
+  now-deleted `RecentFirstBudget` raw-block-scan path. That relay parameter is what Phase 7
+  dropped — confirmed by direct read of `declineOutcomeBounded`'s current doc comment (lines
+  504-519 of `value_index_query.go`), which states this distinction explicitly: a decline
+  reaching `declineOutcomeBounded` today means the bounded early-stopping resolution was already
+  attempted upstream (via `tryIndexFetch`'s own still-live `boundedAuthorized` gate) and still
+  found no coverage, so `declineOutcomeBounded` now unconditionally returns `ErrSearchNoCoverage`
+  for a routine (non-`indexOnly`) decline, with nothing left to conditionally relay to.
+
+Phase 8 (task #191) is complete as of this sign-off.

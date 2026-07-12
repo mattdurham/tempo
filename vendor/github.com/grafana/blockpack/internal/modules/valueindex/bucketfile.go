@@ -440,6 +440,16 @@ func encodeBucketBlock(b *BucketBlock) []byte {
 // Recognize with errors.Is(err, ErrNotBucketFile).
 var ErrNotBucketFile = errors.New("valueindex: not a bucket file (bad magic)")
 
+// ErrBlockDirectoryOutOfOrder signals that a v2 BucketGroup file's block directory violates
+// SPEC-VI-1's chronological-ordering invariant (dir[i].MinTimeSec must be non-decreasing across
+// i) -- SplitIntoBlocks/sortBucketBlock guarantee this at write time (bucketmerge.go), and every
+// early-stopping newest-first consumer (QueryBucketFileRangedNewestFirst,
+// matchGroupsInBlockReverse) now depends on it for correctness, not merely performance: a
+// violated invariant would silently return the wrong newest-N results rather than crash. Decoded
+// at DecodeBucketFile/ReadBucketFileMetadata's shared decodeBlockIndex choke point so both the
+// in-memory and ranged read paths get the same check for free.
+var ErrBlockDirectoryOutOfOrder = errors.New("valueindex: block directory is not chronologically ordered (SPEC-VI-1)")
+
 // DecodeBucketFile parses the full v2 wire format produced by EncodeBucketFile.
 // A bad header or footer magic is reported as ErrNotBucketFile (the data is not a
 // v2 file at all); every other failure is a genuine decode error on a v2 file.
@@ -550,7 +560,44 @@ func decodeBlockIndex(data []byte) ([]BlockDirEntry, error) {
 		pos += xvl
 		dir = append(dir, d)
 	}
+	if err := validateBlockDirectoryOrder(dir); err != nil {
+		return nil, err
+	}
 	return dir, nil
+}
+
+// validateBlockDirectoryOrder asserts SPEC-VI-1 (amended)'s chronological-ordering invariant:
+// the block directory is ordered by construction -- SplitIntoBlocks sorts the full merged group
+// list before chunking it into contiguous, non-overlapping block ranges (bucketmerge.go), so
+// block N+1 always covers strictly later time than block N. This was previously an emergent
+// property, never asserted on read; every early-stopping newest-first consumer now depends on it
+// for CORRECTNESS (a violation would silently return the wrong newest-N, not crash), so it is
+// promoted here to a decode-time-asserted invariant, checked once at this shared choke point for
+// both DecodeBucketFile and ReadBucketFileMetadata.
+//
+// A block with zero groups is encoded with MinTimeSec=MaxTimeSec=0 (ComputeBlockMeta's explicit
+// empty-block case) and carries no real chronological position -- EncodeBucketFile supports an
+// empty block appearing anywhere in the block list (e.g. after filterDeadRefs drops every ref in
+// one block but not its neighbors) without corrupting the file, so such entries are exempt from
+// this check in both directions, not merely tolerated as a one-off exception.
+func validateBlockDirectoryOrder(dir []BlockDirEntry) error {
+	lastMinTimeSec := uint64(0)
+	haveLast := false
+	for i := range dir {
+		d := &dir[i]
+		if d.MinTimeSec == 0 && d.MaxTimeSec == 0 {
+			continue
+		}
+		if haveLast && d.MinTimeSec < lastMinTimeSec {
+			return fmt.Errorf(
+				"valueindex: block %d MinTimeSec (%d) precedes an earlier block's MinTimeSec (%d): %w",
+				i, d.MinTimeSec, lastMinTimeSec, ErrBlockDirectoryOutOfOrder,
+			)
+		}
+		lastMinTimeSec = d.MinTimeSec
+		haveLast = true
+	}
+	return nil
 }
 
 func decodeBucketBlock(raw []byte) (*BucketBlock, error) {

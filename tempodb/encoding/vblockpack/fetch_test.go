@@ -24,6 +24,17 @@ import (
 func createFetchTestBlock(t *testing.T) (*blockpackBlock, *backend.BlockMeta) {
 	t.Helper()
 
+	// Phase 0 removed the vr==nil unconditional scan fallback — every Fetch now needs a
+	// configured value index. Tests that want a specific VI behavior (an empty store, a
+	// build-error store, vr==nil, etc.) call withVISink/withVIQueryReader themselves BEFORE
+	// calling this helper; only auto-install a default working fixture when nothing else has,
+	// so those tests' explicit setup is never silently overridden.
+	if !viExplicitlySetForTest {
+		viStore := &fakeVISink{}
+		withVISink(t, viStore, "indexes")
+		withVIQueryReader(t, viStore, "indexes")
+	}
+
 	ctx := context.Background()
 	tmpDir := t.TempDir()
 	rawR, rawW, _, err := local.New(&local.Config{Path: tmpDir})
@@ -95,12 +106,26 @@ func createFetchTestBlock(t *testing.T) (*blockpackBlock, *backend.BlockMeta) {
 // collectFetch runs Fetch with the given conditions and returns all spans grouped by trace.
 func collectFetch(t *testing.T, block *blockpackBlock, conditions []traceql.Condition, allConditions bool) []*traceql.Spanset {
 	t.Helper()
+	// Phase 0 removed the vr==nil unconditional scan fallback — every Fetch now needs a
+	// configured value index. Mirrors createFetchTestBlock's own guard for callers that build
+	// their block manually instead of via that helper; only auto-installs a default (possibly
+	// zero-coverage, in which case the MaxTraces limit below authorizes the bounded fallback
+	// path) reader when nothing has explicitly configured one already.
+	if !viExplicitlySetForTest && getValueIndexQueryReader() == nil {
+		withVIQueryReader(t, &fakeVISink{}, "indexes")
+	}
 	ctx := context.Background()
 	req := traceql.FetchSpansRequest{
 		Conditions:    conditions,
 		AllConditions: allConditions,
 	}
-	resp, err := block.Fetch(ctx, req, common.SearchOptions{})
+	// MaxTraces: a limit is required to authorize the bounded newest-first path
+	// (boundedAuthorized, Phase 0) for query shapes the value index legitimately declines to
+	// answer at all (e.g. match-all/"{}" -- no leaf predicate to look up, an unindexable shape
+	// per B1/#496). Set generously so it never truncates these small test fixtures; indexable
+	// conditions are answered directly by createFetchTestBlock's now-default working index and
+	// never reach this budget at all.
+	resp, err := block.Fetch(ctx, req, common.SearchOptions{MaxTraces: 10000})
 	require.NoError(t, err)
 	defer resp.Results.Close()
 
@@ -398,6 +423,14 @@ func TestFetch_KindFilter(t *testing.T) {
 	// Build a block with two traces:
 	//   trace A: span with Kind=CLIENT
 	//   trace B: span with Kind=SERVER
+	//
+	// Phase 0 (scan-fallback removal): install a REAL value-index store on both the write and
+	// read side (see createFetchTestBlock's own doc comment) -- this test builds its own block
+	// directly rather than via createFetchTestBlock, so it must set this up itself.
+	store := &fakeVISink{}
+	withVISink(t, store, "indexes")
+	withVIQueryReader(t, store, "indexes")
+
 	ctx := context.Background()
 	tmpDir := t.TempDir()
 	rawR, rawW, _, err := local.New(&local.Config{Path: tmpDir})
@@ -479,6 +512,14 @@ func TestFetch_KindFilter(t *testing.T) {
 
 // TestFetch_StatusFilter verifies that {status=error} and {status=ok} correctly filter spans by OTLP status code.
 func TestFetch_StatusFilter(t *testing.T) {
+	// Phase 0 (scan-fallback removal): this test builds its own block directly rather than via
+	// createFetchTestBlock, so it must install a REAL value-index store itself (see
+	// createFetchTestBlock's own doc comment for why an empty store would silently give a
+	// false-negative answer for these equality/comparison leaves).
+	store := &fakeVISink{}
+	withVISink(t, store, "indexes")
+	withVIQueryReader(t, store, "indexes")
+
 	ctx := context.Background()
 	tmpDir := t.TempDir()
 	rawR, rawW, _, err := local.New(&local.Config{Path: tmpDir})
@@ -566,6 +607,13 @@ func TestFetch_StatusFilter(t *testing.T) {
 // (OTLP OK=1, ERROR=2 vs Tempo StatusError=0, StatusOk=1, StatusUnset=2).
 // Without explicit conversion, kind/status filtering would return wrong spans.
 func TestFetch_KindStatusAttributeFor(t *testing.T) {
+	// Phase 0 (scan-fallback removal): this test builds its own block directly rather than via
+	// createFetchTestBlock, so it must install a REAL value-index store itself (see
+	// createFetchTestBlock's own doc comment).
+	store := &fakeVISink{}
+	withVISink(t, store, "indexes")
+	withVIQueryReader(t, store, "indexes")
+
 	ctx := context.Background()
 	tmpDir := t.TempDir()
 	rawR, rawW, _, err := local.New(&local.Config{Path: tmpDir})
@@ -734,7 +782,11 @@ func TestFetch_TimeRangeSkip(t *testing.T) {
 		EndTimeUnixNanos:   sixMonthsAgo,
 	}
 
-	resp, err := block.Fetch(ctx, req, common.SearchOptions{})
+	// MaxTraces: a "{}" match-all query has no indexable leaf, so it always routes to a routine
+	// decline (Phase 0) -- a limit is required to authorize the bounded newest-first path instead
+	// of a hard error. The bounded path still correctly returns empty here since none of the
+	// block's real spans fall inside this deliberately-mismatched query window.
+	resp, err := block.Fetch(ctx, req, common.SearchOptions{MaxTraces: 100})
 	require.NoError(t, err)
 	defer resp.Results.Close()
 
@@ -756,6 +808,13 @@ func TestFetch_TimeRangeSkip(t *testing.T) {
 // Prevents a panic in Grafana's Tempo datasource plugin when mixed bool/string
 // attribute values appear across spans (data frame column type must be uniform).
 func TestFetch_BoolAttrConvertedToString(t *testing.T) {
+	// Phase 0 (scan-fallback removal): this test builds its own block directly rather than via
+	// createFetchTestBlock, so it must install a REAL value-index store itself (see
+	// createFetchTestBlock's own doc comment).
+	store := &fakeVISink{}
+	withVISink(t, store, "indexes")
+	withVIQueryReader(t, store, "indexes")
+
 	ctx := context.Background()
 	tmpDir := t.TempDir()
 	rawR, rawW, _, err := local.New(&local.Config{Path: tmpDir})
@@ -821,6 +880,13 @@ func TestFetch_BoolAttrConvertedToString(t *testing.T) {
 // string, int, and float span attributes with correct types, and that booleans
 // are always returned as strings (preventing Grafana data frame type panics).
 func TestFetch_AllAttributesReturnsAllTypes(t *testing.T) {
+	// Phase 0 (scan-fallback removal): this test builds its own block directly rather than via
+	// createFetchTestBlock, so it must install a REAL value-index store itself (see
+	// createFetchTestBlock's own doc comment).
+	store := &fakeVISink{}
+	withVISink(t, store, "indexes")
+	withVIQueryReader(t, store, "indexes")
+
 	ctx := context.Background()
 	tmpDir := t.TempDir()
 	rawR, rawW, _, err := local.New(&local.Config{Path: tmpDir})
@@ -903,6 +969,14 @@ func TestFetch_AllAttributesReturnsAllTypes(t *testing.T) {
 // datasource from panicking on inconsistent attribute sets across spans
 // (data frame column type must be uniform: nullable *string vs plain string).
 func TestFetch_AllAttributesLimitedToQueryConditions(t *testing.T) {
+	// Phase 0 (scan-fallback removal): this test builds its own block directly rather than via
+	// createFetchTestBlock, so it must install a REAL value-index store itself (see
+	// createFetchTestBlock's own doc comment for why an empty store would silently give a
+	// false-negative answer for this equality leaf).
+	store := &fakeVISink{}
+	withVISink(t, store, "indexes")
+	withVIQueryReader(t, store, "indexes")
+
 	ctx := context.Background()
 	tmpDir := t.TempDir()
 	rawR, rawW, _, err := local.New(&local.Config{Path: tmpDir})
@@ -1010,17 +1084,20 @@ func TestFetch_SetsAttributeMatched(t *testing.T) {
 // Fix location: tempodb/encoding/vblockpack/backend_block.go:Fetch() — detect nil Fields,
 // issue a metadata re-query with "{}" + SelectColumns for the matched trace IDs.
 //
-// F-9 (issue #481 parts 2/3): common.SearchOptions now carries MaxTraces: 5 — a fixture-level
-// change forced by Phase F's decline-routing rewrite (F-8). This test's structural query has no
-// value-index reader configured at all, so it declines identically to
-// structural_dispatch_test.go's TestFetch_StructuralIndexOnlyFalse_DeclineRoutingUnaffectedByVIConfig;
-// without a limit that decline now hard-errors (ErrSearchNoCoverage) instead of falling back to a
-// scan. Adding the limit routes through F-3's bounded structural path instead — the SAME correct
-// answer this test's actual (unrelated) invariant, RootServiceName/DurationNanos population, needs
-// to observe. This is the ONLY change; the RootServiceName/DurationNanos assertions below are
-// untouched.
+// Phase 7 (plan-scan-fallback.md) removed the #481-part-2 bounded-scan mechanism this test used
+// to route through under the default (non-slice) dispatch — a structural decline under per-block
+// dispatch now ALWAYS hard-errors, regardless of limit (Phase 6's asymmetry finding). A structural
+// query can therefore only ever succeed through Fetch via a genuine #487 slice job (IndexOnly:
+// true) with real index coverage — mirroring
+// structural_dispatch_test.go's TestFetch_StructuralQuery_TriesIndexPathBeforeScanFallback. This
+// test now writes through a REAL (non-empty) value-index sink so the index-driven structural path
+// actually answers, and sets IndexOnly: true accordingly. The RootServiceName/DurationNanos
+// assertions below (this test's actual, unrelated invariant) are untouched.
 func TestFetch_StructuralQueryPopulatesRootServiceName(t *testing.T) {
 	t.Cleanup(blockpack.ClearReaderCaches)
+	viStore := &fakeVISink{}
+	withVISink(t, viStore, "indexes")
+	withVIQueryReader(t, viStore, "indexes")
 
 	ctx := context.Background()
 	tmpDir := t.TempDir()
@@ -1080,7 +1157,7 @@ func TestFetch_StructuralQueryPopulatesRootServiceName(t *testing.T) {
 	fetchCtx := common.WithOriginalTraceQLQuery(ctx, structuralQuery, false)
 
 	req := traceql.FetchSpansRequest{}
-	resp, err := blk.Fetch(fetchCtx, req, common.SearchOptions{MaxTraces: 5})
+	resp, err := blk.Fetch(fetchCtx, req, common.SearchOptions{MaxTraces: 5, IndexOnly: true})
 	require.NoError(t, err)
 	defer resp.Results.Close()
 
@@ -1109,6 +1186,13 @@ func TestFetch_StructuralQueryPopulatesRootServiceName(t *testing.T) {
 // oversized payloads from reaching the Grafana UI.
 func TestFetch_SpanCapAtDefaultSpansPerSpanSet(t *testing.T) {
 	const totalSpans = 5 // deliberately > DefaultSpansPerSpanSet (3)
+
+	// Phase 0 (scan-fallback removal): this test builds its own block directly rather than via
+	// createFetchTestBlock, so it must install a REAL value-index store itself (see
+	// createFetchTestBlock's own doc comment).
+	store := &fakeVISink{}
+	withVISink(t, store, "indexes")
+	withVIQueryReader(t, store, "indexes")
 
 	ctx := context.Background()
 	tmpDir := t.TempDir()

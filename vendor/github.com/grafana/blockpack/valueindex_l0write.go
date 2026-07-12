@@ -90,7 +90,12 @@ type l0TraceAccum struct {
 // caller's column policy, mirroring valueindexconsumer's identical
 // "unconditional trace-by-id buffering, regardless of the configured column
 // allowlist" pattern (service.go).
-func WriteValueIndexL0(r *Reader, store ObjectPutter, sourceRef, tenant, indexPrefix string, policy ColumnPolicy) error {
+func WriteValueIndexL0(
+	r *Reader,
+	store ObjectPutter,
+	sourceRef, tenant, indexPrefix string,
+	policy ColumnPolicy,
+) error {
 	if r == nil || store == nil {
 		return nil
 	}
@@ -344,10 +349,11 @@ func writeColumnMetadata(store ObjectPutter, tenant, indexPrefix, colName, colTy
 	if indexPrefix == "" {
 		indexPrefix = defaultL0IndexPrefix
 	}
+	createdAtUnix := int64(createdAtSec) //nolint:gosec // unix seconds fits int64 for any realistic timestamp
 	data, err := json.Marshal(columnMetadata{
 		ColumnName: colName,
 		ColumnType: colType,
-		CreatedAt:  time.Unix(int64(createdAtSec), 0).UTC().Format(time.RFC3339), //nolint:gosec // unix seconds fits int64 for any realistic timestamp
+		CreatedAt:  time.Unix(createdAtUnix, 0).UTC().Format(time.RFC3339),
 	})
 	if err != nil {
 		return fmt.Errorf("blockpack: writeColumnMetadata: marshal: %w", err)

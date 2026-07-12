@@ -828,6 +828,16 @@ Back-refs (Phase F additions): `queryoptions.go:RecentFirstBudget` (`SPEC-ROOT-0
 `internal/modules/executor/stream.go` (`SPEC-STREAM-13`, the bounded-read mechanism),
 `internal/modules/queryplan/queryplan.go:SelectSearchStrategy` (`SPEC-QP-6`). Issue #481.
 
+**Retracted (2026-07-12, plan-scan-fallback.md Phase 7, task #190).** The bounded-scan
+mechanism this whole addendum describes — `QueryOptions.RecentFirstBudget`, its consumption via
+`queryplan.SelectSearchStrategy`, and the `DispatchBoundedRecentFirst` strategy value — has been
+REMOVED, not merely superseded by a new option alongside it. This addendum's own framing
+("additive, not yet a removal") is retained above verbatim for history but is no longer an
+accurate description of the current contract; see `SPEC-ROOT-023`'s own retirement note (below)
+for what replaced it. The three routine-decline categories this addendum's own middle paragraph
+says are "unchanged by this phase" remain genuinely unchanged by THIS retraction too — only the
+bounded-scan alternative itself is gone, not the decline categories it once sat alongside.
+
 ---
 
 ## SPEC-FORMAT-001: All Metadata Sections Must Be ToC-Driven for Selective Decoding
@@ -1234,3 +1244,113 @@ Back-refs: `queryoptions.go:RecentFirstBudget`, `api.go:validateQueryOptions`,
 (`SPEC-STREAM-13`), `internal/modules/executor/options.go`/`structuralresult.go`/
 `stream_structural.go` (`SPEC-STRUCT-13`/`14`). Tests: `recentfirst_test.go`,
 `internal/modules/executor/recentfirst_test.go`. Issue #481.
+
+**RETIRED (2026-07-12, plan-scan-fallback.md Phase 7, task #190).** `RecentFirstBudget` — this
+type, the `QueryOptions.RecentFirstBudget` field, its executor-local mirror
+(`internal/modules/executor/recentfirst.go`, file deleted outright), and the
+`DispatchBoundedRecentFirst` `DispatchStrategy` value that activated it (`SPEC-QP-6`) — has been
+REMOVED from the codebase entirely, confirmed by repo-wide grep: zero remaining references in
+either `blockpack` or `tempo/tempodb` outside of historical comments describing the removal
+itself. **Why removal, not merely continued additive coexistence:** the bounded-scan strategy
+this type activated existed to serve `LowSelectivity`/`UnknownSelectivity` queries carrying a
+limit — exactly the case `SPEC-VI-12`'s early-stopping index resolution (Phases 2-5 of the same
+plan) now serves instead, via genuine index-driven resolution rather than a capped raw-block
+scan. With that replacement in place, `SelectSearchStrategy`'s `LowSelectivity`/
+`UnknownSelectivity`-with-limit rows collapse to `DispatchBlockSharded` (see `queryplan/SPECS.md`
+`SPEC-QP-6`'s own updated table) rather than a third dispatch value, since the ordinary
+index-driven path now answers those queries correctly and boundedly on its own.
+
+This entry (including its Contract/Execution-semantics/mirror/test-coverage paragraphs above) is
+retained verbatim for history, per this file's own ID convention (IDs are never reused or
+renumbered; a superseded entry is marked rather than deleted). Every back-ref function/type named
+above (`queryoptions.go:RecentFirstBudget`, `internal/modules/executor/recentfirst.go`,
+`recentfirst_test.go`, `internal/modules/executor/recentfirst_test.go`) no longer exists in the
+codebase. See `SPEC-VI-12` (`internal/modules/valueindex/SPECS.md`) for the mechanism that made
+this removal safe, and `executor/SPECS.md` `SPEC-STREAM-13`/`SPEC-STRUCT-13`/`SPEC-STRUCT-14` for
+this type's own now-retired mechanism-level consumers (each carries its own matching retirement
+note).
+
+---
+
+## SPEC-ROOT-024: `IsMatchAllProgram`/`QueryNewestFirstMatchAll` — Bounded Newest-First Materializer for Match-All Queries
+*Added: 2026-07-12 (plan-scan-fallback.md Phase 6b)*
+
+**What this is.** A TraceQL program (or intrinsic-only condition set, e.g. tempo's own
+`SearchMetaConditions()`) with ZERO leaf predicates AND ZERO listed columns has nothing for the
+value index — or any predicate evaluator — to check; every span in every visited block matches
+trivially. `IsMatchAllProgram(prog *Program) bool` (`matchall_query.go`) detects this exact shape
+(`prog == nil || prog.Predicates == nil || (len(Nodes)==0 && len(Columns)==0)`) so a caller (tempo's
+`Fetch`) can route it to `QueryNewestFirstMatchAll` instead of ever attempting a value-index build
+for a query that has no predicate to look up in the first place. There is no coverage gap here —
+`SPEC-ROOT-019`'s authoritative-index contract does not apply, since there is no predicate to be
+authoritative ABOUT.
+
+**Deliberately NOT a revival of the retired `RecentFirstBudget`/`DispatchBoundedRecentFirst`
+(`SPEC-ROOT-023`, being removed by plan-scan-fallback.md Phase 7).** `RecentFirstBudget` bounded
+the COST of evaluating an EXPENSIVE FILTER via a scan; a match-all query has no filter to evaluate
+at any cost. The only correctness requirement is a positive `Limit` — there is no other dimension
+to bound the read by — and the only work is walking blocks newest-first and decoding them directly
+until `Limit` spans are materialized.
+
+**Contract:** `QueryNewestFirstMatchAll(ctx, r *Reader, opts QueryOptions) ([]SpanMatch, QueryStats,
+error)` requires `r != nil` and `opts.Limit > 0` (an immediate error otherwise, no block read at
+all — unlike `RecentFirstBudget`'s multi-dimensional budget, there is no "unbounded but capped by
+bytes/duration" mode here, since a match-all query could otherwise materialize an entire tenant's
+data). Widens `opts.EndNano == 0` to `math.MaxUint64` before use, mirroring `api.go`'s
+`normalizeTimeRange` "0 means unbounded" convention — most match-all requests have no explicit time
+window, and a literal 0 would incorrectly match nothing against `internal/modules/blockio/reader`'s
+`BlockIndicesNewestFirst` (`SPEC-RDR-013`), which takes a literal window, not a 0-means-unbounded one.
+
+**Execution:** walks `r.BlockIndicesNewestFirst(opts.StartNano, maxNano)`'s block order one block
+at a time, decoding each via `QueryTraceQLWithProgram` with a package-level, once-compiled
+`matchAllProgram` (`CompileTraceQL("{}", QueryOptions{})` — deterministic, so nothing
+query-specific to recompile per call) and `blockOpts` narrowed to exactly one block
+(`StartBlock`/`BlockCount: 1`) and the REMAINING limit (`opts.Limit - len(matches)`). Stops as soon
+as `len(matches) >= opts.Limit` — no further blocks are read past that point. Uses the same
+`QueryTraceQLWithProgram` machinery every other query path already uses, so `SPEC-007`'s
+single-I/O-per-block invariant is unchanged and not re-implemented here.
+
+**Correctness mechanism for exact-window matching — corrected, binding clause (this entry's
+authoritative statement supersedes any earlier informal description of this path as
+"window-aware"):** `BlockIndicesNewestFirst` (`SPEC-RDR-013`) prunes and orders at BLOCK
+granularity only — a block whose own `[minTS, maxTS]` range overlaps `[opts.StartNano, maxNano]`
+is included in full, even though individual spans inside it may fall outside that exact window.
+`QueryNewestFirstMatchAll` itself performs no additional per-span window check of its own either.
+**The actual per-span `[StartNano, EndNano]` correctness is enforced entirely by the ordinary
+per-block `QueryTraceQLWithProgram` → `Collect` call's EXISTING per-row time filtering** — the
+same mechanism (`internal/modules/executor/SPECS.md` `SPEC-STREAM-4`: a non-empty
+`TimestampColumn` in `CollectOptions` enables a per-row `[MinNano, MaxNano]` check) every other
+query path already relies on, driven by `blockOpts`' carried-over `StartNano`/`EndNano` (and
+whatever `TimestampColumn`/`Direction` the caller's own `opts` already set) — NOT by any
+window-awareness logic added inside `BlockIndicesNewestFirst` or `QueryNewestFirstMatchAll`
+themselves. This function's own contribution is exclusively WHICH blocks get visited and in WHAT
+ORDER (newest-first, for early stopping); it delegates all per-span correctness to the pre-existing
+`Collect` path unchanged.
+
+Back-refs: `matchall_query.go:IsMatchAllProgram,QueryNewestFirstMatchAll,matchAllProgram`.
+See `internal/modules/blockio/reader/SPECS.md` `SPEC-RDR-013` (`BlockIndicesNewestFirst`, the
+block-ordering primitive this function walks) and `internal/modules/executor/SPECS.md`
+`SPEC-STREAM-4` (the per-row time-filtering mechanism that supplies this function's actual
+per-span window correctness). `SPEC-ROOT-023` (`RecentFirstBudget`) for the mechanism this is
+explicitly NOT a revival of. Issue: plan-scan-fallback.md Phase 6b.
+
+**Confirmed caller-pitfall incident (2026-07-12, task #193, found by reviewer-1-5).** Tempo's
+`backend_block.go` match-all dispatch branch violated this entry's own binding contract
+("`opts.Limit > 0` ... an immediate error otherwise") by calling `QueryNewestFirstMatchAll`
+whenever a query was classified match-all, WITHOUT first checking whether the caller's own
+`MaxTraces` was `0` — and `common.SearchOptions.MaxTraces`'s own contract defines `0` as
+"unlimited," a convention real callers (tempo's local ingester-side metrics-range paths,
+`common.DefaultSearchOptions()`) actively rely on. The result: every unfiltered metrics query
+against not-yet-flushed/ingester-local data hard-errored via a tempo-side sentinel
+(`ErrMatchAllRequiresLimit`, since deleted) instead of running the query at all. **This is not a
+defect in this entry's own contract** — the contract already correctly specifies that a caller
+must supply a positive `Limit` before calling `QueryNewestFirstMatchAll` at all; the bug was
+tempo's dispatch layer calling this function in a case its own contract explicitly does not
+cover (`MaxTraces == 0`, i.e. no bound at all) instead of routing that case to the ordinary
+unbounded scan, exactly as every other query shape without a limit already does. Fixed
+tempo-side only (`backend_block.go`'s match-all case now gates on `spanLimit > 0` before ever
+calling `QueryNewestFirstMatchAll`; `spanLimit <= 0` falls through to the pre-existing unbounded
+path) — no blockpack code or contract change was needed or made. Recorded here as confirmation
+that this entry's Limit-required contract is load-bearing: a caller that gets this wrong fails
+loudly (a hard error) rather than silently, which is what let this incident be caught and fixed
+quickly rather than silently under/over-counting.

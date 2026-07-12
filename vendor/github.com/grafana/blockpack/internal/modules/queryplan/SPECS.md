@@ -330,6 +330,55 @@ Tests: `queryplan_test.go` (`TestSelectSearchStrategy_FiveRowCore`,
 `TestSelectSearchStrategy_NeverReturnsTimeSlicedOrFakeDeclineStrategy` — see `queryplan/TESTS.md`
 `TEST-QP-1`/`TEST-QP-2`). See `NOTES.md` NOTE-QP-010. Issue #481.
 
+**Update (2026-07-12, plan-scan-fallback.md Phase 7, task #190): the five-row table above is
+STALE — `DispatchBoundedRecentFirst` has been deleted from `DispatchStrategy` entirely, and the
+decision table has collapsed.** Confirmed by direct read of the current implementation:
+
+```go
+func SelectSearchStrategy(sel Selectivity, hasLimit bool) (strategy DispatchStrategy, planTimeDecline bool) {
+	if sel == LowSelectivity && !hasLimit {
+		return DispatchBlockSharded, true
+	}
+	return DispatchBlockSharded, false
+}
+```
+
+**The current table (every row, no exceptions):**
+
+| `Selectivity` | `hasLimit` | `strategy` | `planTimeDecline` |
+|---|---|---|---|
+| `Selective` | any | `DispatchBlockSharded` | `false` |
+| `LowSelectivity` | `true` | `DispatchBlockSharded` | `false` |
+| `LowSelectivity` | `false` | `DispatchBlockSharded` | `true` |
+| `UnknownSelectivity` | any | `DispatchBlockSharded` | `false` |
+
+`strategy` is now `DispatchBlockSharded` in every row — `hasLimit` affects ONLY `planTimeDecline`
+(via the single `LowSelectivity && !hasLimit` exceptional case), never the strategy value itself,
+since there is no longer a second non-`DispatchBlockSharded` strategy to select between.
+`DispatchStrategy` itself is now a genuine 2-value enum (`DispatchBlockSharded`,
+`DispatchTimeSliced` — the latter from `SPEC-QP-3`, unrelated to and unaffected by this change).
+`LowSelectivity`/`UnknownSelectivity`-with-a-limit queries, which previously activated
+`DispatchBoundedRecentFirst`, now dispatch as ordinary `DispatchBlockSharded` — the case is served
+correctly and boundedly instead by `SPEC-VI-12`'s early-stopping index resolution (root
+`SPEC.md` `SPEC-ROOT-023`'s own retirement note has the full removal rationale), not by a distinct
+dispatch strategy at the queryplan layer.
+
+**Why this is an update to SPEC-QP-6, not a separate retirement entry:** `SelectSearchStrategy`
+itself is still live, still called the same way, still has the same signature and the same
+`(strategy, planTimeDecline)` two-return-value shape and the same "decline is out-of-band, not a
+fake enum value" design this entry's own body already argues for. Only ONE table row's outcome
+and the enum's cardinality changed — this is a narrowing correction to an existing contract, not
+a removal of the contract itself (contrast with `SPEC-ROOT-023`/`SPEC-STREAM-13`/`SPEC-STRUCT-13`/
+`14`, which describe mechanisms that no longer exist at all).
+Pinned by `queryplan_test.go:TestSelectSearchStrategy_NoLongerReturnsDispatchBoundedRecentFirst`
+(Phase 7's own regression test, confirmed present by direct read). **Correction:** the original
+`TestSelectSearchStrategy_FiveRowCore` name referenced in this entry's own pre-Phase-7 Tests:
+line was NOT left stale — it was renamed to `TestSelectSearchStrategy_FourRowCore`, confirmed by
+direct read of `queryplan_test.go`, matching the table's new row count exactly.
+
+Back-ref (current): `internal/modules/queryplan/queryplan.go:SelectSearchStrategy,DispatchStrategy`
+(now 2-valued). Tests: `queryplan_test.go:TestSelectSearchStrategy_FourRowCore,TestSelectSearchStrategy_NoLongerReturnsDispatchBoundedRecentFirst`.
+
 ---
 
 ## SPEC-QP-7: `LeadDetail` / `ClassifyProgramVCNTWithDetail` — Both-Sides'-Costs Contract

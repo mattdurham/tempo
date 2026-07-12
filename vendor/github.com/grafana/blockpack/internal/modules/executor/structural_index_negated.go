@@ -120,7 +120,16 @@ func ExecuteNegatedStructuralFromIndex(
 
 	colHash := valueindex.ColHash(modules_shared.TraceIDColumnName)
 	colTypeName := valueindex.ColTypeName(modules_shared.ColumnTypeUUID)
-	keys, discoverErr := valueindex.DiscoverIndexFiles(ctx, traceGroupStore, tenant, indexPrefix, colHash, colTypeName, minTS, maxTS)
+	keys, discoverErr := valueindex.DiscoverIndexFiles(
+		ctx,
+		traceGroupStore,
+		tenant,
+		indexPrefix,
+		colHash,
+		colTypeName,
+		minTS,
+		maxTS,
+	)
 	if discoverErr != nil {
 		return nil, false, fmt.Errorf("ExecuteNegatedStructuralFromIndex: discover index files: %w", discoverErr)
 	}
@@ -138,7 +147,7 @@ func ExecuteNegatedStructuralFromIndex(
 		}
 		done, evalErr := evalOneNegatedStructuralCandidateTrace(
 			ctx, traceID, keys, traceGroupStore, readerFor, minTS, maxTS,
-			rightSpansByTrace[traceID], op, leftProg, opts, result, stats,
+			rightSpansByTrace[traceID].spans, op, leftProg, opts, result, stats,
 		)
 		if evalErr != nil {
 			return nil, false, evalErr
@@ -229,7 +238,7 @@ func evalOneNegatedStructuralCandidateTrace(
 	}
 
 	recs := resolvedSpansToNegatedStructuralRecs(resolvedSpans, leftMatchSpanIDs, rightMatchAddrs)
-	resolved, _ := resolveStructuralParentIndices([][]structuralSpanRec{recs}, nil, false)
+	resolved := resolveStructuralParentIndices([][]structuralSpanRec{recs}, nil)
 	if len(resolved) == 0 {
 		return false, nil
 	}

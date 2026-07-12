@@ -46,13 +46,17 @@ func TestTryIndexFetch_RoutineDecline_WithoutBoundedAuthorization_HardErrors(t *
 	require.True(t, errors.Is(idxErr, ErrSearchNoCoverage))
 }
 
-// TestTryIndexFetch_RoutineDecline_WithBoundedAuthorization_Relays is #63/R7's companion: WITH
-// boundedAuthorized=true (per R17, Fetch's LOCAL derivation from this query carrying a limit —
-// not threaded from the frontend's QueryPlan.Strategy, which has no wire path to this per-block
-// call), the SAME routine decline is relayed as (nil, false, nil) — unchanged from today's
-// contract — so the caller (F-8) can route to the bounded path instead of treating it as a hard
-// failure.
-func TestTryIndexFetch_RoutineDecline_WithBoundedAuthorization_Relays(t *testing.T) {
+// TestTryIndexFetch_RoutineDecline_WithBoundedAuthorization_HardErrors is Phase 6's
+// (plan-scan-fallback.md) companion to the WithoutBoundedAuthorization test above, superseding
+// this test's own former "_Relays" name/behavior: once Phases 2-4 landed real early-stopping
+// index resolution, boundedAuthorized=true no longer means "relay this decline so the caller
+// can route to a SEPARATE bounded raw-block-scan path" — tryIndexFetch's own call site (above
+// this function in value_index_query.go) already tried BuildValueIndexSourceBounded FIRST when
+// boundedAuthorized is true, BEFORE ever reaching declineOutcomeBounded. A decline reaching here
+// means the bounded, early-stopping attempt already ran and genuinely found nothing -- there is
+// no separate path left to route to, so this now hard-errors exactly like the unauthorized case,
+// with the SAME ErrSearchNoCoverage sentinel.
+func TestTryIndexFetch_RoutineDecline_WithBoundedAuthorization_HardErrors(t *testing.T) {
 	withVIQueryReader(t, &fakeVISink{}, "indexes")
 
 	b, _ := createFetchTestBlock(t)
@@ -67,7 +71,8 @@ func TestTryIndexFetch_RoutineDecline_WithBoundedAuthorization_Relays(t *testing
 	)
 	require.False(t, ok)
 	require.Nil(t, matches)
-	require.NoError(t, idxErr, "a routine decline WITH bounded authorization must relay (nil,false,nil), not hard-error")
+	require.Error(t, idxErr, "Phase 6: a routine decline WITH bounded authorization must now hard-error too -- there is no separate bounded-scan path left to relay to")
+	require.True(t, errors.Is(idxErr, ErrSearchNoCoverage))
 }
 
 // TestTryIndexFetch_RoutineDecline_IndexOnlySliceJob_ErrSliceIndexCoverageGap_Unchanged is #63's

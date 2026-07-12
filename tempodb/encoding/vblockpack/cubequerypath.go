@@ -8,7 +8,9 @@ package vblockpack
 //  3. If found → reads cube files from S3 and returns exact counts.
 //  4. If not found → fires TryCreate (cardinality gate via VCNT data).
 //
-// Falls back to the full block scan on any error or cache miss.
+// On any error or cache miss, falls through to the VI/metrics decline path (ExecuteMetricsTraceQL's
+// own decline contract), which itself hard-errors with one of blockpack's F-4 sentinels — there is
+// no full block scan fallback.
 
 import (
 	"bytes"

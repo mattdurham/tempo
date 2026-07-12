@@ -298,3 +298,72 @@ func filterMetas(metas []FileMeta, queryMinSec, queryMaxSec uint64) []string {
 	}
 	return out
 }
+
+// FilesForTimeRangeNewestFirst mirrors FilesForTimeRange but returns keys ordered by
+// SortFileMetasNewestFirst instead of SortFileMetas. The cache's underlying entry.metas stays
+// sorted ascending (unchanged -- RemoveFiles/AddFile/refreshAccessed all depend on that order);
+// this method filters first (via filterMetasNewestFirst, which walks metas in reverse -- correct
+// because reversing an ascending-sorted slice's SURVIVING subset preserves each entry's relative
+// order once re-sorted below) then re-sorts the filtered subset via SortFileMetasNewestFirst, so
+// a mixed-level result is never merely "the ascending list reversed" (that would put Level DESC
+// first, not the ASC-then-newest-time-first order NewestFirst callers need).
+func (c *IndexFileCache) FilesForTimeRangeNewestFirst(
+	ctx context.Context,
+	colHash, colTypeName string,
+	queryMinSec, queryMaxSec uint64,
+) ([]string, error) {
+	key := colKey{colHash: colHash, colTypeName: colTypeName}
+
+	c.mu.Lock()
+	entry := c.entries[key]
+	c.mu.Unlock()
+
+	if entry == nil {
+		metas, err := c.listColumn(ctx, colHash, colTypeName)
+		if err != nil {
+			return nil, err
+		}
+		c.mu.Lock()
+		if existing := c.entries[key]; existing != nil {
+			existing.accessed = true
+			metas = existing.metas
+		} else {
+			c.entries[key] = &colEntry{
+				metas:    metas,
+				accessed: true,
+			}
+		}
+		c.mu.Unlock()
+		return filterMetasNewestFirst(metas, queryMinSec, queryMaxSec), nil
+	}
+
+	c.mu.Lock()
+	entry.accessed = true
+	metas := entry.metas
+	c.mu.Unlock()
+	return filterMetasNewestFirst(metas, queryMinSec, queryMaxSec), nil
+}
+
+// filterMetasNewestFirst returns the keys of metas overlapping [queryMinSec, queryMaxSec],
+// ordered by SortFileMetasNewestFirst. metas must already be sorted by SortFileMetas (the cache's
+// standing invariant); the filtered subset is copied and re-sorted rather than merely reversed,
+// since Level's priority direction is ASC in both orderings (only WallMinSec/WallMaxSec flip),
+// so a plain reversal of the input would incorrectly put Level DESC first for a mixed-level file
+// set.
+func filterMetasNewestFirst(metas []FileMeta, queryMinSec, queryMaxSec uint64) []string {
+	var matched []FileMeta
+	for i := range metas {
+		if metas[i].IsInTimeRange(queryMinSec, queryMaxSec) {
+			matched = append(matched, metas[i])
+		}
+	}
+	if len(matched) == 0 {
+		return nil
+	}
+	SortFileMetasNewestFirst(matched)
+	out := make([]string, len(matched))
+	for i := range matched {
+		out[i] = matched[i].Filename
+	}
+	return out
+}

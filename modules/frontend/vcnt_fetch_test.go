@@ -291,10 +291,15 @@ func (c *countingRawReader) Read(ctx context.Context, name string, keyPath backe
 // classification, and compiles a real query via blockpack.CompileTraceQL/
 // CompileTraceQLMetricsFilter — never a hand-built Selectivity/*blockpack.Program value.
 
-// TestBuildQueryPlanFromProgram_LowSelectivityWithLimit_SelectsBoundedRecentFirst is a MUST per
-// plan-f.md Task 6: a search query whose predicate value covers most of the column's live spans
-// (LowSelectivity) with a limit present must select DispatchBoundedRecentFirst (R3).
-func TestBuildQueryPlanFromProgram_LowSelectivityWithLimit_SelectsBoundedRecentFirst(t *testing.T) {
+// TestBuildQueryPlanFromProgram_LowSelectivityWithLimit_FallsThroughToResolvabilityPath (Phase 7,
+// plan-scan-fallback.md) replaces the retired DispatchBoundedRecentFirst assertion: once
+// SelectSearchStrategy no longer intercepts LowSelectivity+hasLimit into a dedicated bounded
+// strategy, the query instead falls through to the existing cost/perMinuteForLead/BuildQueryPlan
+// flow — the SAME resolvability-only gate every other qualified query goes through, resolving to
+// DispatchTimeSliced here (a resolvable, VCNT-covered leaf). The querier's own per-block
+// bounded-index path (tempo's backend_block.go) now handles the LIMIT dimension directly, without
+// any plan-time signal.
+func TestBuildQueryPlanFromProgram_LowSelectivityWithLimit_FallsThroughToResolvabilityPath(t *testing.T) {
 	restore := vblockpack.ConfigureValueIndexQueryForTest(emptyVIStore{}, testIndexPrefix)
 	defer restore()
 
@@ -306,9 +311,9 @@ func TestBuildQueryPlanFromProgram_LowSelectivityWithLimit_SelectsBoundedRecentF
 
 	plan, err := buildQueryPlan(context.Background(), rawR, tenant, nil,
 		`{ span.http.method = "GET" }`, 0, 200, 1000, true /* hasLimit */)
-	require.NoError(t, err)
+	require.NoError(t, err, "LowSelectivity+hasLimit no longer plan-time-declines -- a limit alone never forces a decline")
 	require.NotNil(t, plan)
-	require.Equal(t, blockpack.DispatchBoundedRecentFirst, plan.Strategy)
+	require.Equal(t, blockpack.DispatchTimeSliced, plan.Strategy)
 }
 
 // TestBuildMetricsQueryPlanFromProgram_LowSelectivityWithoutLimit_NeverBoundedRecentFirst is a
@@ -332,12 +337,13 @@ func TestBuildMetricsQueryPlanFromProgram_LowSelectivityWithoutLimit_NeverBounde
 	require.Nil(t, plan, "no plan must be returned alongside a plan-time decline error")
 }
 
-// TestBuildQueryPlanFromProgram_UnknownSelectivity_WithLimit_SelectsBoundedRecentFirst covers
-// R3's UnknownSelectivity+limit row: no VCNT signal at all for the queried column (not even an
-// empty-but-present record) classifies as UnknownSelectivity, which — per R3 — is treated as
-// bounded-eligible when a limit exists (worst case: a few extra low-yield blocks, kept safe by
-// the hard cap).
-func TestBuildQueryPlanFromProgram_UnknownSelectivity_WithLimit_SelectsBoundedRecentFirst(t *testing.T) {
+// TestBuildQueryPlanFromProgram_UnknownSelectivity_WithLimit_FallsThroughToResolvabilityPath
+// (Phase 7, plan-scan-fallback.md) covers UnknownSelectivity+limit: no VCNT signal at all for the
+// queried column (not even an empty-but-present record) classifies as UnknownSelectivity, which
+// now falls through to the same cost/perMinuteForLead/BuildQueryPlan flow as every other
+// non-decline outcome — resolving to DispatchTimeSliced via BuildQueryPlan's own documented
+// VCNT-blind fallback (a resolvable-but-VCNT-blind plan still qualifies for DispatchTimeSliced).
+func TestBuildQueryPlanFromProgram_UnknownSelectivity_WithLimit_FallsThroughToResolvabilityPath(t *testing.T) {
 	restore := vblockpack.ConfigureValueIndexQueryForTest(emptyVIStore{}, testIndexPrefix)
 	defer restore()
 
@@ -349,15 +355,16 @@ func TestBuildQueryPlanFromProgram_UnknownSelectivity_WithLimit_SelectsBoundedRe
 		`{ span.http.method = "GET" }`, 0, 200, 1000, true /* hasLimit */)
 	require.NoError(t, err)
 	require.NotNil(t, plan)
-	require.Equal(t, blockpack.DispatchBoundedRecentFirst, plan.Strategy)
+	require.Equal(t, blockpack.DispatchTimeSliced, plan.Strategy)
 }
 
-// TestBuildQueryPlanFromProgram_UnknownSelectivity_WithoutLimit_StaysIndexOnly covers R3's
-// UnknownSelectivity+no-limit row: with no selectivity signal AND no limit, there is no safe way
-// to guess whether an unbounded-equivalent read would be cheap or catastrophic, so the query
-// falls through to the existing index-only path (DispatchBlockSharded/DispatchTimeSliced,
-// hard-erroring on decline downstream) rather than being bounded-served.
-func TestBuildQueryPlanFromProgram_UnknownSelectivity_WithoutLimit_StaysIndexOnly(t *testing.T) {
+// TestBuildQueryPlanFromProgram_UnknownSelectivity_HasLimitNoLongerAffectsOutcome (Phase 7,
+// plan-scan-fallback.md, replaces the retired _StaysIndexOnly test) pins that hasLimit no longer
+// differentiates UnknownSelectivity's outcome at all now that DispatchBoundedRecentFirst is gone
+// -- WithLimit and WithoutLimit both reach the identical BuildQueryPlan fallthrough and produce
+// the identical DispatchTimeSliced strategy, proving hasLimit's only remaining effect on this
+// function is via LowSelectivity's planTimeDecline gate, never via strategy selection itself.
+func TestBuildQueryPlanFromProgram_UnknownSelectivity_HasLimitNoLongerAffectsOutcome(t *testing.T) {
 	restore := vblockpack.ConfigureValueIndexQueryForTest(emptyVIStore{}, testIndexPrefix)
 	defer restore()
 
@@ -368,8 +375,8 @@ func TestBuildQueryPlanFromProgram_UnknownSelectivity_WithoutLimit_StaysIndexOnl
 		`{ span.http.method = "GET" }`, 0, 200, 1000, false /* hasLimit */)
 	require.NoError(t, err)
 	require.NotNil(t, plan)
-	require.NotEqual(t, blockpack.DispatchBoundedRecentFirst, plan.Strategy,
-		"UnknownSelectivity with no limit must stay on the index-only path, never bounded")
+	require.Equal(t, blockpack.DispatchTimeSliced, plan.Strategy,
+		"hasLimit=false must produce the same strategy as hasLimit=true for UnknownSelectivity now")
 }
 
 // recordedSpansFrontend installs an in-process span recorder as the global tracer provider and

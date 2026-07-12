@@ -199,11 +199,10 @@ func runViBackfillCore(
 	ctx context.Context,
 	entry blockpack.Entry,
 	fetcher blockpack.BlockFetcher,
-	objStore blockpack.ObjectStore,
+	registry *blockpack.Registry,
 	putter blockpack.ObjectPutter,
 	indexPrefix string,
 ) error {
-	registry := blockpack.NewRegistry(objStore, entry.Tenant)
 	eng := blockpack.NewBackfillEngine(entry, blockpack.BackfillConfig{
 		Store:       putter,
 		Fetcher:     fetcher,
@@ -265,7 +264,7 @@ func runViBackfillCore(
 	return nil
 }
 
-// RunViBackfillDeps bundles the three backend-specific dependencies
+// RunViBackfillDeps bundles the backend-specific dependencies
 // RunViBackfill/launchViBackfill need to run a column's backfill: fetching
 // raw historical blocks (Fetcher), the viusage registry's backing store
 // (ObjStore), and where finished VI files get written (Putter). Constructed
@@ -274,10 +273,30 @@ func runViBackfillCore(
 // Track A/C) -- RunViBackfill/launchViBackfill themselves are pure
 // plumbing+metrics+error-handling with zero backend-specific construction
 // left inside them.
+//
+// Registry (2026-07-11, live-bug fix): the ALREADY-CONSTRUCTED, tenant- and
+// backend-correct *blockpack.Registry to use for this specific entry's
+// backfill run. Set by the caller (ConfigureViUsage's onShouldBackfill
+// closure, via the SAME realUsageRecorder.registryFor(tenant) call the
+// triggering RecordUse used) -- NOT rebuilt from ObjStore inside
+// runViBackfillCore. A live tenant-11638 test confirmed the bug this fixes:
+// when Postgres is configured, RecordUseAndMaybeTrigger creates/updates the
+// entry via the Postgres-backed registry, but runViBackfillCore used to
+// unconditionally build a FRESH blob-backed registry from ObjStore, which had
+// never heard of that entry -- every watermark-persist call failed with
+// "entry ... not found," aborting the backfill on its very first progress
+// callback. Nil means "not set" -- RunViBackfill falls back to constructing
+// one from ObjStore (the pre-2026-07-11 behavior), which remains CORRECT only
+// for callers that never configure Postgres (e.g. backend-worker's own
+// RunViBackfill call site as of this fix -- flagged, not yet threaded with
+// pgPool; same bug class would resurface there for a Postgres-configured
+// tenant whose backfill lease happens to be picked up by backend-worker
+// instead of a querier/frontend process).
 type RunViBackfillDeps struct {
 	Fetcher  blockpack.BlockFetcher
 	ObjStore blockpack.ObjectStore
 	Putter   blockpack.ObjectPutter
+	Registry *blockpack.Registry
 }
 
 // NewViBackfillDepsS3 builds RunViBackfillDeps from S3 config -- a pure code
@@ -349,8 +368,16 @@ func RunViBackfill(ctx context.Context, entry blockpack.Entry, deps RunViBackfil
 	if deps.Fetcher == nil || deps.ObjStore == nil || deps.Putter == nil {
 		return nil
 	}
+	registry := deps.Registry
+	if registry == nil {
+		// Pre-2026-07-11 fallback for callers that haven't set Registry yet
+		// (backend-worker's own RunViBackfill call site) -- only correct when
+		// Postgres is never configured for the tenant in question, since this
+		// always builds the blob-backed registry regardless.
+		registry = blockpack.NewRegistry(deps.ObjStore, entry.Tenant)
+	}
 	metricViBackfillStarted.Inc()
-	err := runViBackfillCore(ctx, entry, deps.Fetcher, deps.ObjStore, deps.Putter, defaultValueIndexPref)
+	err := runViBackfillCore(ctx, entry, deps.Fetcher, registry, deps.Putter, defaultValueIndexPref)
 	if err != nil && !isContextErr(ctx, err) {
 		metricViBackfillFailed.Inc()
 		level.Warn(util_log.Logger).Log(

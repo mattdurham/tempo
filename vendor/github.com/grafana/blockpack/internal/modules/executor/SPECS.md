@@ -554,6 +554,20 @@ newest-first ordering, never-routes-through-topK, including the `Limit>0`+`MaxBy
 regression coverage added by issue #71's post-mortem), `internal/modules/executor/recentfirst_test.go`
 (`shouldUseTopKPath` gate pin). Issue #481.
 
+**RETIRED (2026-07-12, plan-scan-fallback.md Phase 7, task #190).** `CollectOptions.RecentFirstBudget`
+and its consumer code in `stream.go` (`scanBlocks`' truncation, the per-group `bytesSoFar`/
+`scanStart` budget checks) have been REMOVED, along with `internal/modules/executor/recentfirst.go`
+(file deleted outright — confirmed, no longer present in the tree) and its dedicated test suite.
+`Collect` no longer has a bounded, pointed newest-first read mode distinct from the ordinary
+`Direction`/`TimestampColumn`/`Limit`-driven paths (`SPEC-STREAM-5`/`7`/`8`). See `SPEC-ROOT-023`
+for the full removal rationale (this mechanism's replacement, `SPEC-VI-12`'s early-stopping index
+resolution, serves the case this budget existed for via a categorically different mechanism — a
+resolution-time index walk, not a capped raw-block scan — so there is no successor entry within
+THIS file for the removed mechanism itself).
+
+Back-ref (current): confirmed absent — `internal/modules/executor/recentfirst.go` and
+`recentfirst_test.go` no longer exist in the tree.
+
 ---
 
 ## SPEC-INTRINSIC-004: File-level bloom pre-check before intrinsic scan
@@ -959,6 +973,22 @@ Issue #481.
 `IsRecording()`) — visibility only, no semantic change to this rule's own contract above
 (NOTE-480, issue #493).
 
+**RETIRED (2026-07-12, plan-scan-fallback.md Phase 7, task #190).** `Options.Direction`/
+`Options.RecentFirstBudget`, `fetchStructuralBlocksBounded`, and
+`StructuralResult.BudgetStopped`/`BlocksRead` (the budget-populated fields — `BlocksRead` itself
+survives as a field, see below) have been REMOVED. `StructuralResult` is now just `{Matches
+[]SpanMatch, BlocksRead int}` — `BudgetStopped` is gone entirely; `BlocksRead` remains but is no
+longer budget-gated (it is populated on every path now, not "ONLY when `Options.RecentFirstBudget`
+was set" as this entry originally specified). `ExecuteStructural`'s 1e/1f decline-category chains
+now always run the full, unbounded scan engine this entry's own Contract paragraph describes as
+the pre-Phase-7-#481 default — there is no bounded alternative left to select. See `SPEC-ROOT-023`
+for why this was removed rather than left as a permanent additive alternative, and `SPEC-STRUCT-14`
+for the corresponding retirement of this entry's own downstream parent-resolution consequence.
+
+Back-ref (current): `internal/modules/executor/structuralresult.go:StructuralResult` (now
+`{Matches, BlocksRead}` only), `stream_structural.go:ExecuteStructural` (unconditional unbounded
+path).
+
 ---
 
 ## SPEC-STRUCT-14: Incompleteness-Exclusion Contract for Bounded Structural Parent Resolution
@@ -1006,6 +1036,23 @@ regression coverage). Issue #481.
 `IncompleteTraceCount` is now also attached as `blockpack.structural.incomplete_trace_count`
 on the `blockpack.query` span (guarded by `IsRecording()`) — visibility only, no semantic
 change to this rule's own contract above (NOTE-480, issue #493).
+
+**RETIRED (2026-07-12, plan-scan-fallback.md Phase 7, task #190).** `resolveStructuralParentIndices`'s
+`budgetMode` parameter described above has been REMOVED from the function's signature entirely
+(confirmed by direct read: current signature is `resolveStructuralParentIndices(traceSpans
+[][]structuralSpanRec, ops []traceqlparser.StructuralOp) [][]structuralSpanRec` — two parameters,
+no boolean). `StructuralResult.IncompleteTraceCount` (and `BudgetStopped`, `SPEC-STRUCT-13`) are
+likewise removed from `StructuralResult`, which is now just `{Matches []SpanMatch, BlocksRead
+int}`. The function now ALWAYS takes the unbounded path's own treatment this entry described as
+already-correct-and-unchanged: an unresolved-but-present parent reference is always treated as a
+genuine orphan (`parentIdx = -1`, root-like), because `SPEC-STRUCT-13`'s bounded path (the only
+caller that ever needed the wholesale-exclusion behavior this entry specifies) no longer exists —
+see that entry's own retirement note for why. This entry's reasoning (why wholesale exclusion,
+not partial evaluation, was the correct choice UNDER a bounded budget) is retained verbatim for
+history; it no longer describes a reachable code path.
+
+Back-ref (current): `internal/modules/executor/stream_structural.go:resolveStructuralParentIndices`
+(now unconditional), `structuralresult.go:StructuralResult` (now `{Matches, BlocksRead}` only).
 
 ## 12. Pipeline Aggregate Queries (streamPipelineQuery)
 

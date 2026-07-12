@@ -171,13 +171,25 @@ func ConfigureViUsage(
 	} else {
 		backfillDeps = NewViBackfillDepsRaw(rawR, rawW)
 	}
-	rec := &realUsageRecorder{
+	// var + separate assignment (not :=) is required here: onShouldBackfill's
+	// closure below calls rec.registryFor, which needs rec in scope -- a
+	// short variable declaration's RHS cannot see its own LHS identifier.
+	var rec *realUsageRecorder
+	rec = &realUsageRecorder{
 		store:      store,
 		usageCfg:   usageCfg,
 		triggerCfg: triggerCfg,
 		pgPool:     pgPool,
 		onShouldBackfill: func(entry blockpack.Entry) {
 			deps := backfillDeps
+			// registryFor(tenant) returns the SAME memoised registry the
+			// triggering RecordUse call just used (Postgres-backed when
+			// pgPool != nil, else the existing blob-backed path) -- fixes a
+			// live bug (2026-07-11, tenant 11638) where runViBackfillCore
+			// built a FRESH blob-backed registry from ObjStore regardless of
+			// Postgres config, so the just-created Postgres entry was
+			// invisible to the backfill's own watermark-persist calls.
+			deps.Registry = rec.registryFor(entry.Tenant)
 			if pgPool != nil {
 				deps = NewViBackfillDepsCatalogOverride(deps, pgPool, entry, backend.NewReader(rawR))
 			}
