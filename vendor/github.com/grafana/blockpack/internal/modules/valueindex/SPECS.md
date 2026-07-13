@@ -14,7 +14,7 @@ across the whole value-index pipeline's NOTES.md files by established convention
 assigned in ascending order and never reused or renumbered; superseded entries are marked
 `[SUPERSEDED by SPEC-VI-N]` rather than deleted.
 
-Next free ID: **SPEC-VI-13**.
+Next free ID: **SPEC-VI-14**.
 
 ---
 
@@ -786,3 +786,41 @@ reported:
   for a routine (non-`indexOnly`) decline, with nothing left to conditionally relay to.
 
 Phase 8 (task #191) is complete as of this sign-off.
+
+---
+
+## SPEC-VI-13: `TruncateTimeValueToMillis` — the ONE shared write/read truncation function for span:start/span:duration (task #203, CRITICAL)
+*Added: 2026-07-12*
+
+**Contract:** `TruncateTimeValueToMillis(nanos uint64) uint64` returns `nanos / 1_000_000` — the
+millisecond-truncation NOTE-VI-027 (issue #415) already documented as a deliberate, one-sided
+write-time decision for `span:start`/`span:end`/`span:duration`'s stored value-index canonical
+value. This function is the SINGLE authoritative implementation of that division: root
+`valueindex_extract.go`'s `truncateTimeValueToMillis` (write side) and
+`internal/modules/vibuilder/builder.go`'s `intOrDedicatedColType` (read side, gated by
+`dedicatedColumnOverride.truncateMillis`) both call it directly rather than each dividing by
+`1_000_000` independently.
+
+**Why this matters as a binding contract, not merely a helper:** before task #203, only the write
+side truncated; the read side (query-literal predicate construction) did not. A query's
+raw-nanosecond literal compared against a millisecond-scale stored value is wrong by a factor of
+10^6 — for realistic sub-second durations this makes the comparison wrong for virtually every
+query, not merely imprecise at the margins. Both call sites MUST divide by the exact same factor
+for a query threshold to mean the same thing as the value it is compared against.
+
+**Placement rationale:** `valueindex` is a leaf package both root `blockpack`
+(`valueindex_extract.go`) and `internal/modules/vibuilder` already import, in either direction,
+with no cycle — making a single shared Go function possible here, unlike NOTE-VI-051's own
+`span:start`-second-floor duplication across the blockpack/tempo-mrd repo boundary (a genuinely
+separate Go module on the other side, where no single function can be shared and independent,
+documented, coordinated duplication remains the only option).
+
+**Non-goal:** this function does not, and cannot, restore sub-millisecond precision to a
+value-index-backed duration/start comparison — that loss is NOTE-VI-027's own accepted trade-off
+(a ~1000x cardinality reduction), unchanged by task #203; this function only ensures both sides of
+the comparison lose precision the SAME way instead of one side losing it and the other not.
+
+Back-refs: `internal/modules/valueindex/hash.go:TruncateTimeValueToMillis`, root
+`valueindex_extract.go:truncateTimeValueToMillis` (delegates), `internal/modules/vibuilder/
+builder.go:intOrDedicatedColType` (delegates). See `vibuilder/NOTES.md` NOTE-VI-107 for the full
+discovery narrative and `vibuilder/SPECS.md` SPEC-VB-6 for the binding read-side contract.

@@ -168,8 +168,23 @@ func buildSourceBoundedMultiLeafAND(
 
 	src.RecordFileIO(anchorFilesRead+confirmFilesRead, anchorBytesRead+confirmBytesRead)
 
+	// AddLeaf, not Add (issue #206): a pure multi-leaf AND on the SAME column (e.g.
+	// `score >= 100 && score <= 150`) is exactly this function's own scope -- two leaves in
+	// work sharing one column name, one of them the anchor and the rest "other" leaves. Add's
+	// column-name-only keying would merge the anchor's confirmed subset and an other leaf's
+	// full resolution into the SAME bucket when they share a column, so viEvalAND downstream
+	// would intersect that merged set with itself instead of the anchor's confirmed answer
+	// against the other leaf's own set. AddLeaf keys each leaf by w.idx/anchor.idx instead --
+	// the leaf's DFS leaf-slot STRUCTURAL position (assigned by collectLeaves, re-derived
+	// identically by viEvalNode at eval time for the same query text), not a *vm.RangeNode
+	// pointer: a pointer-identity scheme was tried first and discarded, because the public
+	// blockpack.QueryTraceQLFromIndex recompiles the query string independently rather than
+	// reusing this package's *vm.Program, so the node pointers seen at build time and at
+	// eval time are, in general, two different tree instances even for identical query text.
+	// idx keeps leaves disambiguated regardless of column-name collisions and survives that
+	// independent recompile.
 	if wm, ok := watermarks[anchor.col]; !ok || wm.CoversRange(minSec, maxSec) {
-		src.Add(anchor.col, anchor.colType, confirmed)
+		src.AddLeaf(anchor.idx, anchor.col, anchor.colType, confirmed)
 		added = true
 	}
 	for i, w := range work {
@@ -179,7 +194,7 @@ func buildSourceBoundedMultiLeafAND(
 		if wm, ok := watermarks[w.col]; ok && !wm.CoversRange(minSec, maxSec) {
 			continue
 		}
-		src.Add(w.col, w.colType, otherResults[i])
+		src.AddLeaf(w.idx, w.col, w.colType, otherResults[i])
 		added = true
 	}
 	return added, nil

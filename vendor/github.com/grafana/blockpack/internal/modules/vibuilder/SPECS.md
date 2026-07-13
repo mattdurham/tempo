@@ -21,7 +21,8 @@ than deleted. `vibuilder/NOTES.md`'s own entries continue to use the separate, s
 counter (spanning `valueindex`/`valueindexcompactor`/`valueindexconsumer`/`executor`/`vibuilder`)
 — this SPEC-VB-N convention applies only to this file and to `TESTS.md`'s parallel `TEST-VB-N`.
 
-Next free ID: **SPEC-VB-6**.
+Next free ID: **SPEC-VB-8** (corrected — SPEC-VB-7 itself was already assigned/present below;
+this counter had gone stale).
 
 ---
 
@@ -182,20 +183,30 @@ leaf).
 
 **Enforcement (`BuildSource(ctx, disc, store, prog, minSec, maxSec, watermarks
 map[string]ColumnWatermark) (*executor.SliceValueIndexSource, bool, error)`) — the ENTIRE R7
-enforcement point, at BOTH of this file's `src.Add` call sites, no other change to `BuildSource`'s
+enforcement point, at this file's `src.AddLeaf` call site, no other change to `BuildSource`'s
 decision logic:**
 
 ```go
 if wm, ok := watermarks[w.col]; ok && !wm.CoversRange(minSec, maxSec) {
     continue // leave uncovered; the executor's existing decline/fallback path fires
 }
-src.Add(w.col, w.colType, results)
+src.AddLeaf(w.idx, w.col, w.colType, results)
 ```
 
-1. The leaf-predicate loop (per-leaf `RangeNode` resolution).
-2. The match-all/`Columns`-list branch (`{} | rate()`-shaped queries) — a match-all query over
-   a partially-backfilled column has the IDENTICAL partial-coverage risk as a leaf predicate
-   and must be gated too; this is not an optional second application, both sites are required.
+1. The leaf-predicate loop (per-leaf `RangeNode` resolution) — the sole remaining gate site.
+
+**Correction (task #211, 2026-07-12): the "match-all/`Columns`-list branch" second gate site
+described in the original version of this entry no longer exists.** That branch (`Nodes` empty,
+`Columns` populated — the shape this entry originally attributed to `{} | rate()`) was removed
+entirely: `internal/modules/executor/metrics_trace.go`'s `viMatchSpans` (the only consumer of a
+source this package builds) already declines unconditionally whenever `Predicates.Nodes` is
+empty, regardless of `Columns` — and, per direct investigation, this shape is NEVER produced by
+the real compiler for a genuine match-all (`{} | rate()` compiles with `Predicates == nil`
+entirely; `Nodes: nil, Columns: [...]` only ever arises from a compile-time decline, e.g. task
+#210's zero-node-operand AND/OR guard). `BuildSource`/`BuildSourceBounded` now decline this
+shape immediately, before ever consulting `watermarks` or performing any I/O — see this
+package's own `builder.go` file doc comment for the full argument. `buildSourceBoundedColumnsOnly`
+(the `BuildSourceBounded` twin of this now-removed branch) was deleted along with it.
 
 `watermarks == nil` (the common case — dedicated columns, and every caller not participating
 in #496's usage-triggered backfill) → both gates degrade to a no-op (`ok` is always `false` for
@@ -227,7 +238,7 @@ have masked the adversarial test's intended failure mode on a naive first attemp
 
 Back-refs: `internal/modules/vibuilder/watermark.go:ColumnWatermark,CoversRange`,
 `internal/modules/vibuilder/builder.go:anyLeafAdded`,
-`internal/modules/vibuilder/builder.go:BuildSource` (both gate sites). See `viusage/SPECS.md`
+`internal/modules/vibuilder/builder.go:BuildSource` (sole remaining gate site, task #211). See `viusage/SPECS.md`
 SPEC-VIUSAGE-2 (the duplicated-logic twin) and `NOTES.md` (this file) for the import-cycle
 placement rationale.
 
@@ -264,11 +275,18 @@ verdict. `ColType` is the zero `modules_shared.ColumnType` when `Indexable` is `
 (`buildPredicate` never resolves a type for a shape it rejects) or for a match-all leaf (no
 predicate to type-check against).
 
-**Match-all case:** a match-all query (`prog.Predicates.Nodes` empty, `.Columns` populated —
-e.g. `{} | rate()`) returns one entry per listed column with `Indexable: true` and a zero
-`ColType` — mirrors `AllLeavesIndexable`'s own match-all handling (`BuildSource`'s
-`lookupColumnAll` path never rejects a column's shape in this case, but a match-all leaf has
-no predicate to resolve a type from).
+**`Nodes`-empty/`Columns`-populated case:** a program with `prog.Predicates.Nodes` empty and
+`.Columns` populated returns one entry per listed column with `Indexable: true` and a zero
+`ColType` — mirrors `AllLeavesIndexable`'s own handling of this shape. **Correction (task #211,
+2026-07-12):** this entry originally called this shape "match-all" (e.g. `{} | rate()`) and
+cited `BuildSource`'s `lookupColumnAll` path as never rejecting it. Neither claim holds: a
+genuine `{} | rate()` compiles with `prog.Predicates == nil` entirely (not this shape at all),
+and `BuildSource`/`BuildSourceBounded` no longer call `lookupColumnAll` for this shape — they
+decline it immediately (see SPEC-VB-4's own correction and `builder.go`'s package doc comment).
+`LeafColumns` still reports `Indexable: true` here regardless, because its own caller (#496's
+usage-recording hook) tracks "this query referenced column X" for backfill-triggering purposes,
+a deliberately different and narrower question than "can this be answered from the index" —
+unaffected by `BuildSource`'s own decline for this shape.
 
 **Empty case:** a program referencing nothing at all (no `Nodes`, no `Columns`, or `prog ==
 nil`/`prog.Predicates == nil`) returns `nil`.
@@ -282,3 +300,197 @@ Back-refs: `internal/modules/vibuilder/builder.go:LeafColumns,LeafColumnInfo` (r
 `collectLeaves`, `buildPredicate` — see SPEC-VB-3), `valueindex_query.go:LeafColumns,
 LeafColumnInfo` (root re-export). See `viusage/SPECS.md` SPEC-VIUSAGE-1 (the
 `(Tenant, ColumnHash, ColumnType)` key `ColType` serves) for the intended #496 B1 consumer.
+
+## SPEC-VB-6: `valueAsColType` is column-name-aware — `dedicatedNumericColumnTypes` overrides the Int64 default for span:start/span:duration (task #203, CRITICAL)
+*Added: 2026-07-12*
+
+**Contract (binding — this is a correctness contract, not an optimization):** `valueAsColType(col
+string, v vm.Value)` and its Int/Duration helper `intOrDedicatedColType(col string, d int64)` MUST
+resolve a leaf's value-index column type and comparison value from the SPECIFIC column being
+queried (`col`, always `n.Column`/`leaf.col` — never resolved independent of the column name), not
+from the TraceQL literal's own type alone. Before this fix, every `vm.TypeInt`/`vm.TypeDuration`
+literal mapped unconditionally to `modules_shared.ColumnTypeInt64` regardless of `col` — wrong for
+`span:start`/`span:duration`, whose real on-disk value-index type is `ColumnTypeUint64`
+(`writer_block.go`'s `feedSpanTiming`/`applySpanStart`/`applySpanDuration`, confirmed against a real
+`CreateBlock`+`Reader` round trip). This made every `{duration > Xms}`/`{start > X}` value-index
+lookup search the WRONG type-bucket directory, which never has any files for these columns —
+`BuildSource`'s "Add even when empty" contract (NOTE-VI-036) then made this indistinguishable from
+"the index confirms zero real matches," so the query always silently succeeded empty: never an
+error, never the real matches, for every value-index-backed duration/start comparison in
+production (a silent wrong-answer bug, not a decline).
+
+**Two stacked corrections, both required (fixing only the first is NOT sufficient for correct
+results — see NOTE-VI-107 for why):**
+1. **Type-bucket correction:** `dedicatedNumericColumnTypes` maps `span:start`/`span:duration` to
+   `ColumnTypeUint64`; every other column (not present in the map, or an attribute) keeps the
+   unchanged `ColumnTypeInt64` default — zero behavior change for any column this bug did not
+   affect.
+2. **Unit correction, CORRECTED by task #204 (see SPEC-VB-7 — this bullet originally described
+   task #203's own buggy fix; kept here, struck through in spirit, purely so this history is
+   traceable):** ~~for a column whose override entry sets `truncateMillis`, the raw-nanosecond
+   literal is divided via `valueindex.TruncateTimeValueToMillis` before being cast to `uint64`,
+   and the original comparison operator is reused unchanged.~~ That approach is only
+   mathematically sound for two of five comparison operators at exactly one threshold alignment
+   each (SPEC-VB-7's decidability rule) — for every other (operator, threshold) pair it produced a
+   silent wrong answer (a false negative for `>`, a false positive for `>=`/`<=`, both reproduced
+   live and documented in SPEC-VB-7). The correct behavior — decide per-operator whether the
+   comparison is even answerable from a millisecond bucket at all, and decline rather than guess
+   when it is not — is now implemented by `decidableTimeBucketThreshold` and specified in
+   SPEC-VB-7.
+
+**A negative literal against a Uint64-backed column is left unindexable (`ok=false`), never
+wrapped via `uint64(d)`** — the real column can never hold a negative value, so no real row could
+satisfy such a comparison against a wrapped, huge threshold; the caller falls back to a full block
+scan instead of risking a wrong predicate.
+
+**`LeafIndexable` must pass `col: n.Column` when constructing its probe `leaf`** (not a zero-value
+`leaf{node: n}`) — its own contract (SPEC-VB-3) requires it make "the exact same decision"
+`buildPredicate` makes for the same leaf when driven through `collectLeaves` (which always sets
+`col: n.Column`); omitting `col` here would silently skip the override for the equality-leaf branch
+and drift from that guarantee specifically for the negative-literal edge case above.
+
+**Audited and found NOT affected (every other intrinsic/dedicated numeric column):** `span:kind`
+and `span:status` are genuinely `Int64` on disk (`feedSpanKind`/`feedSpanStatus`); every int-valued
+attribute (including #496's `DefaultDedicatedColumns`, e.g. `span.http.response.status_code`) is
+always `Int64` because OTLP's `AnyValue` always represents integer attribute values as `int64` —
+there is no write path that stores an attribute as `Uint64`, and none of these columns go through
+`truncateTimeValueToMillis` either (name-gated to `span:start`/`span:end`/`span:duration` only).
+`span:end` has NO real on-disk column at all (NOTE-399: synthesized from `span:start` +
+`span:duration` on read, only its range-index min/max is fed) — never written to the value index in
+any type bucket, so it carries neither risk, though it remains subject to the separate,
+already-documented "no VI files ever written for this column" gap (NOTE-VI-036), unrelated to this
+fix.
+
+**Regression tests (real write+read round trip, not hand-built structs):**
+`TestBuildSource_RangePredicateBuilds`/`_SpanStart` (`builder_test.go`, this package) pin the fix at
+the `vibuilder` unit level with fixtures pre-truncated to milliseconds (mirroring the real write
+path exactly, not the raw nanosecond span value). The end-to-end pin lives in tempo:
+`tempodb/encoding/vblockpack/duration_intrinsic_divergence_local_test.go`'s
+`TestValueIndexQuery_DurationColumnTypeMismatch_AlwaysMasksRealCoverage`,
+`TestFetch_DurationComparisons_SameClassification_FullCoverage`, and
+`TestFetch_SpanStartComparison_FindsRealUint64MillisecondTruncatedCoverage` — all three go through
+a real `CreateBlock` write + real `blockpackBlock.Fetch` read, and were mutation-verified (reverting
+this fix reproduces each test's original failure mode; restoring it passes them again).
+
+Back-refs: `internal/modules/vibuilder/builder.go:valueAsColType,intOrDedicatedColType,
+dedicatedNumericColumnTypes,dedicatedColumnOverride,LeafIndexable`. See NOTE-VI-107 (this file's
+NOTES.md) for the millisecond-truncation half of the fix, and
+`internal/modules/valueindex/hash.go:TruncateTimeValueToMillis` (SPEC-VI, `valueindex/SPECS.md`)
+for the shared truncation function both the write and read sides now call. **See SPEC-VB-7 for the
+task #204 correction to this SPEC's original unit-correction bullet (point 2 above) — floor-
+truncating both sides and reusing the operator unchanged, as originally specified here, is a wrong-
+answer bug at almost every non-degenerate threshold.**
+
+## SPEC-VB-7: Millisecond-bucket comparison decidability — `decidableTimeBucketThreshold` (task #204, CRITICAL — corrects SPEC-VB-6 point 2 / NOTE-VI-107)
+*Added: 2026-07-12*
+
+**Supersedes SPEC-VB-6's original point 2.** Task #203's unit correction floor-truncated BOTH
+the stored bucket and the query threshold to the same millisecond granularity and reused the
+original comparison operator unchanged. That is mathematically sound for exactly two of the five
+comparison operators, at exactly one threshold alignment each — for every other (operator,
+threshold) combination it silently produced a wrong answer. Both directions were reproduced live
+with real tests during #203's own holistic review: a false negative (`{duration > 1ms}` silently
+dropping a real 1.5ms span) and a false positive (`{duration >= 1.6ms}` incorrectly matching that
+same 1.5ms span).
+
+**Contract (binding — this is a correctness contract, not an optimization):** for span:start /
+span:duration (any column whose `dedicatedColumnOverride.truncateMillis` is set), a range-bound
+Int/Duration literal MUST be resolved through `decidableTimeBucketThreshold(nanos uint64, op
+timeCompareOp) (bucket uint64, ok bool)` before a `valueindex.RangePredicate` or
+`BetweenPredicate` is built against it. `ok=false` means the comparison is genuinely
+UNDECIDABLE from the stored millisecond bucket alone — the caller (`intOrDedicatedColType`) MUST
+leave the leaf unindexable (`ok=false` propagates through `valueAsRangeColType` →
+`buildRangePredicate`/`buildPredicate` → `BuildSource`, leaving the column uncovered, the exact
+same "decline, fall back to a full scan" convention `LeafIndexable` already uses for every other
+unsupported predicate shape). **Never build a predicate from a bucket value when
+`decidableTimeBucketThreshold` reports `ok=false`** — that is precisely task #203's bug.
+
+**The decidability rule** (derived from first principles: a stored bucket B represents an unknown
+real value in `[B*1e6, (B+1)*1e6 - 1]` nanoseconds; let `Tq = T div 1_000_000`, `Tr = T mod
+1_000_000` for a raw-nanosecond threshold T):
+
+| Operator | Decidable iff | Decidable comparison (unchanged op, threshold=Tq) | Practical frequency |
+|---|---|---|---|
+| `>=` | `Tr == 0` (T is millisecond-aligned) | `B >= Tq` | common — round-ms thresholds |
+| `<`  | `Tr == 0` | `B < Tq` | common — round-ms thresholds |
+| `>`  | `Tr == 999_999` (T is 1ns below the next ms) | `B > Tq` | vanishingly rare in practice |
+| `<=` | `Tr == 999_999` | `B <= Tq` | vanishingly rare in practice |
+| `==` | never — no value of Tr makes it decidable | (always decline) | never |
+
+**Why `>=`/`<` and `>`/`<=` are decidable at OPPOSITE alignments, not the same one:** a
+millisecond-aligned threshold sits exactly on a bucket's LOWER edge. `>=`/`<` treat that edge
+inclusively/exclusively in a way that cleanly partitions every bucket (the aligned bucket itself
+resolves cleanly). `>`/`<=` treat that same edge the other way — the aligned bucket's lower-edge
+value itself disagrees with the rest of the bucket, so alignment at the LOWER edge is exactly the
+one case that stays ambiguous for `>`/`<=`; they are only decidable at the UPPER edge instead
+(`Tr == 999_999`). Rounding direction cannot rescue both operator pairs at once — adjusting which
+edge is "inclusive" only swaps which pair is decidable at which alignment; it can never eliminate
+the single-bucket gap for both pairs simultaneously. This is a genuine, permanent information
+loss from the write-side truncation (NOTE-VI-027), not a rounding bug.
+
+**Equality is unconditionally undecidable, regardless of alignment:** the true-match region for
+`==` is a single exact nanosecond value, which a 1,000,000-wide bucket interval can never
+represent exactly (unlike `>=`/`<`/`>`/`<=`, whose true/false regions are half-open intervals that
+CAN align with a bucket boundary). `buildPredicate`'s equality branch always resolves `ok=false`
+for span:start/span:duration.
+
+**Between (two-sided range) predicates:** `buildRangePredicate`'s two-sided branch resolves each
+bound independently through `decidableTimeBucketThreshold` under its OWN operator (derived from
+`MinInclusive`/`MaxInclusive`), then normalizes into `NewBetweenPredicate`'s inclusive-inclusive
+shape via `betweenTimeBucketBounds` (a GT lower bound becomes `bucket+1`; an LT upper bound
+becomes `bucket-1`).
+
+**Correction (task #206 holistic review — this paragraph originally described the two bounds'
+decidable alignment backwards):** the lower bound's exclusive operator is `>` (GT, decidable
+only at the rare `Tr==999_999` alignment per the table above), but the upper bound's exclusive
+operator is `<` (LT, decidable at the COMMON `Tr==0` alignment, same as `>=`) — NOT the same
+rare alignment as the lower bound. The two bounds' exclusive operators are decidable at
+OPPOSITE alignments, exactly like the standalone one-sided case above; there is nothing special
+about being the second bound of a `between` that changes which alignment its own operator needs.
+The original wording ("declines whenever EITHER bound uses an exclusive comparison at a
+non-`Tr==999_999` threshold") incorrectly applied the lower bound's rare-alignment requirement to
+the upper bound too. The code itself (`betweenTimeBucketBounds`'s callers each pass the bound's
+own correct `timeCompareOp` to `decidableTimeBucketThreshold` independently) was never affected by
+this — only this prose description was backwards.
+
+**Reachability (task #206 investigation, CRITICAL finding): this two-sided branch
+(`n.Min != nil && n.Max != nil`) is DEAD CODE for every real TraceQL query today.**
+`traceql_compiler.go`'s `extractTraceQLNodes` ALWAYS decomposes an AND of two range comparisons
+on the same column (e.g. `{ duration > 1ms && duration < 2ms }`) into TWO SEPARATE top-level leaf
+`RangeNode`s (one `Min`-only, one `Max`-only) — confirmed by direct inspection of the compiled
+program's `Predicates.Nodes` for representative queries, not assumed. There is no TraceQL syntax
+and no compiler code path that produces a single `RangeNode` with both `Min` and `Max` set
+simultaneously; `buildRangePredicate`'s `case n.Min != nil && n.Max != nil` therefore has no live
+caller. It is kept rather than deleted because it is harmless, independently correct (per the
+corrected alignment description above), and cheap to keep as defensive coverage should a future
+compiler change ever produce a genuine combined bound. **There is currently NO test at all —
+neither a real-query end-to-end test nor even a direct unit-level call with a hand-built
+`*vm.RangeNode` carrying both `Min` and `Max` — exercising this branch** (confirmed by searching
+`internal/modules/vibuilder/*_test.go` for any construction combining both fields); it is untested,
+not merely "tested only synthetically." See `internal/modules/executor/metrics_trace.go`'s `SliceValueIndexSource
+.AddLeaf`/`LookupLeaf` (issue #206) for the actual, reachable same-column-AND bug this
+investigation was chasing — a same-column AND range query is real and common, it just resolves via
+TWO leaves, not this branch.
+
+**Regression tests (real write-path, task #204):**
+- `internal/modules/vibuilder/decidability_test.go`:
+  `TestDecidableTimeBucketThreshold_MatchesBruteForceGroundTruth` brute-forces every one of the
+  1,000,000 real nanosecond values a bucket could represent for a sweep of (bucket, remainder,
+  operator) combinations and asserts `decidableTimeBucketThreshold`'s verdict matches the ground
+  truth exactly — not merely recorded expected outputs.
+  `TestDecidableTimeBucketThreshold_TruthTable` pins the concrete named cases from this table,
+  including both original bug reports.
+- `valueindex_boundary_decidability_test.go` (root package): end-to-end, through the REAL write
+  path (`blockpack.NewWriter` → `ExtractValueIndexEntries` → `valueindex.Writer.FlushBucket` →
+  `vibuilder.BuildSource`), with five real spans at exact durations (1.000/1.400/1.500/1.999/2.000
+  ms) straddling the 1ms/2ms bucket boundaries. Covers a decidable and a non-decidable threshold
+  for every operator (`>`, `>=`, `<`, `<=`, `==`), including both original bug reports verbatim
+  (`{duration > 1ms}` and `{duration >= 1.6ms}`).
+- Mutation-verified: temporarily reverting `decidableTimeBucketThreshold` to task #203's original
+  "floor both sides, keep the operator" behavior reproduces BOTH documented wrong-answer shapes
+  exactly — the `>1ms` case drops the real 1.4/1.5/1.999ms spans (false negative) and the
+  `>=1.6ms` case incorrectly includes the real 1.0/1.4/1.5ms spans (false positive). Restoring the
+  fix passes all cases again.
+
+Back-refs: `internal/modules/vibuilder/builder.go:decidableTimeBucketThreshold,timeCompareOp,
+intOrDedicatedColType,valueAsRangeColType,buildRangePredicate,betweenTimeBucketBounds`.

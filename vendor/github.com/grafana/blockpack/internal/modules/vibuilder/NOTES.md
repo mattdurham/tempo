@@ -19,10 +19,17 @@ prose in the executor NOTES. `vibuilder.BuildSource` implements it so tempo's
   files via the `FileDiscoverer` (an `IndexFileCache`, issue #462) → download via
   `FileStore` → `valueindex.QueryFiles(pred, ...)` → map `LookupResult` →
   `executor.VILookupResult` → `src.Add`.
-- **Match-all with a column list** (no Nodes, Columns populated — the shape of
-  `{} | rate()`): probe every type bucket per column with a **nil predicate**
-  (`Reader.Lookup` treats nil as match-all) to enumerate the span universe for
-  `AllResults`.
+- **Match-all with a column list** (no Nodes, Columns populated) originally probed every
+  type bucket per column with a **nil predicate** (`Reader.Lookup` treats nil as match-all)
+  to enumerate the span universe for `AllResults`. **Removed (task #211, 2026-07-12): this
+  branch is gone.** It was originally attributed to `{} | rate()`, but a genuine `{} |
+  rate()` compiles with `prog.Predicates == nil` entirely (`vm.compileMatchAllProgram` never
+  populates `Predicates`) — `Nodes: nil, Columns: [...]` only ever arises from a
+  compile-time DECLINE in the real compiler (task #210's zero-node-operand AND/OR guard, a
+  standalone `!~`, etc.), and `executor.viMatchSpans` (the only consumer of a source this
+  package builds) already declines unconditionally whenever `Nodes` is empty regardless of
+  `Columns`. This branch's I/O was therefore always wasted — see this file's own package doc
+  comment (`builder.go`) for the full argument.
 
 **Coverage contract (mirrors NOTE-VI-033 exactly).** A column that is indexed but
 has no matching spans (or no files at all) is `Add`ed with an **empty slice** —
@@ -30,9 +37,9 @@ that is *coverage*, not fallback. `LookupResults` then returns `(nil, true)`. A
 column the builder could not express a predicate for (vector, present-only, or an
 unsupported value type) is **never Added**, so the executor sees no coverage and
 falls back to a full block scan for that leaf. `BuildSource` returns
-`(nil, false, nil)` only when *no* column resolved at all (e.g. bare `{}`, which
-has neither nodes nor columns and so cannot enumerate a universe partitioned
-per column) — the caller then skips the index path entirely.
+`(nil, false, nil)` when *no* column resolved at all (e.g. bare `{}`) OR when
+`Nodes` is empty (task #211: a program with `Nodes` empty is always a compile-time
+decline in practice, never answerable) — the caller then skips the index path entirely.
 
 **Fail-safe on error.** A discovery or download error is returned to the caller,
 which must fall back to a full scan rather than fail the query. A per-file download
@@ -507,6 +514,147 @@ change accidentally introduced de-duplication into `LeafColumns` itself.
 
 Back-ref: `internal/modules/vibuilder/builder.go:LeafColumns`'s own doc comment (states this
 same reasoning). See `SPECS.md` SPEC-VB-5.
+
+## NOTE-VI-107: `valueAsColType`'s column-name-aware fix needed a SECOND correction — millisecond truncation — discovered only after the first one unmasked it (task #203, CRITICAL)
+
+*Added: 2026-07-12*
+
+Task #203's headline finding was a value-index type-bucket mismatch: `span:start`/`span:duration`
+are real `Uint64` columns on disk, but `valueAsColType` mapped every Int/Duration TraceQL literal
+to `ColumnTypeInt64` unconditionally, so `{duration > Xms}`/`{start > X}` always searched the wrong
+type-bucket and always found zero files — silently, with no error, regardless of real data (see
+`SPECS.md` SPEC-VB-6 for the full root-cause writeup).
+
+**Fixing that alone was not sufficient for correct results, and this was NOT visible from the
+type-fix's own synthetic unit tests.** The original `TestBuildSource_RangePredicateBuilds` (this
+package) hand-built its VI fixture via `valueindex.NewWriter(...).AddEntryV2(...)` directly —
+bypassing the real write-path extraction entirely — and happened to write RAW NANOSECOND values
+(`200000000`, `50000000`) straight into the fixture. Comparing those against a raw-nanosecond query
+threshold "worked," but only because the test skipped the real extraction step that actually
+produces span:duration's stored value.
+
+**The real production write path does something the type-only fix's tests never exercised:** root
+`valueindex_extract.go`'s `truncateTimeValueToMillis` (NOTE-VI-027, issue #415) divides
+`span:start`/`span:end`/`span:duration`'s raw-nanosecond value by 1,000,000 before it is written to
+the value index — a deliberate ~1000x cardinality reduction so every span landing in the same
+millisecond shares one value bucket. This was discovered only while mutation-verifying the
+type-bucket fix against a REAL end-to-end write+read round trip in tempo
+(`duration_intrinsic_divergence_local_test.go`'s
+`TestFetch_DurationComparisons_SameClassification_FullCoverage`): after fixing the type-bucket bug
+alone, `{duration > 0ms}` correctly found 2 real matches, but `{duration > 1ms}` found ZERO despite
+a genuine 5ms-duration span existing in the same block — because the real stored canonical values
+were milliseconds (`0`, `1`, `5`), while the query's literal stayed in nanoseconds
+(`1,000,000` for `1ms`), comparing 6 orders of magnitude apart.
+
+**Fix:** a shared function, `valueindex.TruncateTimeValueToMillis` (`internal/modules/valueindex/
+hash.go`), is now called from BOTH sides — root `valueindex_extract.go`'s
+`truncateTimeValueToMillis` (write side, refactored to delegate rather than duplicate the
+division) and `vibuilder/builder.go`'s `intOrDedicatedColType` (read side, new call, gated by
+`dedicatedColumnOverride.truncateMillis` alongside the `Uint64` type override). Moved to
+`valueindex` specifically because it is a leaf package both root `blockpack` and `vibuilder`
+already import with no cycle either direction — a single shared implementation cannot drift out of
+sync the way NOTE-VI-051's own span:start-second-floor duplication (across the blockpack/tempo-mrd
+repo boundary, where a single Go function genuinely is not possible) deliberately still does.
+
+**Why this needed catching now rather than accepting it as a smaller, separate issue:** both bugs
+share the exact same two columns (`span:start`, `span:duration`) and the exact same fix location
+(`intOrDedicatedColType`); fixing only the type-bucket half would have made task #203's own
+reproduction test pass for the WRONG reason (its fixture happened to use exact-millisecond
+nanosecond values, `0`/`1,000,000`/`5,000,000`ns — all cleanly divisible by 1,000,000 with no
+remainder) while leaving every real production duration/start comparison just as silently wrong as
+before, this time failing in the opposite direction (near-always-empty instead of the type bug's
+always-empty). Regression tests for both stacked bugs, together, are `TestBuildSource_
+RangePredicateBuilds`/`_SpanStart` (`builder_test.go`, updated to store PRE-TRUNCATED millisecond
+fixture values, matching the real write path) and tempo's `TestValueIndexQuery_
+DurationColumnTypeMismatch_AlwaysMasksRealCoverage`, `TestFetch_DurationComparisons_
+SameClassification_FullCoverage`, and `TestFetch_SpanStartComparison_
+FindsRealUint64MillisecondTruncatedCoverage` (all real `CreateBlock`+`Fetch` round trips).
+
+**CORRECTED by task #204 (2026-07-12) — the paragraph below is WRONG and is kept only for
+history; see NOTE-VI-108 for the actual behavior.** ~~Accepted, unrelated limitation this fix
+does NOT change: millisecond truncation on both sides means a value-index-backed duration/start
+comparison cannot distinguish sub-millisecond differences (e.g. a genuinely-1.9ms span and a
+genuinely-1.1ms span both truncate to the same millisecond bucket) — this is NOTE-VI-027's own
+deliberate, pre-existing cardinality/precision trade-off, not something task #203 introduced or
+is expected to fix; it now applies symmetrically to both the write and read sides instead of only
+the write side.~~ This framed the boundary ambiguity as a harmless, accepted precision limit.
+It is not: floor-truncating the query threshold and reusing the original operator unchanged
+(exactly what this NOTE originally specified) produces a SILENT WRONG ANSWER — not merely reduced
+precision — for almost every realistic threshold, in both directions (a false negative for `>`, a
+false positive for `>=`/`<=`), reproduced live during #203's own holistic review. Task #204 fixed
+this by declining (reporting the leaf unindexable) whenever the comparison is genuinely
+undecidable from the bucket alone, rather than answering with reduced precision. See NOTE-VI-108.
+
+Back-ref: `internal/modules/vibuilder/builder.go:intOrDedicatedColType,dedicatedColumnOverride,
+dedicatedNumericColumnTypes`, `internal/modules/valueindex/hash.go:TruncateTimeValueToMillis`,
+root `valueindex_extract.go:truncateTimeValueToMillis`. See `SPECS.md` SPEC-VB-6/SPEC-VB-7 for the
+binding contract text, and NOTE-VI-108 (below) for the task #204 correction.
+
+## NOTE-VI-108: floor-truncating both sides and reusing the operator (NOTE-VI-107's original fix) was itself a wrong-answer bug — millisecond-bucket comparisons must be per-operator decidability-gated instead (task #204, CRITICAL)
+
+*Added: 2026-07-12*
+
+NOTE-VI-107 (above) fixed a real unit-mismatch bug by floor-truncating a query's raw-nanosecond
+threshold to the same millisecond bucket the write side already stores, then reusing the
+original comparison operator (`>`, `>=`, `<`, `<=`, `==`) unchanged. That fix's own holistic
+review (both `review-consolidator` and `go-presubmit-reviewer`, independently, each with a live
+reproduction test) found this produces a silent wrong answer in BOTH directions:
+
+- **False negative:** `{duration > 1ms}` silently dropped a real 1.5ms-duration span. The stored
+  bucket for both a genuinely-1.0ms span and a genuinely-1.5ms span is the SAME value (`1`,
+  since both floor to 1ms); comparing that shared bucket `1 > 1` (the floor-truncated threshold)
+  is false, even though the real 1.5ms span genuinely IS greater than the real 1ms threshold.
+- **False positive:** the SAME 1.5ms span incorrectly matched `{duration >= 1.6ms}` — its bucket
+  (`1`) compared against the floor-truncated threshold (`1`) satisfies `1 >= 1`, even though the
+  real value (1.5ms) is NOT actually >= the real threshold (1.6ms).
+
+**Root cause (numerical, not a code typo):** once a real value is floor-truncated to millisecond
+granularity for storage, the exact sub-millisecond real value is permanently lost. A stored
+bucket B represents an UNKNOWN real value anywhere in `[B*1e6, (B+1)*1e6 - 1]` nanoseconds.
+Whether "some value in bucket B satisfies `real_value <op> threshold`" is decidable from the
+bucket alone ONLY when every value in that interval agrees on the answer — which happens at
+exactly one threshold alignment per operator PAIR (`>=`/`<` agree at a millisecond-aligned
+threshold; `>`/`<=` agree only at the opposite, vanishingly-rare edge, one nanosecond below the
+next millisecond; `==` never agrees, at any alignment). Adjusting rounding direction cannot fix
+this generally — it only shifts which operator pair is decidable at which alignment, never
+eliminates the ambiguity for the other pair. This is a genuine, permanent information loss from
+the write-side truncation (NOTE-VI-027's own deliberate ~1000x cardinality reduction), not a
+rounding bug.
+
+**Fix:** `decidableTimeBucketThreshold(nanos uint64, op timeCompareOp) (bucket uint64, ok bool)`
+(`vibuilder/builder.go`) is the single source of truth for whether a given (operator, threshold)
+pair is answerable from a millisecond bucket at all. `intOrDedicatedColType` now takes the
+comparison operator as a parameter (threaded down from `buildRangePredicate`'s Min/Max branches,
+each of which know their own exact operator from `MinInclusive`/`MaxInclusive`, and from
+`buildPredicate`'s equality branch, which always passes the "never decidable" equality
+sentinel) and declines (`ok=false`) whenever the pair is undecidable — leaving the leaf
+unindexable via the exact same convention `LeafIndexable`/`buildPredicate` already use for every
+other unsupported predicate shape, consistent with this whole session's "never guess, decline
+instead" philosophy (NOTE-VI-096, issue #474/#481). See `SPECS.md` SPEC-VB-7 for the full
+decidability truth table and binding contract text.
+
+**Why this needed catching now rather than accepting it as a smaller, separate issue:** this is
+the THIRD layer of bugs found in this exact fix location (type-bucket mismatch → unit mismatch →
+boundary decidability), each unmasked only after fixing the previous one. Both directions were
+reproduced with real tests before this fix, and mutation-verified after it: temporarily reverting
+`decidableTimeBucketThreshold` to NOTE-VI-107's original "floor both sides, keep the operator"
+behavior reproduces both the false-negative and false-positive shapes exactly; restoring the fix
+passes all cases again.
+
+**Regression tests:** `internal/modules/vibuilder/decidability_test.go` (brute-force property
+test over every possible bucket/remainder/operator combination, plus a named truth-table test)
+and root `valueindex_boundary_decidability_test.go` (real write-path end-to-end, five spans at
+exact durations straddling the 1ms/2ms bucket boundaries, both original bug reports reproduced
+verbatim as decline assertions). `TestBuildSource_RangePredicateBuilds`/`_SpanStart`
+(`builder_test.go`) were updated from `>` to `>=` — their original `duration > 100ms`/
+`start > X` queries are themselves an instance of the undecidable shape this fix now correctly
+declines for, so they were switched to the operator/alignment combination (`>=` at a
+millisecond-aligned threshold) that IS decidable, to keep pinning their original subject (the
+type-bucket + unit corrections) without asserting the now-corrected-away buggy behavior.
+
+Back-ref: `internal/modules/vibuilder/builder.go:decidableTimeBucketThreshold,timeCompareOp,
+intOrDedicatedColType,valueAsRangeColType,buildRangePredicate,betweenTimeBucketBounds`. See
+`SPECS.md` SPEC-VB-7 for the binding contract text.
 
 ## NOTE-VI-105: A5's mutation-check confirmed, and a SECOND independent bug it caught — `added`/`ok` was tracking "had a buildable predicate," not "actually Added" (#496, R7)
 

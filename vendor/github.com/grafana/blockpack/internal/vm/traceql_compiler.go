@@ -621,7 +621,25 @@ func extractTraceQLPredicates(expr traceqlparser.Expr) *QueryPredicates {
 
 // extractTraceQLNodes recursively extracts block-pruning nodes and accessed columns.
 //
-// AND: left and right nodes concatenated (AND-combined at top level by the planner).
+// NOTE-492: OpAnd's composite wrapper (issue #208) and unconstrained-arm decline guard
+// (issue #210) — see internal/vm/NOTES.md NOTE-492 for the full rationale.
+//
+// AND: if both sides produce nodes, wraps them in a single AND composite (IsOR: false);
+//
+//	if either side is unconstrained (no nodes -- e.g. a negation operator that only
+//	contributes to cols), the entire AND is unconstrained (returns nil nodes). Mirrors
+//	OR's own guard below: silently concatenating only the constrained side's nodes would
+//	make the value-index path (executor.viEvalNodes/viEvalAND) evaluate the constrained
+//	side ALONE as if it were the whole query, dropping the unconstrained side's
+//	constraint and returning an over-inclusive (wrong) answer (task #210). The composite
+//	wrapper itself (rather than a bare flat concatenation) is required so this AND's
+//	grouping survives intact when the result is absorbed into an enclosing OR's Children
+//	instead of becoming the program's own top-level Nodes list -- a flat, unwrapped
+//	concatenation would be silently reinterpreted there as N separate OR siblings instead
+//	of one AND group (task #208). viEvalNode/collectLeaves/hasORNode/planAndNodes all
+//	already walk Children generically regardless of nesting depth or IsOR value, so this
+//	wrapper is a correctness-neutral no-op whenever it lands as the sole top-level node.
+//
 // OR:  if both sides produce nodes, wraps in a single OR composite; if either side is
 //
 //	unconstrained (no nodes), the entire OR is unconstrained (returns nil nodes).
@@ -638,7 +656,14 @@ func extractTraceQLNodes(expr traceqlparser.Expr) (nodes []RangeNode, cols []str
 	case traceqlparser.OpAnd:
 		ln, lc := extractTraceQLNodes(e.Left)
 		rn, rc := extractTraceQLNodes(e.Right)
-		return append(ln, rn...), dedupStrings(append(lc, rc...))
+		cols = dedupStrings(append(lc, rc...))
+		if len(ln) == 0 || len(rn) == 0 {
+			// One side of the user-written AND is unconstrained (e.g. involves a computed
+			// column or a negation). See the doc comment above for why this forces a
+			// decline (task #210) rather than silently dropping that side's constraint.
+			return nil, cols
+		}
+		return []RangeNode{{IsOR: false, Children: append(ln, rn...)}}, cols
 
 	case traceqlparser.OpOr:
 		ln, lc := extractTraceQLNodes(e.Left)
@@ -818,6 +843,12 @@ func extractNeqNode(expr *traceqlparser.BinaryExpr) (nodes []RangeNode, cols []s
 		neqVal := neqRangeValue(columnName, s)
 		minV := neqVal
 		maxV := neqVal
+		// task #213: mark the RequirePresent leaf as paired with the range-OR sibling this
+		// exact call is about to append — see RangeNode.NeqPairedRange's own doc comment.
+		// Only set here (the scoped, non-intrinsic-refs branch), never for the unscoped
+		// OR-of-two-RequirePresent shape below or the intrinsic-refs-skip case above, where no
+		// value-bearing sibling exists.
+		nodes[0].NeqPairedRange = true
 		nodes = append(nodes, RangeNode{
 			IsOR: true,
 			Children: []RangeNode{
@@ -878,8 +909,12 @@ func extractNeqNumericNode(
 
 	minV := vmValue
 	maxV := vmValue
+	// task #213: mark the RequirePresent leaf as paired with the range-OR sibling below —
+	// see RangeNode.NeqPairedRange's own doc comment. Unlike the string path there is no
+	// intrinsic-refs skip here (see this function's own doc comment), so the scoped numeric
+	// branch always has a genuine sibling to pair with.
 	nodes = []RangeNode{
-		{Column: columnName, RequirePresent: true},
+		{Column: columnName, RequirePresent: true, NeqPairedRange: true},
 		{
 			IsOR: true,
 			Children: []RangeNode{

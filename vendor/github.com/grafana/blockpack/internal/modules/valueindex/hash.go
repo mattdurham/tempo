@@ -53,6 +53,27 @@ func ColTypeName(colType shared.ColumnType) string {
 	}
 }
 
+// TruncateTimeValueToMillis divides a raw-nanosecond time-domain value (span:start,
+// span:end, span:duration) down to millisecond granularity. This is the SAME
+// truncation both the write-side value-index extraction (root package's
+// valueindex_extract.go, truncateTimeValueToMillis, NOTE-VI-027/issue #415 — a
+// deliberate ~1000x cardinality reduction so every span in the same millisecond
+// shares one value bucket) and the read-side predicate construction
+// (vibuilder/builder.go's dedicated-column override, NOTE-VI-107/task #203) must apply.
+// A query literal compared against a stored canonical value for one of these columns
+// MUST go through this exact function before the comparison, or the two sides silently
+// compare nanoseconds against milliseconds (off by 10^6) — task #203's second finding,
+// discovered only after fixing that task's headline int64/uint64 type-bucket bug
+// unmasked it. Lives here (a leaf package both root and vibuilder already import, with
+// no cycle either direction) specifically so the two call sites share one
+// implementation and cannot drift out of sync independently — unlike NOTE-VI-051's own
+// span:start-second-floor duplication across the blockpack/tempo-mrd repo boundary,
+// which predates this and remains a deliberate, documented cross-repo exception (a
+// single shared Go function is not possible across that boundary; it is possible here).
+func TruncateTimeValueToMillis(nanos uint64) uint64 {
+	return nanos / 1_000_000
+}
+
 // ValueHash returns the 32-char lower-hex value hash for a canonical-encoded value.
 // value_hash = lower_hex(SHA-256(encoded_value)[:16])
 func ValueHash(encodedValue []byte) string {

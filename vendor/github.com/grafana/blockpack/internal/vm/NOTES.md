@@ -215,8 +215,16 @@ the range rewrite is not applied to the unscoped expansion.
 Hex-bytes attributes (`trace:id` etc., `neqRangeValue`) decode the literal to a 16-byte
 `TypeBytes` value so the bytes bounds pruner compares against the column's native encoding.
 
+**Addendum (task #213, 2026-07-12):** the scoped branch's `RequirePresent` node now also sets
+`RangeNode.NeqPairedRange = true`, marking it as paired with the range-OR node appended right
+after it in the same returned slice. This is consumed downstream by
+`vibuilder.collectLeaves`/`executor.SliceValueIndexSource` (see
+`internal/modules/executor/NOTES.md`'s NOTE-VI-107 task #213 addendum) to let the value-index
+path safely substitute this leaf's own paired sibling data instead of declining — NEVER set for
+the unscoped branch below, which has no such sibling.
+
 **Back-ref:** `vm/traceql_compiler.go:extractNeqNode,neqRangeValue,isIntrinsicRefsColumn`,
-`executor/plan_blocks.go:rejectStringRange,rejectBytesRange`.
+`vm/rangenode.go:RangeNode.NeqPairedRange`, `executor/plan_blocks.go:rejectStringRange,rejectBytesRange`.
 
 ## NOTE-454 (compiler side): numeric `!= V` presence + range-OR rewrite (issue #372)
 *Added: 2026-06-19*
@@ -244,7 +252,13 @@ range/ColStats pruning path.
 **Unscoped numeric `attr != V`** keeps presence-only (OR of per-scope `RequirePresent`
 leaves), mirroring the string unscoped path.
 
+**Addendum (task #213, 2026-07-12):** mirrors NOTE-453's own addendum — the scoped branch's
+`RequirePresent` leaf always sets `RangeNode.NeqPairedRange = true` (unconditionally here,
+unlike the string path's `isIntrinsicRefsColumn` skip; see `extractNeqNumericNode`'s own doc
+comment), never the unscoped branch above.
+
 **Back-ref:** `vm/traceql_compiler.go:extractNeqNode,extractNeqNumericNode`,
+`vm/rangenode.go:RangeNode.NeqPairedRange`,
 `executor/plan_blocks.go:colStatsRejectsInt64,colStatsRejectsFloat64,numNodeBoundExceedsMax`.
 
 ## NOTE-491 — MetricsShapeIsVIAnswerable extracted from ExecuteTraceMetricsFromVI's inline gate, for plan-time reuse (issue #487, holistic-review Issue 2/B)
@@ -269,3 +283,79 @@ alone cannot serve this call site).
 Back-refs: `internal/vm/metrics_compiler.go:MetricsShapeIsVIAnswerable`,
 `internal/modules/executor/metrics_trace.go:ExecuteTraceMetricsFromVI`,
 `metricsfilter.go:CompileTraceQLMetricsFilter`. See `SPECS.md` SPEC-VM-1. Issue #487.
+
+## NOTE-492 — extractTraceQLNodes OpAnd: composite wrapper + unconstrained-arm decline guard (issues #208, #210)
+
+*Added: 2026-07-12*
+
+`extractTraceQLNodes`'s `OpAnd` case had two bugs, both found by task #209's oracle-comparison
+audit (`value_index_oracle_comparison_test.go` shapes 6/8/11b) and fixed together since they are
+adjacent branches of the same `switch` arm and any coordinated fix has to keep both consistent:
+
+1. **No AND composite wrapper (issue #208).** The old code returned a bare flat-concatenated
+   slice (`append(ln, rn...)`). This is safe only when the slice becomes the program's own
+   top-level `Nodes` list (the "flat list = AND" convention) — but when an AND expression is one
+   arm of a user-written `||`, that flat slice was absorbed directly into the enclosing `OpOr`
+   case's `Children`, silently discarding the inner AND grouping: `(A&&B)||(C&&D)` compiled to a
+   single OR of 4 flat leaves `[A,B,C,D]` instead of `(A&&B)||(C&&D)`. The fix wraps the combined
+   children in a single AND composite `RangeNode{IsOR: false, Children: append(ln, rn...)}`,
+   mirroring the `OpOr` case's own composite wrapper immediately below it. This is a correctness-
+   neutral no-op wherever the result lands as the sole top-level `Nodes` entry: `RangeNode`'s
+   composite semantics (doc comment, `bytecode.go`) already define `IsOR=false` composites as
+   "block must satisfy ALL children", and every downstream consumer already walks `Children`
+   generically regardless of nesting depth or `IsOR` value —
+   `executor.viEvalNode`/`viEvalNodes` (query-time AND/OR evaluation),
+   `vibuilder.collectLeaves`/`hasORNode`/`isFlatORQuery` (issue #206's DFS leaf-slot numbering,
+   OR-detection), `queryplan.planAndNodes`/`planOrNode` ("maximal-AND-subtree" flattening — this
+   rule already anticipated nested AND composites), and `executor.translateNode`/`BuildPredicates`
+   (already documents "AND composites (IsOR:false) → queryplanner.Predicate{Op:LogicalAND,...}"
+   as an anticipated shape). None of these required changes; the composite shape they already
+   supported for chained OR-of-OR (`a||b||c` nests the same way today) now also applies to AND.
+2. **No unconstrained-arm decline guard (issue #210).** `OpOr` already declines the whole OR
+   (`return nil, cols`) when either side contributes zero nodes (e.g. a negation operator like
+   `!~`, which only contributes to `cols`, never `Nodes`) — silently pruning/answering from the
+   other arm alone would be wrong for an OR (a block/span satisfying only the unconstrained arm
+   would be missed). `OpAnd` had no analog: it unconditionally concatenated `append(ln, rn...)`,
+   so `{ span.score = 100 && span.tag !~ "^bar.*" }` compiled to a tree containing ONLY the
+   `score=100` leaf — the `!~` operand's constraint vanished from the value-index tree entirely,
+   and `executor.viEvalNodes`/`viEvalAND` then answered using `score=100` alone, an over-inclusive
+   (wrong) match set rather than a decline. The fix adds the same guard to `OpAnd`
+   (`if len(ln) == 0 || len(rn) == 0 { return nil, cols }`, checked before the composite wrap),
+   so the whole AND now correctly compiles to `Nodes: nil, Columns: [...the still-referenced
+   columns...]` (never a silently-dropped constraint) instead of the old over-inclusive
+   `score=100`-alone tree.
+
+**Correction (6th review pass, task #211/#212 pass, 2026-07-12): this entry originally claimed
+"the caller (`BuildValueIndexSource`) falls back to the block-scan path" as if
+`vibuilder.BuildSource`/`BuildValueIndexSource` itself performed the decline. That was never
+accurate: `BuildSource`'s own predicate-tree walk never inspects the AND-decline outcome as a
+decline signal at all — before task #211's own fix, a `Nodes: nil, Columns: [...]` program (this
+guard's exact output shape) was misclassified by `BuildSource` as a genuine match-all-with-
+column-list and triggered a real (wasted) `lookupColumnAll` fetch, reporting `ok=true` right up
+until `executor.viMatchSpans` (`internal/modules/executor/metrics_trace.go`) — one layer
+downstream, the actual and ONLY place that inspects `len(preds.Nodes) == 0` as a hard decline
+signal for `Nodes: nil, Columns: [...]` regardless of what `BuildSource` populated — declined and
+forced the fallback. Task #211 closed that gap by making `BuildSource`/`BuildSourceBounded`
+ALSO decline immediately for this shape (matching `viMatchSpans`'s own contract, eliminating the
+wasted I/O — see `internal/modules/vibuilder/builder.go`'s own package doc comment for the
+full argument), but the authoritative, load-bearing decline point for THIS guard's correctness
+has always been `viMatchSpans`, not `BuildSource`. Also: shapes 11a/11c
+(`value_index_oracle_comparison_test.go`) no longer decline as of task #212 — a narrower,
+unrelated fix to `SliceValueIndexSource.LookupLeaf`'s own leaf-aware gate (NOTE-VI-107 addendum,
+`internal/modules/executor/NOTES.md`) now resolves a `RequirePresent` leaf's missing entry via
+its column's real sibling data instead of blanket-declining; those two shapes were renamed
+`...ResolvesCorrectly` and now assert the correct VI-path answer, not a decline. This entry's
+own shapes 6/8/11b guard is unaffected by that fix (no `RequirePresent` leaf is involved here at
+all — `!~` contributes zero nodes for an entirely different reason, `OpNotRegex`'s own
+`negationCols`-only branch).
+
+Both fixes are coordinated in the same `case traceqlparser.OpAnd:` block: the decline guard runs
+first (mirroring `OpOr`'s own ordering), then the composite wrap. Verified via oracle-comparison
+regression tests (shapes 6, 8, 11b tightened to real passing assertions) and full-suite
+`go test -race ./...` with zero regressions, including the sibling
+`structural_oracle_comparison_test.go` suite (structural queries compile each leg through this
+exact same function).
+
+Back-refs: `internal/vm/traceql_compiler.go:extractTraceQLNodes`,
+`internal/modules/vibuilder/builder.go:BuildSource, BuildSourceBounded`,
+`internal/modules/executor/metrics_trace.go:viMatchSpans`. Issues #208, #210, #211.

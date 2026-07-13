@@ -123,9 +123,9 @@ Back-ref: `internal/modules/vibuilder/leaf_indexable_test.go`. Issue #487.
 ## TEST-VB-5: `ColumnWatermark`/`BuildSource`'s R7 coverage gate — boundary conditions and both `src.Add` sites (#496)
 *Added: 2026-07-10*
 
-**Scenario:** `ColumnWatermark.CoversRange`'s 4 branches (SPEC-VB-4) and `BuildSource`'s two
-gated `src.Add` call sites (leaf predicates, match-all/`Columns` list) — both need the gate,
-and an absent watermark entry must behave exactly as pre-#496.
+**Scenario:** `ColumnWatermark.CoversRange`'s 4 branches (SPEC-VB-4) and `BuildSource`'s
+gated `src.AddLeaf` call site (leaf predicates) — an absent watermark entry must behave
+exactly as pre-#496.
 
 **Setup/Assertions:**
 - `TestColumnWatermark_CoversRange_DoneAlwaysTrue`, `_NeverTriggeredAlwaysFalse`,
@@ -141,10 +141,15 @@ and an absent watermark entry must behave exactly as pre-#496.
 - `TestBuildSource_MixedLeaves_OneGatedOneNot_EdgeCase1` — plan.md's own "Edge Case 1: a query
   references BOTH a dedicated and a non-dedicated column in one predicate tree" — one leaf
   gated, one not, in the SAME query.
-- `TestBuildSource_MatchAll_WatermarkGateSkipsUncoveredColumn` /
-  `_MatchAll_WatermarkCoveredColumnResolves` — the SECOND `src.Add` call site (match-all/
-  `Columns`-list queries have the identical partial-coverage risk as leaf predicates and must
-  be gated too, per plan.md 4.7's explicit two-call-site callout).
+- **Superseded (task #211, 2026-07-12):** `TestBuildSource_MatchAll_WatermarkGateSkipsUncoveredColumn`
+  / `_MatchAll_WatermarkCoveredColumnResolves` originally covered a SECOND `src.Add` call site
+  (match-all/`Columns`-list queries) that no longer exists — that branch was removed entirely
+  because it was always wasted I/O for a shape `executor.viMatchSpans` declines unconditionally
+  anyway (see SPEC-VB-4's own correction). Renamed
+  `TestBuildSource_NodesEmptyColumnsPopulated_DeclinesRegardlessOfWatermark` /
+  `_DeclinesEvenWithWatermarkCoverage` (same file) — now pin that this shape declines
+  immediately with ZERO I/O regardless of watermark state, not that the watermark gate itself
+  resolves it either way.
 
 **Spec invariants tested:** SPEC-VB-4.
 
@@ -197,3 +202,55 @@ re-export parity.
 
 Back-refs: `internal/modules/vibuilder/leaf_columns_test.go` (9 tests),
 `valueindex_leafcolumns_test.go` (2 tests, root package).
+
+---
+
+## TEST-VB-7: `decidableTimeBucketThreshold` — millisecond-bucket comparison decidability, per operator, brute-force-verified (task #204, CRITICAL)
+*Added: 2026-07-12*
+
+**Scenario:** SPEC-VB-7's full contract — for every comparison operator (`>`, `>=`, `<`, `<=`,
+`==`) against a millisecond-truncated dedicated time column (span:start/span:duration), the
+decidability gate must agree exactly with the mathematical ground truth (whether every real
+nanosecond value a stored bucket could represent agrees on the comparison's outcome), not merely
+match a set of recorded expected outputs.
+
+**Setup/Assertions (`decidability_test.go`, white-box `vibuilder` package):**
+- `TestDecidableTimeBucketThreshold_MatchesBruteForceGroundTruth` — for a sweep of buckets and
+  remainders across every operator, brute-forces all 1,000,000 real nanosecond values the
+  ambiguous bucket could represent and asserts `decidableTimeBucketThreshold`'s `ok` verdict
+  matches `bucketIsGapFree`'s ground truth exactly, and that a decidable bucket threshold equals
+  `Tq` (nanos div 1e6) unchanged.
+- `TestDecidableTimeBucketThreshold_TruthTable` — pins the concrete named cases from
+  SPEC-VB-7's truth table, including both original bug reports (`>1ms` false-negative shape,
+  `>=1.6ms`/`<=1.6ms` false-positive shape) and equality's unconditional undecidability.
+
+**Setup/Assertions (`valueindex_boundary_decidability_test.go`, root `blockpack_test` package —
+real write-path end-to-end):**
+- Five real spans with exact nanosecond durations (1.000/1.400/1.500/1.999/2.000ms) written via
+  `blockpack.NewWriter`, extracted through the REAL `blockpack.ExtractValueIndexEntries`
+  (applies the real millisecond truncation), fed into a real `valueindex.Writer.FlushBucket`, and
+  queried via `vibuilder.BuildSource` with a compiled TraceQL program — not a hand-built,
+  pre-truncated fixture.
+- `TestBoundaryDecidability_GTE_WholeMillisecondIsDecidable` / `_LT_WholeMillisecondIsDecidable`
+  — a millisecond-aligned threshold returns the exact real match set for `>=`/`<`.
+- `TestBoundaryDecidability_GTE_SubMillisecondDeclines` / `_LT_SubMillisecondDeclines` — a
+  non-aligned threshold declines (`ok=false`) for `>=`/`<`, including the exact false-positive
+  bug report (`>=1.6ms`).
+- `TestBoundaryDecidability_GT_WholeMillisecondDeclines` — the exact false-negative bug report
+  (`>1ms`) now declines instead of silently dropping real matches.
+- `TestBoundaryDecidability_GT_R999999IsDecidable` / `_LTE_R999999IsDecidable` — the rare but
+  real decidable case for `>`/`<=` (`Tr == 999_999`).
+- `TestBoundaryDecidability_LTE_SubMillisecondDeclines` — `<=`'s non-decidable case declines.
+- `TestBoundaryDecidability_EQ_AlwaysDeclines` — equality declines at BOTH a millisecond-aligned
+  and a non-aligned threshold, proving there is no decidable case for `==` at all.
+
+**Mutation-verified:** temporarily reverting `decidableTimeBucketThreshold` to task #203's
+original "floor both sides, keep the operator" behavior reproduces both documented wrong-answer
+shapes exactly (verified via a scratch reproduction, not left in the tree) — the `>1ms` case
+drops the real 1.4/1.5/1.999ms spans (false negative) and the `>=1.6ms` case incorrectly includes
+the real 1.0/1.4/1.5ms spans (false positive). Restoring the fix passes all cases again.
+
+**Spec invariants tested:** SPEC-VB-7.
+
+Back-refs: `internal/modules/vibuilder/decidability_test.go` (2 tests, ~70 brute-force subtests),
+`valueindex_boundary_decidability_test.go` (9 tests, root package).

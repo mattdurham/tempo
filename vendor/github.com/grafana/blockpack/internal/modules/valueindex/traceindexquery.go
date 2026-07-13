@@ -33,9 +33,62 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"log/slog"
+	"time"
 
 	"github.com/golang/snappy"
+	"go.opentelemetry.io/otel/attribute"
 )
+
+// traceLookupStepThreshold is the per-step duration above which LookupTraceGroupPartial's
+// step helper (traceLookupStep) additionally emits a slog.Warn line, on top of the OTel span
+// it always records (task #202). An OTel span alone requires a trace exporter/viewer on hand
+// to inspect; a slow round trip buried inside the object-store client's OWN internal
+// retry/backoff loop (invisible to this package -- e.g. minio-go's executeMethod defaults to
+// MaxRetry=10 attempts with exponential backoff up to a 1s cap per attempt, silently consuming
+// several seconds with no single call ever "looking" abnormally slow to a naive timeout check)
+// is exactly the kind of thing an operator investigating a live incident needs to see in plain
+// application logs first, without needing a sampled trace already captured for that specific
+// request. 500ms is comfortably above blockpack's own CLAUDE.md guidance that a single object-
+// store round trip is normally 50-100ms, so a step this slow is already anomalous.
+const traceLookupStepThreshold = 500 * time.Millisecond
+
+// traceLookupStep runs fn as one named step of a LookupTraceGroupPartial call (task #202):
+// "size", "footer_read", "tail_read", or "block_read". It wraps fn in a child OTel span named
+// "valueindex.trace_lookup.<step>" carrying the object key, byte count, and duration (plus any
+// caller-supplied extra attributes, e.g. a block index) so a future 10-20s trace-by-id timeout
+// can be attributed to the EXACT step responsible -- Size(key) [StatObject], the footer ReadAt,
+// the tail (block-directory + string-table) ReadAt, or one SPECIFIC block-body ReadAt -- instead
+// of surfacing as one aggregate "context deadline exceeded" with no breakdown. When fn takes at
+// least traceLookupStepThreshold, a structured slog.Warn line is also emitted so the same
+// attribution is visible in plain application logs even without a trace viewer.
+func traceLookupStep(
+	ctx context.Context, key, step string, byteLen int, fn func() error, extra ...attribute.KeyValue,
+) error {
+	_, span := tracer.Start(ctx, "valueindex.trace_lookup."+step)
+	defer span.End()
+
+	start := time.Now()
+	err := fn()
+	dur := time.Since(start)
+
+	if span.IsRecording() {
+		attrs := append([]attribute.KeyValue{
+			attribute.String("valueindex.trace_lookup.key", key),
+			attribute.Int("valueindex.trace_lookup.bytes", byteLen),
+			attribute.Int64("valueindex.trace_lookup.duration_ms", dur.Milliseconds()),
+		}, extra...)
+		if err != nil {
+			attrs = append(attrs, attribute.String("valueindex.trace_lookup.error", err.Error()))
+		}
+		span.SetAttributes(attrs...)
+	}
+	if dur >= traceLookupStepThreshold {
+		slog.Warn("valueindex: LookupTraceGroupPartial: slow step",
+			"key", key, "step", step, "bytes", byteLen, "duration_ms", dur.Milliseconds(), "err", err)
+	}
+	return err
+}
 
 // TraceFooter is the decoded fixed-size v2 TraceGroup file footer.
 type TraceFooter struct {
@@ -109,9 +162,19 @@ func LookupTraceGroupPartial(
 	traceID [16]byte,
 	queryMinSec, queryMaxSec uint64,
 ) (TraceGroup, bool, error) {
-	size, err := store.Size(key)
-	if err != nil {
-		return TraceGroup{}, false, fmt.Errorf("valueindex: trace lookup size %q: %w", key, err)
+	ctx, span := tracer.Start(ctx, "valueindex.trace_lookup")
+	defer span.End()
+	if span.IsRecording() {
+		span.SetAttributes(attribute.String("valueindex.trace_lookup.key", key))
+	}
+
+	var size int64
+	if serr := traceLookupStep(ctx, key, "size", 0, func() error {
+		var err error
+		size, err = store.Size(key)
+		return err
+	}); serr != nil {
+		return TraceGroup{}, false, fmt.Errorf("valueindex: trace lookup size %q: %w", key, serr)
 	}
 	if size < int64(traceFooterSize) {
 		return TraceGroup{}, false, fmt.Errorf(
@@ -121,7 +184,10 @@ func LookupTraceGroupPartial(
 
 	// Read the footer (fixed tail).
 	footerBuf := make([]byte, traceFooterSize)
-	if _, rerr := store.ReadAt(key, footerBuf, size-int64(traceFooterSize)); rerr != nil {
+	if rerr := traceLookupStep(ctx, key, "footer_read", traceFooterSize, func() error {
+		_, err := store.ReadAt(key, footerBuf, size-int64(traceFooterSize))
+		return err
+	}); rerr != nil {
 		return TraceGroup{}, false, fmt.Errorf("valueindex: trace lookup footer %q: %w", key, rerr)
 	}
 	ft, ferr := DecodeTraceFooter(footerBuf)
@@ -145,7 +211,11 @@ func LookupTraceGroupPartial(
 	}
 	tailLen := uint64(size) - tailStart
 	tail := make([]byte, tailLen)
-	if _, rerr := store.ReadAt(key, tail, int64(tailStart)); rerr != nil { //nolint:gosec // tailStart <= size
+	//nolint:gosec // tailLen is bounded by size (int64), validated above.
+	if rerr := traceLookupStep(ctx, key, "tail_read", int(tailLen), func() error {
+		_, err := store.ReadAt(key, tail, int64(tailStart)) //nolint:gosec // tailStart <= size
+		return err
+	}); rerr != nil {
 		return TraceGroup{}, false, fmt.Errorf("valueindex: trace lookup tail %q: %w", key, rerr)
 	}
 
@@ -176,7 +246,7 @@ func LookupTraceGroupPartial(
 		if !traceBlockMayContain(d, traceID, queryMinSec, queryMaxSec) {
 			continue
 		}
-		blkGroups, berr := readTraceBlockForID(store, key, size, d, table, traceID)
+		blkGroups, berr := readTraceBlockForID(ctx, store, key, size, d, table, traceID, i)
 		if berr != nil {
 			return TraceGroup{}, false, fmt.Errorf(
 				"valueindex: trace lookup %q block %d: %w", key, i, berr,
@@ -206,14 +276,21 @@ func traceBlockMayContain(
 }
 
 // readTraceBlockForID ranged-reads only the given block's compressed body and
-// returns every group in it matching traceID (nil if the bloom excludes it).
+// returns every group in it matching traceID (nil if the bloom excludes it). blockIdx
+// identifies this block's position in the file's directory (task #202) purely for the
+// "valueindex.trace_lookup.block_index" span attribute below -- it distinguishes WHICH of
+// potentially several surviving blocks' ReadAt call was slow, since a file can hold many
+// blocks and LookupTraceGroupPartial's own doc comment already notes more than one can
+// legitimately survive pruning for a given TraceID.
 func readTraceBlockForID(
+	ctx context.Context,
 	store TraceRandomReader,
 	key string,
 	size int64,
 	d *traceBlockDirEntry,
 	table *StringTable,
 	traceID [16]byte,
+	blockIdx int,
 ) ([]TraceGroup, error) {
 	end := d.compOff + d.compLen
 	usize := uint64(size) //nolint:gosec // size is validated >= traceFooterSize by the caller, so non-negative
@@ -221,7 +298,12 @@ func readTraceBlockForID(
 		return nil, fmt.Errorf("body out of bounds")
 	}
 	blockBuf := make([]byte, d.compLen)
-	if _, rerr := store.ReadAt(key, blockBuf, int64(d.compOff)); rerr != nil { //nolint:gosec // compOff <= size
+	//nolint:gosec // d.compLen is bounded by size (int64), validated above.
+	rerr := traceLookupStep(ctx, key, "block_read", int(d.compLen), func() error {
+		_, err := store.ReadAt(key, blockBuf, int64(d.compOff)) //nolint:gosec // compOff <= size
+		return err
+	}, attribute.Int("valueindex.trace_lookup.block_index", blockIdx))
+	if rerr != nil {
 		return nil, rerr
 	}
 	blkGroups, _, berr := scanTraceBlockForID(blockBuf, table, traceID)

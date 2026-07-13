@@ -158,6 +158,12 @@ func blockFileRefFromMeta(meta modules_shared.BlockMeta) modules_shared.BlockFil
 // the index degenerates to a per-span posting list. Truncation gives ~1000x
 // cardinality reduction so spans in the same millisecond share one value bucket.
 //
+// Delegates to valueindex.TruncateTimeValueToMillis (NOTE-VI-107, task #203) — the
+// read side (vibuilder/builder.go's dedicated-column override) must divide a query
+// literal by the exact same factor before comparing it against one of these columns'
+// stored canonical value, and the two call sites share this one function specifically
+// so they cannot drift out of sync independently. See that function's own doc comment.
+//
 // Non-time columns and unexpected value types pass through unchanged. The returned
 // value keeps the same dynamic type as the input (uint64 stays uint64, int64 stays
 // int64) so the recorded ColumnType is still correct.
@@ -171,9 +177,10 @@ func truncateTimeValueToMillis(name string, val any) any {
 	}
 	switch v := val.(type) {
 	case uint64:
-		return v / 1_000_000
+		return valueindex.TruncateTimeValueToMillis(v)
 	case int64:
-		return v / 1_000_000
+		//nolint:gosec // v is a real span-timing nanosecond value, always non-negative in practice
+		return int64(valueindex.TruncateTimeValueToMillis(uint64(v)))
 	default:
 		return val
 	}
