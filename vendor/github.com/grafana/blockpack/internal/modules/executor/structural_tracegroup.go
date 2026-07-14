@@ -16,18 +16,6 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// candidateFetchConcurrency bounds how many candidate trace-by-id index files
-// FindTraceGroupInCandidates resolves in parallel (task #199, NOTE-VI-106). It mirrors
-// vibuilder.downloadConcurrency's convention exactly (same value, same errgroup.SetLimit
-// mechanism) but is its OWN constant rather than an import: executor cannot import vibuilder
-// without an import cycle (vibuilder itself imports executor — see structural_index.go's own
-// "internal import" note), so this package-level constant is the sanctioned mirror, not a new
-// unbounded goroutine-per-candidate scheme. Kept in lockstep with vibuilder.downloadConcurrency
-// (currently 4) since both bound the same kind of work: an object-store round trip per candidate
-// immediately followed by CPU-bound decode (LookupTraceGroupPartial's footer/TOC parse plus, on a
-// bloom hit, a snappy block decode) under the querier's own CPU limit.
-const candidateFetchConcurrency = 4
-
 // FindTraceGroupInCandidates fetches and decodes every candidate trace-by-id index file in keys,
 // merging every matching group found for traceID across ALL of them — candidates are NOT
 // short-circuited on the first match, since DiscoverIndexFiles can legitimately return multiple
@@ -42,14 +30,18 @@ const candidateFetchConcurrency = 4
 // correct answer, which is no longer true under the authoritative contract).
 //
 // NOTE-VI-106 (task #199): every candidate's LookupTraceGroupPartial call is fanned out
-// CONCURRENTLY, bounded by candidateFetchConcurrency, mirroring vibuilder.queryKeysRanged's
-// errgroup fan-out for the sibling search/metrics value-index path — resolving candidates one at a
-// time made wall-clock latency scale linearly with the candidate count instead of being bounded by
-// the slowest single one. Concurrency is fetch-only: results are collected into a slice indexed by
-// each candidate's ORIGINAL position in keys and merged back in that same order once every
-// candidate has resolved, so the "first occurrence wins" SpanID-dedup and minimum-TimeSec merge
-// semantics stay byte-identical to the prior sequential loop regardless of which goroutine happens
-// to finish first.
+// CONCURRENTLY, with NO cap on the number in flight (task #216 follow-up, removing the
+// candidateFetchConcurrency=4 bound this note originally introduced) — one goroutine and one
+// object-store round trip per candidate, unconditionally. This work is I/O-bound: every candidate
+// pays 2-3 sequential ranged reads (Size/footer/tail) regardless of whether it holds the trace,
+// and the CPU-bound decode step (snappy block decode) is gated per-BLOCK on a bloom/min-max hit
+// inside a candidate, not per-candidate-FILE — so fanning out every candidate file concurrently
+// does not multiply CPU-bound work the way capping was originally (overcautiously) meant to
+// prevent. Concurrency is fetch-only: results are collected into a slice indexed by each
+// candidate's ORIGINAL position in keys and merged back in that same order once every candidate
+// has resolved, so the "first occurrence wins" SpanID-dedup and minimum-TimeSec merge semantics
+// stay byte-identical to the prior sequential (and later capped-concurrent) loop regardless of
+// which goroutine happens to finish first.
 //
 // Returns (group, true, nil) on a hit, (zero, false, nil) when no candidate holds the trace (an
 // authoritative miss), or (zero, false, err) on any fetch/decode failure.
@@ -70,8 +62,11 @@ func FindTraceGroupInCandidates(
 	}
 	results := make([]candidateResult, len(keys))
 
+	// No SetLimit: one goroutine and one object-store round trip per candidate, unconditionally
+	// (see this function's own doc comment for why an artificial file-level cap is not needed
+	// here). Real concurrency is bounded by the candidate count itself and the object store's
+	// own capacity, not by a self-imposed serialization point.
 	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(candidateFetchConcurrency)
 	for i, key := range keys {
 		g.Go(func() (err error) {
 			// SPEC-ROOT-001: goroutine panics must not crash the process — mirrors

@@ -1673,11 +1673,26 @@ Back-ref: `internal/modules/executor/structural_traceresolve.go:ResolveTraceGrou
 
 **Contract:** `FindTraceGroupInCandidates(ctx, lister valueindex.LookupStore, keys []string, traceID [16]byte, queryMinSec, queryMaxSec uint64) (valueindex.TraceGroup, bool, error)` (`internal/modules/executor/structural_tracegroup.go`) fetches and decodes every candidate trace-by-id index file in `keys`, merging every matching group found for `traceID` across all of them (SpanID-deduplicated, first occurrence wins; `TimeSec` is the minimum across matches). Candidates are never short-circuited on first match — disjoint-span L0 files for the same TraceID are a legitimate pre-compaction state. A fetch/decode failure on any candidate is index/data inconsistency and returns an ERROR (NOTE-VI-071's authoritative-index contract), never silently skipped.
 
-**Concurrency (task #199, NOTE-VI-106, 2026-07-12):** every candidate's `valueindex.LookupTraceGroupPartial` call is fanned out CONCURRENTLY via `errgroup`, bounded by `candidateFetchConcurrency` (4, mirroring `vibuilder.downloadConcurrency`'s convention and value) — wall-clock latency is bounded by the slowest single candidate instead of scaling linearly with the candidate count. The merge itself remains deterministic: results are collected into a slice indexed by each candidate's original position in `keys` and folded back in that same order once every candidate has resolved, so the SpanID-dedup/minimum-`TimeSec` merge semantics are byte-identical to the prior strictly-sequential loop regardless of goroutine completion order. A real (non-404-class) error on any candidate still fails the whole call, mirroring `vibuilder.queryKeysRanged`'s sibling-abort guard.
+**Concurrency (task #199, NOTE-VI-106, 2026-07-12; cap removed task #216, 2026-07-14):** every
+candidate's `valueindex.LookupTraceGroupPartial` call is fanned out CONCURRENTLY via `errgroup`,
+with NO limit on the number in flight — one goroutine and one object-store round trip per
+candidate, unconditionally. (The original 2026-07-12 fix bounded this at
+`candidateFetchConcurrency=4`; that cap itself reproduced the same class of live-cluster
+trace-by-id timeout once a query window's candidate count exceeded a handful of files, since
+wall-clock time is `(candidateCount / 4) x per-candidate latency`. Removed entirely rather than
+raised, per this project's no-backwards-compat convention and because the work is purely
+I/O-bound — the CPU-bound decode step is gated per-BLOCK on a bloom hit inside a candidate, not
+per candidate FILE, so an artificial file-level cap was never actually protecting CPU the way its
+own original rationale assumed.) The merge itself remains deterministic: results are collected
+into a slice indexed by each candidate's original position in `keys` and folded back in that same
+order once every candidate has resolved, so the SpanID-dedup/minimum-`TimeSec` merge semantics
+are byte-identical to the prior strictly-sequential (and later capped-concurrent) loop regardless
+of goroutine completion order. A real (non-404-class) error on any candidate still fails the whole
+call, mirroring `vibuilder.queryKeysRanged`'s sibling-abort guard.
 
 Shared, canonical implementation for both `GetTraceByID`'s single-trace lookup (root `findTraceGroupInCandidates` is a thin delegate) and `ExecuteStructuralFromIndex`'s (SPEC-STRUCT-9) many-candidate-trace discovery loop.
 
-Back-ref: `internal/modules/executor/structural_tracegroup.go:FindTraceGroupInCandidates`, root `reader.go:findTraceGroupInCandidates` (thin delegate). See NOTE-VI-091 for original design rationale and NOTE-VI-106 for the concurrency fix. Issue #489, task #199.
+Back-ref: `internal/modules/executor/structural_tracegroup.go:FindTraceGroupInCandidates`, root `reader.go:findTraceGroupInCandidates` (thin delegate). See NOTE-VI-091 for original design rationale, NOTE-VI-106 for the original concurrency fix, and NOTE-VI-108 for the task #216 cap removal. Issue #489, task #199, task #216.
 
 ---
 

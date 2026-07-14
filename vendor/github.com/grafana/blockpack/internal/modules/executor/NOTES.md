@@ -8042,3 +8042,65 @@ Back-ref: `internal/modules/executor/block_group_pipeline.go:blockGroupPipeline`
 `internal/modules/executor/predicates_export_test.go`,
 `internal/modules/executor/stream_topk_intrinsic_unbounded_test.go`. See SPEC-STREAM-11,
 SPEC-STREAM-13 (R14-AMENDED), SPEC-STREAM-14. Issue #197, task #215.
+
+---
+
+## NOTE-VI-108 — FindTraceGroupInCandidates: candidateFetchConcurrency cap removed entirely, no artificial ceiling (task #216, 2026-07-14)
+
+**Decision.** The `candidateFetchConcurrency=4` cap NOTE-VI-106 introduced (task #199) is removed
+outright, not raised. `FindTraceGroupInCandidates`'s `errgroup` fan-out now runs one goroutine and
+one object-store round trip per candidate index file, unconditionally — real concurrency is
+bounded only by the candidate count itself and the object store's own capacity, never by a
+self-imposed serialization point.
+
+**How this was found: the cap itself reproduced the exact bug it was meant to fix.** Live
+dev-cluster testing (tempo-dev-test-03, immediately after deploying issues #497/#499) found EVERY
+trace-by-id lookup failing deterministically at ~20.2s (2 × the query-frontend's `MaxRetries`
+against the querier's own 10s `TraceByID.QueryTimeout`), with `context deadline exceeded` on
+`valueindex: trace lookup footer/tail` — reproducible on trivially small (1ms duration) traces,
+not just large ones, and unrelated to any code #497/#499 actually touch (confirmed by grep: neither
+touches `internal/modules/executor` or `internal/modules/valueindex`). Real S3 latency measured
+directly (`tempodb_backend_request_duration_seconds`, Mimir) was fast: p99 GET=1.16s, HEAD=0.31s —
+ruling out raw object-store slowness. The actual mechanism: `LookupTraceGroupPartial`
+(`internal/modules/valueindex/traceindexquery.go`) issues 3 SEQUENTIAL round trips per candidate
+unconditionally (`Size`, footer `ReadAt`, tail `ReadAt`) before any bloom/min-max check even runs —
+so wall-clock time for N candidates capped at 4-way concurrency is `(N/4) x per-candidate latency`,
+which exceeds a 10s budget once a query window's not-yet-compacted candidate count reaches a few
+dozen files (this tenant's blocklist was ~250 blocks; a wide, unbounded `/api/traces/{id}` window
+with no time hint can trivially produce that many L0 trace-index candidates).
+
+**Why remove rather than raise the cap.** The cap's own original rationale (NOTE-VI-106) cited
+"CPU-bound decode... under the querier's own CPU limit" as the reason to bound concurrency at all.
+That rationale does not hold at the FILE level: `LookupTraceGroupPartial`'s CPU-bound step (a
+snappy block decode) only runs per-BLOCK, gated on `traceBlockMayContain`'s bloom/min-max hit
+*inside* an already-fetched candidate — it does not run unconditionally per candidate file the way
+the three ranged reads do. Fanning out every candidate FILE concurrently therefore does not
+multiply CPU-bound work; it only increases in-flight I/O, which the object store and the querier's
+own connection pool are built to absorb. Raising the cap to some larger fixed number would still
+reintroduce the identical failure mode at a higher candidate count — removing it entirely is the
+only fix that scales with however many not-yet-compacted candidates a query window happens to
+produce.
+
+**Team's general operating principle (explicitly stated by the user during this investigation):**
+this project's approach to this class of problem is to add resources/hardware to hit a target
+wall-clock time, not to self-impose artificial serialization points that create a false ceiling
+independent of available capacity — mirrors the same reasoning already applied to `vibuilder`'s
+own `downloadConcurrency` precedent and to issue #497's unrelated but philosophically identical
+"remove the limit rather than raise it" cardinality-gate decision.
+
+**Test.** `gettracebyid_candidate_concurrency_test.go`'s
+`TestGetTraceByID_CandidateFilesFetchedConcurrently_NoArtificialCap` (renamed from
+`..._FetchedSequentially_NotConcurrent`, which task #199 already made stale by fixing the original
+fully-sequential bug) now asserts peak in-flight calls reach the FULL candidate count
+(`nCandidates=6`), not merely ">1" — the old ">1" assertion would also have passed against a
+capped-at-4 fan-out, so it could never have caught this regression.
+
+**Mutation-test verification performed (per this project's standing convention,
+`feedback_mutation_test_review.md`).** Temporarily reintroduced `g.SetLimit(4)` — confirmed
+`TestGetTraceByID_CandidateFilesFetchedConcurrently_NoArtificialCap` fails exactly as expected
+(`maxInFlight=4`, not `6`); reverted, re-confirmed passing (`maxInFlight=6`).
+
+Back-ref: `internal/modules/executor/structural_tracegroup.go:FindTraceGroupInCandidates`;
+root `gettracebyid_candidate_concurrency_test.go`. See SPEC-VIS-5 (`SPECS.md`) for the updated
+contract, NOTE-VI-106 for the original (now-superseded) capped fix. Issue #489, task #199, task
+#216.
