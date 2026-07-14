@@ -185,6 +185,52 @@ func testSearchProgressShouldQuitMostRecent(t *testing.T, marshalingFormat api.M
 	require.True(t, should)
 }
 
+// TestSearchCombiner_GenuineErrorStillFailsWholeQuery (#217 task 1.4, the safety-net regression
+// test explicitly required before Phase 1 is considered done): a real, NON-coverage 500 from
+// one job alongside successful jobs must still fail the WHOLE query, unchanged by Phase 1's new
+// PartialStatus-propagation logic added to search.go's combine/finalize/diff closures.
+func TestSearchCombiner_GenuineErrorStillFailsWholeQuery(t *testing.T) {
+	c := NewTypedSearch(10, false, api.MarshallingFormatProtobuf, false)
+
+	resp1 := &tempopb.SearchResponse{Traces: []*tempopb.TraceSearchMetadata{{TraceID: "trace1"}}}
+	require.NoError(t, c.AddResponse(toHTTPResponseWithFormat(t, resp1, 200, nil, api.MarshallingFormatProtobuf)))
+	require.NoError(t, c.AddResponse(toHTTPResponseWithFormat(t, &tempopb.SearchResponse{}, 500, nil, api.MarshallingFormatProtobuf)))
+
+	_, err := c.GRPCFinal()
+	require.Error(t, err, "a genuine 500 from one job must still fail the whole query, exactly as before Phase 1")
+}
+
+// TestSearchCombiner_PropagatesPartialFromOneJobWithoutDiscardingOthers (#217 task 1.2/1.3) is
+// search's analog of the metrics combiner's primary Phase 1.3 proof test: M real-trace 200s plus
+// 1 coverage-gap-tolerant 200/PARTIAL/empty (item A's new SearchResponse.Status/Message fields,
+// exactly the shape backend_block.go's Fetch path now signals via
+// slice_partial_response.go/querier.go's SearchBlock) must combine into a final response
+// containing ALL of the real traces AND Status=PARTIAL with a non-empty message.
+func TestSearchCombiner_PropagatesPartialFromOneJobWithoutDiscardingOthers(t *testing.T) {
+	c := NewTypedSearch(10, false, api.MarshallingFormatProtobuf, false)
+
+	resp1 := &tempopb.SearchResponse{
+		Traces: []*tempopb.TraceSearchMetadata{{TraceID: "trace1"}},
+	}
+	resp2 := &tempopb.SearchResponse{
+		Traces: []*tempopb.TraceSearchMetadata{{TraceID: "trace2"}},
+	}
+	require.NoError(t, c.AddResponse(toHTTPResponseWithFormat(t, resp1, 200, nil, api.MarshallingFormatProtobuf)))
+	require.NoError(t, c.AddResponse(toHTTPResponseWithFormat(t, resp2, 200, nil, api.MarshallingFormatProtobuf)))
+
+	partialResp := &tempopb.SearchResponse{
+		Status:  tempopb.PartialStatus_PARTIAL,
+		Message: "no value-index coverage for this slice's window",
+	}
+	require.NoError(t, c.AddResponse(toHTTPResponseWithFormat(t, partialResp, 200, nil, api.MarshallingFormatProtobuf)))
+
+	final, err := c.GRPCFinal()
+	require.NoError(t, err)
+	require.Len(t, final.Traces, 2, "both real jobs' traces must survive the partial job's contribution")
+	require.Equal(t, tempopb.PartialStatus_PARTIAL, final.Status)
+	require.NotEmpty(t, final.Message)
+}
+
 func TestSearchCombinesResultsJSON(t *testing.T) {
 	testSearchCombinesResults(t, api.MarshallingFormatJSON)
 }

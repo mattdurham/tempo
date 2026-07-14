@@ -1785,3 +1785,39 @@ Back-refs: `valueindex_extract.go:ExtractValueIndexEntries,extractBlockColumns,
 ExtractValueIndexEntriesForColumns` (root package), `valueindex_l0write.go:WriteValueIndexL0`
 (root package). See `SPECS.md` SPEC-VI-11, `valueindexconsumer/NOTES.md`'s R10 acknowledgment
 entry (the full "why different in kind" argument), and `viusage/NOTES.md` NOTE-VIUSAGE-6/7.
+
+## NOTE-VI-107 — colHash -> column-name audit manifest lives in `internal/modules/colhashmanifest`, not here (task #216, cross-reference entry)
+
+Date: 2026-07-13
+
+`ColHash` (`hash.go`) is a genuine one-way hash — `hex(SHA256(colName)[:16])`, with no other
+mechanism anywhere to recover the source column name from a hash. This was a real operational
+blind spot: browsing VI's on-disk layout (`<tenant>/<indexPrefix>/<colHash>/<colTypeName>/...`)
+directly shows only opaque hash-named directories. Task #216 closes this with a best-effort,
+per-tenant, JSON-serialized manifest (mirroring `internal/modules/cube`'s own `Registry`
+pattern) mapping `colHash -> colName`, shared between VI and VCNT since both compute the
+IDENTICAL hash function independently and could genuinely collide on the same column.
+
+**Why the new code does not live in this package.** The manifest's registry logic
+(`internal/modules/colhashmanifest`) and its VI-side call site
+(`internal/modules/valueindexconsumer/service.go:flushColumn`, NOTE-VI-106) both live outside
+`valueindex` deliberately:
+
+- `valueindex` itself never touches object storage — `Writer`/`NewWriter` only produce bytes
+  (`writer.go`); the actual `Put` to S3 for VI's L0 files happens in
+  `valueindexconsumer.Service.flushColumn`, which is the genuine "first write" hook this
+  manifest needs.
+- The manifest's own registry type intentionally does NOT import `valueindex` (or
+  `valuecounts`) — it is generic, orthogonal infrastructure that only ever handles
+  `(tenant, colHash, colName)` as plain strings its callers already resolved, preserving the
+  existing deliberate decoupling between the VI and VCNT `ColHash` implementations (see
+  `valuecountscompactor/service.go`'s `ownsShard` doc comment, and
+  `colhashmanifest/NOTES.md` NOTE-COLMANIFEST-1 for the full argument).
+
+This manifest is purely additive, best-effort observability — it is NEVER consulted by any of
+this package's own read/write/query logic, and nothing in `valueindex` changed to support it.
+
+Back-refs: `internal/modules/colhashmanifest` (the shared registry — see its own SPECS.md/
+NOTES.md for the full contract), `internal/modules/valueindexconsumer/NOTES.md` NOTE-VI-106
+(the actual VI-side call site and hook rationale), `internal/modules/valuecounts/NOTES.md`
+NOTE-VC-020 (VCNT's symmetric cross-reference entry), `hash.go:ColHash`.

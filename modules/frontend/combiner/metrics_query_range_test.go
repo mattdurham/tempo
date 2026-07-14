@@ -16,6 +16,161 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestQueryRangeCombiner_PropagatesPartialFromOneJobWithoutDiscardingOthers (#217 task 1.3) is
+// the single most important test in Phase 1: it is the literal proof of the brainstorm-cited
+// scenario — "some jobs succeed, one job hits a coverage gap, final response contains the
+// successful jobs' results" AND carries PartialStatus=PARTIAL with a non-empty message. Feeds
+// the combiner M real-data 200s and 1 coverage-gap-tolerant 200/PARTIAL/empty (exactly the shape
+// backend_block.go's QueryRange now returns per Phase 1.1/slice_partial_response.go), then
+// asserts the final response contains ALL of the real series AND Status=PARTIAL.
+func TestQueryRangeCombiner_PropagatesPartialFromOneJobWithoutDiscardingOthers(t *testing.T) {
+	start := uint64(1100 * time.Second)
+	end := uint64(1300 * time.Second)
+	step := traceql.DefaultQueryRangeStep(start, end)
+	bar := &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: "bar"}}
+
+	req := &tempopb.QueryRangeRequest{
+		Query: "{} | rate()",
+		Start: start,
+		End:   end,
+		Step:  step,
+	}
+
+	c, err := NewTypedQueryRange(req, 100)
+	require.NoError(t, err)
+
+	// M=2 jobs with real data.
+	resp1 := &tempopb.QueryRangeResponse{
+		Series: []*tempopb.TimeSeries{
+			{
+				Labels:  []v1.KeyValue{{Key: "foo", Value: bar}},
+				Samples: []tempopb.Sample{{TimestampMs: 1200_000, Value: 2}},
+			},
+		},
+	}
+	resp2 := &tempopb.QueryRangeResponse{
+		Series: []*tempopb.TimeSeries{
+			{
+				Labels:  []v1.KeyValue{{Key: "boo", Value: bar}},
+				Samples: []tempopb.Sample{{TimestampMs: 1200_000, Value: 3}},
+			},
+		},
+	}
+	require.NoError(t, c.AddResponse(toHTTPResponseWithFormat(t, resp1, 200, 0, api.HeaderAcceptJSON)))
+	require.NoError(t, c.AddResponse(toHTTPResponseWithFormat(t, resp2, 200, 0, api.HeaderAcceptJSON)))
+
+	// The 1 coverage-gap-tolerant job: a normal 200 carrying Status=PARTIAL and a message, no
+	// series at all — exactly what backend_block.go's QueryRange now returns for an indexOnly
+	// slice job that tolerated a coverage-gap decline (Phase 1.1).
+	partialResp := &tempopb.QueryRangeResponse{
+		Status:  tempopb.PartialStatus_PARTIAL,
+		Message: "no value-index coverage for this slice's window",
+	}
+	require.NoError(t, c.AddResponse(toHTTPResponseWithFormat(t, partialResp, 200, 0, api.HeaderAcceptJSON)))
+
+	final, err := c.GRPCFinal()
+	require.NoError(t, err)
+	require.Len(t, final.Series, 2, "both real jobs' series must survive the partial job's contribution")
+	require.Equal(t, tempopb.PartialStatus_PARTIAL, final.Status, "the final response must carry PARTIAL forward from the one declined job")
+	require.NotEmpty(t, final.Message, "the final response must carry a non-empty message explaining the gap")
+}
+
+// TestQueryRangeCombiner_PartialMessagesDeduped_MultipleGapsSameReason (#217 task 1.3) pins the
+// dedupe half of the plan's own stated requirement ("dedupe identical messages, cap total
+// message length defensively"): N jobs reporting the IDENTICAL partial message must not repeat
+// it N times in the final message.
+func TestQueryRangeCombiner_PartialMessagesDeduped_MultipleGapsSameReason(t *testing.T) {
+	start := uint64(1100 * time.Second)
+	end := uint64(1300 * time.Second)
+	step := traceql.DefaultQueryRangeStep(start, end)
+
+	req := &tempopb.QueryRangeRequest{Query: "{} | rate()", Start: start, End: end, Step: step}
+	c, err := NewTypedQueryRange(req, 100)
+	require.NoError(t, err)
+
+	const msg = "no value-index coverage for this slice's window"
+	for i := 0; i < 3; i++ {
+		partialResp := &tempopb.QueryRangeResponse{Status: tempopb.PartialStatus_PARTIAL, Message: msg}
+		require.NoError(t, c.AddResponse(toHTTPResponseWithFormat(t, partialResp, 200, 0, api.HeaderAcceptJSON)))
+	}
+
+	final, err := c.GRPCFinal()
+	require.NoError(t, err)
+	require.Equal(t, tempopb.PartialStatus_PARTIAL, final.Status)
+	require.Equal(t, msg, final.Message, "identical messages from multiple declined jobs must be deduplicated, not repeated")
+}
+
+// TestQueryRangeCombiner_CoverageGapPartial_DoesNotTriggerEarlyQuit (#217 task 1.3, a finding
+// surfaced by TDD-ing task 1.3's own test): pkg/traceql.QueryRangeCombiner.Combine treats ANY
+// incoming resp.Status==PARTIAL as evidence of series-count truncation and flips
+// maxSeriesReached, which gates this combiner's `quit` early-stop optimization
+// (modules/frontend/combiner/metrics_query_range.go). Left unguarded, a single benign
+// coverage-gap-tolerant job (Phase 1.1) arriving early would incorrectly make the frontend STOP
+// waiting for the remaining real-data shards — truncating a correct answer instead of merely
+// annotating it partial, exactly the over-declining failure mode #217's own Phase 1.5 boundary
+// test is concerned with. This test pins that a coverage-gap PARTIAL job, even alongside shard
+// completion metadata, does NOT trip ShouldQuit() on its own — only a genuine max-series
+// overflow may.
+func TestQueryRangeCombiner_CoverageGapPartial_DoesNotTriggerEarlyQuit(t *testing.T) {
+	start := uint64(1100 * time.Second)
+	end := uint64(1300 * time.Second)
+	step := traceql.DefaultQueryRangeStep(start, end)
+
+	req := &tempopb.QueryRangeRequest{Query: "{} | rate()", Start: start, End: end, Step: step, MaxSeries: 100}
+	c, err := NewQueryRange(req, 100)
+	require.NoError(t, err)
+
+	// Shard completion metadata IS present, and TotalJobs:1 means the single job response
+	// below (shardIdx 0, the default responseData toHTTPResponseWithFormat assigns) completes
+	// the shard immediately, making completedThrough != Unknown right away — the OTHER half of
+	// quit's condition — isolating this test to prove the coverage-gap signal alone isn't
+	// sufficient to trip quit.
+	metadata := &QueryRangeJobResponse{
+		JobMetadata: shardtracker.JobMetadata{
+			TotalJobs: 1,
+			Shards:    []shardtracker.Shard{{TotalJobs: 1, CompletedThroughSeconds: 1200}},
+		},
+	}
+	require.NoError(t, c.AddResponse(metadata))
+
+	partialResp := &tempopb.QueryRangeResponse{
+		Status:  tempopb.PartialStatus_PARTIAL,
+		Message: "no value-index coverage for this slice's window",
+	}
+	require.NoError(t, c.AddResponse(toHTTPResponseWithFormat(t, partialResp, 200, 0, api.HeaderAcceptJSON)))
+
+	require.False(t, c.ShouldQuit(),
+		"a coverage-gap-tolerant PARTIAL job must not trigger the max-series early-quit optimization on its own")
+}
+
+// TestQueryRangeCombiner_GenuineErrorStillFailsWholeQuery (#217 task 1.4, the safety-net
+// regression test explicitly required before Phase 1 is considered done): a real, NON-coverage
+// 500 from one job alongside successful jobs must still fail the WHOLE query, unchanged by
+// Phase 1's new PartialStatus-propagation logic. Phase 1's scope is narrow — tolerating a
+// coverage-gap decline that arrives as an ordinary 200 — and must never be mistaken for
+// widening tolerance to any other error class.
+func TestQueryRangeCombiner_GenuineErrorStillFailsWholeQuery(t *testing.T) {
+	start := uint64(1100 * time.Second)
+	end := uint64(1300 * time.Second)
+	step := traceql.DefaultQueryRangeStep(start, end)
+	bar := &v1.AnyValue{Value: &v1.AnyValue_StringValue{StringValue: "bar"}}
+
+	req := &tempopb.QueryRangeRequest{Query: "{} | rate()", Start: start, End: end, Step: step}
+	c, err := NewTypedQueryRange(req, 100)
+	require.NoError(t, err)
+
+	resp1 := &tempopb.QueryRangeResponse{
+		Series: []*tempopb.TimeSeries{
+			{Labels: []v1.KeyValue{{Key: "foo", Value: bar}}, Samples: []tempopb.Sample{{TimestampMs: 1200_000, Value: 2}}},
+		},
+	}
+	require.NoError(t, c.AddResponse(toHTTPResponseWithFormat(t, resp1, 200, 0, api.HeaderAcceptJSON)))
+	require.NoError(t, c.AddResponse(toHTTPResponseWithFormat(t, &tempopb.QueryRangeResponse{}, 500, 0, api.HeaderAcceptJSON)))
+
+	_, err = c.GRPCFinal()
+	require.Error(t, err, "a genuine 500 from one job must still fail the whole query, exactly as before Phase 1")
+}
+
 func TestAttachExemplars(t *testing.T) {
 	start := uint64(10 * time.Second)
 	end := uint64(20 * time.Second)

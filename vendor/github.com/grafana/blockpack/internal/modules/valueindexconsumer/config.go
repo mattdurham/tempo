@@ -66,6 +66,16 @@ type Config struct {
 	// slog.Default(), so logging is always live. It is not settable from YAML;
 	// the embedder (tempo) injects its configured logger programmatically.
 	Logger *slog.Logger `yaml:"-"`
+	// ManifestStore is the optional object-storage surface used to update the best-effort
+	// colHash -> column-name audit manifest (internal/modules/colhashmanifest) after each
+	// successful L0 flush (NOTE-VI-106, task #216). When nil (the default), manifest
+	// recording is skipped entirely -- this is purely additive observability, never
+	// consulted by any read/write/query path, and a failure to update it never fails the
+	// real flush (flushColumn logs a warning and continues). Not settable from YAML; the
+	// embedder (tempo) injects it programmatically, reusing the SAME conditional-PUT-
+	// capable object store it already wires into internal/modules/cube.Registry /
+	// internal/modules/viusage.Registry -- no new tempo-side store implementation needed.
+	ManifestStore ManifestStore `yaml:"-"`
 	// RedisAddr is the host:port of the Redis server backing the stream.
 	RedisAddr string `yaml:"redis_addr"`
 	// StreamName is the Redis stream key consumed. Defaults to

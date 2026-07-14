@@ -46,19 +46,23 @@
 //  6. Group.Lead() (NOTE-QP-004/SPEC-QP-1, issue #487) — the plan's most-selective
 //     leaf as its own exported accessor, for callers (time-slice construction) that
 //     need the lead leaf itself rather than a selectivity verdict derived from it.
-//  7. TimeSlice / BuildTimeSlices (NOTE-QP-005/SPEC-QP-2, issue #487) — partitions a
-//     query window into minute-aligned, chronologically-ordered sub-windows, sized
-//     adaptively from a lead leaf's per-minute VCNT signal (denser minutes get
-//     narrower slices) with a uniform-width fallback when no signal exists. This is
-//     the #487 time-slice job-sharding primitive: shard by the index's own time
-//     partition key instead of by block.
+//  7. TimeSlice / BuildTimeSlices (NOTE-QP-005/SPEC-QP-2, issue #487; width forced to
+//     exactly one minute by #217/NOTE-QP-012) — partitions a query window into
+//     minute-aligned, chronologically-ordered, EXACTLY-60s-wide sub-windows, each
+//     carrying a lead leaf's per-minute VCNT signal when available (EstKnown=true) or
+//     no signal at all when it isn't (EstKnown=false) — this is the #487 time-slice
+//     job-sharding primitive: shard by the index's own time partition key instead of
+//     by block. Pre-#217, slice width itself was adaptive (denser minutes narrower,
+//     up to a 1h ceiling, uniform-width fallback when no signal existed); #217
+//     removed that width-adaptivity entirely in favor of forced maximum parallelism
+//     (bounded, predictable latency independent of window width) — see NOTE-QP-012.
 //  8. QueryPlan / BuildQueryPlan / DispatchStrategy (NOTE-QP-006/SPEC-QP-3, issue
 //     #487) — composes Plan(), Lead(), and BuildTimeSlices into the top-level output
 //     blockpack hands a caller: a Strategy verdict (DispatchBlockSharded, the
 //     always-safe zero value, or DispatchTimeSliced) gated SOLELY on whether every
-//     leaf is resolvable by the index; lead-leaf VCNT-estimability governs only
-//     whether the resulting TimeSlices are adaptive or uniform-width, never Strategy
-//     itself.
+//     leaf is resolvable by the index; lead-leaf VCNT-estimability no longer governs
+//     slice width post-#217 (every slice is forced to 60s regardless), only whether
+//     each slice's EstKnown/EstMatches/VCNTEmpty carry real signal.
 //
 // # AND vs OR semantics (the crux)
 //

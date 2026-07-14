@@ -16,6 +16,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
+	"github.com/grafana/blockpack/internal/modules/colhashmanifest"
 	"github.com/grafana/blockpack/internal/modules/valueindex"
 )
 
@@ -27,6 +28,20 @@ import (
 // supply their object store via the public valueindexconsumer subpackage.
 type ObjectPutter interface {
 	Put(path string, data []byte) error
+}
+
+// ManifestStore is the optional object-storage surface used to update the best-effort
+// colHash -> column-name audit manifest (internal/modules/colhashmanifest) after a
+// successful L0 flush (NOTE-VI-106, task #216). It is deliberately a separate, narrower
+// interface from ObjectPutter rather than widening ObjectPutter itself -- ObjectPutter's
+// own doc comment scopes it to "write a fully-formed value index file to a key," and this
+// is an unrelated, optional, best-effort side-channel. Use context and (Get, Put) because
+// colhashmanifest.Store already requires exactly that shape; any Store structurally
+// satisfies this interface too. Config.ManifestStore is nil by default, which fully
+// disables manifest recording -- see flushColumn.
+type ManifestStore interface {
+	Get(ctx context.Context, key string) ([]byte, error)
+	Put(ctx context.Context, key string, data []byte) error
 }
 
 // spillWriteBufSize is the size of the bufio.Writer wrapping each spill file
@@ -101,6 +116,14 @@ type Service struct {
 	pendingCol   map[string]int               // message ID → count of buffers still holding its entries
 	columns      map[string]struct{}
 
+	// manifestSeen caches (tenant, colHash) pairs already confirmed recorded in the colHash
+	// manifest this process's lifetime, keyed by tenant+"\x00"+colHash (NOTE-VI-108, task #216
+	// HIGH follow-up). recordManifestEntry checks this BEFORE ever calling into
+	// colhashmanifest.RecordColumn, skipping the Get round-trip entirely once a colHash is
+	// known-recorded -- Service is single-goroutine (see the struct doc comment above), so no
+	// locking is needed, matching buffers/pendingCol's existing plain-map convention.
+	manifestSeen map[string]struct{}
+
 	metrics *consumerMetrics // nil when Config.Registerer is nil (no-op)
 	logger  *slog.Logger     // never nil — defaults to slog.Default() (NOTE-VI-028)
 	now     func() time.Time
@@ -126,6 +149,7 @@ func NewService(cfg Config, consumer Consumer, extractor Extractor, store Object
 		buffers:      make(map[bufferKey]*columnBuffer),
 		traceBuffers: make(map[string]*traceGroupBuffer),
 		pendingCol:   make(map[string]int),
+		manifestSeen: make(map[string]struct{}),
 		cfg:          cfg,
 		columns:      cfg.columnSet(),
 		metrics:      newConsumerMetrics(cfg.Registerer),
@@ -482,6 +506,7 @@ func (s *Service) flushColumn(ctx context.Context, buf *columnBuffer) error {
 		s.metrics.incError(consumerOpFlush)
 		return fmt.Errorf("valueindexconsumer: put %q: %w", key, err)
 	}
+	s.recordManifestEntry(ctx, buf)
 	colElapsed := s.now().Sub(flushStart)
 	s.metrics.observeFlush(colElapsed, len(data))
 
@@ -526,6 +551,43 @@ func (s *Service) flushColumn(ctx context.Context, buf *columnBuffer) error {
 		s.logger.Debug("value-index consumer messages acked", "acked", len(ackIDs), "ok", true)
 	}
 	return nil
+}
+
+// recordManifestEntry updates the best-effort colHash -> column-name audit manifest
+// (internal/modules/colhashmanifest) for buf's column, if a ManifestStore is configured
+// (NOTE-VI-106, task #216). This is purely additive observability -- never consulted by
+// any read/write/query path -- so a nil ManifestStore or any recording failure is
+// deliberately swallowed here (logged at Warn) rather than returned: the real flush this
+// call follows has already succeeded and must never be failed retroactively by this
+// side-channel.
+//
+// NOTE-VI-108 (task #216 HIGH follow-up): checks s.manifestSeen BEFORE ever calling into
+// colhashmanifest.RecordColumn, which otherwise performs a full Get of the tenant's aggregate
+// manifest file on EVERY flush of a given column, forever -- flushColumn runs on VI's real L0
+// write path, every column flush, indefinitely. Once a (tenant, colHash) pair is confirmed
+// recorded (RecordColumn returns nil), this process never issues another manifest Get for that
+// pair, turning the steady-state cost into O(distinct colHashes ever seen by this process)
+// rather than O(flushes). A process restart just means the first flush after restart pays the
+// cost again and re-confirms via a real Get -- this cache is purely a latency/I/O optimization,
+// never a correctness dependency (see SPECS.md SPEC-VI-6).
+func (s *Service) recordManifestEntry(ctx context.Context, buf *columnBuffer) {
+	if s.cfg.ManifestStore == nil {
+		return
+	}
+	key := buf.tenant + "\x00" + buf.colHash
+	if _, known := s.manifestSeen[key]; known {
+		return
+	}
+	nowSec := uint64(s.now().Unix()) //nolint:gosec // unix seconds fits uint64 for any realistic timestamp
+	err := colhashmanifest.RecordColumn(
+		ctx, s.cfg.ManifestStore, buf.tenant, buf.colHash, buf.colName, colhashmanifest.SourceVI, nowSec,
+	)
+	if err != nil {
+		s.logger.Warn("value-index consumer: column manifest update failed",
+			"col", buf.colName, "col_hash", buf.colHash, "tenant", buf.tenant, "err", err)
+		return
+	}
+	s.manifestSeen[key] = struct{}{}
 }
 
 // resolvePendingAcks decrements s.pendingCol for every message ID in

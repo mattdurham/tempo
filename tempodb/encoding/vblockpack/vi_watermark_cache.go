@@ -161,6 +161,34 @@ func setViWatermarkCache(c *viWatermarkCache) {
 	viWatermarkCachePtr = c
 }
 
+// ConfigureViWatermarkCacheForTest installs a pre-seeded watermarks map for tenant as the
+// process-level watermark cache, for tests in OTHER packages that need
+// watermarksForOrNil/CheckIndexCoverage-adjacent behavior against a genuine (if hand-seeded)
+// watermark state, without a live registry object store (#217/Phase 2.2 — mirrors
+// ConfigureValueIndexQueryForTest's cross-package test-injection pattern 1:1; exposed here for
+// the identical reason that helper is exposed: this package's own withVIQueryReader-style
+// helpers cannot be called across a package boundary). A nil watermarks map installs an entry
+// with no columns (i.e. no gating for any column), matching a tenant with no
+// usage-triggered/mid-backfill columns at all. Returns a restore function the caller MUST defer
+// to reset prior process-level state — this is a shared package-level singleton.
+func ConfigureViWatermarkCacheForTest(tenant string, watermarks map[string]blockpack.ColumnWatermark) (restore func()) {
+	viWatermarkCacheMu.Lock()
+	prev := viWatermarkCachePtr
+	viWatermarkCachePtr = &viWatermarkCache{
+		ttl: time.Hour,
+		now: time.Now,
+		entries: map[string]viWatermarkCacheEntry{
+			tenant: {watermarks: watermarks, fetched: time.Now()},
+		},
+	}
+	viWatermarkCacheMu.Unlock()
+	return func() {
+		viWatermarkCacheMu.Lock()
+		viWatermarkCachePtr = prev
+		viWatermarkCacheMu.Unlock()
+	}
+}
+
 func getViWatermarkCache() *viWatermarkCache {
 	viWatermarkCacheMu.RLock()
 	defer viWatermarkCacheMu.RUnlock()

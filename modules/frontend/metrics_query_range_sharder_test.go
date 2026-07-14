@@ -2,6 +2,8 @@ package frontend
 
 import (
 	"context"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"sort"
 	"strconv"
@@ -1006,4 +1008,88 @@ func TestMetricsQueryRangeSharder_GroupByQueryStaysBlockSharded(t *testing.T) {
 	for _, d := range dispatched {
 		require.False(t, d.IndexOnly, "a group-by metrics query must dispatch ordinary block-sharded jobs, never IndexOnly=true ones")
 	}
+}
+
+// TestQueryRangeSharder_VcntBytesReadSurfacesOnJobMetadata is the required sharder-level test
+// for issue #218 Phase 3: drives the REAL queryRangeSharder.RoundTrip with a real
+// RawReaderProvider (local backend) and real VCNT objects, asserting the resulting
+// QueryRangeJobResponse metadata's VcntBytesRead equals the EXACT total bytes of the .vcnt
+// objects written for the queried column (mutation-style: an exact value, not merely "> 0").
+func TestQueryRangeSharder_VcntBytesReadSurfacesOnJobMetadata(t *testing.T) {
+	restore := vblockpack.ConfigureValueIndexQueryForTest(emptyVIStore{}, testIndexPrefix)
+	defer restore()
+
+	rawR, rawW := newLocalRawReadWriter(t)
+	// writeVCNTObject always writes under the "tenant-a" keypath (see its own doc comment) --
+	// the tenant used for this test must match it exactly.
+	tenant := "tenant-a"
+
+	// "POST" is the minority value (Selective) so the query never plan-time-declines on low
+	// selectivity, letting a real, qualified plan (and its VCNT fetch) run to completion.
+	obj1 := vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 5, "POST": 3})
+	obj2 := vcntObj(t, "span.http.method", 120, map[string]int64{"GET": 2})
+	writeVCNTObject(t, rawW, "span.http.method", obj1)
+	writeVCNTObject(t, rawW, "span.http.method", obj2)
+	expectedBytesRead := int64(len(obj1) + len(obj2))
+
+	bm := backend.NewBlockMeta(tenant, uuid.New(), "vParquet4")
+	bm.StartTime = time.Unix(1, 0)
+	bm.EndTime = time.Unix(200, 0)
+	bm.Size_ = defaultTargetBytesPerRequest
+	bm.TotalRecords = 1
+	bm.ReplicationFactor = backend.MetricsGeneratorReplicationFactor
+
+	reader := &mockReaderWithRawReader{
+		mockReader: &mockReader{metas: []*backend.BlockMeta{bm}},
+		rawR:       rawR,
+	}
+
+	o, err := overrides.NewOverrides(overrides.Config{}, nil, prometheus.NewRegistry())
+	require.NoError(t, err)
+
+	sharder := newAsyncQueryRangeSharder(reader, o, QueryRangeSharderConfig{
+		StreamingShards:    defaultMostRecentShards,
+		ConcurrentRequests: 10,
+	}, nil, false, newJobsPerQueryHistogram(), log.NewNopLogger())
+
+	// next's response must NOT be a *combiner.QueryRangeJobResponse -- that type is
+	// IsMetadata()==true, same as the sharder's own jobMetadata, so returning one here would
+	// make it ambiguous below which QueryRangeJobResponse is the sharder's real metadata vs. a
+	// per-job stand-in.
+	next := pipeline.AsyncRoundTripperFunc[combiner.PipelineResponse](func(r pipeline.Request) (pipeline.Responses[combiner.PipelineResponse], error) {
+		return pipeline.NewHTTPToAsyncResponseWithRequestData(&http.Response{
+			StatusCode: 200,
+			Body:       io.NopCloser(strings.NewReader("{}")),
+		}, r.ResponseData()), nil
+	})
+	testRT := sharder.Wrap(next)
+
+	// Start must be non-zero: RoundTrip only invokes buildMetricsQueryPlan (and therefore the
+	// VCNT fetch) when both Start and End are set.
+	httpReq := api.BuildQueryRangeRequest(httptest.NewRequest("GET", "/", nil), &tempopb.QueryRangeRequest{
+		Query: `{ span.http.method = "POST" } | rate()`,
+		Start: uint64(1 * time.Second),
+		End:   uint64(200 * time.Second),
+		Step:  uint64(10 * time.Second),
+	}, "")
+	httpReq = httpReq.WithContext(user.InjectOrgID(httpReq.Context(), tenant))
+
+	resps, err := testRT.RoundTrip(pipeline.NewHTTPRequest(httpReq))
+	require.NoError(t, err)
+
+	var jobResponse *combiner.QueryRangeJobResponse
+	for {
+		res, done, rerr := resps.Next(context.Background())
+		require.NoError(t, rerr)
+		if done || res == nil {
+			break
+		}
+		if jobRes, ok := res.(*combiner.QueryRangeJobResponse); ok {
+			jobResponse = jobRes
+		}
+	}
+
+	require.NotNil(t, jobResponse, "expected to receive QueryRangeJobResponse metadata")
+	require.Equal(t, expectedBytesRead, jobResponse.VcntBytesRead)
+	require.Positive(t, jobResponse.VcntBytesRead, "fixture sanity check: the written VCNT objects must be non-empty")
 }

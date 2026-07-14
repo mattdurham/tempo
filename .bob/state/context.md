@@ -1,9 +1,3 @@
-time=2026-07-02T17:02:25.546-04:00 level=WARN msg="llm chain: backend failed, falling back" name=primary:openai err="llm request: Post \"http://192.168.4.42:1234/v1/chat/completions\": dial tcp 192.168.4.42:1234: connect: no route to host" elapsed_ms=3055
-time=2026-07-02T17:02:26.798-04:00 level=INFO msg="llm chain: succeeded on fallback" name=fallback1:anthropic skipped=1 elapsed_ms=1251
-time=2026-07-02T17:02:31.178-04:00 level=WARN msg="llm chain: backend failed, falling back" name=primary:openai err="llm request: Post \"http://192.168.4.42:1234/v1/chat/completions\": dial tcp 192.168.4.42:1234: connect: no route to host" elapsed_ms=3053
-time=2026-07-02T17:02:33.048-04:00 level=INFO msg="llm chain: succeeded on fallback" name=fallback1:anthropic skipped=1 elapsed_ms=1869
-time=2026-07-02T17:02:37.514-04:00 level=WARN msg="llm chain: backend failed, falling back" name=primary:openai err="llm request: Post \"http://192.168.4.42:1234/v1/chat/completions\": dial tcp 192.168.4.42:1234: connect: no route to host" elapsed_ms=3051
-time=2026-07-02T17:02:38.743-04:00 level=INFO msg="llm chain: succeeded on fallback" name=fallback1:anthropic skipped=1 elapsed_ms=1228
 # Agent Context
 
 ## Role & Principles
@@ -11,65 +5,65 @@ INVARIANT (blockpack Reader lifetime — foundational to the whole cache archite
 
 > id: 0e1f00d5-b106-46b3-a479-e1e8425ff135
 
-INVARIANT (blockpack lazy-column lifetime): A V14 lazily-registered column holds compressedEncoding = rawBytes[start:end] — a ZERO-COPY sub-slice into the pooled assembled read buffer (NOTE-208) — and defers snappy decode to first access (ensureDecompressed, SPEC-V14-002).…
+INVARIANT (blockpack rw.DataType controls cache eviction priority, NOT just labeling): every Provider.ReadAt / Reader.readRange call passes an rw.DataType, and SharedLRUCache.dataTypeTier maps it to one of 4 eviction tiers (0=hardest to evict … 3=evicted first). Mapping:…
 
-> id: d1c28f0f-ce82-4447-87da-be7856eb3958
+> id: 2445ef14-fa7e-499a-b599-2fd229f69b6d
 
 INVARIANT: blockpack reader WantAll() eagerly decodes EVERY column in a block and causes 300MB+ memory spikes per block on the query path — use WantOnly(cols) for query-driven paths (lazy zero-decode for unreferenced columns). WantAll() is reserved for genuinely all-column…
 
 > id: ce1757f9-7f77-4d0f-8d58-e736f360d3dd
 
-INVARIANT (blockpack rw.DataType controls cache eviction priority, NOT just labeling): every Provider.ReadAt / Reader.readRange call passes an rw.DataType, and SharedLRUCache.dataTypeTier maps it to one of 4 eviction tiers (0=hardest to evict … 3=evicted first). Mapping:…
+**Decompose monolithic problems into independent, swappable optimization layers with graceful fallbacks rather than attempting comprehensive rewrites.**
 
-> id: 2445ef14-fa7e-499a-b599-2fd229f69b6d
+> id: f2d25742-7a08-4e16-9c10-882565e569b3
 
-Analyze query patterns to identify and fix performance bottlenecks through data-driven optimization.
+**"Defer observable side effects until explicitly requested; keep hot paths unconditionally fast."**
 
-> id: cd554a9a-6723-4be7-8a1c-43455981fd2b
+> id: da287611-033b-4f90-81b8-09af528525de
 
 
 ## Relevant Techniques
+Predicate pushdown / index pre-filter pattern: when an index scan has a 'predicate kind X not supported here, fall back to full scan' branch, measure the fallback cost before micro-optimizing it. The fallback often re-fetches and re-decodes the entire wide row group/block for…
+
+> id: c4d80eda-d605-4991-b675-387933d4fce2
+
 TECHNIQUE: before deleting a 'redundant' dual-storage column on the strength of 'there's already a fallback', audit what EACH fallback actually costs — a fallback can be O(log N) on one read path and O(all_rows whole-file decode) on another. In blockpack a by-VALUE-sorted…
 
 > id: aff4d73c-a7cf-4dee-85fd-1f62b678c62d
 
-TECHNIQUE: when a columnar engine couples 'sort key' and 'whether to sort' into one field (non-empty string => sort), an unordered query that needs no sort key gets locked out of every fast path the field gates. Split into (sortKey, wantSort bool). Then the sortKey can be ALWAYS…
+TECHNIQUE (the 'return nil cascades to full fallback' trap): in a layered query-pushdown pre-filter, a leaf evaluator that returns 'nil/unevaluable' for an UNSUPPORTED predicate shape often does NOT degrade gracefully — it can propagate all the way up (leaf nil -> node…
 
-> id: 236a05ba-f570-4764-a6b7-5c630eb25aa5
+> id: 4d46a49d-e00f-43b3-8e19-227272a94210
 
-**Skill Description:** *Optimizing query performance through block-level data access and predicate pushdown efficiency, particularly in low-latency, high-volume scenarios involving filtered or aggregated workloads.*
+TECHNIQUE: in a paged columnar store, an equality predicate on a SORTED column is a degenerate range [target,target] — reuse the existing min/max page-pruned range scanner verbatim instead of writing an equality-specific path. Min/max page-skip is exact for sorted data (a page…
 
-> id: 0740c433-ede1-4dee-a9ee-184d6e33092c
+> id: 48b220a6-ad9d-43cc-bfe7-a2504c871ad4
 
-**Core Pattern Identified:**
+TECHNIQUE: when converting an 'index is a hint, always safe to fall back' contract into an 'index is authoritative' one, audit every ok=false / fallback return and classify each as CORRECTNESS ('the index genuinely cannot answer' — keep, document as an explicit exception) vs…
 
-> id: 352de1cf-87d8-41d6-84af-81e3b513a7e9
-
-**Core Pattern:** Systematically identifying performance degradation patterns in query systems by analyzing benchmark data, categorizing failure modes (timeouts, errors, latency spikes), and recommending targeted optimizations.
-
-> id: 93d67269-3f6a-402b-8f5a-f7ba82ef5e01
+> id: 133c974e-2cd0-46de-a882-136d2cd48175
 
 
 ## Current Project Context
-A 30-second gateway timeout is causing trace-by-ID requests to time out before completion, especially for large tenants with extensive trace data. The query performance bottleneck stems from inefficient trace index scanning without time-bound filters, leading to slow block…
+The architecture implements a tiered query execution strategy with explicit fallback contracts: when index-only mode is enabled (IndexOnly=true), queries decline with typed sentinel errors (ErrSliceIndexCoverageGap, ErrStructuralIndexCoverageGap) rather than silently falling…
 
-> id: db450247-7d49-4df0-9843-22a29640f8cf
+> id: d7c208a6-27db-43a4-a4c5-062962e870b0
 
-Compaction was making 350+ individual S3 ranged GET calls (one per column section across 7 blocks × 50 columns) instead of 7 bulk block reads. Each request carries 50-100ms latency overhead, creating 17-35 seconds of pure S3 I/O waste before any actual work begins.
+The index path was successfully refactored to eliminate full scans by replacing `getTraceByIDFullScan` with a `scanTraceByID` fallback that only applies to WAL blocks lacking a lister, ensuring the index remains authoritative once engaged rather than degrading to sequential…
 
-> id: 51040524-50d8-47ab-b253-42d56a8771ea
+> id: 4f23a570-0f1a-4876-9022-a9870fbddd36
 
-The blockpack querier is I/O-latency bound due to four strictly serial S3 GET requests per block for intrinsic columns (span:start, span:duration, resource.service.name, span:status/kind), each adding 50–100 ms of wait time, which can be collapsed into one concurrent fetch by…
+When index data inconsistency is detected during query execution, the system must fail the query with an explicit error rather than silently falling back to a scan that could produce incorrect results. The test suite distinguishes between authoritative index corruption (which…
 
-> id: 5f4df19f-f18f-4b4e-9e0a-204ad6cd1500
+> id: 95046133-fa7b-4702-927e-8286cb8cdd00
 
-Blockpack outperforms Parquet across all query types and workloads by reducing S3 request volume and latency, with a 6–90x speedup in key query scenarios due to efficient predicate evaluation and reduced I/O. A significant 42.6% of querier memory allocations stem from…
+When time-slice jobs encounter index coverage gaps, the system must fail the query rather than silently fall back to a full block scan, preventing double-counting and data corruption masking by converting routine index declines into explicit ErrSliceIndexCoverageGap errors.…
 
-> id: 15862857-a923-4f42-8e90-43badd2f0780
+> id: d8053d93-0251-4a8a-91b4-c02ba192be98
 
-A key decision to delay block dispatching until post-frontend filtering reduced query latency by skipping unnecessary S3 fetches for blocks with empty string bounds. The problem of delayed rejection at the querier level, after dispatch, meant performance gains were not…
+Deliberate sequencing of index removal proved critical: premature deletion of the full-scan fallback after `WriteValueIndexL0` landed would have caused widespread "not found" errors for pre-fix data, so verification must wait until index coverage actually accumulates. A…
 
-> id: 4aceeab6-39c0-4dac-be43-20ecbcbb4892
+> id: 84cc0fa9-0f0c-4254-8e3a-e9c05ece967a
 
 
 ## Related Context (via graph)
@@ -81,17 +75,17 @@ A key decision to delay block dispatching until post-frontend filtering reduced 
 
 > id: cb9984df-c534-4573-b311-853292409d83
 
-**Problem:** NOTE-012 blanket rejects snappy decode pooling, stating "column decode output buffers are referenced by `rawEncoding` and outlive the decode call." This is true for the **lazy registration path** (lines 282–304 of `block_parser.go`), where decompressed buffers ARE…
+/home/mdurham/source/blockpack_collection/blockpack-worktrees/read-path-modernization/tracemetricoptions.go:35:	// same block. Mirrors the search path's own IndexOnly contract (QueryTraceQLFromIndex's…
 
-> id: 6bb1cd6c-6a32-49ba-bcb3-b01f72e54ae8
+> id: 489c11af-a28e-4344-a3ee-c902d98f2009
 
-The codebase uses selective column decoding (WantOnly vs WantAll) to prevent 300MB+ memory spikes by avoiding parsing of unused columns, with a pooled intern map strategy (ParseBlockFromBytesWithIntern) held across the entire block lifetime to eliminate per-call allocation…
+/home/mdurham/source/blockpack_collection/blockpack-worktrees/read-path-modernization/tracemetricoptions.go:// ExecuteMetricsTraceQL returns when TraceMetricOptions.IndexOnly is set and the value index…
 
-> id: 33b7a0b6-3da8-4327-a734-31f80c5aff3f
+> id: acb60870-63a8-4532-ad29-614a0402d683
 
-**Core Pattern**: Systematically identifying performance degradation root causes by correlating query characteristics (complexity, cardinality, filter scope) with execution latency, then prescribing targeted optimizations.
+/home/mdurham/source/blockpack_collection/blockpack-worktrees/read-path-modernization/tracemetricoptions.go:6:// ExecuteMetricsTraceQL returns when TraceMetricOptions.IndexOnly is set and the value index…
 
-> id: 2d51411f-d446-47e3-8ac5-cb5db575f3e2
+> id: 53133bc0-9a09-4fc4-a285-68a972a77297
 
 
 ## Memory IDs (for exploration)
@@ -101,31 +95,30 @@ Use these IDs to explore further:
   lth graph ppr --seeds <id,...>  — personalized pagerank from seeds
 
   0e1f00d5-b106-46b3-a479-e1e8425ff135
-  d1c28f0f-ce82-4447-87da-be7856eb3958
-  ce1757f9-7f77-4d0f-8d58-e736f360d3dd
   2445ef14-fa7e-499a-b599-2fd229f69b6d
-  cd554a9a-6723-4be7-8a1c-43455981fd2b
+  ce1757f9-7f77-4d0f-8d58-e736f360d3dd
+  f2d25742-7a08-4e16-9c10-882565e569b3
+  da287611-033b-4f90-81b8-09af528525de
+  c4d80eda-d605-4991-b675-387933d4fce2
   aff4d73c-a7cf-4dee-85fd-1f62b678c62d
-  236a05ba-f570-4764-a6b7-5c630eb25aa5
-  0740c433-ede1-4dee-a9ee-184d6e33092c
-  352de1cf-87d8-41d6-84af-81e3b513a7e9
-  93d67269-3f6a-402b-8f5a-f7ba82ef5e01
-  db450247-7d49-4df0-9843-22a29640f8cf
-  51040524-50d8-47ab-b253-42d56a8771ea
-  5f4df19f-f18f-4b4e-9e0a-204ad6cd1500
-  15862857-a923-4f42-8e90-43badd2f0780
-  4aceeab6-39c0-4dac-be43-20ecbcbb4892
+  4d46a49d-e00f-43b3-8e19-227272a94210
+  48b220a6-ad9d-43cc-bfe7-a2504c871ad4
+  133c974e-2cd0-46de-a882-136d2cd48175
+  d7c208a6-27db-43a4-a4c5-062962e870b0
+  4f23a570-0f1a-4876-9022-a9870fbddd36
+  95046133-fa7b-4702-927e-8286cb8cdd00
+  d8053d93-0251-4a8a-91b4-c02ba192be98
+  84cc0fa9-0f0c-4254-8e3a-e9c05ece967a
   c326e175-423b-44f1-9968-ecf3dce7ac44
   cb9984df-c534-4573-b311-853292409d83
-  6bb1cd6c-6a32-49ba-bcb3-b01f72e54ae8
-  33b7a0b6-3da8-4327-a734-31f80c5aff3f
-  2d51411f-d446-47e3-8ac5-cb5db575f3e2
+  489c11af-a28e-4344-a3ee-c902d98f2009
+  acb60870-63a8-4532-ad29-614a0402d683
+  53133bc0-9a09-4fc4-a285-68a972a77297
 
 ## Filter by project
 Memories from these projects are present:
   lth prompt "..." --attr project=github.com/grafana/blockpack
   lth prompt "..." --attr project=grafana/blockpack
-  lth prompt "..." --attr project=mattdurham/lth
   lth prompt "..." --attr project=mattdurham/tempo
   lth projects  — list all tracked projects
   lth chat "..." --attr project=<project> — filtered chat

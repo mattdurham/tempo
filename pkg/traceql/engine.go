@@ -201,6 +201,16 @@ func (e *Engine) ExecuteSearch(ctx context.Context, searchReq *tempopb.SearchReq
 		res.Metrics.InspectedBytes = fetchSpansResponse.Bytes()
 		span.SetAttributes(attribute.Int64("inspectedBytes", int64(res.Metrics.InspectedBytes)))
 	}
+	// issue #218: per-category breakdown of InspectedBytes. Nil when the implementer
+	// does not track a given category (e.g. vparquet, wal).
+	if fetchSpansResponse.IndexBytes != nil {
+		res.Metrics.IndexBytesRead = fetchSpansResponse.IndexBytes()
+		span.SetAttributes(attribute.Int64("indexBytesRead", int64(res.Metrics.IndexBytesRead)))
+	}
+	if fetchSpansResponse.DataFileBytes != nil {
+		res.Metrics.DataFileBytesRead = fetchSpansResponse.DataFileBytes()
+		span.SetAttributes(attribute.Int64("dataFileBytesRead", int64(res.Metrics.DataFileBytesRead)))
+	}
 
 	return res, nil
 }

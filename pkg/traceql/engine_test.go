@@ -202,6 +202,10 @@ func TestEngine_Execute(t *testing.T) {
 	assert.Equal(t, expectedTraceSearchMetadata, response.Traces)
 
 	assert.Equal(t, uint64(100_00), response.Metrics.InspectedBytes)
+	// issue #218: IndexBytes/DataFileBytes closures must land on the exact
+	// SearchMetrics fields, independent of InspectedBytes.
+	assert.Equal(t, uint64(1000), response.Metrics.IndexBytesRead)
+	assert.Equal(t, uint64(2000), response.Metrics.DataFileBytesRead)
 }
 
 func TestEngine_asTraceSearchMetadata(t *testing.T) {
@@ -421,6 +425,12 @@ func (m *MockSpanSetFetcher) Fetch(_ context.Context, request FetchSpansRequest)
 		Results: m.iterator,
 		Bytes: func() uint64 {
 			return 100_00 // hardcoded in tests
+		},
+		IndexBytes: func() uint64 {
+			return 1000 // hardcoded in tests, issue #218
+		},
+		DataFileBytes: func() uint64 {
+			return 2000 // hardcoded in tests, issue #218
 		},
 	}, nil
 }

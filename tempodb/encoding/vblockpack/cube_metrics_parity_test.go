@@ -1063,6 +1063,7 @@ func buildCubeQueryResponseThroughRealPath(
 
 	minMinute, maxMinute := ^uint32(0), uint32(0)
 	inputs := make([]blockpack.CubeRollupInput, 0, len(byMinute))
+	var cubeBytesRead int64
 	for minute, minuteSpans := range byMinute {
 		acc, accErr := blockpack.NewCubeAccumulator(def, minute)
 		if accErr != nil {
@@ -1081,6 +1082,7 @@ func buildCubeQueryResponseThroughRealPath(
 		if openErr != nil {
 			t.Fatalf("OpenCubeReaderFromBytes: %v", openErr)
 		}
+		cubeBytesRead += reader.BytesRead()
 		inputs = append(inputs, blockpack.CubeNewRollupInput(reader))
 		if minute < minMinute {
 			minMinute = minute
@@ -1096,7 +1098,7 @@ func buildCubeQueryResponseThroughRealPath(
 	}
 
 	req := &tempopb.QueryRangeRequest{Query: query}
-	return buildCubeQueryResponse(cells, []string{"service.name"}, aggAttrNames, req)
+	return buildCubeQueryResponse(cells, []string{"service.name"}, aggAttrNames, req, cubeBytesRead)
 }
 
 // sampleValuesByService extracts each series' single sample value, keyed by its first label's
@@ -1476,20 +1478,82 @@ func TestCubeMetricsParity_RouterSupersetTieBreak(t *testing.T) {
 		t.Fatalf("CubeRollup: %v", err)
 	}
 	req := &tempopb.QueryRangeRequest{Query: "{} | count_over_time() by (service.name)"}
-	resp := buildCubeQueryResponse(cells, res.Entry.Dimensions, res.Entry.AggAttrs, req)
+	resp := buildCubeQueryResponse(cells, res.Entry.Dimensions, res.Entry.AggAttrs, req, readerB.BytesRead())
 	got := sampleValuesByService(resp)
 	if got["svc-a"] != 3 {
 		t.Fatalf("response count for svc-a = %v, want 3 (cube B's real data, not cube A's 1-span file)", got["svc-a"])
 	}
 }
 
-// TestCubeMetricsParity_ResolutionCompletenessDecline is fixture (g): a query window not fully
-// covered by the chosen resolution's watermark must decline the WHOLE query, never a partial or
-// mixed-resolution answer (ruling 4(b)). E-6b/E-12a have both landed (this test was a stale
-// t.Skip stub left over from before they did, #491 Phase E fix pass, review.md Issue 4 /
-// go-presubmit.md #1) — this proves the tempo-side integration via a real Registry round trip and
-// the real Registry.UpdateWatermarks production method (E-12a), not a hand-built RegistryEntry
-// literal with Watermarks poked in directly.
+// TestBuildCubeQueryResponse_SetsExactCubeBytesRead_AndLeavesOtherByteFieldsZero (issue #218,
+// Phase 5) proves buildCubeQueryResponse's SearchMetrics.CubeBytesRead equals the exact real
+// cube file byte size for a cube-answered response, and that IndexBytesRead/DataFileBytesRead/
+// VcntBytesRead all stay exactly 0 — a cube-answered response never touches VI/scan/VCNT.
+// Mutation-verified: see the Phase 5 report (blockpack accessor + this threading were each
+// independently broken and confirmed to fail before being reverted).
+func TestBuildCubeQueryResponse_SetsExactCubeBytesRead_AndLeavesOtherByteFieldsZero(t *testing.T) {
+	idHex := blockpack.CubeComputeID("tenant-218", []string{"service.name"}, nil, []string{blockpack.CubeDurationColumn})
+	id, err := blockpack.CubeIDFromHex(idHex)
+	if err != nil {
+		t.Fatalf("CubeIDFromHex: %v", err)
+	}
+	def := blockpack.CubeDefinition{
+		Dim1Column: "service.name",
+		Dim2Column: "__all__",
+		AggAttrs: []blockpack.CubeAggAttrDef{
+			{Column: blockpack.CubeDurationColumn, Type: blockpack.CubeAggAttrTypeInt64},
+		},
+		ID:         id,
+		Resolution: 1,
+	}
+	acc, err := blockpack.NewCubeAccumulator(def, 10)
+	if err != nil {
+		t.Fatalf("NewCubeAccumulator: %v", err)
+	}
+	if _, err := acc.Add(spanAt(10, 0, "svc-a", 2_000_000).toSpanValues()); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	data, err := acc.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	reader, err := blockpack.OpenCubeReaderFromBytes(data)
+	if err != nil {
+		t.Fatalf("OpenCubeReaderFromBytes: %v", err)
+	}
+
+	cells, err := blockpack.CubeRollup([]blockpack.CubeRollupInput{blockpack.CubeNewRollupInput(reader)}, 1, 10, 10)
+	if err != nil {
+		t.Fatalf("CubeRollup: %v", err)
+	}
+
+	req := &tempopb.QueryRangeRequest{Query: "{} | count_over_time() by (service.name)"}
+	resp := buildCubeQueryResponse(cells, []string{"service.name"}, nil, req, reader.BytesRead())
+
+	if resp.Metrics == nil {
+		t.Fatal("resp.Metrics is nil, want a populated SearchMetrics")
+	}
+	if got, want := resp.Metrics.CubeBytesRead, uint64(len(data)); got != want { //nolint:gosec
+		t.Errorf("CubeBytesRead = %d, want exact real cube file size %d", got, want)
+	}
+	if resp.Metrics.IndexBytesRead != 0 {
+		t.Errorf("IndexBytesRead = %d, want 0 (cube path never touches VI)", resp.Metrics.IndexBytesRead)
+	}
+	if resp.Metrics.DataFileBytesRead != 0 {
+		t.Errorf("DataFileBytesRead = %d, want 0 (cube path never touches block scan)", resp.Metrics.DataFileBytesRead)
+	}
+	if resp.Metrics.VcntBytesRead != 0 {
+		t.Errorf("VcntBytesRead = %d, want 0 (cube path never touches VCNT)", resp.Metrics.VcntBytesRead)
+	}
+}
+
+// TestCubeMetricsParity_ResolutionCompletenessDecline is fixture (g), UPDATED for #217's ruling
+// 4(b) REVISIT (SPEC-CUBE-028): a query window not fully covered by the chosen resolution's
+// watermark now serves its COVERED sub-range (Found=true, CoveredMinMinute/CoveredMaxMinute
+// clamped to the actual overlap) instead of declining the whole query — the caller
+// (cubequerypath.go) is responsible for covering the uncovered edge via the VI fallback. E-6b/
+// E-12a's real-Registry-round-trip integration style is preserved unchanged; only the asserted
+// outcome for partial coverage changed, from "decline" to "serve the covered sub-range."
 func TestCubeMetricsParity_ResolutionCompletenessDecline(t *testing.T) {
 	ctx := context.Background()
 	tenant := "parity-completeness-tenant"
@@ -1518,20 +1582,25 @@ func TestCubeMetricsParity_ResolutionCompletenessDecline(t *testing.T) {
 	}
 	router := blockpack.NewCubeQueryRouter(entries)
 
-	// A query window [0,100] is NOT fully covered by the watermark [0,50] — must decline the
-	// WHOLE query, never serve a partial/mixed-resolution answer.
+	// A query window [0,100] is NOT fully covered by the watermark [0,50] — #217/SPEC-CUBE-028
+	// now serves the covered sub-range [0,50] instead of declining the whole query.
 	res, err := router.Route(tenant, []string{"service.name"}, nil, "", 1, 0, 100)
 	if err != nil {
 		t.Fatalf("Route: %v", err)
 	}
-	if res.Found {
-		t.Fatal("Route must decline when the watermark does not fully cover the requested window")
+	if !res.Found {
+		t.Fatal("Route must serve the covered sub-range for partial (edge-truncated) coverage, not decline")
+	}
+	if res.CoveredMinMinute != 0 || res.CoveredMaxMinute != 50 {
+		t.Fatalf("CoveredMinMinute/Max = [%d,%d], want [0,50] (the watermark's own covered range)",
+			res.CoveredMinMinute, res.CoveredMaxMinute)
 	}
 
 	// Positive control: extend the watermark via the REAL Registry.UpdateWatermarks production
 	// method (E-12a — the same method Compactor.Execute calls on every successful rollup write)
-	// to fully cover [0,100], then re-route. This must now succeed, proving the decline above was
-	// genuinely caused by incomplete coverage and not some unrelated bug.
+	// to fully cover [0,100], then re-route. This must now report the FULL window as covered,
+	// proving the partial result above was genuinely driven by the watermark's own extent and
+	// not some unrelated bug.
 	if err := reg.UpdateWatermarks(ctx, idHex, 1, 51, 100); err != nil {
 		t.Fatalf("UpdateWatermarks: %v", err)
 	}
@@ -1549,5 +1618,9 @@ func TestCubeMetricsParity_ResolutionCompletenessDecline(t *testing.T) {
 	}
 	if res.Entry.CubeID != idHex {
 		t.Fatalf("Route must select the registered cube, got %q, want %q", res.Entry.CubeID, idHex)
+	}
+	if res.CoveredMinMinute != 0 || res.CoveredMaxMinute != 100 {
+		t.Fatalf("CoveredMinMinute/Max = [%d,%d], want the FULL requested window [0,100] once coverage is complete",
+			res.CoveredMinMinute, res.CoveredMaxMinute)
 	}
 }

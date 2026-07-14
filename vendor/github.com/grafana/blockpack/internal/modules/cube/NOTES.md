@@ -694,3 +694,111 @@ methods (`Load`/`Add`/`Remove`/`UpdateWatermarks`/`IsActive`) are unchanged one-
 **Back-ref:** `internal/modules/cube/entry_store.go:entryStore,blobEntryStore,EntryStore,
 externalEntryStoreAdapter,NewRegistryFromEntryStore`; `internal/modules/cube/registry.go:Registry`.
 See `SPECS.md` SPEC-CUBE-014's `[UPDATED]` annotation and `NOTE-CUBE-009`'s addendum above.
+
+## NOTE-CUBE-026: ruling 4(b) revisit rationale — why "decline the whole query" was the actual bug (issue #217)
+
+*Added: 2026-07-13*
+
+**Why the original ruling 4(b) (`SPEC-CUBE-023`/E-6b) was revisited.** The original design's own
+stated rationale — "verify complete coverage or decline, never serve a partial/mixed-resolution
+answer" — was defensible in isolation, but issue #217's governing principle
+("never decline a query we have coverage for") identified this as the SAME class of bug already
+fixed for the value-index path (Phase 2, tempo's `CheckIndexCoverage` simplification): a cube with
+full backfill for 90% of a requested window used to decline the WHOLE query rather than serve the
+90% it genuinely has. `Route`'s caller (tempo's `cubequerypath.go`) already had an existing,
+non-terminal fallback path (`ErrCubeWarming` → VI/scan) for the `Found=false` case — the only
+change needed was giving `Route` a way to say "found, but only this sub-range" instead of a
+binary `Found bool`, so the caller could serve the covered part directly instead of discarding it
+entirely and falling back to a (slower, VI-based) answer for the WHOLE window.
+
+**Why this is safe without inventing a mixed-resolution merge engine.** The revisit is
+deliberately scoped to a SINGLE resolution level's own edge-truncated coverage — Decision 1
+(smallest-covering-superset tie-break across candidate cubes) and the "no mixed-resolution
+answers" boundary are both untouched. `CoveredMinMinute`/`CoveredMaxMinute` describe one
+contiguous overlap of one chosen level's own watermark with the query window; nothing about
+picking a DIFFERENT resolution level or stitching two levels together changed.
+
+**Why a genuine interior gap remains out of scope.** `ResolutionWatermark` is a single
+`{MinMinute, MaxMinute}` pair by construction (`SPEC-CUBE-...`'s own definition) — it can only
+ever describe ONE contiguous covered range. A backfill that somehow produced two disjoint covered
+segments with a hole between them cannot be expressed by this struct at all; `Route` has no way to
+even detect such a case, let alone serve around it. This remains a genuine, acknowledged gap
+(carried forward from the original ruling), not something this revisit resolves — a richer
+watermark representation (e.g. a list of covered ranges) would be required, and is explicitly
+deferred as a future follow-up if it turns out to matter in practice.
+
+**Consumer-side implication (tempo, out of this repo's scope but recorded for cross-reference):**
+`cubequerypath.go`'s `tryQueryFromCube` narrows its actual cell read to
+`CoveredMinMinute`/`CoveredMaxMinute` (never reads cells outside the confirmed-covered range) and
+tags the resulting `QueryRangeResponse` `PartialStatus_PARTIAL` with a message identifying the
+uncovered edge. It deliberately does NOT additionally merge a second, VI-sourced answer for the
+uncovered edge within the same call — that merge was assessed and found to require a
+metrics-function-specific re-aggregation strategy (sum-like functions merge safely; `rate()`/
+`quantile_over_time()` do not merge correctly via simple concatenation) that no existing code path
+in either repo implements today; shipping it without being able to verify correctness for every
+supported function was judged riskier than the honest partial-coverage answer actually shipped.
+
+Back-ref: `internal/modules/cube/router.go:RoutingResult,Route` (`SPEC-CUBE-028`).
+tempo-side: `tempodb/encoding/vblockpack/cubequerypath.go:tryQueryFromCube,cubeCoveredWindow,cubePartialCoverageMessage`.
+Issue #217.
+
+## NOTE-CUBE-027: post-#217 review fix pass — consumer-side short-circuit correction, and the boundary-step under-counting limitation (2026-07-13 follow-up)
+
+*Added: 2026-07-13, follow-up to `NOTE-CUBE-026`/`SPEC-CUBE-028` (does not silently rewrite either — see below).*
+
+A consolidated review of #217 (`tempo/.bob/state/217-review.md`) found one CRITICAL and one HIGH
+finding, both about `NOTE-CUBE-026`'s own "consumer-side implication" paragraph (the last
+paragraph above). This entry records the fix pass; it supersedes nothing in `NOTE-CUBE-026`/
+`SPEC-CUBE-028` themselves — `Route`'s own contract is unchanged and still correctly described
+there.
+
+**CRITICAL, fixed (tempo-side): `tryQueryFromCube`'s PARTIAL answer was returned unconditionally
+by its caller.** `NOTE-CUBE-026` correctly describes `tryQueryFromCube` narrowing to
+`CoveredMinMinute`/`CoveredMaxMinute` and tagging the result `PartialStatus_PARTIAL` — but it did
+not call out that `backend_block.go`'s `QueryRange` (the caller) returned THAT partial answer
+unconditionally on `ok=true`, without ever attempting the VI/scan path below it, even though that
+path is a zero-new-code, always-available fallback that (pre-#217) was ALWAYS tried whenever the
+cube path declined (`ok=false`). This meant a cube backfill lag could force a needlessly truncated
+answer even when VI/scan could have answered the full window — the exact class of bug #217 exists
+to prevent, reintroduced one call site up from the fix. Corrected: `QueryRange` now defers a
+PARTIAL cube answer (mirroring the existing `cubeWarming` "only surfaced if the path below ALSO
+declines" pattern) and only falls back to it once VI/scan itself declines for that window.
+**Independently verified while fixing this:** every cube-answerable query has a group-by clause
+(`tryQueryFromCube` declines immediately otherwise), and blockpack's VI-only metrics engine
+(`vm.MetricsShapeIsVIAnswerable`, since issue #481 removed the scan-based engine outright) can
+never answer a group-by query — so "cube partial AND VI/scan has full coverage" cannot currently
+be constructed by any real query; the only reachable outcome today is "cube partial AND VI/scan
+declines," which correctly falls back to cube's own partial answer. The fix is still correct and
+intentionally kept — it is architecturally right per #217's own principle and future-proofs
+against any later relaxation of VI's group-by restriction — but it is a no-op for every query
+reachable in the current codebase. Tempo-side test:
+`tempodb/encoding/vblockpack/cubequerypath_partial_fallback_test.go`'s
+`TestQueryRange_CubePartialCoverage_DefersToVIScan_FallsBackWhenVIDeclines` (real end-to-end
+`QueryRange` call, real cube registry entry + real cube L0 file served through a real
+`*minio.Client`/local fake-S3 endpoint, real VI-backed block).
+
+**HIGH, documented (not fixed): a step wider than one minute straddling the covered/uncovered
+boundary can be computed from fewer minutes than its full width, with no per-step signal.**
+`buildCubeQueryResponse` emits one sample per per-minute cube cell regardless of `req.Step`;
+`CoveredMinMinute`/`CoveredMaxMinute` are watermark-derived with no relationship to `req.Step`'s
+own alignment. If a query's step is wider than one minute and the covered/uncovered boundary falls
+mid-step, that one step is computed from fewer minutes than its full width for
+`rate()`/`sum_over_time()`/`quantile_over_time()`-style functions, indistinguishable from a
+fully-covered step except via the response-level `PartialStatus_PARTIAL` flag (which does not
+localize WHICH step is affected). This is judged an acceptable, explicitly acknowledged limitation
+for now — analogous to the genuine-interior-gap limitation `NOTE-CUBE-026` already documents
+honestly rather than silently — because a correct fix (rounding `CoveredMinMinute`/
+`CoveredMaxMinute` inward to the nearest `req.Step`-aligned boundary before narrowing, dropping the
+partial step entirely) touches the same narrowing logic the CRITICAL fix above already changed in
+the same review pass, and the risk of introducing a NEW boundary-arithmetic bug while fixing a
+narrower, harder-to-trigger issue (a wide-step query whose window happens to straddle a backfill
+boundary) was judged not worth taking in the same pass as the CRITICAL fix. Left as a real,
+tracked follow-up, not a silent gap: a future fix should round `CoveredMinMinute` up and
+`CoveredMaxMinute` down to the nearest multiple of the query's step width (measured from the
+query's own `reqMinMinute` origin, matching how steps are actually aligned) before narrowing in
+`cubeCoveredWindow`, dropping the boundary-spanning step entirely rather than serving it truncated.
+
+Back-ref: `internal/modules/cube/router.go:RoutingResult,Route` (unchanged).
+tempo-side: `tempodb/encoding/vblockpack/backend_block.go:QueryRange` (the CRITICAL fix),
+`tempodb/encoding/vblockpack/cubequerypath.go:buildCubeQueryResponse,cubeCoveredWindow` (the HIGH
+finding, unchanged — documented only). Issue #217, review `tempo/.bob/state/217-review.md`.

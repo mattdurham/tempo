@@ -1,6 +1,7 @@
 package vblockpack
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -9,6 +10,7 @@ import (
 	commonpbv1 "github.com/grafana/tempo/pkg/tempopb/common/v1"
 	resourcepbv1 "github.com/grafana/tempo/pkg/tempopb/resource/v1"
 	tracepbv1 "github.com/grafana/tempo/pkg/tempopb/trace/v1"
+	"github.com/stretchr/testify/require"
 )
 
 // TestExtractFilters_EmptyPredicate: an empty {} query yields no filters but is a valid
@@ -415,6 +417,60 @@ func TestTryQueryFromCube_ExcludesFileOnAggAttrsMismatch(t *testing.T) {
 	if err == nil {
 		t.Fatal("classifyCubeFile must return a non-nil error for a mismatch")
 	}
+}
+
+// TestCubeCoveredWindow_RealRouterResult (#217/SPEC-CUBE-028, Phase 3.3) drives
+// cubeCoveredWindow/cubePartialCoverageMessage against a REAL router.Route result over a real
+// CubeRegistry round trip (mirroring TestCubeMetricsParity_ResolutionCompletenessDecline's own
+// real-Registry style in cube_metrics_parity_test.go) — extracted the same way
+// rollupCubeInputs was, because tryQueryFromCube's S3/minio file-listing wiring is otherwise
+// untestable in isolation (no minio test double exists in this codebase for listObjects/
+// getObject, only for the registry store seam).
+func TestCubeCoveredWindow_RealRouterResult(t *testing.T) {
+	ctx := context.Background()
+	tenant := "cube-covered-window-tenant"
+	objStore := &fakeSchedObjectStore{}
+	reg := blockpack.NewCubeRegistry(objStore, tenant)
+
+	idHex := blockpack.CubeComputeID(tenant, []string{"service.name"}, nil, []string{blockpack.CubeDurationColumn})
+	entry := blockpack.CubeRegistryEntry{
+		CubeID:     idHex,
+		Tenant:     tenant,
+		Dimensions: []string{"service.name"},
+		AggAttrs:   []string{blockpack.CubeDurationColumn},
+		Watermarks: map[uint32]blockpack.CubeResolutionWatermark{1: {MinMinute: 10, MaxMinute: 50}},
+		Resolution: 1,
+	}
+	require.NoError(t, reg.Add(ctx, entry))
+	entries, _, err := reg.Load(ctx)
+	require.NoError(t, err)
+	router := blockpack.NewCubeQueryRouter(entries)
+
+	t.Run("right-edge partial", func(t *testing.T) {
+		result, routeErr := router.Route(tenant, []string{"service.name"}, nil, "", 1, 0, 100)
+		require.NoError(t, routeErr)
+		require.True(t, result.Found)
+
+		minM, maxM, partial := cubeCoveredWindow(result, 0, 100)
+		require.True(t, partial)
+		require.Equal(t, uint32(10), minM)
+		require.Equal(t, uint32(50), maxM)
+
+		msg := cubePartialCoverageMessage(minM, maxM, 0, 100)
+		require.Contains(t, msg, "[10,50]")
+		require.Contains(t, msg, "[0,100]")
+	})
+
+	t.Run("full coverage", func(t *testing.T) {
+		result, routeErr := router.Route(tenant, []string{"service.name"}, nil, "", 1, 10, 50)
+		require.NoError(t, routeErr)
+		require.True(t, result.Found)
+
+		minM, maxM, partial := cubeCoveredWindow(result, 10, 50)
+		require.False(t, partial, "requesting exactly the covered window must not be partial")
+		require.Equal(t, uint32(10), minM)
+		require.Equal(t, uint32(50), maxM)
+	})
 }
 
 // TestTryQueryFromCube_AggAttrsMismatchIsDistinguishableFromMissingFile (#491, E-10/APPENDIX 3):

@@ -20,7 +20,7 @@ superseded entries are marked `[SUPERSEDED by SPEC-VI-N]` rather than deleted.
 Created as part of wiring `internal/modules/valueindex/traceindex.go` into the trace-by-id path
 (task #85), per CLAUDE.md's standing permission to create spec files under `internal/modules/`.
 
-Next free ID: **SPEC-VI-5**.
+Next free ID: **SPEC-VI-7**.
 
 ---
 
@@ -223,3 +223,62 @@ Back-ref: `internal/modules/valueindexconsumer/service.go:ingest`. See
 `valueindexcompactor/NOTES.md` NOTE-VI-065 (the format-dispatch ordering fix this is a
 corollary to) and NOTE-VI-066 (what would otherwise silently absorb a misrouted file, containing
 but not preventing the underlying problem).
+
+---
+
+## SPEC-VI-5: `Config.ManifestStore` / `flushColumn`'s colHash-manifest hook — optional, best-effort, never blocking
+*Added: 2026-07-13 (task #216)*
+
+**Contract:** `flushColumn` calls `s.recordManifestEntry(ctx, buf)` immediately after its own
+`s.store.Put(key, data)` succeeds. `recordManifestEntry`:
+
+- Is a pure no-op (zero I/O) when `Config.ManifestStore` is nil — the default. Existing callers
+  that never set this field see byte-for-byte unchanged behavior.
+- Otherwise calls `colhashmanifest.RecordColumn(ctx, s.cfg.ManifestStore, buf.tenant,
+  buf.colHash, buf.colName, colhashmanifest.SourceVI, now)` — see
+  `colhashmanifest/SPECS.md` SPEC-COLMANIFEST-4 for that function's own write-once contract.
+- NEVER returns an error and NEVER causes `flushColumn` to fail: any error `RecordColumn`
+  returns (including every error from a misbehaving `ManifestStore`) is logged at `Warn` and
+  discarded. `flushColumn`'s real S3 write and message-ack bookkeeping are entirely unaffected
+  by a failing or absent `ManifestStore`.
+
+`ManifestStore` (`service.go`) is a narrow, separate interface —
+`Get(ctx, key) ([]byte, error)` / `Put(ctx, key, data) error` — deliberately NOT folded into
+the existing `ObjectPutter` (`Put(path, data) error`, no context, no `Get`): widening
+`ObjectPutter` for this unrelated, optional side-channel would violate its own documented
+single-purpose scope ("write a fully-formed value index file to a key"). Any object store that
+already offers ctx-based `Get`/`Put` (e.g. the same conditional-PUT-capable store tempo already
+wires into `cube.Registry`/`viusage.Registry`) satisfies `ManifestStore` with no adapter.
+
+Back-refs: `internal/modules/valueindexconsumer/service.go:recordManifestEntry,ManifestStore`,
+`internal/modules/valueindexconsumer/config.go:Config.ManifestStore`,
+`internal/modules/colhashmanifest/SPECS.md` SPEC-COLMANIFEST-1 through 4. See `NOTES.md`
+NOTE-VI-106 for the full rationale and why VCNT's equivalent hook lives in
+`valuecountscompactor` instead of a symmetric `valuecounts`-side consumer (VCNT has none).
+
+---
+
+## SPEC-VI-6: `Service.manifestSeen` — in-process cache bounds the manifest hook to one `Get` per `(tenant, colHash)` per process lifetime
+*Added: 2026-07-13 (task #216 HIGH follow-up)*
+
+**Contract:** `recordManifestEntry` checks `s.manifestSeen[tenant+"\x00"+colHash]` BEFORE ever
+calling `colhashmanifest.RecordColumn`. If the key is present, `recordManifestEntry` returns
+immediately with zero I/O — no `Get`, no `Put`. Otherwise it calls `RecordColumn` as before
+(SPEC-VI-5); on success (nil error) the key is added to `manifestSeen`, so every subsequent
+flush of that same `(tenant, colHash)` for the remaining lifetime of this process skips the
+manifest store entirely. A failed `RecordColumn` call does NOT populate the cache, so the next
+flush retries against the real store rather than permanently giving up after one transient
+failure.
+
+**Rationale:** Without this cache, `colhashmanifest.RecordColumn` performs a full `Get` of the
+tenant's aggregate manifest file on every single `flushColumn` call for a column, forever — even
+once that `(tenant, colHash)` pair is already durably recorded and every future call would be a
+guaranteed no-op Get-only round trip (SPEC-COLMANIFEST-4 point 3). `Service` is single-goroutine
+(this file's own struct doc comment), so `manifestSeen` needs no locking — a plain map, matching
+`buffers`/`pendingCol`'s existing convention. A process restart simply means the first flush
+after restart re-confirms via one real `Get`, exactly like a cold cache; this is a pure
+latency/I/O optimization with no correctness dependency, since the manifest itself is never read
+by any query/write path (`colhashmanifest/SPECS.md` SPEC-COLMANIFEST-1).
+
+Back-ref: `internal/modules/valueindexconsumer/service.go:Service.manifestSeen,recordManifestEntry`
+(NOTE-VI-108).

@@ -176,13 +176,18 @@ func (s queryRangeSharder) RoundTrip(pipelineRequest pipeline.Request) (pipeline
 	if req.Start != 0 && req.End != 0 {
 		dedicated := s.overrides.DedicatedColumns(tenantID)
 		var planErr error
-		plan, planErr = buildMetricsQueryPlan(ctx, s.rawR, tenantID, dedicated, req.Query, req.Start/uint64(time.Second), req.End/uint64(time.Second), s.cfg.ConcurrentRequests)
+		var vcntBytesRead int64
+		plan, vcntBytesRead, planErr = buildMetricsQueryPlan(ctx, s.rawR, tenantID, dedicated, req.Query, req.Start/uint64(time.Second), req.End/uint64(time.Second), s.cfg.ConcurrentRequests)
 		if planErr != nil {
 			// F-6 (issue #481 parts 2/3, R6): a resolvable-but-low-selectivity metrics query has
 			// no safe answer (R2: metrics is never bounded-served) — fail HERE, at plan time,
 			// rather than dispatch N per-block jobs that would each independently decline.
 			return pipeline.NewBadRequest(planErr), nil
 		}
+		// issue #218 Phase 3: surface the frontend's plan-time VCNT fetch total on the
+		// job-metadata response the combiner reads via its "metadata" callback — see
+		// shardtracker.JobMetadata.VcntBytesRead's own doc comment for why 0 is expected.
+		jobMetadata.VcntBytesRead = vcntBytesRead
 	}
 	s.backendRequests(ctx, tenantID, pipelineRequest, *req, cutoff, targetBytesPerRequest, plan, reqCh, jobMetadata)
 

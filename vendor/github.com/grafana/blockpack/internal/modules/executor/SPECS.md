@@ -613,6 +613,28 @@ intrinsic-only predicate (no attribute-leaf column for the value index to prune 
 prefix of coalesced groups needed to prove the heap can no longer improve — not the whole file.
 `StepStats.IOOps`/`BytesRead` on the `"block-scan"` step reflect this bounded prefix.
 
+**Qualification (2026-07-13, task #215): the bounded prefix has a scheduling-dependent floor
+of `min(remaining groups, defaultPipelineWorkers)`, not "1 group."** This early stop shares
+`blockGroupPipeline` (SPEC-STREAM-11) with every other block-scan path, and inherits the same
+concurrent-prefetch-overshoot tradeoff SPEC-STREAM-13's R14-AMENDED note documents for
+`RecentFirstBudget` (now retired, but the underlying `blockGroupPipeline` mechanics it described
+are unchanged): the dispatcher's semaphore is pre-filled with `defaultPipelineWorkers` (8,
+NOTE-058) tokens and provides no synchronous per-group check of `topKScanBlocks`' own
+heap-saturation signal before dispatch — that check only runs, sequentially, inside
+`processGroup` once a group's own I/O has already completed. So for a file with at most
+`defaultPipelineWorkers` total coalesced groups, every group may already be dispatched before
+the first group's early-stop signal can fire; for a larger file, up to `defaultPipelineWorkers`
+groups are fetched "for free" before the semaphore's backpressure engages. This is an accepted
+tradeoff, not a correctness gap (identical reasoning to R14-AMENDED: results are unaffected,
+since `processGroup` still runs in ascending group order and a group whose I/O was wastefully
+prefetched but never reached `processGroup` never contributes rows). Task #215 confirmed the
+`min(remaining, defaultPipelineWorkers)` ceiling empirically (~80+ stress-repro attempts under
+artificial CPU contention: observed `IOOps` ranged from 1 up to but never beyond 8) and updated
+`stream_topk_intrinsic_unbounded_test.go`'s regression guard to assert against this ceiling
+(`executor.DefaultPipelineWorkers`, a `predicates_export_test.go` export) with a fixture sized
+well past it, rather than a strict `IOOps < totalGroups` bound that races on this ceiling for
+small files.
+
 **Correctness, not just performance.** The suffix-bound check is derived independently per
 remaining group from real `BlockMeta` bounds, not from an assumption that offset order exactly
 tracks timestamp order — a group is only ever proven "cannot improve" when its own aggregate
@@ -678,7 +700,7 @@ func ExecuteTraceMetrics(
 ) (*TraceMetricsResult, error)
 ```
 
-### 10.2 Types (SURVIVES — used unchanged by `ExecuteTraceMetricsFromVI`/`api.go`)
+### 10.2 Types (SURVIVES, field renamed — used by `ExecuteTraceMetricsFromVI`/`api.go`)
 
 ```go
 type TraceMetricLabel struct {
@@ -692,10 +714,20 @@ type TraceTimeSeries struct {
 }
 
 type TraceMetricsResult struct {
-    Series        []TraceTimeSeries
-    BytesRead     int64
-    BlocksScanned int
+    Series         []TraceTimeSeries
+    IndexBytesRead int64
+    BlocksScanned  int
 }
+```
+
+**`BytesRead` renamed to `IndexBytesRead` (issue #218, 2026-07-13):** the field was dead under
+`ExecuteTraceMetrics` (deleted, see §7 above) and remained dead/always-zero under
+`ExecuteTraceMetricsFromVI` until this change. `ExecuteTraceMetricsFromVI` now populates it from
+the queried `*SliceValueIndexSource`'s `ValueIndexBuildStats.BytesRead` (`metrics_trace.go`,
+back-ref: `RecordFileIO`/`Stats`) — the total byte size of value-index files downloaded
+resolving the query. Zero for a non-production `ValueIndexSource` test fake that doesn't track
+file I/O. No caller referenced the old `BytesRead` name (verified repo-wide); this is a rename,
+not an additive field.
 ```
 
 ### 10.3 Supported Functions `[SUPERSEDED — see SPEC-VIS-2: only count_over_time()/rate() without group-by survive, via ExecuteTraceMetricsFromVI]`

@@ -16,7 +16,7 @@ of sharing the `SPEC-VI-N` prefix with independent per-file counters). IDs are a
 ascending order and never reused or renumbered; superseded entries are marked
 `[SUPERSEDED by SPEC-VC-N]` rather than deleted.
 
-Next free ID: **SPEC-VC-4**.
+Next free ID: **SPEC-VC-6**.
 
 ---
 
@@ -202,3 +202,67 @@ Back-refs: `internal/modules/valuecountscompactor/cluster.go` (`clusterByTimeRan
 (the v2 filename format this clustering is built on). Tests: `cluster_test.go`, and the new
 `compactColumn`/`mergeLevel` tests in `service_internal_test.go`/`service_test.go` — see TESTS.md
 TEST-VC-25 through TEST-VC-29.
+
+---
+
+## SPEC-VC-4: `Config.ManifestStore` / `mergeLevel`'s colHash-manifest hook — optional, best-effort, never blocking
+*Added: 2026-07-13 (task #216)*
+
+**Contract:** `mergeLevel` calls `s.recordManifestEntry(ctx, colDir, merged[0].ColumnName)`
+immediately after its own compacted-output `s.store.Put(key, data)` succeeds (only when
+`len(merged) > 0` — i.e. only when an output file was actually written). `recordManifestEntry`:
+
+- Is a pure no-op (zero I/O) when `Config.ManifestStore` is nil — the default. Every existing
+  caller/test is unaffected.
+- Otherwise derives `tenant` and `colHash` from `colDir`'s own layout
+  (`"<tenant>/<indexPrefix>/unique_values/<colHash>"`, via `tenantFromColDir`/`path.Base`) and
+  calls `colhashmanifest.RecordColumn(ctx, s.cfg.ManifestStore, tenant, colHash,
+  merged[0].ColumnName, colhashmanifest.SourceVCNT, now)` — see `colhashmanifest/SPECS.md`
+  SPEC-COLMANIFEST-4. `merged[0].ColumnName` is representative of the whole `colDir` because
+  every VCNT record under one `colDir` was written for the same original column name (they all
+  share the same `colHash`).
+- NEVER returns an error and NEVER causes `mergeLevel` to fail: any error `RecordColumn`
+  returns is logged at `Warn` and discarded. The real compacted output write, delete-of-inputs,
+  and metrics bookkeeping are entirely unaffected by a failing or absent `ManifestStore`.
+
+`ManifestStore` (`service.go`) is a narrow `Get(ctx,key)([]byte,error)`/`Put(ctx,key,data)error`
+interface. Any value of this package's own `Store` interface satisfies `ManifestStore`
+structurally (Go permits assigning a superset-method-set interface value to a narrower
+interface-typed variable) — most production callers can simply pass the same store used for
+`NewService`.
+
+**Why this is at compaction time, not L0 write time (unlike VI's symmetric hook):** VCNT has no
+blockpack-owned L0 write path — the root `vcnt.go` doc comment confirms tempo itself PUTs L0
+`.vcnt` files to S3 using blockpack's helper functions. `mergeLevel` is the earliest point
+blockpack's OWN code ever touches a given colHash's VCNT data via object storage. See
+`NOTES.md` NOTE-VC-019 for the full accounting of this lag.
+
+Back-refs: `internal/modules/valuecountscompactor/service.go:recordManifestEntry,ManifestStore,tenantFromColDir,mergeLevel`,
+`internal/modules/valuecountscompactor/config.go:Config.ManifestStore`,
+`internal/modules/colhashmanifest/SPECS.md` SPEC-COLMANIFEST-1 through 4.
+
+---
+
+## SPEC-VC-5: `Service.manifestSeen` — in-process cache bounds the manifest hook to one `Get` per `(tenant, colHash)` per process lifetime
+*Added: 2026-07-13 (task #216 HIGH follow-up)*
+
+**Contract:** `recordManifestEntry` checks `s.manifestSeen[tenant+"\x00"+colHash]` BEFORE ever
+calling `colhashmanifest.RecordColumn`. If the key is present, `recordManifestEntry` returns
+immediately with zero I/O — no `Get`, no `Put`. Otherwise it calls `RecordColumn` as before
+(SPEC-VC-4); on success (nil error) the key is added to `manifestSeen`, so every subsequent
+non-empty merge of that same `(tenant, colHash)` for the remaining lifetime of this process
+skips the manifest store entirely. A failed `RecordColumn` call does NOT populate the cache, so
+the next merge retries against the real store rather than permanently giving up after one
+transient failure.
+
+**Rationale:** Without this cache, `colhashmanifest.RecordColumn` performs a full `Get` of the
+tenant's aggregate manifest file on every non-empty `mergeLevel` merge of a column, forever —
+even once that `(tenant, colHash)` pair is already durably recorded and every future call would
+be a guaranteed no-op Get-only round trip (`colhashmanifest/SPECS.md` SPEC-COLMANIFEST-4 point
+3). `Run`/`RunOnce` drive compaction sequentially with no concurrent goroutines touching
+`Service` state, so `manifestSeen` needs no locking. A process restart simply means the first
+merge after restart re-confirms via one real `Get`, exactly like a cold cache; this is a pure
+latency/I/O optimization with no correctness dependency.
+
+Back-ref: `internal/modules/valuecountscompactor/service.go:Service.manifestSeen,recordManifestEntry`
+(NOTE-VC-021).

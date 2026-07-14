@@ -376,6 +376,15 @@ func (q *QueryRangeCombiner) Combine(resp *tempopb.QueryRangeResponse) {
 		q.metrics.InspectedTraces += resp.Metrics.InspectedTraces
 		q.metrics.InspectedSpans += resp.Metrics.InspectedSpans
 		q.metrics.CompletedJobs += resp.Metrics.CompletedJobs
+		// issue #218: mirror modules/frontend/combiner's QueryRangeMetricsCombiner.Combine so
+		// the live-store "recent" query-range path (querier_query_range.go's queryRangeRecent)
+		// sums the same per-category breakdown the frontend combiner already sums. Currently a
+		// no-op in practice: livestore's own QueryRange (instance_search.go) does not populate
+		// any of these 4 fields yet.
+		q.metrics.IndexBytesRead += resp.Metrics.IndexBytesRead
+		q.metrics.DataFileBytesRead += resp.Metrics.DataFileBytesRead
+		q.metrics.CubeBytesRead += resp.Metrics.CubeBytesRead
+		q.metrics.VcntBytesRead += resp.Metrics.VcntBytesRead
 	}
 }
 

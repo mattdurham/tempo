@@ -36,6 +36,7 @@ import (
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/blocklist"
 	"github.com/grafana/tempo/tempodb/encoding/common"
+	"github.com/grafana/tempo/tempodb/encoding/vblockpack"
 )
 
 var _ tempodb.Reader = (*mockReader)(nil)
@@ -1959,6 +1960,93 @@ func TestSkipASTTransformationsMerge(t *testing.T) {
 			assert.Equal(t, tc.expectedSkip, capturedSkip, "skip_ast_transformations mismatch")
 		})
 	}
+}
+
+// TestAsyncSearchSharder_VcntBytesReadSurfacesOnJobMetrics is the required sharder-level test
+// for issue #218 Phase 3: drives the REAL asyncSearchSharder.RoundTrip with a real
+// RawReaderProvider (local backend) and real VCNT objects, asserting the resulting
+// SearchJobResponse metadata's VcntBytesRead equals the EXACT total bytes of the .vcnt objects
+// written for the queried column (mutation-style: an exact value, not merely "> 0").
+func TestAsyncSearchSharder_VcntBytesReadSurfacesOnJobMetrics(t *testing.T) {
+	restore := vblockpack.ConfigureValueIndexQueryForTest(emptyVIStore{}, testIndexPrefix)
+	defer restore()
+
+	rawR, rawW := newLocalRawReadWriter(t)
+	// writeVCNTObject always writes under the "tenant-a" keypath (see its own doc comment) --
+	// the tenant used for this test must match it exactly.
+	tenant := "tenant-a"
+
+	// "POST" is the minority value (Selective) so the query never plan-time-declines on low
+	// selectivity, letting a real, qualified plan (and its VCNT fetch) run to completion.
+	obj1 := vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 5, "POST": 3})
+	obj2 := vcntObj(t, "span.http.method", 120, map[string]int64{"GET": 2})
+	writeVCNTObject(t, rawW, "span.http.method", obj1)
+	writeVCNTObject(t, rawW, "span.http.method", obj2)
+	expectedBytesRead := int64(len(obj1) + len(obj2))
+
+	bm := backend.NewBlockMeta(tenant, uuid.New(), "vParquet4")
+	bm.StartTime = time.Unix(1, 0)
+	bm.EndTime = time.Unix(200, 0)
+	bm.Size_ = defaultTargetBytesPerRequest
+	bm.TotalRecords = 8
+
+	reader := &mockReaderWithRawReader{
+		mockReader: &mockReader{metas: []*backend.BlockMeta{bm}},
+		rawR:       rawR,
+	}
+
+	o, err := overrides.NewOverrides(overrides.Config{}, nil, prometheus.NewRegistry())
+	require.NoError(t, err)
+
+	sharder := newAsyncSearchSharder(reader, o, SearchSharderConfig{
+		QueryBackendAfter:     0,
+		IngesterShards:        1,
+		MostRecentShards:      defaultMostRecentShards,
+		TargetBytesPerRequest: defaultTargetBytesPerRequest,
+		ConcurrentRequests:    5,
+	}, nil, newJobsPerQueryHistogram(), log.NewNopLogger())
+
+	// Start must be non-zero: RoundTrip only invokes buildQueryPlan (and therefore the VCNT
+	// fetch) when both Start and End are set (see RoundTrip's own "Skipped entirely... when
+	// searchReq.Start/End are zero" comment).
+	searchReq := &tempopb.SearchRequest{
+		Query: `{ span.http.method = "POST" }`,
+		Start: 1,
+		End:   200,
+		Limit: 10,
+	}
+	httpReq, err := api.BuildSearchRequest(httptest.NewRequest("GET", "/", nil), searchReq)
+	require.NoError(t, err)
+	httpReq = httpReq.WithContext(user.InjectOrgID(httpReq.Context(), tenant))
+
+	next := pipeline.AsyncRoundTripperFunc[combiner.PipelineResponse](func(r pipeline.Request) (pipeline.Responses[combiner.PipelineResponse], error) {
+		resString, merr := (&jsonpb.Marshaler{}).MarshalToString(&tempopb.SearchResponse{Metrics: &tempopb.SearchMetrics{}})
+		require.NoError(t, merr)
+		return pipeline.NewHTTPToAsyncResponseWithRequestData(&http.Response{
+			Body:       io.NopCloser(strings.NewReader(resString)),
+			StatusCode: 200,
+		}, r.ResponseData()), nil
+	})
+
+	testRT := sharder.Wrap(next)
+	resps, err := testRT.RoundTrip(pipeline.NewHTTPRequest(httpReq))
+	require.NoError(t, err)
+
+	var searchJobResponse *combiner.SearchJobResponse
+	for {
+		res, done, rerr := resps.Next(context.Background())
+		require.NoError(t, rerr)
+		if done || res == nil {
+			break
+		}
+		if jobRes, ok := res.(*combiner.SearchJobResponse); ok {
+			searchJobResponse = jobRes
+		}
+	}
+
+	require.NotNil(t, searchJobResponse, "expected to receive SearchJobResponse metadata")
+	require.Equal(t, expectedBytesRead, searchJobResponse.VcntBytesRead)
+	require.Positive(t, searchJobResponse.VcntBytesRead, "fixture sanity check: the written VCNT objects must be non-empty")
 }
 
 func urisEqual(t *testing.T, expectedURIs, actualURIs []string) {

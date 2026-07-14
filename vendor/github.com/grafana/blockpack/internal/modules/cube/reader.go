@@ -16,7 +16,12 @@ type Reader struct {
 	dir         []ChunkDirEntry
 	chunksStart uint64
 	header      Header
+	bytesRead   int64
 }
+
+// BytesRead returns the exact byte count of the encoded cube file this Reader was opened from
+// (SPEC-CUBE-030) — used tempo-side to attribute cube-answered query cost (issue #218).
+func (r *Reader) BytesRead() int64 { return r.bytesRead }
 
 // NumAggAttrs returns this file's declared per-cell aggAttr count (0 for a pure-count cube).
 // E-6b/E-10 use this to cross-check an opened file's actual shape against its RegistryEntry via
@@ -72,6 +77,7 @@ func OpenReader(path string) (*Reader, error) {
 		dict:        dict,
 		dir:         dir,
 		chunksStart: footer.ChunksOffset,
+		bytesRead:   int64(len(data)),
 	}, nil
 }
 
@@ -105,7 +111,14 @@ func OpenReaderFromBytes(data []byte) (*Reader, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cube: decode chunk directory: %w", err)
 	}
-	return &Reader{data: data, header: header, dict: dict, dir: dir, chunksStart: footer.ChunksOffset}, nil
+	return &Reader{
+		data:        data,
+		header:      header,
+		dict:        dict,
+		dir:         dir,
+		chunksStart: footer.ChunksOffset,
+		bytesRead:   int64(len(data)),
+	}, nil
 }
 
 // GetCell returns the count for (minute, dim1, dim2), or (0, false) if not present.

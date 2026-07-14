@@ -326,8 +326,10 @@ func (w *walBlock) Fetch(ctx context.Context, req traceql.FetchSpansRequest, opt
 		if err != nil || len(snapshot) == 0 {
 			w.mu.Unlock()
 			return traceql.FetchSpansResponse{
-				Results: &sliceSpansetIterator{},
-				Bytes:   func() uint64 { return 0 },
+				Results:       &sliceSpansetIterator{},
+				Bytes:         func() uint64 { return 0 },
+				IndexBytes:    func() uint64 { return 0 },
+				DataFileBytes: func() uint64 { return 0 },
 			}, nil
 		}
 	}
@@ -335,8 +337,10 @@ func (w *walBlock) Fetch(ctx context.Context, req traceql.FetchSpansRequest, opt
 
 	if len(snapshot) == 0 {
 		return traceql.FetchSpansResponse{
-			Results: &sliceSpansetIterator{},
-			Bytes:   func() uint64 { return 0 },
+			Results:       &sliceSpansetIterator{},
+			Bytes:         func() uint64 { return 0 },
+			IndexBytes:    func() uint64 { return 0 },
+			DataFileBytes: func() uint64 { return 0 },
 		}, nil
 	}
 
@@ -419,8 +423,10 @@ func (w *walBlock) Fetch(ctx context.Context, req traceql.FetchSpansRequest, opt
 	}
 
 	return traceql.FetchSpansResponse{
-		Results: &sliceSpansetIterator{spansets: spansets},
-		Bytes:   func() uint64 { return uint64(len(snapshot)) },
+		Results:       &sliceSpansetIterator{spansets: spansets},
+		Bytes:         func() uint64 { return uint64(len(snapshot)) },
+		IndexBytes:    func() uint64 { return 0 },
+		DataFileBytes: func() uint64 { return 0 },
 	}, nil
 }
 

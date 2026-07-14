@@ -36,13 +36,13 @@ import (
 func buildStructuralQueryPlan(
 	ctx context.Context, rawR backend.RawReader, tenant string, dedicated backend.DedicatedColumns, query string,
 	minTS, maxTS uint64, concurrentRequests int, hasLimit bool,
-) (*blockpack.QueryPlan, error) {
+) (*blockpack.QueryPlan, int64, error) {
 	if rawR == nil || query == "" {
-		return nil, nil
+		return nil, 0, nil
 	}
 	leftProg, _, _, ok, err := blockpack.CompileStructuralLegs(query)
 	if err != nil || !ok || leftProg == nil {
-		return nil, nil
+		return nil, 0, nil
 	}
 	// boundedEligible=true: structural chains that flatten to other than exactly 2 nodes go
 	// through the same plan-time classification as plain search (LowSelectivity+no-limit still

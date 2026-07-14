@@ -155,13 +155,13 @@ func splitObjectKey(fullKey string) (backend.KeyPath, string) {
 func buildQueryPlan(
 	ctx context.Context, rawR backend.RawReader, tenant string, dedicated backend.DedicatedColumns, query string,
 	minTS, maxTS uint64, concurrentRequests int, hasLimit bool,
-) (*blockpack.QueryPlan, error) {
+) (*blockpack.QueryPlan, int64, error) {
 	if rawR == nil || query == "" {
-		return nil, nil
+		return nil, 0, nil
 	}
 	prog, err := blockpack.CompileTraceQL(query, blockpack.QueryOptions{})
 	if err != nil || prog == nil {
-		return nil, nil
+		return nil, 0, nil
 	}
 	return buildQueryPlanFromProgram(ctx, rawR, tenant, dedicated, prog, minTS, maxTS, concurrentRequests, true, hasLimit)
 }
@@ -189,13 +189,13 @@ func buildQueryPlan(
 func buildMetricsQueryPlan(
 	ctx context.Context, rawR backend.RawReader, tenant string, dedicated backend.DedicatedColumns, query string,
 	minTS, maxTS uint64, concurrentRequests int,
-) (*blockpack.QueryPlan, error) {
+) (*blockpack.QueryPlan, int64, error) {
 	if rawR == nil || query == "" {
-		return nil, nil
+		return nil, 0, nil
 	}
 	prog, viAnswerableShape, err := blockpack.CompileTraceQLMetricsFilter(query)
 	if err != nil || prog == nil || !viAnswerableShape {
-		return nil, nil
+		return nil, 0, nil
 	}
 	// boundedEligible=false (R2: metrics is never bounded-served); hasLimit is irrelevant on
 	// this path and unused by buildQueryPlanFromProgram's boundedEligible=false branch.
@@ -220,10 +220,16 @@ func buildMetricsQueryPlan(
 // hasLimit is meaningful ONLY when boundedEligible is true (search/structural); metrics callers
 // pass it as false and it is never read on the boundedEligible=false branch, since R2 already
 // forecloses metrics from ever being bounded-served regardless of a limit.
+// buildQueryPlanFromProgram's second return value (issue #218 Phase 3) is the VCNT bytesRead
+// fetchVCNTSection already computes below — surfaced here so callers can thread it into
+// SearchMetrics.vcntBytesRead without this function needing any response-shape awareness of
+// its own. It is 0 whenever the function returns before reaching the VCNT fetch (nil rawR/
+// query, CheckIndexCoverage decline) and is still reported on both plan-time-decline error
+// returns below, since the VCNT I/O already happened by that point.
 func buildQueryPlanFromProgram(
 	ctx context.Context, rawR backend.RawReader, tenant string, dedicated backend.DedicatedColumns,
 	prog *blockpack.Program, minTS, maxTS uint64, concurrentRequests int, boundedEligible, hasLimit bool,
-) (*blockpack.QueryPlan, error) {
+) (*blockpack.QueryPlan, int64, error) {
 	// issue #493 Task 4a/4b: attach qualification/plan attributes to whatever span is already
 	// active on ctx — this function has no span of its own; ctx is the SAME ctx
 	// search_sharder.go/metrics_query_range_sharder.go already attached frontend.ShardSearch/
@@ -248,15 +254,15 @@ func buildQueryPlanFromProgram(
 	// a query that fails this check always resolves to DispatchBlockSharded regardless of what
 	// cost/perMinuteForLead say, so computing those first — which requires fetchVCNTSection's
 	// S3 Find+Read fan-out — would pay that I/O cost for a query statically guaranteed never to
-	// benefit from it. CheckIndexCoverage itself does no VCNT/object-store I/O (it only reads
-	// the query's already-compiled shape plus, when shape-eligible, the value-index's own
-	// separate discovery cache), so this ordering costs nothing extra for queries that DO
-	// qualify.
-	if !vblockpack.CheckIndexCoverage(ctx, tenant, prog, minTS, maxTS) {
+	// benefit from it. CheckIndexCoverage itself does no I/O at all as of #217/Phase 2.1 — it is
+	// a pure shape (AllLeavesIndexable) + deployment (reader configured) check with no
+	// whole-window data-availability opinion; per-slice coverage is decided later, locally and
+	// authoritatively, by each DispatchTimeSliced slice's own tryIndexFetch call.
+	if !vblockpack.CheckIndexCoverage(prog) {
 		if span.IsRecording() {
 			span.SetAttributes(attribute.String("plan.qualification_outcome", "not_indexable"))
 		}
-		return nil, nil
+		return nil, 0, nil
 	}
 
 	dims := make([]string, 0, len(prog.WantColumns))
@@ -302,7 +308,7 @@ func buildQueryPlanFromProgram(
 			if span.IsRecording() {
 				span.SetAttributes(attribute.String("plan.qualification_outcome", "low_selectivity_no_limit_search"))
 			}
-			return nil, fmt.Errorf("plan-time decline for tenant %s: %w", tenant, ErrPlanTimeLowSelectivityNoLimit)
+			return nil, bytesRead, fmt.Errorf("plan-time decline for tenant %s: %w", tenant, ErrPlanTimeLowSelectivityNoLimit)
 		}
 		// SelectSearchStrategy's only other outcome is DispatchBlockSharded (Phase 7,
 		// plan-scan-fallback.md, removed the DispatchBoundedRecentFirst strategy entirely — the
@@ -320,7 +326,7 @@ func buildQueryPlanFromProgram(
 		if span.IsRecording() {
 			span.SetAttributes(attribute.String("plan.qualification_outcome", "low_selectivity_metrics_no_partial_aggregate"))
 		}
-		return nil, fmt.Errorf("plan-time decline for tenant %s: %w", tenant, ErrPlanTimeLowSelectivityNoLimit)
+		return nil, bytesRead, fmt.Errorf("plan-time decline for tenant %s: %w", tenant, ErrPlanTimeLowSelectivityNoLimit)
 	}
 
 	cost, perMinuteForLead := blockpack.TimeSliceOracle(data, dir, minTS, maxTS)
@@ -346,7 +352,7 @@ func buildQueryPlanFromProgram(
 			attribute.Float64("plan.slices_est_known_fraction", knownFraction),
 		)
 	}
-	return &plan, nil
+	return &plan, bytesRead, nil
 }
 
 // dispatchStrategyString renders a blockpack.DispatchStrategy for the plan.strategy span

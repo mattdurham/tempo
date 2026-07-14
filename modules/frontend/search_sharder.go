@@ -163,17 +163,22 @@ func (s asyncSearchSharder) RoundTrip(pipelineRequest pipeline.Request) (pipelin
 	if searchReq.Start != 0 && searchReq.End != 0 {
 		dedicated := s.overrides.DedicatedColumns(tenantID)
 		var planErr error
-		plan, planErr = buildQueryPlan(ctx, s.rawR, tenantID, dedicated, searchReq.Query, uint64(searchReq.Start), uint64(searchReq.End), s.cfg.ConcurrentRequests, hasLimit)
+		var vcntBytesRead int64
+		plan, vcntBytesRead, planErr = buildQueryPlan(ctx, s.rawR, tenantID, dedicated, searchReq.Query, uint64(searchReq.Start), uint64(searchReq.End), s.cfg.ConcurrentRequests, hasLimit)
 		if planErr != nil {
 			return pipeline.NewBadRequest(planErr), nil
 		}
 		if plan == nil {
-			plan, planErr = buildStructuralQueryPlan(ctx, s.rawR, tenantID, dedicated, searchReq.Query, uint64(searchReq.Start), uint64(searchReq.End), s.cfg.ConcurrentRequests, hasLimit)
+			plan, vcntBytesRead, planErr = buildStructuralQueryPlan(ctx, s.rawR, tenantID, dedicated, searchReq.Query, uint64(searchReq.Start), uint64(searchReq.End), s.cfg.ConcurrentRequests, hasLimit)
 			if planErr != nil {
 				return pipeline.NewBadRequest(planErr), nil
 			}
 			planIsStructural = plan != nil
 		}
+		// issue #218 Phase 3: surface the frontend's plan-time VCNT fetch total on the
+		// job-metadata response the combiner reads via its "metadata" callback — see
+		// shardtracker.JobMetadata.VcntBytesRead's own doc comment for why 0 is expected.
+		jobMetrics.VcntBytesRead = vcntBytesRead
 	}
 
 	// pass subCtx in requests so we can cancel and exit early

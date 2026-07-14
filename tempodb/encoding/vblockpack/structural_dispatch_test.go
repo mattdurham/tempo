@@ -10,6 +10,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -249,11 +250,12 @@ func TestFetch_StructuralQuery_NeverDispatchedAsBlockSharded(t *testing.T) {
 		"a default block-sharded (IndexOnly=false) Fetch call must never attempt the structural index path")
 }
 
-// TestFetch_StructuralIndexOnly_ReturnsTypedErrorOnCoverageGap (DT2) pins the #487 typed-error
+// TestFetch_StructuralIndexOnly_TolerantResponseOnCoverageGap (DT2, #217 task 1.1 rename/update
+// of the former TestFetch_StructuralIndexOnly_ReturnsTypedErrorOnCoverageGap) pins the CURRENT
 // contract for structural slice jobs: with no value-index reader configured (a routine decline)
-// and IndexOnly=true, Fetch must fail with blockpack.ErrStructuralIndexCoverageGap rather than
-// falling back to a full scan.
-func TestFetch_StructuralIndexOnly_ReturnsTypedErrorOnCoverageGap(t *testing.T) {
+// and IndexOnly=true, Fetch must NOT fail — it tolerates the decline as an empty, successful
+// result (never falling back to a full scan either).
+func TestFetch_StructuralIndexOnly_TolerantResponseOnCoverageGap(t *testing.T) {
 	dir := t.TempDir()
 	withVISink(t, nil, "")
 	withVIQueryReader(t, nil, "") // index path disabled -> routine decline
@@ -266,24 +268,79 @@ func TestFetch_StructuralIndexOnly_ReturnsTypedErrorOnCoverageGap(t *testing.T) 
 
 	ctx := structuralFetchReq()
 	req := traceql.FetchSpansRequest{}
-	_, err = block.Fetch(ctx, req, common.SearchOptions{IndexOnly: true})
-	require.Error(t, err, "a structural IndexOnly slice job must fail on a routine decline, not scan")
-	require.True(t, errors.Is(err, blockpack.ErrStructuralIndexCoverageGap),
-		"err = %v, want blockpack.ErrStructuralIndexCoverageGap", err)
+	resp, err := block.Fetch(ctx, req, common.SearchOptions{IndexOnly: true})
+	require.NoError(t, err, "a structural IndexOnly slice job's routine decline must be tolerated (#217), not hard-error")
+	require.NotNil(t, resp.Results)
+	ss, iterErr := resp.Results.Next(ctx)
+	require.NoError(t, iterErr)
+	require.Nil(t, ss, "tolerated decline must yield zero spansets, not a full scan")
 }
 
-// TestFetch_IndexOnlySliceJob_DecliningStructuralQuery_HardErrors_NeverBounded is F-8's other
+// hideTraceGroupStore wraps a valueIndexStore and hides trace-by-id (TraceIDColumnName) index
+// files from List, while passing through every other List/Get/Size/ReadAt call (including the
+// search-VI files the structural query's left leg depends on for real coverage). Used to
+// construct a genuine "left leg has real index coverage, but the trace-by-id index has zero
+// candidate files" coverage gap (ExecuteStructuralFromIndex's own len(keys)==0 decline,
+// structural_index.go) deterministically, without relying on timing/window coincidences.
+type hideTraceGroupStore struct {
+	valueIndexStore
+	hideSubstr string
+}
+
+func (h *hideTraceGroupStore) List(ctx context.Context, prefix string) ([]string, error) {
+	if strings.Contains(prefix, h.hideSubstr) {
+		return nil, nil
+	}
+	return h.valueIndexStore.List(ctx, prefix)
+}
+
+// TestFetch_StructuralIndexOnlyToleratedDecline_ReportsRealIndexBytesRead (#218 holistic-review
+// MEDIUM fix, structural counterpart of slice_errors_test.go's
+// TestFetch_IndexOnlyToleratedDecline_ReportsRealIndexBytesRead) pins that the structural path's
+// tolerated coverage-gap early return also threads the bytes already spent resolving the left
+// leg into the returned FetchSpansResponse.IndexBytes closure. writeParentChildBlock gives the
+// left leg (svc-root) genuine, real search-VI coverage (real bytes read); hideTraceGroupStore
+// then hides the trace-by-id index files so ExecuteStructuralFromIndex's own len(keys)==0 gate
+// fires ErrStructuralIndexCoverageGap AFTER those left-leg bytes were already spent.
+func TestFetch_StructuralIndexOnlyToleratedDecline_ReportsRealIndexBytesRead(t *testing.T) {
+	dir := t.TempDir()
+	viStore := &fakeVISink{}
+	withVISink(t, viStore, "indexes")
+	traceColHash := blockpack.ColHash(blockpack.TraceIDColumnName)
+	hidden := &hideTraceGroupStore{valueIndexStore: viStore, hideSubstr: traceColHash}
+	withVIQueryReader(t, hidden, "indexes")
+
+	meta, _ := writeParentChildBlock(t, dir, uuid.New())
+
+	rawR, _, _, err := local.New(&local.Config{Path: dir})
+	require.NoError(t, err)
+	block := newBackendBlock(meta, backend.NewReader(rawR))
+
+	ctx := structuralFetchReq()
+	req := traceql.FetchSpansRequest{}
+	resp, err := block.Fetch(ctx, req, common.SearchOptions{IndexOnly: true})
+	require.NoError(t, err, "a structural coverage-gap decline on an IndexOnly slice job must be tolerated, not hard-error")
+	require.NotNil(t, resp.Results)
+	ss, iterErr := resp.Results.Next(ctx)
+	require.NoError(t, iterErr)
+	require.Nil(t, ss, "a tolerated structural coverage-gap decline must yield zero spansets")
+
+	require.NotNil(t, resp.IndexBytes, "IndexBytes must be set on the tolerated structural coverage-gap path")
+	require.Greater(t, resp.IndexBytes(), uint64(0),
+		"the real bytes already spent resolving the covered left (svc-root) leg must be reported, not dropped")
+}
+
+// TestFetch_IndexOnlySliceJob_DecliningStructuralQuery_ToleratedAsEmptyPartial_NeverBounded
+// (#217 task 1.1 rename/update of the former
+// TestFetch_IndexOnlySliceJob_DecliningStructuralQuery_HardErrors_NeverBounded) is F-8's other
 // mandatory checklist test (review Medium Issue 1): the structural counterpart of
-// TestFetch_SliceJob_Decline_HardErrors_NeverBounded (fetch_bounded_dispatch_test.go). A genuine
-// #487 slice job (IndexOnly=true) on a structural query whose index path declines coverage must
-// hard-error with blockpack.ErrStructuralIndexCoverageGap EVEN WHEN a limit (MaxTraces) is
-// present on the request — indexOnly takes ABSOLUTE priority over boundedAuthorized, mirroring
-// the filter path's R11-AMENDED invariant. This invariant holds today by construction:
-// structuralDeclineOutcome(indexOnly=true, ...) unconditionally returns
-// ErrStructuralIndexCoverageGap before Fetch's `!opts.IndexOnly` structural-decline branch
-// (backend_block.go, which now ALWAYS hard-errors regardless of limit, Phase 7) can ever be
-// reached.
-func TestFetch_IndexOnlySliceJob_DecliningStructuralQuery_HardErrors_NeverBounded(t *testing.T) {
+// TestFetch_SliceJob_Decline_ToleratedAsEmptyPartial_NeverBounded (fetch_bounded_dispatch_test.go).
+// A genuine #487 slice job (IndexOnly=true) on a structural query whose index path declines
+// coverage must be TOLERATED (#217) even with a limit (MaxTraces) present on the request — never
+// falling back to a bounded/full-scan path either (indexOnly still takes ABSOLUTE priority over
+// boundedAuthorized, mirroring the filter path's R11-AMENDED invariant — only the "decline"
+// outcome's shape changed, from hard error to tolerated empty result).
+func TestFetch_IndexOnlySliceJob_DecliningStructuralQuery_ToleratedAsEmptyPartial_NeverBounded(t *testing.T) {
 	dir := t.TempDir()
 	withVISink(t, nil, "")
 	withVIQueryReader(t, nil, "") // index path disabled -> routine decline
@@ -296,10 +353,12 @@ func TestFetch_IndexOnlySliceJob_DecliningStructuralQuery_HardErrors_NeverBounde
 
 	ctx := structuralFetchReq()
 	req := traceql.FetchSpansRequest{}
-	_, err = block.Fetch(ctx, req, common.SearchOptions{IndexOnly: true, MaxTraces: 5})
-	require.Error(t, err, "a structural slice job's routine decline must hard-error even with a limit present")
-	require.True(t, errors.Is(err, blockpack.ErrStructuralIndexCoverageGap),
-		"err = %v, want blockpack.ErrStructuralIndexCoverageGap (a limit must never authorize a bounded path for a slice job)", err)
+	resp, err := block.Fetch(ctx, req, common.SearchOptions{IndexOnly: true, MaxTraces: 5})
+	require.NoError(t, err, "a structural slice job's routine decline must be tolerated (#217) even with a limit present")
+	require.NotNil(t, resp.Results)
+	ss, iterErr := resp.Results.Next(ctx)
+	require.NoError(t, iterErr)
+	require.Nil(t, ss, "a limit must never authorize a bounded path for a slice job's tolerated decline")
 }
 
 // TestFetch_StructuralIndexOnlyFalse_VIDisabled_HardErrors (Phase 0, renamed from
@@ -431,11 +490,12 @@ func TestFetch_NegatedStructuralQuery_TriesIndexPathBeforeScanFallback(t *testin
 	require.True(t, spy.called.Load(), "the index-driven negated structural path must have been attempted")
 }
 
-// TestFetch_NegatedStructuralIndexOnly_ReturnsTypedErrorOnCoverageGap (DT1b/DT2) pins that
-// negated ops get the SAME typed-error/indexOnly contract as positive ops (tryNegatedStructuralIndexFetch
-// reuses structuralDeclineOutcome unchanged) — mirrors
-// TestFetch_StructuralIndexOnly_ReturnsTypedErrorOnCoverageGap exactly, with a negated query.
-func TestFetch_NegatedStructuralIndexOnly_ReturnsTypedErrorOnCoverageGap(t *testing.T) {
+// TestFetch_NegatedStructuralIndexOnly_TolerantResponseOnCoverageGap (DT1b/DT2, #217 task 1.1
+// rename/update of the former TestFetch_NegatedStructuralIndexOnly_ReturnsTypedErrorOnCoverageGap)
+// pins that negated ops get the SAME tolerant/indexOnly contract as positive ops
+// (tryNegatedStructuralIndexFetch reuses structuralDeclineOutcome unchanged) — mirrors
+// TestFetch_StructuralIndexOnly_TolerantResponseOnCoverageGap exactly, with a negated query.
+func TestFetch_NegatedStructuralIndexOnly_TolerantResponseOnCoverageGap(t *testing.T) {
 	dir := t.TempDir()
 	withVISink(t, nil, "")
 	withVIQueryReader(t, nil, "") // index path disabled -> routine decline
@@ -448,8 +508,10 @@ func TestFetch_NegatedStructuralIndexOnly_ReturnsTypedErrorOnCoverageGap(t *test
 
 	ctx := common.WithOriginalTraceQLQuery(context.Background(), negatedStructQuery, false)
 	req := traceql.FetchSpansRequest{}
-	_, err = block.Fetch(ctx, req, common.SearchOptions{IndexOnly: true})
-	require.Error(t, err, "a negated structural IndexOnly slice job must fail on a routine decline, not scan")
-	require.True(t, errors.Is(err, blockpack.ErrStructuralIndexCoverageGap),
-		"err = %v, want blockpack.ErrStructuralIndexCoverageGap", err)
+	resp, err := block.Fetch(ctx, req, common.SearchOptions{IndexOnly: true})
+	require.NoError(t, err, "a negated structural IndexOnly slice job's routine decline must be tolerated (#217), not hard-error")
+	require.NotNil(t, resp.Results)
+	ss, iterErr := resp.Results.Next(ctx)
+	require.NoError(t, iterErr)
+	require.Nil(t, ss, "tolerated decline must yield zero spansets, not a full scan")
 }

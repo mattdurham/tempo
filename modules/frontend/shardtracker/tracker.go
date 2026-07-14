@@ -23,6 +23,11 @@ type JobMetadata struct {
 	TotalJobs   int
 	TotalBytes  uint64
 	Shards      []Shard
+	// VcntBytesRead (issue #218 Phase 3) is the frontend's plan-time VCNT fetch total
+	// (vcnt_fetch.go's fetchVCNTSection), set once per query by the sharder, not per job.
+	// Expected small or often zero by design — VCNT is planning-only selectivity metadata,
+	// not a per-request data read; a low/zero value here is correct behavior, not a bug.
+	VcntBytesRead int64
 }
 
 // CompletionTracker tracks which shards have been completed so that results

@@ -79,7 +79,8 @@ type QueryPlan struct {
 // which leaf will be lead ahead of time. Its MinuteCount.Count values are expected to be
 // non-negative, mirroring SelectivityPerMinute's own liveness-rule contract; BuildTimeSlices
 // defensively clamps a non-conforming negative Count to zero rather than letting it corrupt
-// the adaptive-width target calculation.
+// the per-minute EstMatches signal (#217/NOTE-QP-012: slice width itself is no longer
+// target-derived — every slice is forced to exactly one minute).
 //
 // Binding contract (issue #487): a resolvable-but-VCNT-blind plan (Lead() returns ok=false, or
 // perMinuteForLead returns empty) STILL qualifies for DispatchTimeSliced — BuildTimeSlices' own

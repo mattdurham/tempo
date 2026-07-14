@@ -41,7 +41,7 @@ func TestQualification_IndexCoverageDeclineForcesBlockSharded(t *testing.T) {
 	minTS := uint64(time.Now().Add(-10 * time.Minute).Unix())
 	maxTS := uint64(time.Now().Add(10 * time.Minute).Unix())
 
-	allLeavesResolvable := CheckIndexCoverage(context.Background(), "test-tenant", prog, minTS, maxTS)
+	allLeavesResolvable := CheckIndexCoverage(prog)
 	require.False(t, allLeavesResolvable, "an empty index store must decline, not report coverage")
 
 	cost, perMinuteForLead := blockpack.TimeSliceOracle(nil, nil, minTS, maxTS)
@@ -69,12 +69,79 @@ func TestQualification_IndexCoverageMatchAllowsTimeSliced(t *testing.T) {
 	minTS := uint64(time.Now().Add(-10 * time.Minute).Unix())
 	maxTS := uint64(time.Now().Add(10 * time.Minute).Unix())
 
-	allLeavesResolvable := CheckIndexCoverage(context.Background(), tenant, prog, minTS, maxTS)
+	allLeavesResolvable := CheckIndexCoverage(prog)
 	require.True(t, allLeavesResolvable, "a real block's VI coverage must be reported, not declined")
 
 	cost, perMinuteForLead := blockpack.TimeSliceOracle(nil, nil, minTS, maxTS)
 	plan := blockpack.BuildQueryPlan(prog, cost, allLeavesResolvable, perMinuteForLead, minTS, maxTS, 1000, blockpack.DefaultK)
 	require.Equal(t, blockpack.DispatchTimeSliced, plan.Strategy)
+}
+
+// TestCheckIndexCoverage_IgnoresWatermarks_EvenWithHalfBackfill (#217, Phase 2.1) pins the fix
+// for the reported bug: a query with full backfill for HALF a window used to report
+// allLeavesResolvable=false (decline the WHOLE window) because CheckIndexCoverage consulted
+// watermarksForOrNil/BuildValueIndexSource's whole-window coverage gate. After the fix,
+// CheckIndexCoverage is a pure shape+deployment check — it no longer consults watermarks at
+// all — so it must report true even though the SAME watermark state would make
+// BuildValueIndexSource itself (still called per-slice by tryIndexFetch) report incomplete
+// coverage for the whole window. Per-slice coverage is decided locally and authoritatively by
+// each slice job's own tryIndexFetch call (Phase 1/2's dispatch redesign), not by this
+// frontend-side, block-independent proxy.
+func TestCheckIndexCoverage_IgnoresWatermarks_EvenWithHalfBackfill(t *testing.T) {
+	dir := t.TempDir()
+	viStore := &fakeVISink{}
+	withVISink(t, viStore, "indexes")
+	withVIQueryReader(t, viStore, "indexes")
+
+	tenant := "test-tenant"
+	_, _ = writeSvcBlock(t, dir, viStore, tenant, uuid.New(), "svc-alpha", 300)
+
+	// The query window is a full 2h; the column's backfill watermark only confirms coverage for
+	// the NEWEST half (WatermarkSec set to the window's midpoint) — the classic "full backfill
+	// for half a window" shape this whole task fixes.
+	windowStart := uint64(time.Now().Add(-2 * time.Hour).Unix())
+	windowEnd := uint64(time.Now().Unix())
+	midpoint := windowStart + (windowEnd-windowStart)/2
+
+	fakeCache := &viWatermarkCache{
+		ttl: time.Hour,
+		now: time.Now,
+		entries: map[string]viWatermarkCacheEntry{
+			tenant: {
+				fetched: time.Now(),
+				watermarks: map[string]blockpack.ColumnWatermark{
+					"resource.service.name": {Triggered: true, Done: false, WatermarkSec: midpoint},
+				},
+			},
+		},
+	}
+	prevCache := getViWatermarkCache()
+	setViWatermarkCache(fakeCache)
+	t.Cleanup(func() { setViWatermarkCache(prevCache) })
+
+	prog, err := blockpack.CompileTraceQL(svcAlphaQuery, blockpack.QueryOptions{})
+	require.NoError(t, err)
+
+	// Sanity check: prove the watermark state really would have declined the whole window under
+	// the OLD (pre-#217) BuildValueIndexSource-based gate, so this test is anchored to a genuine
+	// coverage-gap scenario rather than a vacuous one.
+	cache := viStore // fakeVISink also satisfies the reader's cacheFor-style lookup in this test file's helpers
+	_ = cache
+	vr := getValueIndexQueryReader()
+	require.NotNil(t, vr, "test setup: reader must be configured")
+	src, ok, buildErr := blockpack.BuildValueIndexSource(
+		context.Background(), vr.cacheFor(tenant), vr.store, prog, windowStart, windowEnd,
+		watermarksForOrNil(context.Background(), tenant),
+	)
+	require.NoError(t, buildErr)
+	require.False(t, ok, "test setup: half-backfill watermark must still make BuildValueIndexSource decline the whole window")
+	require.Nil(t, src)
+
+	// The actual assertion: CheckIndexCoverage must NOT decline, because it no longer consults
+	// watermarks at all — only shape (AllLeavesIndexable) and deployment (reader configured).
+	allLeavesResolvable := CheckIndexCoverage(prog)
+	require.True(t, allLeavesResolvable,
+		"CheckIndexCoverage must ignore watermark state entirely; per-slice coverage is decided by each slice's own tryIndexFetch")
 }
 
 // TestQualification_MixedIndexableAndNegatedLeafForcesBlockSharded is the T5b/#162 regression
@@ -99,10 +166,35 @@ func TestQualification_MixedIndexableAndNegatedLeafForcesBlockSharded(t *testing
 	minTS := uint64(time.Now().Add(-10 * time.Minute).Unix())
 	maxTS := uint64(time.Now().Add(10 * time.Minute).Unix())
 
-	allLeavesResolvable := CheckIndexCoverage(context.Background(), "test-tenant", prog, minTS, maxTS)
+	allLeavesResolvable := CheckIndexCoverage(prog)
 	require.False(t, allLeavesResolvable, "a query mixing an indexable leaf with a RequirePresent-only leaf must not report full coverage")
 
 	cost, perMinuteForLead := blockpack.TimeSliceOracle(nil, nil, minTS, maxTS)
 	plan := blockpack.BuildQueryPlan(prog, cost, allLeavesResolvable, perMinuteForLead, minTS, maxTS, 1000, blockpack.DefaultK)
 	require.Equal(t, blockpack.DispatchBlockSharded, plan.Strategy)
+}
+
+// TestCheckIndexCoverage_DurationStrictGT_RemainsUndecidable_UnaffectedByPhase2Simplification
+// (#217 Phase 4.2, the red-herring regression guard) pins Phase 0's grounding-pass finding: the
+// ORIGINAL live repro's `{duration > 1ms}` shape is architecturally UNDECIDABLE
+// (vibuilder.decidableTimeBucketThreshold's own derivation — a strict `>` at an exact
+// millisecond-aligned threshold cannot be resolved against the millisecond-bucketed dedicated
+// duration column, task #204) and is UNRELATED to this task's coverage-gap fix; it must decline
+// identically before and after every #217 phase. `{duration >= 1ms}` (the SAME threshold, `>=`
+// instead of `>`) IS decidable and must remain eligible. This test exists so a future change
+// that accidentally "fixes" shape-undecidability rejection while touching coverage-tolerance
+// code (Phase 2.1's CheckIndexCoverage simplification, in particular) fails loudly here instead
+// of silently changing which query shapes are answerable from the index.
+func TestCheckIndexCoverage_DurationStrictGT_RemainsUndecidable_UnaffectedByPhase2Simplification(t *testing.T) {
+	withVIQueryReader(t, &fakeVISink{}, "indexes")
+
+	gtProg, err := blockpack.CompileTraceQL(`{ duration > 1ms }`, blockpack.QueryOptions{})
+	require.NoError(t, err)
+	require.False(t, CheckIndexCoverage(gtProg),
+		"{duration > 1ms} is architecturally undecidable (decidableTimeBucketThreshold, task #204) and must still decline after #217's CheckIndexCoverage simplification (Phase 2.1)")
+
+	geProg, err := blockpack.CompileTraceQL(`{ duration >= 1ms }`, blockpack.QueryOptions{})
+	require.NoError(t, err)
+	require.True(t, CheckIndexCoverage(geProg),
+		"{duration >= 1ms} is decidable at the SAME threshold (only the operator differs) and must remain eligible — proving the GT case's decline above is shape-driven, not a blanket duration-column rejection")
 }

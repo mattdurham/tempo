@@ -16,7 +16,7 @@ renumbered.
 `internal/modules/valueindex/traceindex.go` into the trace-by-id path), per CLAUDE.md's
 standing permission to create spec files under `internal/modules/`.
 
-Next free ID: **TEST-VI-7**.
+Next free ID: **TEST-VI-9**.
 
 ---
 
@@ -173,3 +173,53 @@ Back-ref: `internal/modules/valueindexconsumer/traceflush_test.go:TestIngest_Tra
 → compactor merge → `GetTraceByID` query against real (non-fake) implementations of each
 stage — the canonical reference for how Stages 1-4 fit together, not itself a
 `valueindexconsumer`-scoped unit test so it has no dedicated `TEST-VI-N` entry of its own here.
+
+---
+
+## TEST-VI-7: colHash-manifest hook — happy path, nil-store no-op, fast-error tolerance
+*Added: 2026-07-13 (task #216)*
+
+**Scenario:** `flushColumn`'s best-effort colHash-manifest hook (`recordManifestEntry`,
+SPEC-VI-5) records an entry when configured, is a pure no-op when unconfigured, and never fails
+the real flush when the manifest store returns a fast error.
+
+**Setup/Assertions (`manifest_hook_test.go`):**
+
+- `TestFlushColumn_RecordsManifestEntry` — a configured `ManifestStore` receives exactly one
+  `Put`; the resulting manifest entry decodes to the correct `ColumnName`/`ColumnHash`/
+  `FirstSeenBy`.
+- `TestFlushColumn_NilManifestStoreIsNoOp` — the default (unset) `ManifestStore` leaves
+  `flushColumn`'s real S3 write entirely unaffected.
+- `TestFlushColumn_ManifestPutFailureDoesNotFailFlush` — a `ManifestStore` whose `Put` returns a
+  FAST error (`context.DeadlineExceeded`, not a hang) never fails `flushColumn`; the real index
+  file is still written.
+
+**Spec invariants tested:** SPEC-VI-5.
+
+Back-ref: `internal/modules/valueindexconsumer/manifest_hook_test.go`.
+
+---
+
+## TEST-VI-8: colHash-manifest hook — hanging-store bound and in-process cache (task #216 post-review fix pass)
+*Added: 2026-07-13*
+
+**Scenario:** Two follow-up findings from task #216's review pass (CRITICAL + HIGH):
+`flushColumn` must remain bounded even when the manifest store HANGS (not merely errors fast),
+and repeated flushes of an already-recorded column must not re-issue the manifest `Get`.
+
+**Setup/Assertions (`manifest_hook_test.go`):**
+
+- `TestFlushColumn_HangingManifestStoreDoesNotBlockFlush` — a `hangingManifestStore` whose
+  `Get`/`Put` block on `<-ctx.Done()` must still let `flushColumn` return within a bounded time
+  (via `colhashmanifest.manifestOpTimeout`, SPEC-COLMANIFEST-5) and still write the real index
+  file. Confirmed red (hung indefinitely) before `colhashmanifest`'s timeout fix landed, green
+  (~6s, 2x `manifestOpTimeout`) after.
+- `TestFlushColumn_ManifestCacheSkipsRepeatedGet` — flushing the same column 3 times against a
+  call-counting `fakeManifestStore` must issue exactly 1 manifest `Get` total (SPEC-VI-6).
+  Confirmed red (3 calls) before `Service.manifestSeen` was added, green (1 call) after.
+
+**Spec invariants tested:** SPEC-VI-6, `colhashmanifest/SPECS.md` SPEC-COLMANIFEST-5.
+
+Back-ref: `internal/modules/valueindexconsumer/manifest_hook_test.go`. See `colhashmanifest/
+TESTS.md` TEST-COLMANIFEST-15 (the package-level counterpart of the hanging-store test) and
+`NOTES.md` NOTE-VI-108.

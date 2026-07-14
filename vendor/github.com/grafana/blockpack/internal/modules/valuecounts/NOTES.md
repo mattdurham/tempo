@@ -364,7 +364,7 @@ part 2).
 ### Consumer
 
 tempo `cube_backfill.go:buildVCNTSection` lists+downloads the `.vcnt` files under each dim's
-`value_counts/<colHash>/` prefix (through the shared `cachingStore`-wrapped `minioVIStore`, issue
+`unique_values/<colHash>/` prefix (through the shared `cachingStore`-wrapped `minioVIStore`, issue
 #478) and calls this to build the section `maybeCreateCube` hands to `TryCreate`. VCNT filenames carry
 no embedded time range (unlike VI files), so all of a column's files are fetched and the query window
 is applied at the record level by the gate's `ValuesInRange` decode. **[Superseded by NOTE-VC-017,
@@ -640,3 +640,36 @@ statement in NOTE-VC-012 (which remains, marked superseded, for historical accur
 `VCNTBuildSectionFromObjects`'s original 2026-07-06 design constraint). See
 `valuecountscompactor/NOTES.md`'s own new dated entry for the clustering algorithm built on top
 of this filename change, and its `SPECS.md` SPEC-VC-3.
+
+## NOTE-VC-020 — colHash -> column-name audit manifest lives in `internal/modules/colhashmanifest`, not here (task #216, cross-reference entry)
+
+Date: 2026-07-13
+
+`ColHash` (`filename.go`) is a genuine one-way hash — `hex(SHA256(colName)[:16])`, identical to
+`valueindex.ColHash`, with no other mechanism anywhere to recover the source column name from a
+hash. Browsing VCNT's on-disk layout (`<tenant>/indexes/unique_values/<colHash>/...`) directly
+shows only opaque hash-named directories. Task #216 closes this with a best-effort, per-tenant,
+JSON-serialized manifest (`internal/modules/colhashmanifest`, mirroring `internal/modules/cube`'s
+own `Registry` pattern) mapping `colHash -> colName`, shared between VI and VCNT since both
+compute the IDENTICAL hash function independently and could genuinely collide on the same
+column.
+
+**Why the new code does not live in this package.** `valuecounts` itself never touches object
+storage; the module that actually performs a real object-storage write using
+`valuecounts.ColHash`-keyed paths is `internal/modules/valuecountscompactor` (for L1+ merges —
+see that package's NOTES.md NOTE-VC-019 for why compaction, not an L0 write blockpack does not
+own, is VCNT's earliest available hook). The manifest's own registry logic
+(`internal/modules/colhashmanifest`) intentionally does NOT import `valuecounts` (or
+`valueindex`) — it only ever handles `(tenant, colHash, colName)` as plain strings its callers
+already resolved, preserving the existing deliberate decoupling between the VI and VCNT
+`ColHash` implementations (see `valuecountscompactor/service.go`'s `ownsShard` doc comment, and
+`colhashmanifest/NOTES.md` NOTE-COLMANIFEST-1 for the full argument).
+
+This manifest is purely additive, best-effort observability — it is NEVER consulted by any of
+this package's own read/write/query logic (including `Compact`, `SelectivityInRange`, or any
+decode path), and nothing in `valuecounts` changed to support it.
+
+Back-refs: `internal/modules/colhashmanifest` (the shared registry — see its own SPECS.md/
+NOTES.md for the full contract), `internal/modules/valuecountscompactor/NOTES.md` NOTE-VC-019
+(the actual VCNT-side call site and hook rationale), `internal/modules/valueindex/NOTES.md`
+NOTE-VI-107 (VI's symmetric cross-reference entry), `filename.go:ColHash`.

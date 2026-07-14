@@ -35,6 +35,7 @@ import (
 	"github.com/grafana/tempo/tempodb/backend/azure"
 	backend_cache "github.com/grafana/tempo/tempodb/backend/cache"
 	"github.com/grafana/tempo/tempodb/backend/gcs"
+	"github.com/grafana/tempo/tempodb/backend/instrumentation"
 	"github.com/grafana/tempo/tempodb/backend/local"
 	"github.com/grafana/tempo/tempodb/backend/s3"
 	"github.com/grafana/tempo/tempodb/blocklist"
@@ -419,16 +420,51 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 // newMinioForValueIndex builds a minio client for the value-index query path from
 // the trace S3 config. Credentials come from the AWS environment, matching the
 // value-index consumer/compactor clients (cmd/tempo/app/value_index.go).
+//
+// Task #202 (live incident: trace-by-id lookups taking 10-20+ seconds and timing out):
+// before this change, this client had ZERO HTTP-level observability -- unlike the main
+// data-block S3 client (tempodb/backend/s3/s3.go's createCore), which wraps its transport in
+// instrumentation.NewTransport to populate tempodb_backend_request_duration_seconds, this
+// client passed no custom Transport at all, so none of the GetObject/StatObject calls the
+// value-index query path issues (minioVIStore.Size/ReadAt, on the trace-by-id and
+// search/metrics read paths alike) ever recorded a single HTTP-round-trip-duration sample.
+// Wiring the SAME instrumented transport in here (mirroring createCore exactly) means every
+// individual HTTP attempt -- including every RETRY minio-go's own internal executeMethod loop
+// issues (up to minio.MaxRetry attempts, 10 by default, with exponential backoff up to a 1s
+// cap per attempt -- see minio-go/v7's retry.go) -- now shows up as its own histogram sample,
+// labeled by status code. A retry storm (repeated 5xx/429/RequestTimeout responses) becomes
+// directly visible as a burst of non-2xx-labeled samples correlated with the incident window,
+// instead of being invisible inside one opaque, multi-second Size()/ReadAt() call. This does
+// NOT change retry/backoff BEHAVIOR (still governed by the same process-global minio.MaxRetry/
+// DefaultRetryUnit/DefaultRetryCap the main S3 backend's own config sets, see s3.go's
+// internalNew) -- it only makes that behavior observable for this client, which previously had
+// no visibility into it at all.
 func newMinioForValueIndex(cfg *s3.Config) (*minio.Client, error) {
+	opts, err := minioOptionsForValueIndex(cfg)
+	if err != nil {
+		return nil, err
+	}
 	endpoint := cfg.Endpoint
 	if endpoint == "" {
 		endpoint = fmt.Sprintf("s3.%s.amazonaws.com", cfg.Region)
 	}
-	return minio.New(endpoint, &minio.Options{
-		Creds:  credentials.NewEnvAWS(),
-		Secure: !cfg.Insecure,
-		Region: cfg.Region,
-	})
+	return minio.New(endpoint, opts)
+}
+
+// minioOptionsForValueIndex builds newMinioForValueIndex's *minio.Options, split out as its own
+// function so a test can assert directly on the constructed Transport field (task #202) without
+// needing to reach into minio.Client's own private fields to prove the wiring stuck.
+func minioOptionsForValueIndex(cfg *s3.Config) (*minio.Options, error) {
+	transport, err := minio.DefaultTransport(!cfg.Insecure)
+	if err != nil {
+		return nil, fmt.Errorf("newMinioForValueIndex: create default transport: %w", err)
+	}
+	return &minio.Options{
+		Creds:     credentials.NewEnvAWS(),
+		Secure:    !cfg.Insecure,
+		Region:    cfg.Region,
+		Transport: instrumentation.NewTransport(transport),
+	}, nil
 }
 
 func (rw *readerWriter) WriteBlock(ctx context.Context, c WriteableBlock) error {
@@ -653,8 +689,12 @@ func (rw *readerWriter) SearchTags(ctx context.Context, meta *backend.BlockMeta,
 	// build response
 	collected := distinctValues.Strings()
 	resp := &tempopb.SearchTagsV2Response{
-		Scopes:  make([]*tempopb.SearchTagsV2Scope, 0, len(collected)),
-		Metrics: &tempopb.MetadataMetrics{InspectedBytes: mc.TotalValue()},
+		Scopes: make([]*tempopb.SearchTagsV2Scope, 0, len(collected)),
+		// issue #218 Phase 8: SearchTags never consults the value index or VCNT for
+		// either backend (vblockpack: no ValueIndex set in executeQuery's opts;
+		// vparquet4: block_search_tags.go's mcb(rr.BytesRead()) is a plain row-group
+		// read) — mc.TotalValue() is entirely data-file/block-scan bytes.
+		Metrics: &tempopb.MetadataMetrics{InspectedBytes: mc.TotalValue(), DataFileBytesRead: mc.TotalValue()},
 	}
 	for scope, vals := range collected {
 		resp.Scopes = append(resp.Scopes, &tempopb.SearchTagsV2Scope{
@@ -684,7 +724,9 @@ func (rw *readerWriter) SearchTagValues(ctx context.Context, meta *backend.Block
 
 	return &tempopb.SearchTagValuesResponse{
 		TagValues: dv.Strings(),
-		Metrics:   &tempopb.MetadataMetrics{InspectedBytes: mc.TotalValue()},
+		// issue #218 Phase 8: see SearchTags above — same all-scan characteristic for
+		// both backends, so mc.TotalValue() is entirely data-file bytes.
+		Metrics: &tempopb.MetadataMetrics{InspectedBytes: mc.TotalValue(), DataFileBytesRead: mc.TotalValue()},
 	}, err
 }
 
@@ -713,7 +755,9 @@ func (rw *readerWriter) SearchTagValuesV2(ctx context.Context, meta *backend.Blo
 	}
 
 	resp := &tempopb.SearchTagValuesV2Response{
-		Metrics: &tempopb.MetadataMetrics{InspectedBytes: mc.TotalValue()},
+		// issue #218 Phase 8: see SearchTags above — same all-scan characteristic for
+		// both backends, so mc.TotalValue() is entirely data-file bytes.
+		Metrics: &tempopb.MetadataMetrics{InspectedBytes: mc.TotalValue(), DataFileBytesRead: mc.TotalValue()},
 	}
 	for _, v := range dv.Values() {
 		v2 := v

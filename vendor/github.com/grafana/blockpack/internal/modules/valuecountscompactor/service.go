@@ -11,21 +11,42 @@ import (
 	"strings"
 	"time"
 
+	"github.com/grafana/blockpack/internal/modules/colhashmanifest"
 	"github.com/grafana/blockpack/internal/modules/valuecounts"
 )
 
 // NOTE: see internal/modules/valuecountscompactor/NOTES.md.
 // Any changes to this file must be reflected there.
 
+// ManifestStore is the optional object-storage surface used to update the best-effort
+// colHash -> column-name audit manifest (internal/modules/colhashmanifest) after a
+// successful merge write (NOTE-VC-020, task #216). Defined as its own narrow interface
+// (rather than reusing Store directly in Config) mirroring this package's existing
+// Object/IndexObject-style deliberate decoupling from valueindexcompactor's structurally
+// identical types -- any Store value satisfies ManifestStore structurally regardless,
+// since Store's method set is a superset. Config.ManifestStore is nil by default, which
+// fully disables manifest recording -- see mergeLevel.
+type ManifestStore interface {
+	Get(ctx context.Context, key string) ([]byte, error)
+	Put(ctx context.Context, key string, data []byte) error
+}
+
 // Service is the value-counts compactor orchestrator. It periodically scans each configured
 // tenant's column directories and compacts same-level VCNT files into fewer, larger files,
 // summing counts and dropping any group whose net count is <= 0 (valuecounts.Compact's own
 // retention rule — there is no source-existence probe here, unlike valueindexcompactor).
 type Service struct {
-	store   Store
-	metrics *compactorMetrics // nil when Config.Registerer is nil (no-op)
-	now     func() time.Time
-	cfg     Config
+	store Store
+	// manifestSeen caches (tenant, colHash) pairs already confirmed recorded in the colHash
+	// manifest this process's lifetime, keyed by tenant+"\x00"+colHash (NOTE-VC-021, task #216
+	// HIGH follow-up). recordManifestEntry checks this BEFORE ever calling into
+	// colhashmanifest.RecordColumn, skipping the Get round-trip entirely once a colHash is
+	// known-recorded -- Run/RunOnce drive compaction sequentially with no concurrent goroutines
+	// touching Service state, so no locking is needed.
+	manifestSeen map[string]struct{}
+	metrics      *compactorMetrics // nil when Config.Registerer is nil (no-op)
+	now          func() time.Time
+	cfg          Config
 }
 
 // NewService builds a compactor service. cfg.Tenants must be non-empty and store must be
@@ -39,10 +60,11 @@ func NewService(cfg Config, store Store) (*Service, error) {
 		return nil, errors.New("valuecountscompactor: store is required")
 	}
 	return &Service{
-		store:   store,
-		cfg:     cfg,
-		metrics: newCompactorMetrics(cfg.Registerer),
-		now:     time.Now,
+		store:        store,
+		cfg:          cfg,
+		manifestSeen: make(map[string]struct{}),
+		metrics:      newCompactorMetrics(cfg.Registerer),
+		now:          time.Now,
 	}, nil
 }
 
@@ -372,6 +394,7 @@ func (s *Service) mergeLevel(ctx context.Context, colDir string, files []levelFi
 			return fmt.Errorf("valuecountscompactor: put %q: %w", key, err)
 		}
 		written = 1
+		s.recordManifestEntry(ctx, colDir, merged[0].ColumnName)
 	}
 
 	var firstErr error
@@ -398,6 +421,65 @@ func (s *Service) mergeLevel(ctx context.Context, colDir string, files []levelFi
 	s.metrics.addMergeCounts(len(processed), written, deleted, len(all), len(merged))
 	s.metrics.incDeferred(deferred)
 	return firstErr
+}
+
+// recordManifestEntry updates the best-effort colHash -> column-name audit manifest
+// (internal/modules/colhashmanifest) for colDir's column, if a ManifestStore is configured
+// (NOTE-VC-020, task #216). tenant and colHash are derived from colDir's own layout
+// ("<tenant>/value_counts/<colHash>", the same shape buildWorkList already parses) rather
+// than threading extra parameters through mergeLevel/compactColumn's existing signatures.
+// This is purely additive observability -- never consulted by any read/write/query path --
+// so a nil ManifestStore or any recording failure is deliberately swallowed here (logged at
+// Warn) rather than returned: the real merge this call follows has already succeeded and
+// must never be failed retroactively by this side-channel.
+//
+// NOTE-VC-021 (task #216 HIGH follow-up): checks s.manifestSeen BEFORE ever calling into
+// colhashmanifest.RecordColumn, which otherwise performs a full Get of the tenant's aggregate
+// manifest file on EVERY non-empty merge of a given column, forever -- mergeLevel runs on
+// VCNT's compaction path, every merge, indefinitely. Once a (tenant, colHash) pair is
+// confirmed recorded (RecordColumn returns nil), this process never issues another manifest
+// Get for that pair, turning the steady-state cost into O(distinct colHashes ever seen by this
+// process) rather than O(merges). A process restart just means the first merge after restart
+// pays the cost again and re-confirms via a real Get -- this cache is purely a latency/I/O
+// optimization, never a correctness dependency (see SPECS.md SPEC-VC-5).
+func (s *Service) recordManifestEntry(ctx context.Context, colDir, colName string) {
+	if s.cfg.ManifestStore == nil {
+		return
+	}
+	tenant := tenantFromColDir(colDir)
+	colHash := path.Base(colDir)
+	key := tenant + "\x00" + colHash
+	if _, known := s.manifestSeen[key]; known {
+		return
+	}
+	nowSec := uint64(s.now().Unix()) //nolint:gosec // unix seconds fits uint64 for any realistic timestamp
+	err := colhashmanifest.RecordColumn(
+		ctx,
+		s.cfg.ManifestStore,
+		tenant,
+		colHash,
+		colName,
+		colhashmanifest.SourceVCNT,
+		nowSec,
+	)
+	if err != nil {
+		slog.Warn("valuecountscompactor: column manifest update failed",
+			"colDir", colDir, "col", colName, "err", err)
+		return
+	}
+	s.manifestSeen[key] = struct{}{}
+}
+
+// tenantFromColDir extracts the leading tenant segment from a colDir shaped
+// "<tenant>/value_counts/<colHash>" (mirrors valueindexconsumer's tenantFromPath: the
+// tenant is always the first path segment, regardless of the rest of the layout).
+func tenantFromColDir(colDir string) string {
+	for i, c := range colDir {
+		if c == '/' {
+			return colDir[:i]
+		}
+	}
+	return ""
 }
 
 // deleteMaxAttempts and deleteRetryBackoff bound mergeLevel's mitigation for the CRITICAL

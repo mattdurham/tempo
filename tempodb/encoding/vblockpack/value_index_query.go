@@ -266,7 +266,36 @@ type indexFetchStats struct {
 	// Used is true when the index path answered the query (the caller skipped the
 	// full block scan).
 	Used bool
+	// MinSec/MaxSec are the second-granularity coverage-check window actually passed to
+	// BuildValueIndexSource(Bounded) (task #201 observability) — the SAME nanoWindowToSec
+	// output tryIndexFetch itself derives from opts.StartNano/EndNano, exposed here so a
+	// caller (Fetch) can attach the real coverage-check inputs to its span/log line without
+	// re-deriving them a second time. Zero value (0, 0) when tryIndexFetch declined before
+	// reaching that derivation (the vr == nil zeroth category).
+	MinSec, MaxSec uint64
+	// DeclineReason is a short, stable machine-grep-able tag for WHY tryIndexFetch did not
+	// answer the query from the index, set at every return point in this file (task #201
+	// observability) — empty when the index DID answer (Used=true). Distinct from the actual
+	// error value returned alongside it: a routine decline may return a nil error (the caller
+	// still needs to know it declined and why, e.g. to route to a bounded read), and an
+	// ErrSliceIndexCoverageGap/ErrSearchNoCoverage error alone does not say whether the
+	// underlying cause was "no VI files discovered at all" vs. "files existed but the query
+	// shape/coverage still declined" vs. "the index-driven path is disabled on this querier
+	// entirely" — exactly the ambiguity task #201's live investigation had to blind-guess at
+	// without this field.
+	DeclineReason string
 }
+
+// Decline reason tags for indexFetchStats.DeclineReason (task #201 observability). Kept as
+// plain string constants (not a typed enum) so they read directly off a span/log line without
+// a lookup table.
+const (
+	declineReasonViDisabled             = "vi_disabled"                // vr == nil: value_index_query.enabled=false
+	declineReasonBuildSourceError       = "build_source_error"         // discovery/decode error building the source
+	declineReasonNoCoverage             = "no_coverage"                // BuildValueIndexSource(Bounded) ok=false
+	declineReasonIndexDataInconsistency = "index_data_inconsistency"   // QueryTraceQLFromIndex returned err
+	declineReasonQueryDeclined          = "query_declined_after_build" // QueryTraceQLFromIndex indexOK=false
+)
 
 // tryIndexFetch attempts to answer a compiled filter program from the value index.
 // It returns three distinct outcomes, mirroring the authoritative contract the
@@ -340,21 +369,27 @@ type indexFetchStats struct {
 // frontend's block-independent plan time; this function remains a reuse of tryIndexFetch's FIRST
 // gate only, now tightened with the shape-completeness half tryIndexFetch's own executor-level
 // check would otherwise catch downstream.
-func CheckIndexCoverage(ctx context.Context, tenant string, prog *blockpack.Program, minSec, maxSec uint64) bool {
+//
+// SIMPLIFIED (#217/SPEC-QP-8, Phase 2.1): this function no longer consults watermarksForOrNil or
+// calls BuildValueIndexSource at all — it is now a pure shape (AllLeavesIndexable) + deployment
+// (reader configured) check, with NO whole-window data-availability opinion. Per-#217's governing
+// principle ("never decline a query we have coverage for"), whole-window watermark consultation
+// here was the actual bug: a query with full backfill for HALF a window used to report false
+// (not resolvable) for the WHOLE window, forcing DispatchBlockSharded and losing the #487
+// per-minute dispatch path's parallelism entirely, even though most of the window WAS covered.
+// Now every shape-eligible, deployment-enabled query dispatches DispatchTimeSliced
+// unconditionally; each resulting slice's own tryIndexFetch call (still gated by
+// watermarksForOrNil/BuildValueIndexSource, unchanged) decides ITS OWN coverage locally and
+// authoritatively — a slice with no coverage declines tolerably (Phase 1's PARTIAL response),
+// never taking down the whole query. ctx/tenant/minSec/maxSec are now unused by this function's
+// body and dropped from the signature entirely (a signature reduction, not a new public API
+// surface) — grep confirms vcnt_fetch.go is the only external caller and it is updated alongside
+// this change.
+func CheckIndexCoverage(prog *blockpack.Program) bool {
 	if !blockpack.AllLeavesIndexable(prog) {
 		return false
 	}
-	vr := getValueIndexQueryReader()
-	if vr == nil {
-		return false
-	}
-	cache := vr.cacheFor(tenant)
-	watermarks := watermarksForOrNil(ctx, tenant)
-	_, ok, err := blockpack.BuildValueIndexSource(ctx, cache, vr.store, prog, minSec, maxSec, watermarks)
-	if err != nil {
-		return false
-	}
-	return ok
+	return getValueIndexQueryReader() != nil
 }
 
 // boundedAuthorized (issue #481 part 3, F-7, R7, LOCAL-DERIVATION contract ruled by R17 —
@@ -383,6 +418,7 @@ func (b *blockpackBlock) tryIndexFetch(
 		// is untouched by boundedAuthorized -- but Fetch's caller now hard-errors with
 		// ErrMaterializedIndexBuilding for that outcome instead of falling back to a scan (Phase
 		// 0). See declineOutcome's own doc comment.
+		stats.DeclineReason = declineReasonViDisabled
 		return declineOutcome(indexOnly, stats)
 	}
 
@@ -390,6 +426,10 @@ func (b *blockpackBlock) tryIndexFetch(
 	// in QueryOptions; map that to the full uint64 range so discovery includes all
 	// files (the per-file time filter then prunes by wall clock).
 	minSec, maxSec := nanoWindowToSec(opts.StartNano, opts.EndNano)
+	// #201 observability: record the real coverage-check inputs unconditionally, before any
+	// decline branch below can return early -- every returned stats value from this point on
+	// carries the exact window BuildValueIndexSource(Bounded) was actually asked to cover.
+	stats.MinSec, stats.MaxSec = minSec, maxSec
 
 	cache := vr.cacheFor(b.meta.TenantID)
 	watermarks := watermarksForOrNil(ctx, b.meta.TenantID)
@@ -419,6 +459,7 @@ func (b *blockpackBlock) tryIndexFetch(
 		// unless boundedAuthorized, or ErrSliceIndexCoverageGap under indexOnly).
 		level.Warn(util_log.Logger).Log("msg", "vblockpack: index fetch: build source error",
 			"block", b.meta.BlockID, "err", err)
+		stats.DeclineReason = declineReasonBuildSourceError
 		return declineOutcomeBounded(indexOnly, stats)
 	}
 	if !ok {
@@ -429,6 +470,7 @@ func (b *blockpackBlock) tryIndexFetch(
 		// this, but it is still called here for the OTHER, indexable-but-uncovered
 		// leaves that a mixed query might contain alongside the unindexable one.
 		recordUsageForDeclinedQuery(ctx, b.meta.TenantID, prog, dedicatedColumnSet(b.meta.DedicatedColumns), time.Now())
+		stats.DeclineReason = declineReasonNoCoverage
 		return declineOutcomeBounded(indexOnly, stats)
 	}
 	level.Info(util_log.Logger).Log("msg", "vblockpack: index fetch: coverage found",
@@ -471,9 +513,11 @@ func (b *blockpackBlock) tryIndexFetch(
 	if err != nil {
 		level.Error(util_log.Logger).Log("msg", "vblockpack: index fetch: index/data inconsistency, failing query (NOTE-VI-078)",
 			"block", b.meta.BlockID, "tenant", b.meta.TenantID, "err", err)
+		stats.DeclineReason = declineReasonIndexDataInconsistency
 		return nil, false, stats, err
 	}
 	if !indexOK {
+		stats.DeclineReason = declineReasonQueryDeclined
 		return declineOutcomeBounded(indexOnly, stats)
 	}
 	stats.Used = true

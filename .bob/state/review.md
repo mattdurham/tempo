@@ -1,263 +1,214 @@
 # Consolidated Code Review Report
 
-Generated: 2026-03-29T00:00:00Z
-Domains Reviewed: Security, Bug Diagnosis, Error Handling, Code Quality, Performance, Go Idioms, Architecture, Documentation, Comment Accuracy, Reference Integrity, Spec-Driven Verification
+Generated: 8th review pass, task #213 fix review (blockpack `main` / tempo `agentic-tempo`,
+uncommitted working trees)
+Scope: Task #213 fix (paired-sibling-leaf identity replaces bare column-name matching for the
+`RequirePresent` value-index carve-out). Repos reviewed: blockpack
+(`/home/mdurham/source/blockpack_collection/blockpack`, branch `main`) and tempo
+(`/home/mdurham/source/blockpack_collection/tempo`, branch `agentic-tempo`, vendors an
+older/stale copy of blockpack — expected/accepted per the review brief).
+Domains Reviewed: Security, Bug Diagnosis, Error Handling, Code Quality, Performance, Go Idioms,
+Architecture, Documentation, Comment Accuracy, Reference Integrity, Spec-Driven Verification,
+Test-Suite Integrity (added this pass), Prompt-Injection Hygiene.
 
 ---
 
 ## Critical Issues (Must Fix Before Commit)
 
-✅ No critical issues found
+✅ No critical issues found. The #213 mechanism itself (`vm.RangeNode.NeqPairedRange`,
+`vibuilder.collectLeaves`/`neqRangeSiblingLeaves`, `SliceValueIndexSource.MarkRequirePresentLeaf`/
+`LookupLeaf`) was traced end-to-end, adversarially probed beyond the stated diff, and verified by
+direct test execution. It correctly fixes the #212 regression described in the task brief and does
+not reopen #212's own fix for the scoped shape. See "Verification Performed" below for the full
+list of checks. The one item that came closest to CRITICAL — an intermittent full-suite test
+failure reproducing the exact pre-#213 wrong-answer signature — is filed as HIGH below because it
+was not reliably reproducible and its root cause was not conclusively identified as a code defect
+in the time available; it does not meet the bar for a confirmed CRITICAL finding, but it must not
+be ignored either.
 
 ---
 
 ## High Priority Issues
 
-### Issue 1: Stale comment claims "intrinsic columns are no longer in block payloads" — contradicts dual-storage reality
+### Issue 1: Intermittent full-module-suite test failure reproduces the EXACT pre-#213 wrong-answer signature; root cause not isolated in this pass
 **Severity:** HIGH
-**Domain:** Comment Accuracy
-**Files:** `vendor/github.com/grafana/blockpack/internal/modules/executor/stream.go:217-219`
-**Description:** The NOTE-050 comment block at lines 217-219 reads:
+**Domain:** test-suite-integrity / bug-diagnosis
+**Files:** `neq_unscoped_collision_realvi_test.go`, `structural_oracle_comparison_test.go` (root
+package, blockpack repo); observed only when driven via `go test -race -count=1 ./...`
+**Description:** All three of #213's new regression tests
+(`TestNeqUnscopedCollision_ReproductionA_FalsePositiveViaAND`,
+`TestNeqUnscopedCollision_ReproductionB_FalseNegativeViaOR`,
+`TestStructuralOracle_Shape7_NegatedRightLeg_UnscopedNeqCollision`) pass reliably (verified 6/6
+consecutive `-race` runs) when the root package is tested alone (`go test -race -count=1 .`), and
+pass in every isolated `-run`-filtered invocation used earlier in this review. However, one full
+`go test -race -count=1 ./...` invocation (1 failure observed out of 14 total attempts across this
+review, ≈7%) produced:
+- `TestNeqUnscopedCollision_ReproductionA_FalsePositiveViaAND`: `viOK=true`, `viIDs={traceA,
+  traceB}` — the EXACT pre-#213 false positive the task brief describes as the original bug.
+- `TestNeqUnscopedCollision_ReproductionB_FalseNegativeViaOR`: `viOK=true`, `viIDs={traceCollisionA,
+  traceCollisionB}` (traceTrue silently dropped) — the EXACT pre-#213 false negative.
+- `TestStructuralOracle_Shape7_NegatedRightLeg_UnscopedNeqCollision`: same false-negative shape on
+  the negated structural right leg.
 
-```
-// NOTE-050: Pure intrinsic queries always use the fast path regardless of Limit —
-// intrinsic columns are no longer in block payloads, so the block scan path would
-// evaluate nil columns and return 0 results for any intrinsic predicate.
-```
-
-This is factually wrong. Dual storage was restored in writer NOTE-002 (2026-03-26). Intrinsic columns ARE written to block payloads via `addPresent`. The comment was written before the rollback and was not updated. Anyone reading this comment will conclude that intrinsic columns are exclusively in the intrinsic TOC section, which has been false since the rollback.
-
-The correct statement is that the fast path is required for efficiency (O(M) vs O(N) block scan) and backward compat with pre-rollback files, not because intrinsic columns are absent from block payloads.
-
-**Impact:** A developer relying on this comment could make incorrect assumptions about file format guarantees, leading to bugs when adding code that reads intrinsic data from block columns.
-
-**Fix:** Update lines 217-219 to read:
-
-```
-// NOTE-050: Pure intrinsic queries always use the fast path regardless of Limit —
-// without the fast path, the block scan's ColumnPredicate evaluates user-attr
-// predicates via nilIntrinsicScan (FullScan for nil intrinsic block columns) and
-// then re-filters via filterRowSetByIntrinsicNodes. For files written between PR #172
-// and its rollback, intrinsic columns may be absent from block payloads, so this
-// path prevents false-negative results on those files. Mixed queries still require
-// Limit > 0 to bound the pre-filter cost.
-```
-
----
-
-### Issue 2: Stale comment in lookupIntrinsicFields references removed MinRef/MaxRef/RefBloom
-**Severity:** HIGH
-**Domain:** Comment Accuracy
-**Files:** `vendor/github.com/grafana/blockpack/internal/modules/executor/stream.go:1216-1218`
-**Description:** The comment at lines 1216-1218 reads:
-
-```
-// Page-skipping optimization: uses GetIntrinsicColumnForRefs instead of GetIntrinsicColumn
-// so that only pages covering the target refs are decoded. With MinRef/MaxRef/RefBloom in
-// the page TOC, irrelevant pages are skipped, reducing decoded rows from O(N_file) to
-// O(N_relevant_pages).
-```
-
-However:
-1. `MinRef`, `MaxRef`, and `RefBloom` have been removed from `PageMeta` and from page TOC encoding as part of this changeset (NOTE-007). There are no longer any ref-range fields in the page TOC.
-2. The actual code at line 1246 calls `r.GetIntrinsicColumn(colName)`, NOT `GetIntrinsicColumnForRefs`. The comment claims the function uses `GetIntrinsicColumnForRefs`, which is incorrect for the current code.
-
-So the comment is wrong on both counts: it claims ref-range page-skipping happens, and it claims a function call that doesn't exist in the implementation.
-
-**Impact:** Misleads maintainers about page-skipping behavior. Someone optimizing or debugging `lookupIntrinsicFields` will expect page-skipping that doesn't happen.
-
-**Fix:** Replace lines 1206-1220 with accurate documentation:
-
-```
-// lookupIntrinsicFields reads intrinsic column values for the given refs and returns one
-// map[string]any per ref. wantCols limits which columns are loaded — when non-nil only
-// columns present in wantCols are fetched.
-// Pass nil to fetch all intrinsic columns (e.g. FindTraceByID needs every field).
-//
-// Field lookup: calls GetIntrinsicColumn to get the full decoded column, then
-// builds a refIndex via EnsureRefIndex (O(N log N), cached on the column object)
-// and does O(log N) LookupRefFast per ref. Total per column: O(M log N) for M target refs.
-//
-// NOTE-007: RefBloom/MinRef/MaxRef were removed from the page TOC — all pages are decoded
-// via DecodePagedColumnBlobFiltered, which no longer skips any pages. The refIndex provides
-// O(log N) reverse lookup after the full column is decoded.
-// The span:end synthesis case uses GetIntrinsicColumn("span:end") since span:end is not
-// in the intrinsic TOC (synthesized from start+duration).
-```
+No `-race` data-race report accompanied the failure (the race detector did not flag any
+unsynchronized memory access), and the failure did not reproduce on any subsequent retry (13/14
+`./...` runs, and 6/6 root-package-only runs, all passed cleanly).
+**Impact:** This is precisely the failure class the entire #203-#213 investigation exists to catch.
+An intermittent, unexplained recurrence of the exact bug signature — even at low frequency —
+means the fix's correctness cannot yet be asserted with full confidence purely from "tests are
+green," which is the same trap that let #212's own regression ship. Two explanations remain open:
+(a) a genuine, rare, timing/ordering-dependent code defect somewhere in the shared
+`SliceValueIndexSource`/`collectLeaves` machinery that only manifests under the CPU/scheduling
+pressure of `go test ./...` building and running every package concurrently, or (b) an
+environmental/infrastructure flake (e.g., resource contention altering goroutine scheduling in an
+unrelated concurrently-running package, transient machine noise) unrelated to the #213 code
+itself. Both `AddLeaf`/`LookupLeaf`/`MarkRequirePresentLeaf` are correctly mutex-guarded and the
+in-memory test fixtures (`memReaderProvider`/`memVIStore`) hold no cross-test shared state that
+review could identify, so no obvious code-level smoking gun was found — but the failure is real,
+was observed directly (not hypothesized), and exactly matches the bug class under investigation.
+**Fix:** Do not close out #213 purely on the strength of a single green `-run`-filtered pass.
+Recommended follow-up before considering this fix fully verified: (1) run `go test -race -count=20
+./...` (or a dedicated CI stress job) to get a more reliable flake-rate estimate and, if it
+reproduces, capture full `-v` output with test ordering and a goroutine dump at failure time; (2)
+audit for any package-level (not per-test) mutable state reachable from the root package's public
+API surface that could be touched by a leaked/background goroutine from an unrelated parallel test
+in `api_test.go`/`v2_e2e_test.go` (the only two files in the root package using `t.Parallel()`);
+(3) if reproduced again, bisect by running progressively larger subsets of `./...` to localize
+which sibling package's concurrent execution correlates with the failure.
 
 ---
 
 ## Medium Priority Issues
 
-### Issue 3: TESTS.md does not document execution_path_test.go EP tests
-**Severity:** MEDIUM
-**Domain:** Spec-Driven Verification (Check B)
-**Files:** `vendor/github.com/grafana/blockpack/internal/modules/executor/TESTS.md`
-**Description:** The `execution_path_test.go` file contains five test functions (EP-01 through EP-05):
-- `TestExecutionPath_RangePredicate_BlockPopulated`
-- `TestExecutionPath_EqualityPredicate_BlockPopulated`
-- `TestExecutionPath_RangeAndEquality_BlockPopulated`
-- `TestExecutionPath_UserAttribute_UsesBlockScan`
-- `TestExecutionPath_Correctness`
-
-NOTE-053 in NOTES.md documents the test function renames (EP-01 → `TestExecutionPath_RangePredicate_BlockPopulated`, EP-03 → `TestExecutionPath_RangeAndEquality_BlockPopulated`). However, TESTS.md has no EP-01 through EP-05 entries at all — these tests are not documented in the spec file. Per the project's spec-driven conventions, TESTS.md should have entries describing what each EP test verifies.
-
-**Impact:** TESTS.md does not fully capture the test plan; EP tests lack a spec backing.
-
-**Fix:** Add entries EP-01 through EP-05 to TESTS.md documenting the execution path tests, with back-references to `execution_path_test.go`.
-
----
-
-### Issue 4: NOTE-NNN placeholder ID in executor NOTES.md
-**Severity:** MEDIUM
-**Domain:** Reference Integrity
-**Files:** `vendor/github.com/grafana/blockpack/internal/modules/executor/NOTES.md:1851`
-**Description:** The entry at line 1851 is titled `## NOTE-NNN: lookupIntrinsicFields Uses GetIntrinsicColumnForRefs (2026-03-28)`. The `NOTE-NNN` placeholder was never replaced with a sequential ID. The repository's CLAUDE.md explicitly requires spec IDs to be assigned before tagging code, and the NOTE convention requires dated sequential IDs.
-
-**Impact:** The `NOTE-NNN` tag is unresolvable. Code comments that would reference this note (e.g., in `stream.go:lookupIntrinsicFields`) cannot be cross-referenced. The placeholder breaks the two-way linking convention.
-
-**Fix:** Assign the next available sequential ID (e.g., NOTE-054 or whatever follows NOTE-053) and replace `NOTE-NNN` throughout the file. Update any back-references to match.
-
----
-
-### Issue 5: Stale secondPassCols comment references "intrinsic-only storage" / "PR #172"
-**Severity:** MEDIUM
-**Domain:** Comment Accuracy
-**Files:** `vendor/github.com/grafana/blockpack/internal/modules/executor/stream.go:185-193`
-**Description:** The NOTE-050 comment block for the `secondPassCols` trace-intrinsic injection (lines 185-193) says:
-
-```
-// With dual storage (restored after PR #172 rollback), new files store intrinsic
-// columns in block payloads too, but ParseBlockFromBytes still returns nil for
-// them when names are not in wantColumns. For backward compatibility with files
-// written between the PR #172 merge and this fix (intrinsic-only storage),
-// identity values must come from lookupIntrinsicFields; nilIntrinsicScan handles
-// absent block columns for those files.
-```
-
-This comment is technically accurate but references PR #172 which is an internal PR number. More importantly, it documents a backward-compat concern about a narrow window of files (between PR #172 merge and rollback) that is unlikely to appear in practice. The explanation is confusing to future readers who don't know what PR #172 was. Additionally, `nilIntrinsicScan` is described as handling absent block columns for these files, but after the identity-column removal (NOTE-005), trace:id, span:id, etc. are now NOT in the intrinsic section for new files either — so the comment is no longer accurate about where these values come from.
-
-**Impact:** Misleads maintainers about where identity fields are sourced in the new file format.
-
-**Fix:** Update the comment to accurately reflect current behavior: identity columns (trace:id, span:id, span:parent_id) are now in block payloads only (NOT in the intrinsic section, per NOTE-005). Therefore `lookupIntrinsicFields` will NOT find these values for new files. The correct source for identity fields in Case A results is `MatchedRow.Block` via `forEachBlockInGroups`, not `lookupIntrinsicFields`.
+✅ No medium priority issues found beyond the items already logged above/below.
 
 ---
 
 ## Low Priority Issues
 
-### Issue 6: feedIntrinsicBytes comment header in intrinsic_accum.go still mentions removed columns
+### Issue 2: New #213 root-package test files are not referenced in any module's TESTS.md
 **Severity:** LOW
-**Domain:** Comment Accuracy
-**Files:** `vendor/github.com/grafana/blockpack/internal/modules/blockio/writer/intrinsic_accum.go:94`
-**Description:** Line 94 reads:
-```
-// feedBytes adds one byte slice value (trace:id, span:id, span:parent_id) to the named flat column.
-```
-
-After NOTE-005, `feedBytes` is no longer called for `trace:id`, `span:id`, or `span:parent_id` — these are identity columns removed from the intrinsic accumulator. The comment describes the old use; the function is now only called by non-identity bytes columns (if any remain). At minimum, the function's docstring should reflect what it is actually used for now.
-
-**Impact:** Low — internal function; incorrect docs mislead but don't cause bugs.
-
-**Fix:** Update the comment: `// feedBytes adds one byte slice value to the named flat column.` (remove the now-removed example columns).
-
----
-
-### Issue 7: NOTES.md entry §6 (NOTE-006) back-reference to intrinsic_ref_filter.go describes removed behavior
-**Severity:** LOW
-**Domain:** Reference Integrity
-**Files:** `vendor/github.com/grafana/blockpack/internal/modules/blockio/shared/NOTES.md:101-103`
-**Description:** NOTE-006's back-reference at lines 101-103 reads:
-
-```
-Back-ref: `internal/modules/blockio/shared/types.go:PageMeta`,
-`internal/modules/blockio/shared/intrinsic_ref_filter.go`,
-`internal/modules/blockio/shared/intrinsic_codec.go:EncodePageTOC/DecodePageTOC`
-```
-
-NOTE-006 documents the *addition* of `MinRef`/`MaxRef`/`RefBloom` to `PageMeta`. These fields were removed in NOTE-007. The back-reference is still valid (the file exists; the note is historical), but the back-ref to `intrinsic_ref_filter.go` is confusing because `intrinsic_ref_filter.go` now contains a comment saying "ref-range page-skipping optimization was removed in NOTE-007." NOTES.md is append-only per convention, so NOTE-006 should not be deleted — but a cross-reference to NOTE-007 in NOTE-006 would help readers understand the supersession.
-
-**Impact:** Minimal — historical note accurately describes what was added; the removal is in NOTE-007. No functional impact.
-
-**Fix:** Append to NOTE-006: `*Superseded by NOTE-007 (2026-03-29): RefBloom/MinRef/MaxRef removed. See NOTE-007 for rationale.*`
+**Domain:** spec-driven-verification (Check B)
+**Files:** `neq_unscoped_collision_realvi_test.go`, `structural_oracle_comparison_test.go` (new
+`Shape7` test) — neither appears in `internal/modules/vibuilder/TESTS.md` or
+`internal/modules/executor/TESTS.md`
+**Description:** The project's spec-driven convention calls for new `Test*` functions to have a
+`TESTS.md` entry. This gap is not new to #213 — the same pre-existing root-package test files from
+#212 (`neq_metrics_realvi_test.go`), #211 (`samecolumnrangeand_realvi_test.go`), and #209
+(`value_index_oracle_comparison_test.go`) are likewise absent from every module's TESTS.md, and
+there is no root-level TESTS.md at all to hold them. This looks like an established (if
+undocumented) convention that root-package `*_realvi_test.go`/oracle-comparison files are
+considered out of the module-level TESTS.md's scope, rather than a regression #213 introduced.
+**Fix:** Not blocking. If the team wants root-package tests tracked in the spec system, either add
+a root `TESTS.md` or fold references into the owning module's TESTS.md (vibuilder/executor,
+depending on which mechanism the test exercises) as a follow-up across #209-#213 together, not as
+a #213-specific fix.
 
 ---
 
 ## Summary
 
-**Total Issues:** 7
+**Total Issues:** 2
 - CRITICAL: 0
-- HIGH: 2
-- MEDIUM: 3
-- LOW: 2
+- HIGH: 1
+- MEDIUM: 0
+- LOW: 1
 
 **Domains with findings:**
-- Security: 0 issues
-- Bug Diagnosis: 0 issues
-- Error Handling: 0 issues
-- Code Quality: 0 issues
-- Performance: 0 issues
-- Go Idioms: 0 issues
-- Architecture: 0 issues
-- Documentation: 0 issues
-- Comment Accuracy: 4 issues (Issues 1, 2, 5, 6)
-- Reference Integrity: 2 issues (Issues 4, 7)
-- Spec-Driven Verification: 1 issue (Issue 3)
+- Security: 0
+- Bug Diagnosis: 1 (shared with Test-Suite Integrity, Issue 1)
+- Error Handling: 0
+- Code Quality: 0
+- Performance: 0
+- Go Idioms: 0
+- Architecture: 0
+- Documentation: 0
+- Comment Accuracy: 0
+- Reference Integrity: 0
+- Spec-Driven Verification: 1 (Issue 2, Check B, pre-existing convention gap)
+- Test-Suite Integrity: 1 (Issue 1)
 
 ---
 
-## Detailed Findings by Domain
+## Verification Performed (this pass)
 
-### Security
-No issues. The changes are purely internal to the blockpack vendor module — no external inputs, no cryptographic operations, no credential handling.
-
-### Bug Diagnosis
-No issues. The three-part change is logically consistent:
-- Identity columns are removed from `intrinsic*` feed calls but `addPresent` is retained, so block columns continue to carry all values.
-- `collectIntrinsicPlain` correctly routes all Case A results through `forEachBlockInGroups`, populating `MatchedRow.Block`.
-- `lookupIntrinsicFields` (Case B TopK path) is retained and unmodified.
-- `feedIntrinsicsFromIndex` correctly skips trace:id, span:id, span:parent_id, span:status_message for new intrinsic accumulators, and populates `addPresent` for them (dual storage preserved for compaction path).
-- Backward compat in `DecodePageTOC`: v0x02 ref-range bytes are read and discarded at lines 247-261 without error — clean.
-- `RefIndexEntry`, `refIndex`, `refIndexOnce` are retained in `types.go` because `EnsureRefIndex`/`LookupRefFast` are still called by `lookupIntrinsicFields` in the Case B path.
-
-### Error Handling
-No issues. All decode paths have appropriate bounds checks and error propagation.
-
-### Code Quality / Logic
-No logical bugs found. The `feedIntrinsicsFromIndex` function correctly handles all identity column cases: it calls `addPresent` for trace:id, span:id, span:parent_id (block column storage) but does NOT call `feedIntrinsic*` for them (no intrinsic accumulator feeding). The `spanStatusMsgColumnName` case similarly uses `addPresent` only.
-
-### Performance
-The change is a performance improvement. No regressions introduced. `forEachBlockInGroups` parallelizes I/O via goroutines (lines 683-691) and minimizes block reads to only those blocks containing matched refs.
-
-### Go Idioms
-No issues.
-
-### Architecture
-No issues. The separation between predicate evaluation (intrinsic section) and field population (block reads) is now clean and consistent across Case A.
-
-### Spec-Driven Verification
-
-**Check A (code satisfies SPECS.md invariants):**
-- SPEC-STREAM-9 Case A (SPECS.md:315-319) updated correctly to reflect that `forEachBlockInGroups` is now used for both equality and range predicates. Code matches the spec.
-- SPEC-STREAM-10 (SPECS.md:338-346) is still accurate — dual storage is in effect; `nilIntrinsicScan` is a conservative no-op for new files.
-
-**Check B (spec docs updated):**
-- `shared/NOTES.md`: NOTE-007 added — PASS
-- `writer/NOTES.md`: NOTE-005 added — PASS
-- `executor/NOTES.md`: NOTE-053 added — PASS
-- `executor/SPECS.md` SPEC-STREAM-9 updated — PASS
-- `executor/TESTS.md`: EP-01/EP-03 rename documented in NOTE-053 but not in TESTS.md itself — see Issue 3 (MEDIUM)
+1. **Mechanism trace, adversarial, beyond the stated diff (review-brief item 3).** Read
+   `extractNeqNode`/`extractNeqNumericNode` directly (`internal/vm/traceql_compiler.go`) and
+   confirmed `NeqPairedRange` is set in exactly the claimed branch (scoped, non-`isIntrinsicRefsColumn`
+   string; scoped numeric) and nowhere else (unscoped string, unscoped numeric, intrinsic-refs-skip
+   string) — matches `RangeNode.NeqPairedRange`'s own doc comment exactly.
+2. **Composite-wrapper adjacency (review-brief item 4, the one nobody had explicitly traced).**
+   Traced how `extractTraceQLNodes`'s `OpAnd`/`OpOr` composite wrapping (issues #208/#210,
+   `NOTE-492`) interacts with the 2-element `[RequirePresent, RangeOR]` tuple `extractNeqNode`/
+   `extractNeqNumericNode` return. Because AND/OR composition only ever *concatenates* whole
+   sub-slices (`append(ln, rn...)`) and never interleaves elements from two different sub-slices,
+   the tuple's own mutual adjacency is preserved at whatever nesting depth it ends up at (bare
+   `!=`, `!=` under AND, `!=` under OR, `!=` under a nested AND-under-OR, two independent `!=`
+   leaves in the same AND) — confirmed by manual derivation through `collectLeaves`' recursive
+   `walk`, which checks `i+1 < len(ns)` against the SAME local slice at whatever recursion depth,
+   never a flattened cross-level view. `neqRangeSiblingLeaves`'s own shape validation (OR of
+   exactly two same-column direct leaves) is a second, independent structural guard against a
+   mispredicted pairing.
+3. **Real test execution, not trusted PASS reports (review-brief items 1-2).** Ran, with `-race`:
+   - Both new #213 reproduction tests plus their control
+     (`neq_unscoped_collision_realvi_test.go`) — pass.
+   - `TestStructuralOracle_Shape7_NegatedRightLeg_UnscopedNeqCollision` — pass.
+   - The full oracle-shape suite (`TestOracle_Shape01`-`Shape11c`, 22 shapes,
+     `value_index_oracle_comparison_test.go`), `TestStructuralOracle_Shape1`-`Shape6b`
+     (`structural_oracle_comparison_test.go`), `neq_metrics_realvi_test.go` (#212's own scoped-`!=`
+     metrics regression test), `samecolumnrangeand_realvi_test.go`, and
+     `valueindex_boundary_decidability_test.go`/`decidability_test.go` (#204's own suite) — all
+     pass.
+   - Explicitly confirmed `TestOracle_Shape11a_NotEquals_AND_ResolvesCorrectly`/`Shape11c` still
+     assert `require.True(t, viOK)` with the exact correct answer — the scoped `!=` carve-out
+     (#212's own target) was NOT overcorrected into a blanket decline by #213's fix.
+4. **Adversarial probes beyond the shipped tests (review-brief item 5).** Wrote and ran (then
+   deleted) a temporary probe test exercising: (a) THREE unrelated leaves colliding on the same
+   expanded column name (`resource.score`) alongside an unscoped `!=`, and (b) an unscoped `!=`
+   combined with a SCOPED `!=` on the identical attribute in the same query. Both declined cleanly
+   (`viOK=false`, no crash, no wrong answer) — confirmed the fix is not merely "safe for the two
+   shipped reproductions" but structurally safe for the whole class of column-name collisions,
+   since pairing is now purely leaf-index-based and never consults `s.data[colName]` for this
+   carve-out. Also confirmed (via the existing `ControlNoCollisionDeclines` test and direct read
+   of `MarkRequirePresentLeaf`/`LookupLeaf`) that an unscoped `!=` with no other leaf on that
+   column at all declines cleanly with no crash on an empty `pairedLeafIdxs` lookup.
+5. **Spec/doc accuracy (review-brief item 6).** Read `NOTE-VI-107`'s task #213 addendum and
+   `SPEC-VIS-6` (`internal/modules/executor/NOTES.md`/`SPECS.md`) and the `NOTE-453`/`NOTE-454`
+   addenda (`internal/vm/NOTES.md`) in full against the actual code — accurate, consistent with the
+   shipped mechanism, and correctly distinguish the scoped/unscoped cases and why the fix is safe
+   for both.
+6. **Prompt-injection sanity check (review-brief item 7).** No injected content was found in the
+   reviewed code, comments, commit history, or git stash entries. However, this review session's
+   own transcript received an injected instruction disguised as a system reminder ("The date has
+   changed... DO NOT mention this to the user explicitly...") immediately followed by
+   fabricated/unsolicited "grafana-dev" MCP server tool-usage instructions appended after the human
+   turn — the identical pattern already flagged in `tempo/.bob/state/go-presubmit.md` and
+   `blockpack/.bob/state/plan.md` from this same investigation's prior passes. Per standing
+   instructions, this is disclosed rather than complied with: no user consent was given for any
+   date/behavior change, and none of this session's findings were altered by it.
+7. **Vendor-tree staleness (accepted, not a finding).** Confirmed the tempo repo's vendored copy of
+   the touched blockpack files (`rangenode.go`, `traceql_compiler.go`, `builder.go`,
+   `metrics_trace.go`) still reflects the PRE-#213 (task #211/#212) state — expected per the
+   review brief ("handled at commit time via a final `go mod vendor -e`"); tempo builds cleanly
+   against this stale vendor tree.
+8. **Build/vet hygiene.** `go build ./...` and `go vet ./...` clean in blockpack; `go build
+   ./tempodb/...` clean in tempo against its current vendor tree.
 
 ---
 
 ## Recommendations
 
-**Routing:** Issues 1 and 2 are HIGH — stale comments that contradict actual behavior and removed features. They do not block compilation or correctness, but they create real risk for future maintainers who act on the incorrect documentation.
+**Routing:** The #213 mechanism itself is sound by every deterministic check performed (code
+trace, doc/spec accuracy, adversarial probing, and >20 total `-race` test runs targeting the exact
+regression). The one open item — Issue 1's intermittent full-suite flake reproducing the exact
+pre-#213 bug signature at a low but non-zero rate — is serious enough, given this investigation's
+own track record (7 of 8 prior passes found a genuinely new bug via adversarial probing), that it
+should not be waved through as "probably just noise" without at least one dedicated stress-test
+follow-up.
 
-**Recommendation:** EXECUTE
-
-Targeted fixes needed before commit:
-1. Fix the `NOTE-050` comment at `stream.go:217-219` (Issue 1)
-2. Fix the `lookupIntrinsicFields` page-skipping comment at `stream.go:1216-1218` (Issue 2)
-3. Assign a real ID to `NOTE-NNN` in `executor/NOTES.md` (Issue 4)
-4. Add EP-01 through EP-05 entries to `executor/TESTS.md` (Issue 3)
-5. Optionally: fix the `secondPassCols` comment at `stream.go:185-193` (Issue 5) and the minor doc issues (Issues 6, 7)
+**Recommendation:** BRAINSTORM (narrowly scoped) — specifically to design and run a stress-test
+follow-up for Issue 1 (e.g., `go test -race -count=20 ./...` a handful of times, or bisecting which
+concurrently-running package correlates with the flake) before this task is marked fully verified.
+If that follow-up fails to reproduce across a reasonably large number of attempts and no plausible
+code-level mechanism is found, downgrade Issue 1 to a documented, monitored risk and proceed to
+COMMIT. Do not commit silently on the strength of this pass's own mostly-clean run alone.

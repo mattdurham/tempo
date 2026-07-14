@@ -256,6 +256,12 @@ type FetchSpansResponse struct {
 	Results SpansetIterator
 	// callback to get the size of data read during Fetch
 	Bytes func() uint64
+	// callback to get the value-index (+ structural-value-index) bytes read during Fetch.
+	// nil when the implementer does not track this category (issue #218).
+	IndexBytes func() uint64
+	// callback to get the data-file/block-scan bytes read during Fetch.
+	// nil when the implementer does not track this category (issue #218).
+	DataFileBytes func() uint64
 }
 
 type SpanIterator interface {

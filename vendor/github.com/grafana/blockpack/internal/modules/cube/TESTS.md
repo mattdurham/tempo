@@ -246,4 +246,10 @@ phase's ID-routing convention (FOOTGUN 5, `.bob/state/spec-knowledge-phase-e.md`
 | TEST-CUBE-101 | `TestColumnFilterToFilter` | definition_test.go | Table test covering every representable ColumnFilter.Value shape (numeric string, Go-duration string, direct float64/int, non-numeric string via EQ fallback to StringFilter) plus the unrepresentable case (GT on a non-numeric string, which must return nil). |
 | TEST-CUBE-102 | `TestColumnFilterToFilter_MissingColumnRejected` | definition_test.go | A span missing the filtered column is rejected by both the NumericFilter-backed and StringFilter-backed conversion paths — a missing column can never satisfy a filter. |
 
-**Next free ID: TEST-CUBE-103.**
+## TEST-CUBE-103 — Cube-bytes capture for byte-breakdown metrics (issue #218, Phase 5)
+
+| ID | Test | File | Scenario/Setup/Assertions |
+|----|------|------|---------------------------|
+| TEST-CUBE-103 | `TestReader_BytesRead_ReportsExactInputLength` | reader_test.go | Setup: a real cube file built via Writer.AddAggCell→Encode, opened both via OpenReaderFromBytes(data) and via OpenReader(path) (data written to a temp file first). Assertion: BytesRead() equals exactly len(data) for both open paths — mutation-verified (an off-by-one mutation on BytesRead()'s return was confirmed to fail this test, then reverted). |
+
+**Next free ID: TEST-CUBE-104.**

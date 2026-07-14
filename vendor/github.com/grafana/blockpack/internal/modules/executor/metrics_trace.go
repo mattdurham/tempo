@@ -145,7 +145,7 @@ func ExecuteTraceMetricsFromVI(
 
 	numBuckets := (tb.EndTime - tb.StartTime + tb.StepSizeNanos - 1) / tb.StepSizeNanos
 	if numBuckets <= 0 {
-		return &TraceMetricsResult{}, true, nil
+		return &TraceMetricsResult{IndexBytesRead: viIndexBytesRead(source)}, true, nil
 	}
 
 	// Count distinct TraceIDs per bucket. A TraceID may appear in multiple spans;
@@ -189,9 +189,20 @@ func ExecuteTraceMetricsFromVI(
 	}
 
 	result := &TraceMetricsResult{
-		Series: []TraceTimeSeries{{Values: values}},
+		Series:         []TraceTimeSeries{{Values: values}},
+		IndexBytesRead: viIndexBytesRead(source),
 	}
 	return result, true, nil
+}
+
+// viIndexBytesRead returns the total value-index byte count the querier's ValueIndexSource
+// downloaded resolving this query (issue #218), or 0 when source isn't the production
+// *SliceValueIndexSource (e.g. a test fake ValueIndexSource that doesn't track file I/O).
+func viIndexBytesRead(source ValueIndexSource) int64 {
+	if sl, ok := source.(*SliceValueIndexSource); ok {
+		return sl.Stats().BytesRead
+	}
+	return 0
 }
 
 // viMatchSpans walks the program's predicate tree and resolves the matching spans

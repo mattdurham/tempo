@@ -405,6 +405,10 @@ func (i *instance) SearchTagsV2(ctx context.Context, req *tempopb.SearchTagsRequ
 		Scopes: make([]*tempopb.SearchTagsV2Scope, 0, len(collected)+1), // +1 for intrinsic below
 		Metrics: &tempopb.MetadataMetrics{
 			InspectedBytes: mc.TotalValue(), // capture metrics
+			// issue #218 Phase 8: SearchTags never consults the value index or VCNT for
+			// either backend (see tempodb.go's tag-search sites) — mc.TotalValue() is
+			// entirely data-file/block-scan bytes, real head/WAL/complete blocks alike.
+			DataFileBytesRead: mc.TotalValue(),
 		},
 	}
 	for scope, vals := range collected {
@@ -473,7 +477,9 @@ func (i *instance) SearchTagValues(ctx context.Context, req *tempopb.SearchTagVa
 
 	return &tempopb.SearchTagValuesResponse{
 		TagValues: distinctValues.Strings(),
-		Metrics:   &tempopb.MetadataMetrics{InspectedBytes: mc.TotalValue()},
+		// issue #218 Phase 8: see SearchTagsV2 above — mc.TotalValue() is entirely
+		// data-file bytes for this all-scan tag-value search.
+		Metrics: &tempopb.MetadataMetrics{InspectedBytes: mc.TotalValue(), DataFileBytesRead: mc.TotalValue()},
 	}, nil
 }
 
@@ -626,7 +632,11 @@ func (i *instance) SearchTagValuesV2(ctx context.Context, req *tempopb.SearchTag
 	metricQueryInspectedBytesTotal.WithLabelValues(i.tenantID, queryOpSearchTagValues).Add(float64(mCollector.TotalValue()))
 
 	resp := &tempopb.SearchTagValuesV2Response{
-		Metrics: &tempopb.MetadataMetrics{InspectedBytes: mCollector.TotalValue()}, // include metrics in response
+		// issue #218 Phase 8: see SearchTagsV2 above — mCollector.TotalValue() is entirely
+		// data-file bytes for this all-scan tag-value search. Note: a disk-cache hit's
+		// contribution (mCollector.Add(len(cacheData)) above) is also a real data-file-style
+		// byte count (cached serialized bytes), not VI/VCNT, so it belongs in this same field.
+		Metrics: &tempopb.MetadataMetrics{InspectedBytes: mCollector.TotalValue(), DataFileBytesRead: mCollector.TotalValue()},
 	}
 
 	for _, v := range vCollector.Values() {

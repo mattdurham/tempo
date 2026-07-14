@@ -7984,3 +7984,61 @@ Back-ref: `internal/modules/executor/stream_structural.go:ExecuteStructural`. Se
 SPEC-STRUCT-13, SPEC-STRUCT-14. Tests: `stream_structural_budget_test.go`
 (`TestExecuteStructural_EmitsBudgetStatsOnQuerySpan`,
 `TestExecuteStructural_UnboundedPath_BudgetAttributesAreZeroValue`). Issue #493.
+
+## NOTE-493: `stream_topk_intrinsic_unbounded_test.go`'s residual flake was a counting/scheduling race in `blockGroupPipeline`, not a bug (task #215)
+
+*Added: 2026-07-13*
+
+Task #215 investigated a one-off flake in the #197 regression guard
+(`TestCollect_IntrinsicOnlyPredicate_MostRecentLimit_ScansEntireFile`): during one full
+`go test ./...` run, `blockScanStep.IOOps == totalGroups` (2 == 2), violating the test's strict
+`IOOps < totalGroups` assertion, while the test passed reliably (10/10) in isolation.
+
+**Root cause confirmed by direct code reading + ~150+ stress-repro attempts under artificial CPU
+contention (`yes > /dev/null` on many cores, `-race`, both the original 2-group fixture and a
+larger one).** `blockGroupPipeline`'s dispatcher (`block_group_pipeline.go`) pre-fills its
+semaphore with `defaultPipelineWorkers` (8, NOTE-058) tokens and dispatches the first
+`min(defaultPipelineWorkers, totalGroups)` groups unconditionally — there is no synchronous,
+per-group check of `topKScanBlocks`' heap-saturation early-stop signal before a dispatch; that
+check only runs, sequentially, inside `processGroup` once a group's own I/O has already
+completed (SPEC-STREAM-11's own contract already documents the semaphore-only backpressure
+model; SPEC-STREAM-13's R14-AMENDED note already named this exact tradeoff for the now-retired
+`RecentFirstBudget` mechanism — this is the same `blockGroupPipeline` behavior, not a new
+mechanism). For a file with `totalGroups <= defaultPipelineWorkers` (the original fixture had
+exactly 2), this burst covers the *entire file*, so whether the early-stop actually reduces
+`IOOps` below `totalGroups` depends entirely on whether the group that triggers
+`errLimitReached` finishes its I/O and reaches `blockGroupPipeline`'s ordered consumer loop
+before the other already-dispatched groups' I/O completes and lands in the (buffered, order-
+independent) `results` channel — a genuine goroutine/OS-thread scheduling race, confirmed
+empirically to range from 1 up to (but never beyond) `defaultPipelineWorkers` groups fetched,
+regardless of `totalGroups`.
+
+**This is not a data-correctness bug — results are unaffected** (`processGroup` runs strictly
+in ascending group order; a group whose I/O raced ahead but was never delivered to
+`processGroup` before cancellation never contributes rows) — only the `IOOps`/`BytesRead` cost
+metrics can occasionally be as high as the full `defaultPipelineWorkers` burst even when the
+early-stop condition was satisfiable after the very first group. Given this is inherent to
+`blockGroupPipeline`'s existing, already-accepted concurrency model (not something introduced
+by #197's fix, and not proportionate to redesign for a LOW-severity, narrow I/O-count tightness
+issue), the fix landed here is test-only:
+
+1. `predicates_export_test.go` now exports `DefaultPipelineWorkers = defaultPipelineWorkers` for
+   tests that need to reason about the pipeline's worker-count ceiling.
+2. `stream_topk_intrinsic_unbounded_test.go`'s fixture (`numSpans`) was increased from 2600 to
+   26000, so `totalGroups` (13) comfortably exceeds `defaultPipelineWorkers` (8) — giving the
+   assertion real headroom instead of a knife-edge race.
+3. The assertion changed from `IOOps < totalGroups` to `IOOps <= DefaultPipelineWorkers`: a
+   tighter, *documented*, empirically-verified ceiling (not a vacuous `<=totalGroups`, which
+   would provide zero regression protection) that still fails hard if #197 ever regresses (which
+   would push `IOOps` toward `totalGroups`, far past the ceiling).
+4. The file's header comment (previously written pre-#197-fix: "Do not fix the underlying bug
+   here... this assertion currently FAILS") was rewritten to reflect that #197 is fixed, this is
+   now a permanent regression guard, and the residual scheduling-dependent ceiling above.
+
+See SPEC-STREAM-14's 2026-07-13 qualification for the formal contract update.
+
+Back-ref: `internal/modules/executor/block_group_pipeline.go:blockGroupPipeline`,
+`internal/modules/executor/stream_topk.go:topKScanBlocks`,
+`internal/modules/executor/predicates_export_test.go`,
+`internal/modules/executor/stream_topk_intrinsic_unbounded_test.go`. See SPEC-STREAM-11,
+SPEC-STREAM-13 (R14-AMENDED), SPEC-STREAM-14. Issue #197, task #215.

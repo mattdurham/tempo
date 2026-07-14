@@ -11,7 +11,7 @@ SPEC-ROOT-009 — this file's own sequence, numbering from 1, independent of
 `internal/modules/valuecounts/TESTS.md`'s own separate `TEST-VC-N` sequence). IDs are assigned
 in ascending order and never reused or renumbered.
 
-Next free ID: **TEST-VC-30**.
+Next free ID: **TEST-VC-32**.
 
 ---
 
@@ -57,7 +57,7 @@ Back-ref: `internal/modules/valuecountscompactor/config_test.go:TestConfig_AllTe
 shape VCNT's compactor relies on (no `<type>` segment, unlike VI's three-level walk).
 
 **Assertions:** Given two objects under distinct column-hash subdirectories,
-`ListDirs("t1/value_counts/")` returns exactly those two immediate child directory
+`ListDirs("t1/indexes/unique_values/")` returns exactly those two immediate child directory
 prefixes.
 
 Back-ref: `internal/modules/valuecountscompactor/store_test.go:TestFakeStore_ListDirsOneLevel`.
@@ -96,7 +96,7 @@ Back-ref: `internal/modules/valuecountscompactor/metrics_test.go:TestNewCompacto
 *Added: 2026-07-02*
 
 **Scenario:** `buildWorkList` discovers all `(tenant, colDir)` pairs via the one-level
-`value_counts/<colHash>/` walk.
+`unique_values/<colHash>/` walk.
 
 **Setup:** Two columns' worth of L0 files under one tenant.
 
@@ -547,3 +547,55 @@ production).
 
 Back-ref: `internal/modules/valuecountscompactor/config_test.go:TestConfig_WithDefaults_MaxTimeSpanPerMerge`.
 Issue #494, task A5/#94.
+
+---
+
+## TEST-VC-30: colHash-manifest hook — happy path, nil-store no-op, fast-error tolerance
+*Added: 2026-07-13 (task #216)*
+
+**Scenario:** `mergeLevel`'s best-effort colHash-manifest hook (`recordManifestEntry`,
+SPEC-VC-4) records an entry when configured, is a pure no-op when unconfigured, and never fails
+the real merge when the manifest store returns a fast error.
+
+**Setup/Assertions (`manifest_hook_test.go`):**
+
+- `TestMergeLevel_RecordsManifestEntry` — a configured `ManifestStore` records exactly one
+  manifest entry decoding to the correct `ColumnName`/`ColumnHash`/`FirstSeenBy`.
+- `TestMergeLevel_NilManifestStoreIsNoOp` — the default (unset) `ManifestStore` leaves
+  compaction entirely unaffected.
+- `TestMergeLevel_ManifestPutFailureDoesNotFailMerge` (`manifestPutFailStore`) — a manifest
+  `Put` that returns a FAST error (not a hang) never fails `mergeLevel`; the real compacted
+  output is still written.
+
+**Spec invariants tested:** SPEC-VC-4.
+
+Back-ref: `internal/modules/valuecountscompactor/manifest_hook_test.go`.
+
+---
+
+## TEST-VC-31: colHash-manifest hook — hanging-store bound and in-process cache (task #216 post-review fix pass)
+*Added: 2026-07-13*
+
+**Scenario:** Two follow-up findings from task #216's review pass (CRITICAL + HIGH): `mergeLevel`
+must remain bounded even when the manifest store HANGS (not merely errors fast), and a second
+merge of an already-recorded column must not re-issue the manifest `Get`.
+
+**Setup/Assertions (`manifest_hook_test.go`):**
+
+- `TestMergeLevel_HangingManifestStoreDoesNotBlockMerge` — a `hangingManifestStore` wrapping
+  `fakeStore` so calls to the manifest path (only) block on `<-ctx.Done()` must still let
+  `RunOnce` return within a bounded time (via `colhashmanifest.manifestOpTimeout`,
+  SPEC-COLMANIFEST-5) and still write the real compacted output. Confirmed red (hung
+  indefinitely) before `colhashmanifest`'s timeout fix landed, green (~6s, 2x
+  `manifestOpTimeout`) after.
+- `TestMergeLevel_ManifestCacheSkipsRepeatedGet` — two independent merges of the same
+  `(tenant, colHash)` must issue exactly 1 manifest `Get` total across both, via the new
+  `store.manifestGetCalls` counter (SPEC-VC-5). Confirmed red (2 calls) before
+  `Service.manifestSeen` was added, green (1 call) after.
+
+**Spec invariants tested:** SPEC-VC-5, `colhashmanifest/SPECS.md` SPEC-COLMANIFEST-5.
+
+Back-ref: `internal/modules/valuecountscompactor/manifest_hook_test.go`,
+`internal/modules/valuecountscompactor/store_test.go:fakeStore.getCalls,manifestGetCalls`. See
+`colhashmanifest/TESTS.md` TEST-COLMANIFEST-15 (the package-level counterpart of the
+hanging-store test) and `NOTES.md` NOTE-VC-021.

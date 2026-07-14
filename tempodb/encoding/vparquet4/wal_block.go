@@ -739,6 +739,14 @@ func (b *walBlock) Fetch(ctx context.Context, req traceql.FetchSpansRequest, _ c
 			}
 			return totalBytesRead
 		},
+		IndexBytes: func() uint64 { return 0 },
+		DataFileBytes: func() uint64 {
+			var totalBytesRead uint64
+			for _, r := range readers {
+				totalBytesRead += r.BytesRead()
+			}
+			return totalBytesRead
+		},
 	}, nil
 }
 

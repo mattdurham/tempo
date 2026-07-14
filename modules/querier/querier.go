@@ -39,6 +39,7 @@ import (
 	"github.com/grafana/tempo/pkg/validation"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding/common"
+	"github.com/grafana/tempo/tempodb/encoding/vblockpack"
 )
 
 var tracer = otel.Tracer("modules/querier")
@@ -414,7 +415,7 @@ func (q *Querier) SearchTags(ctx context.Context, req *tempopb.SearchTagsRequest
 
 	maxDataSize := q.limits.MaxBytesPerTagValuesQuery(userID)
 	distinctValues := collector.NewDistinctString(maxDataSize, req.MaxTagsPerScope, req.StaleValuesThreshold)
-	var inspectedBytes uint64
+	var inspectedBytes, dataFileBytesRead uint64
 
 	results, err := q.forLiveStoreRing(ctx, func(ctx context.Context, client tempopb.QuerierClient) (any, error) {
 		return client.SearchTags(ctx, req)
@@ -428,6 +429,9 @@ outer:
 		resp := result.(*tempopb.SearchTagsResponse)
 		if resp.Metrics != nil {
 			inspectedBytes += resp.Metrics.InspectedBytes
+			// issue #218 Phase 8: sum the live-store's own already-populated per-category
+			// breakdown, mirroring the InspectedBytes aggregation directly above.
+			dataFileBytesRead += resp.Metrics.DataFileBytesRead
 		}
 
 		for _, tag := range resp.TagNames {
@@ -444,7 +448,7 @@ outer:
 
 	return &tempopb.SearchTagsResponse{
 		TagNames: distinctValues.Strings(),
-		Metrics:  &tempopb.MetadataMetrics{InspectedBytes: inspectedBytes},
+		Metrics:  &tempopb.MetadataMetrics{InspectedBytes: inspectedBytes, DataFileBytesRead: dataFileBytesRead},
 	}, nil
 }
 
@@ -456,7 +460,7 @@ func (q *Querier) SearchTagsV2(ctx context.Context, req *tempopb.SearchTagsReque
 
 	maxBytesPerTag := q.limits.MaxBytesPerTagValuesQuery(orgID)
 	distinctValues := collector.NewScopedDistinctString(maxBytesPerTag, req.MaxTagsPerScope, req.StaleValuesThreshold)
-	var inspectedBytes uint64
+	var inspectedBytes, dataFileBytesRead uint64
 
 	// Get results from all live stores.
 	results, err := q.forLiveStoreRing(ctx, func(ctx context.Context, client tempopb.QuerierClient) (any, error) {
@@ -471,6 +475,9 @@ outer:
 		resp := result.(*tempopb.SearchTagsV2Response)
 		if resp.Metrics != nil {
 			inspectedBytes += resp.Metrics.InspectedBytes
+			// issue #218 Phase 8: sum the live-store's own already-populated per-category
+			// breakdown, mirroring the InspectedBytes aggregation directly above.
+			dataFileBytesRead += resp.Metrics.DataFileBytesRead
 		}
 
 		for _, res := range resp.Scopes {
@@ -489,7 +496,7 @@ outer:
 	collected := distinctValues.Strings()
 	resp := &tempopb.SearchTagsV2Response{
 		Scopes:  make([]*tempopb.SearchTagsV2Scope, 0, len(collected)),
-		Metrics: &tempopb.MetadataMetrics{InspectedBytes: inspectedBytes},
+		Metrics: &tempopb.MetadataMetrics{InspectedBytes: inspectedBytes, DataFileBytesRead: dataFileBytesRead},
 	}
 	for scope, vals := range collected {
 		resp.Scopes = append(resp.Scopes, &tempopb.SearchTagsV2Scope{
@@ -509,7 +516,7 @@ func (q *Querier) SearchTagValues(ctx context.Context, req *tempopb.SearchTagVal
 
 	maxDataSize := q.limits.MaxBytesPerTagValuesQuery(userID)
 	distinctValues := collector.NewDistinctString(maxDataSize, req.MaxTagValues, req.StaleValueThreshold)
-	var inspectedBytes uint64
+	var inspectedBytes, dataFileBytesRead uint64
 
 	// Virtual tags values. Get these first.
 	for _, v := range search.GetVirtualTagValues(req.TagName) {
@@ -529,6 +536,9 @@ outer:
 		resp := result.(*tempopb.SearchTagValuesResponse)
 		if resp.Metrics != nil {
 			inspectedBytes += resp.Metrics.InspectedBytes
+			// issue #218 Phase 8: sum the live-store's own already-populated per-category
+			// breakdown, mirroring the InspectedBytes aggregation directly above.
+			dataFileBytesRead += resp.Metrics.DataFileBytesRead
 		}
 
 		for _, res := range resp.TagValues {
@@ -545,7 +555,7 @@ outer:
 
 	return &tempopb.SearchTagValuesResponse{
 		TagValues: distinctValues.Strings(),
-		Metrics:   &tempopb.MetadataMetrics{InspectedBytes: inspectedBytes},
+		Metrics:   &tempopb.MetadataMetrics{InspectedBytes: inspectedBytes, DataFileBytesRead: dataFileBytesRead},
 	}, nil
 }
 
@@ -557,7 +567,7 @@ func (q *Querier) SearchTagValuesV2(ctx context.Context, req *tempopb.SearchTagV
 
 	maxDataSize := q.limits.MaxBytesPerTagValuesQuery(userID)
 	distinctValues := collector.NewDistinctValue(maxDataSize, req.MaxTagValues, req.StaleValueThreshold, func(v tempopb.TagValue) int { return len(v.Type) + len(v.Value) })
-	var inspectedBytes uint64
+	var inspectedBytes, dataFileBytesRead uint64
 
 	// Virtual tags values. Get these first.
 	virtualVals := search.GetVirtualTagValuesV2(req.TagName)
@@ -570,7 +580,7 @@ func (q *Querier) SearchTagValuesV2(ctx context.Context, req *tempopb.SearchTagV
 	// in v1 search b/c intrinsic tags like "status" are conflated with attributes named "status"
 	if virtualVals != nil {
 		// no data was read to collect virtual tags so 0 bytesRead
-		return valuesToV2Response(distinctValues, 0), nil
+		return valuesToV2Response(distinctValues, 0, 0), nil
 	}
 
 	results, err := q.forLiveStoreRing(ctx, func(ctx context.Context, client tempopb.QuerierClient) (any, error) {
@@ -585,6 +595,9 @@ outer:
 		resp := result.(*tempopb.SearchTagValuesV2Response)
 		if resp.Metrics != nil {
 			inspectedBytes += resp.Metrics.InspectedBytes
+			// issue #218 Phase 8: sum the live-store's own already-populated per-category
+			// breakdown, mirroring the InspectedBytes aggregation directly above.
+			dataFileBytesRead += resp.Metrics.DataFileBytesRead
 		}
 
 		for _, res := range resp.TagValues {
@@ -599,12 +612,12 @@ outer:
 		_ = level.Warn(log.Logger).Log("msg", "Search of tag values exceeded limit, reduce cardinality or size of tags", "tag", req.TagName, "orgID", userID, "stopReason", distinctValues.StopReason())
 	}
 
-	return valuesToV2Response(distinctValues, inspectedBytes), nil
+	return valuesToV2Response(distinctValues, inspectedBytes, dataFileBytesRead), nil
 }
 
-func valuesToV2Response(distinctValues *collector.DistinctValue[tempopb.TagValue], bytesRead uint64) *tempopb.SearchTagValuesV2Response {
+func valuesToV2Response(distinctValues *collector.DistinctValue[tempopb.TagValue], bytesRead, dataFileBytesRead uint64) *tempopb.SearchTagValuesV2Response {
 	resp := &tempopb.SearchTagValuesV2Response{
-		Metrics: &tempopb.MetadataMetrics{InspectedBytes: bytesRead},
+		Metrics: &tempopb.MetadataMetrics{InspectedBytes: bytesRead, DataFileBytesRead: dataFileBytesRead},
 	}
 	for _, v := range distinctValues.Values() {
 		v2 := v
@@ -661,6 +674,19 @@ func (q *Querier) SearchBlock(ctx context.Context, req *tempopb.SearchBlockReque
 		}
 		ctx = common.WithOriginalTraceQLQuery(ctx, queryForBackend, mostRecent)
 
+		// #217 task 1.2: install the slice-coverage-gap partial-signal side channel BEFORE
+		// dispatching Fetch calls, so an indexOnly=true slice job that tolerates a coverage-gap
+		// decline (vblockpack's Fetch, backend_block.go) has somewhere to record that fact for
+		// this function to read back below. A no-op (never read) for a non-slice-job request —
+		// opts.IndexOnly is false, so Fetch never calls markSliceCoveragePartial in that case.
+		// See slice_partial_response.go's package doc comment for why this signal must be
+		// context-carried rather than a new field on traceql.FetchSpansResponse (a shared,
+		// backend-agnostic type this vblockpack-specific concern must not touch).
+		var partialSignal *vblockpack.SliceCoveragePartialSignal
+		if req.IndexOnly {
+			ctx, partialSignal = vblockpack.WithSliceCoveragePartialSignal(ctx)
+		}
+
 		fetcher := traceql.NewSpansetFetcherWrapperBoth(
 			func(ctx context.Context, req traceql.FetchSpansRequest) (traceql.FetchSpansResponse, error) {
 				return q.store.Fetch(ctx, meta, req, opts)
@@ -677,7 +703,15 @@ func (q *Querier) SearchBlock(ctx context.Context, req *tempopb.SearchBlockReque
 		for _, name := range req.SearchReq.SkipASTTransformations {
 			compileOpts = append(compileOpts, traceql.WithSkipOptimization(name))
 		}
-		return q.engine.ExecuteSearch(ctx, req.SearchReq, fetcher, compileOpts...)
+		resp, err := q.engine.ExecuteSearch(ctx, req.SearchReq, fetcher, compileOpts...)
+		if err != nil || resp == nil || partialSignal == nil {
+			return resp, err
+		}
+		if partial, message := partialSignal.State(); partial {
+			resp.Status = tempopb.PartialStatus_PARTIAL
+			resp.Message = message
+		}
+		return resp, nil
 	}
 
 	return q.store.Search(ctx, meta, req.SearchReq, opts)
@@ -756,8 +790,10 @@ func (q *Querier) internalTagsSearchBlockV2(ctx context.Context, req *tempopb.Se
 
 	scopedVals := valueCollector.Strings()
 	resp := &tempopb.SearchTagsV2Response{
-		Scopes:  make([]*tempopb.SearchTagsV2Scope, 0, len(scopedVals)),
-		Metrics: &tempopb.MetadataMetrics{InspectedBytes: inspectedBytes},
+		Scopes: make([]*tempopb.SearchTagsV2Scope, 0, len(scopedVals)),
+		// issue #218 Phase 8: FetchTagNames (backend_block.go) never consults the value
+		// index or VCNT, so inspectedBytes here is entirely data-file bytes.
+		Metrics: &tempopb.MetadataMetrics{InspectedBytes: inspectedBytes, DataFileBytesRead: inspectedBytes},
 	}
 	for scope, vals := range scopedVals {
 		resp.Scopes = append(resp.Scopes, &tempopb.SearchTagsV2Scope{
@@ -874,7 +910,9 @@ func (q *Querier) internalTagValuesSearchBlockV2(ctx context.Context, req *tempo
 		level.Warn(log.Logger).Log("msg", "Search tags exceeded limit, reduce cardinality or size of tags", "orgID", tenantID, "stopReason", valueCollector.StopReason())
 	}
 
-	return valuesToV2Response(valueCollector, inspectedBytes), nil
+	// issue #218 Phase 8: FetchTagValues (backend_block.go) never consults the value
+	// index or VCNT, so inspectedBytes here is entirely data-file bytes.
+	return valuesToV2Response(valueCollector, inspectedBytes, inspectedBytes), nil
 }
 
 func (q *Querier) postProcessIngesterSearchResults(req *tempopb.SearchRequest, results []any) *tempopb.SearchResponse {

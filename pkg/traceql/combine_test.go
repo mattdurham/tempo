@@ -269,6 +269,36 @@ func TestCombineResults(t *testing.T) {
 	}
 }
 
+// issue #218: QueryRangeCombiner.Combine (used by querier_query_range.go's queryRangeRecent, the
+// live-store "recent" query-range path) must sum the same per-category byte breakdown
+// modules/frontend/combiner's QueryRangeMetricsCombiner already sums (response_metrics_test.go's
+// TestQueryRangeMetricsCombiner_SumsIndexDataFileAndCubeBytes) — mechanical consistency, even
+// though nothing on the live-store QueryRange path populates these fields yet.
+func TestQueryRangeCombiner_SumsIndexDataFileCubeAndVcntBytes(t *testing.T) {
+	req := &tempopb.QueryRangeRequest{
+		Query: "{ } | count_over_time()",
+		Start: uint64(time.Now().Add(-time.Hour).UnixNano()),
+		End:   uint64(time.Now().UnixNano()),
+		Step:  uint64(time.Minute.Nanoseconds()),
+	}
+
+	c, err := QueryRangeCombinerFor(req, AggregateModeSum, 0)
+	require.NoError(t, err)
+
+	c.Combine(&tempopb.QueryRangeResponse{
+		Metrics: &tempopb.SearchMetrics{IndexBytesRead: 100, DataFileBytesRead: 200, CubeBytesRead: 300, VcntBytesRead: 400},
+	})
+	c.Combine(&tempopb.QueryRangeResponse{
+		Metrics: &tempopb.SearchMetrics{IndexBytesRead: 10, DataFileBytesRead: 20, CubeBytesRead: 30, VcntBytesRead: 40},
+	})
+
+	resp := c.Response()
+	require.Equal(t, uint64(110), resp.Metrics.IndexBytesRead)
+	require.Equal(t, uint64(220), resp.Metrics.DataFileBytesRead)
+	require.Equal(t, uint64(330), resp.Metrics.CubeBytesRead)
+	require.Equal(t, uint64(440), resp.Metrics.VcntBytesRead)
+}
+
 func TestCombinerKeepsMostRecent(t *testing.T) {
 	totalTraces := 10
 	keepMostRecent := 5

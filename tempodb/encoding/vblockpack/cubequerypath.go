@@ -16,6 +16,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"path"
@@ -202,15 +203,49 @@ func (cqp *cubeQueryPath) tryQueryFromCube(
 	requestedResolution := requestedResolutionMinutes(req.Step)
 	result, routeErr := router.Route(tenant, dims, filters, neededAttr, requestedResolution, minMinute, maxMinute)
 	if routeErr != nil || !result.Found {
-		// Cube not found (or found but resolution-incomplete, ruling 4(b) — the whole query
-		// still falls back, never a partial/mixed-resolution answer). Attempt cube creation on
-		// first query. Fire cube creation in a background goroutine so QueryRange is not
-		// blocked. req.Start/req.End are nanoseconds; VCNT records are keyed in unix seconds
-		// (minute-floored), so pass the query window in seconds for the cardinality gate.
+		// Cube not found, or found but with NO overlap at all with the requested window
+		// (ruling 4(b) revisit, #217/SPEC-CUBE-028 — Route only returns Found=false now for "no
+		// usable overlap," not merely "incomplete" coverage; see PARTIAL coverage handling below
+		// for the edge-truncated case). Attempt cube creation on first query. Fire cube creation
+		// in a background goroutine so QueryRange is not blocked. req.Start/req.End are
+		// nanoseconds; VCNT records are keyed in unix seconds (minute-floored), so pass the
+		// query window in seconds for the cardinality gate.
 		minTS := req.Start / 1_000_000_000
 		maxTS := req.End / 1_000_000_000
 		go cqp.maybeCreateCube(context.Background(), tenant, dims, filters, neededAttr, neededAttrType, neededAttrOK, minTS, maxTS)
 		return nil, false, ErrCubeWarming
+	}
+	// #217/SPEC-CUBE-028 (ruling 4(b) revisit, Phase 3.3): partial coverage — the cube's watermark
+	// overlaps only PART of [minMinute, maxMinute]. Narrow the actual cell read to
+	// result.CoveredMinMinute/CoveredMaxMinute (never read cells outside the confirmed-covered
+	// range — reading past it would silently return an incomplete/wrong rollup for that edge) and
+	// tag the response PartialStatus=PARTIAL with a message identifying the uncovered edge(s).
+	//
+	// Scope note (assessed and deliberately deferred, not silently dropped): the plan doc's own
+	// Phase 3.3 additionally proposed dispatching the existing VI/scan fallback for exactly the
+	// uncovered edge and merging it with the cube's answer within this same call. Investigated
+	// and NOT implemented here: merging a second raw metrics result into an already-cube-rolled-
+	// up answer requires selecting a correct re-aggregation mode (traceql.AggregateMode) generic
+	// across every metrics function this path supports (count_over_time/rate/sum_over_time/
+	// histogram_over_time/quantile_over_time) — sum-like functions merge safely, but rate() and
+	// quantile_over_time() do NOT correctly re-aggregate via simple concatenation or summation
+	// without re-deriving them from finer-grained inputs, and no existing call site in either
+	// repo merges two already-computed metrics results this way today (grep-confirmed). Shipping
+	// that merge without being able to verify numeric correctness for every supported function
+	// risked a SILENT wrong-answer bug, which is worse than the honest partial answer served
+	// here. Serving ONLY the cube's own covered sub-range (this fix) already delivers #217's
+	// core guarantee — never decline a query we have coverage for — for the covered majority of
+	// the window; the uncovered edge simply isn't answered by the cube path, exactly as if the
+	// query had asked for only the covered sub-range. Flagged as a real, explicit follow-up.
+	origMinMinute, origMaxMinute := minMinute, maxMinute
+	minMinute, maxMinute, partialCoverage := cubeCoveredWindow(result, minMinute, maxMinute)
+	if partialCoverage {
+		level.Info(util_log.Logger).Log(
+			"msg", "vblockpack: cube: partial coverage, serving covered sub-range only",
+			"tenant", tenant, "cube_id", result.Entry.CubeID,
+			"requested_min_minute", origMinMinute, "requested_max_minute", origMaxMinute,
+			"covered_min_minute", minMinute, "covered_max_minute", maxMinute,
+		)
 	}
 
 	// Cube found: list and download L0 files for the time window.
@@ -221,6 +256,11 @@ func (cqp *cubeQueryPath) tryQueryFromCube(
 	}
 
 	// Download, open, and validate readers (APPENDIX 3: registry-vs-file consistency check).
+	// cubeBytesRead (issue #218, Phase 5) accumulates every successfully-opened cube reader's
+	// exact byte count (blockpack.CubeReader.BytesRead) — including files later excluded by
+	// classifyCubeFile's registry-vs-file mismatch check, since the decode/download cost was
+	// genuinely incurred regardless of whether the file ends up contributing to the rollup.
+	var cubeBytesRead int64
 	inputs := make([]blockpack.CubeRollupInput, 0, len(keys))
 	for _, key := range keys {
 		data, getErr := cqp.getObject(ctx, key)
@@ -231,6 +271,7 @@ func (cqp *cubeQueryPath) tryQueryFromCube(
 		if openErr != nil {
 			continue // routine decode failure — same posture as above
 		}
+		cubeBytesRead += r.BytesRead()
 		if ok, mismatchErr := classifyCubeFile(r, result.Entry); !ok {
 			// A registry/file drift (corruption, a buggy writer, or a stale registry entry) —
 			// excluded from CubeRollup's inputs with the SAME posture as the routine failures
@@ -253,7 +294,12 @@ func (cqp *cubeQueryPath) tryQueryFromCube(
 		return nil, false, nil
 	}
 
-	return buildCubeQueryResponse(cells, result.Entry.Dimensions, result.Entry.AggAttrs, req), true, nil
+	resp := buildCubeQueryResponse(cells, result.Entry.Dimensions, result.Entry.AggAttrs, req, cubeBytesRead)
+	if partialCoverage {
+		resp.Status = tempopb.PartialStatus_PARTIAL
+		resp.Message = cubePartialCoverageMessage(minMinute, maxMinute, origMinMinute, origMaxMinute)
+	}
+	return resp, true, nil
 }
 
 // rollupCubeInputs merges opened cube readers using the ROUTED resolution level
@@ -268,6 +314,31 @@ func rollupCubeInputs(
 	minMinute, maxMinute uint32,
 ) ([]blockpack.CubeMergedCell, error) {
 	return blockpack.CubeRollup(inputs, result.Resolution, minMinute, maxMinute)
+}
+
+// cubeCoveredWindow (#217/SPEC-CUBE-028, ruling 4(b) revisit, Phase 3.3) narrows
+// [reqMinMinute, reqMaxMinute] to result's actual covered sub-range
+// (CoveredMinMinute/CoveredMaxMinute), reporting whether coverage is partial. Pure — no I/O —
+// extracted into its own function for the SAME reason rollupCubeInputs was (see its own doc
+// comment): tryQueryFromCube's S3/minio wiring is otherwise untestable in isolation, but the
+// narrowing/partial-detection logic itself is worth testing directly against a real
+// router.Route result.
+func cubeCoveredWindow(result blockpack.CubeRoutingResult, reqMinMinute, reqMaxMinute uint32) (minMinute, maxMinute uint32, partial bool) {
+	partial = result.CoveredMinMinute > reqMinMinute || result.CoveredMaxMinute < reqMaxMinute
+	if !partial {
+		return reqMinMinute, reqMaxMinute, false
+	}
+	return result.CoveredMinMinute, result.CoveredMaxMinute, true
+}
+
+// cubePartialCoverageMessage builds the PartialStatus_PARTIAL message for a cube answer that
+// only covers [coveredMin,coveredMax] of the originally requested [reqMin,reqMax]. Pure — no
+// I/O — for the same isolation-testability reason as cubeCoveredWindow above.
+func cubePartialCoverageMessage(coveredMin, coveredMax, reqMin, reqMax uint32) string {
+	return fmt.Sprintf(
+		"cube covers minutes [%d,%d] of the requested [%d,%d]; the uncovered edge is not answered by this cube",
+		coveredMin, coveredMax, reqMin, reqMax,
+	)
 }
 
 // maybeCreateCube fires TryCreate for a (tenant, dims, filters) pattern that had no
@@ -680,12 +751,17 @@ func dimLabelKVs(dim1Label, dim2Label, d1, d2 string) []commonpbv1.KeyValue {
 	return labels
 }
 
-// buildCubeQueryResponse builds a QueryRangeResponse from rolled-up cube cells.
+// buildCubeQueryResponse builds a QueryRangeResponse from rolled-up cube cells. cubeBytesRead
+// (issue #218, Phase 5) is the exact total byte count of every cube file opened to answer this
+// query (tryQueryFromCube's own accumulator) — set on the response's SearchMetrics.CubeBytesRead
+// unconditionally; IndexBytesRead/DataFileBytesRead/VcntBytesRead are correctly left at their
+// zero default here, since a cube-answered response never touches VI/scan/VCNT.
 func buildCubeQueryResponse(
 	cells []blockpack.CubeMergedCell,
 	dims []string,
 	aggAttrNames []string,
 	req *tempopb.QueryRangeRequest,
+	cubeBytesRead int64,
 ) *tempopb.QueryRangeResponse {
 	// function/targetIdx select WHICH merged value each cell contributes (E-11a/E-11b) —
 	// count_over_time and rate are unaffected, continuing to read c.Count directly (targetIdx
@@ -700,7 +776,9 @@ func buildCubeQueryResponse(
 	// cell rather than one scalar per cell — a structurally different shape from every other
 	// function, so it gets its own builder (E-11b).
 	if function == "histogram_over_time" {
-		return buildHistogramResponse(cells, dims, targetIdx)
+		resp := buildHistogramResponse(cells, dims, targetIdx)
+		resp.Metrics = &tempopb.SearchMetrics{CubeBytesRead: uint64(cubeBytesRead)} //nolint:gosec
+		return resp
 	}
 
 	quantileP, _ := extractQuantilePercentile(req.Query)
@@ -727,7 +805,10 @@ func buildCubeQueryResponse(
 			Samples: samples,
 		})
 	}
-	return &tempopb.QueryRangeResponse{Series: series}
+	return &tempopb.QueryRangeResponse{
+		Series:  series,
+		Metrics: &tempopb.SearchMetrics{CubeBytesRead: uint64(cubeBytesRead)}, //nolint:gosec
+	}
 }
 
 // buildHistogramResponse builds histogram_over_time's response shape: one series per (dims,

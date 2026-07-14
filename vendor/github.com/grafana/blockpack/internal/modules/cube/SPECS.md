@@ -682,3 +682,71 @@ forward ingest began activating cubes — a silently-wrong-answer regression of 
 for this reason.
 
 **Back-ref:** `internal/modules/cube/definition.go:ColumnFilterToFilter,defOpToFilterOp,numericFilterValue`, `internal/modules/cube/accumulator.go:StringFilter`, `cube_ingest.go:CubeRegistryEntryToDefinition,CubeColumnFilterToFilter,NewCubeStringFilter`
+
+## SPEC-CUBE-028: `Route` serves the covered sub-range instead of declining on partial coverage (issue #217, ruling 4(b) revisit)
+
+*Added: 2026-07-13*
+
+Supersedes ruling 4(b)'s original all-or-nothing contract (`SPEC-CUBE-023`/E-6b). `RoutingResult`
+gains `CoveredMinMinute`/`CoveredMaxMinute uint32`, meaningful only when `Found=true`. `Route`
+now returns `Found=false` ONLY when the chosen resolution level has no watermark entry at all, or
+its watermark's covered range has NO overlap with `[watermarkMinute, queryMaxMinute]`. Any
+non-empty overlap returns `Found=true` with `CoveredMinMinute`/`CoveredMaxMinute` set to that
+overlap — equal to the full requested window when coverage is complete, so callers have one code
+path regardless of whether coverage is partial or complete.
+
+**Scope boundary (unchanged from the original ruling 4(b)):** a genuine INTERIOR gap in a single
+resolution level's own coverage (covered, then a hole, then covered again) is NOT representable
+by the single `[MinMinute,MaxMinute]` `ResolutionWatermark` pair and remains out of scope — see
+`NOTE-CUBE-026`. Mixed-resolution stitching (Decision 1, tie-break across levels) is untouched.
+
+Back-ref: `internal/modules/cube/router.go:RoutingResult,Route`. See `NOTE-CUBE-026`. Issue #217.
+
+## SPEC-CUBE-029: consumer's PARTIAL answer is a fallback-of-last-resort, not an automatic final answer (2026-07-13 follow-up, does not amend SPEC-CUBE-028)
+
+*Added: 2026-07-13.* This entry constrains a CONSUMER of `Route`'s result (`Route` itself,
+`SPEC-CUBE-028`, is unchanged), recorded here since the consumer lives in tempo (out of this
+repo's own build) but the invariant belongs with the spec it depends on.
+
+When `Route` returns `Found=true` with `CoveredMinMinute`/`CoveredMaxMinute` narrower than the
+requested window (edge-truncated partial coverage), the caller MUST NOT treat that partial answer
+as automatically final. The caller must first attempt any other always-available, zero-cube-
+dependency answering path for the full requested window (tempo: the VI/scan metrics path,
+`blockpack.ExecuteMetricsTraceQL`) and use it if it succeeds; the cube's own partial answer is
+used only once that other path also declines or errors for the window — mirroring the existing
+`Found=false`/`ErrCubeWarming` fallback precedence exactly, so both "no coverage at all" and
+"partial coverage" degrade through the SAME fallback-of-last-resort discipline rather than the
+former falling through and the latter short-circuiting.
+
+**Known limitation carried over from `SPEC-CUBE-028`, not fixed by this entry:** the covered/
+uncovered boundary this spec narrows to is watermark-derived (whole minutes), with no relationship
+to the query's own `Step` alignment. A step wider than one minute whose window straddles that
+boundary can be computed from fewer minutes than its full width with no per-step signal
+distinguishing it from a fully-covered step. See `NOTE-CUBE-027` for the full rationale for
+documenting rather than fixing this in the same pass.
+
+Back-ref: tempo-side `tempodb/encoding/vblockpack/backend_block.go:QueryRange`,
+`tempodb/encoding/vblockpack/cubequerypath.go:tryQueryFromCube`. See `NOTE-CUBE-027`. Issue #217,
+review `tempo/.bob/state/217-review.md`.
+
+## SPEC-CUBE-030: `Reader.BytesRead` — exact encoded byte count, captured at open time (issue #218, Phase 5)
+
+*Added: 2026-07-13.*
+
+**Invariant:** `Reader.BytesRead() int64` returns exactly `len(data)` of the byte slice the
+`Reader` was opened from — set once, at construction, by both `OpenReader` (the file's on-disk
+size, via `os.ReadFile`) and `OpenReaderFromBytes` (the caller-supplied in-memory slice's length,
+e.g. an S3 GET response body). This is a plain stored field (`bytesRead int64`), not a
+recomputation — there is exactly one place per constructor that sets it, matching this package's
+existing single-source-of-truth convention for constructor-time invariants.
+
+**Why this exists:** issue #218 attributes a query's total bytes-read cost across its per-source
+categories (VI/VCNT/cube/data-file). A cube-answered query previously had no way to report how many
+bytes its own cube file cost to read — `len(data)` was discarded immediately after decoding in both
+`OpenReader`/`OpenReaderFromBytes`. `BytesRead()` is net-new capture, not a threading of an
+already-computed value (unlike the other three #218 categories, which already existed as tempo-side
+locals — see the #218 plan's §A3).
+
+**Back-ref:** `internal/modules/cube/reader.go:Reader.BytesRead,OpenReader,OpenReaderFromBytes`.
+Tempo-side consumer: `tempodb/encoding/vblockpack/cubequerypath.go` (captures the value at the
+point the cube reader is opened, sets `SearchMetrics.CubeBytesRead`). Issue #218.

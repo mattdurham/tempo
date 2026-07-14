@@ -1,10 +1,15 @@
 package cube
 
 // NOTE: SPEC-CUBE-017 — QueryRouter selects the optimal cube + rollup level for a metrics
-// query. Amended by SPEC-CUBE-023/E-6b (ruling 4(b)): Route no longer reports a partial-coverage
-// window for the caller to stitch with a value-index fallback — it verifies the chosen
-// resolution's watermark COMPLETELY covers the requested window and returns Found=false (decline
-// the whole query) otherwise. There is no partial/mixed-resolution answer.
+// query. Amended by SPEC-CUBE-028/#217 (ruling 4(b) revisit): Route now reports the actual
+// covered sub-range (CoveredMinMinute/CoveredMaxMinute) instead of declining the whole query on
+// any incomplete watermark coverage. Found=false is now reserved for "no usable overlap at all"
+// (no watermark entry for the chosen level, or the watermark's covered range doesn't overlap the
+// query window). Edge-truncated partial coverage (the common backfill-in-progress shape) is
+// served for its covered sub-range; the caller is responsible for falling back to the value
+// index for the uncovered edge(s) (see cubequerypath.go). A genuine INTERIOR gap in the cube's
+// own coverage (covered, then a hole, then covered again) is NOT representable by the single
+// [MinMinute,MaxMinute] ResolutionWatermark pair and remains out of scope — see NOTE-CUBE-026.
 
 import (
 	"fmt"
@@ -30,10 +35,18 @@ func ResolutionLevel(requestedMinutes uint32) uint32 {
 type RoutingResult struct {
 	// Entry is the matching cube definition, or zero if no cube was found.
 	Entry RegistryEntry
-	// Found reports whether a matching cube exists in the registry.
+	// Found reports whether a matching cube exists in the registry AND its chosen resolution
+	// level has at least some overlap with the requested window.
 	Found bool
 	// Resolution is the minutes-per-bucket the router selected (1, 60, or 1440).
 	Resolution uint32
+	// CoveredMinMinute/CoveredMaxMinute (#217/SPEC-CUBE-028) report the actual sub-range of the
+	// requested [watermarkMinute, queryMaxMinute] window this entry's chosen resolution level
+	// covers. Only meaningful when Found is true. Equal to the full requested window when
+	// coverage is complete, so callers have one code path regardless of whether coverage is
+	// partial or complete.
+	CoveredMinMinute uint32
+	CoveredMaxMinute uint32
 }
 
 // QueryRouter resolves a (tenant, dims, filters, resolution) request to the best
@@ -60,11 +73,14 @@ func NewQueryRouter(cubes []RegistryEntry) *QueryRouter {
 // tracks {duration, http.status_code}), Route deterministically prefers the SMALLEST set that
 // still covers neededAttr, breaking ties by newest CreatedAt.
 //
-// Resolution-completeness-or-decline (ruling 4(b)): once a target resolution is chosen (the
-// coarsest level whose granularity is ≤ requestedResolution, via ResolutionLevel), Route
-// verifies the chosen cube's Watermarks[level] COMPLETELY covers [watermarkMinute,
-// queryMaxMinute] before returning Found=true. Incomplete coverage declines the WHOLE query —
-// never a partial/mixed-resolution answer — so the caller falls back to the value index.
+// Resolution-completeness-or-partial (ruling 4(b) revisit, #217/SPEC-CUBE-028): once a target
+// resolution is chosen (the coarsest level whose granularity is ≤ requestedResolution, via
+// ResolutionLevel), Route computes the overlap of the chosen cube's Watermarks[level] with
+// [watermarkMinute, queryMaxMinute]. A non-empty overlap returns Found=true with
+// CoveredMinMinute/CoveredMaxMinute set to that overlap (the full window when coverage is
+// complete); the caller is responsible for covering any uncovered edge via the value-index
+// fallback. Only a chosen level with NO watermark entry at all, or one whose watermark doesn't
+// overlap the query window at all, returns Found=false.
 func (r *QueryRouter) Route(
 	tenant string,
 	dims []string,
@@ -96,16 +112,30 @@ func (r *QueryRouter) Route(
 
 	level := ResolutionLevel(requestedResolution)
 	wm, ok := best.Watermarks[level]
-	if !ok || wm.MinMinute > watermarkMinute || wm.MaxMinute < queryMaxMinute {
-		// Incomplete (or entirely absent) coverage at the chosen resolution — decline the
-		// whole query rather than serve a partial/mixed-resolution answer.
+	if !ok {
+		// No watermark recorded at all for this level — nothing to serve.
+		return RoutingResult{Found: false}, nil
+	}
+
+	coveredMin := wm.MinMinute
+	if watermarkMinute > coveredMin {
+		coveredMin = watermarkMinute
+	}
+	coveredMax := wm.MaxMinute
+	if queryMaxMinute < coveredMax {
+		coveredMax = queryMaxMinute
+	}
+	if coveredMin > coveredMax {
+		// The watermark's covered range doesn't overlap the query window at all.
 		return RoutingResult{Found: false}, nil
 	}
 
 	return RoutingResult{
-		Entry:      best,
-		Found:      true,
-		Resolution: level,
+		Entry:            best,
+		Found:            true,
+		Resolution:       level,
+		CoveredMinMinute: coveredMin,
+		CoveredMaxMinute: coveredMax,
 	}, nil
 }
 

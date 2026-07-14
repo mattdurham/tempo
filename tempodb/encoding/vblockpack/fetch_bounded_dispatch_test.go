@@ -299,14 +299,22 @@ func TestFetch_UnsupportedMetricsShape_ProductionDefault_TypedError_NoScan(t *te
 // are broken simultaneously, confirmed by mutating each individually (still green) and then both
 // together (red), before restoring both to their original state via byte-for-byte sha256-verified
 // copies.
-func TestFetch_SliceJob_Decline_HardErrors_NeverBounded(t *testing.T) {
+// TestFetch_SliceJob_Decline_ToleratedAsEmptyPartial_NeverBounded (#217 task 1.1 rename/update
+// of the former TestFetch_SliceJob_Decline_HardErrors_NeverBounded): a slice job's routine
+// decline no longer hard-errors — it is tolerated as an empty, successful result instead
+// (Phase 1's combiner-visible coverage-gap tolerance), while still never falling back to the
+// unsafe bounded/full-scan path (IndexOnly must still win over boundedAuthorized — the property
+// this test's two-layer mutation-verification below continues to protect).
+func TestFetch_SliceJob_Decline_ToleratedAsEmptyPartial_NeverBounded(t *testing.T) {
 	withVIQueryReader(t, &fakeVISink{}, "indexes") // installed but EMPTY — a genuine routine decline
 
 	block, _ := createFetchTestBlock(t)
 
 	ctx, req := requirePresentDeclineReq()
-	_, err := block.Fetch(ctx, req, common.SearchOptions{IndexOnly: true, MaxTraces: 5})
-	require.Error(t, err, "a slice job's routine decline must hard-error even with a limit present")
-	require.True(t, errors.Is(err, ErrSliceIndexCoverageGap),
-		"err = %v, want ErrSliceIndexCoverageGap (IndexOnly must win over boundedAuthorized)", err)
+	resp, err := block.Fetch(ctx, req, common.SearchOptions{IndexOnly: true, MaxTraces: 5})
+	require.NoError(t, err, "a slice job's routine decline must be tolerated, not hard-error, even with a limit present (#217)")
+	require.NotNil(t, resp.Results, "tolerated decline must still return a valid (empty) iterator")
+	ss, iterErr := resp.Results.Next(ctx)
+	require.NoError(t, iterErr)
+	require.Nil(t, ss, "tolerated decline must yield zero spansets, not a bounded/full-scan result")
 }

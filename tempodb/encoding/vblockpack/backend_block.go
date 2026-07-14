@@ -239,14 +239,17 @@ func (b *blockpackBlock) newReader() (*blockpack.Reader, error) {
 	return blockpack.NewReaderWithSectionCache(b.newReaderProvider(), fileID, getCache())
 }
 
-// executeQuery creates a reader and executes a TraceQL query, returning all matching spans.
-func (b *blockpackBlock) executeQuery(ctx context.Context, query string, opts blockpack.QueryOptions) ([]blockpack.SpanMatch, error) {
+// executeQuery creates a reader and executes a TraceQL query, returning all matching spans
+// along with the query's QueryStats (issue #218 Phase 8: callers that need a real
+// data-file-bytes-read total, e.g. tag/tag-value search, read stats.Steps[].BytesRead —
+// mirroring the exact pattern Fetch already uses at backend_block.go's dataFileBytesRead sum).
+func (b *blockpackBlock) executeQuery(ctx context.Context, query string, opts blockpack.QueryOptions) ([]blockpack.SpanMatch, blockpack.QueryStats, error) {
 	r, err := b.newReader()
 	if err != nil {
-		return nil, fmt.Errorf("failed to create blockpack reader: %w", err)
+		return nil, blockpack.QueryStats{}, fmt.Errorf("failed to create blockpack reader: %w", err)
 	}
-	matches, _, err := blockpack.QueryTraceQL(ctx, r, query, opts)
-	return matches, err
+	matches, stats, err := blockpack.QueryTraceQL(ctx, r, query, opts)
+	return matches, stats, err
 }
 
 // BlockMeta returns the block metadata
@@ -363,10 +366,13 @@ func (b *blockpackBlock) QueryRange(ctx context.Context, req *tempopb.QueryRange
 	}
 
 	if searchOpts.IndexOnly && !indexCovered {
-		// A #487 time-slice job whose index declined must fail rather than fall
-		// through to the cube path or the full-scan metrics path below — neither is
-		// a safe substitute for a narrowed-window slice job.
-		return nil, fmt.Errorf("blockpack QueryRange: %w", ErrSliceIndexCoverageGap)
+		// #217 task 1.1: a #487 time-slice job whose index declined must not fail — a full
+		// scan/cube fallback is still not a safe substitute for a narrowed-window slice job, but
+		// unlike pre-#217, the whole tenant-wide query must not be discarded over ONE uncovered
+		// minute either. Return a normal, empty, PARTIAL response instead of
+		// ErrSliceIndexCoverageGap — from the combiner's point of view this is an ordinary 200
+		// (see slice_partial_response.go's package doc comment).
+		return queryRangePartialCoverageGapResponse("no value-index coverage for this slice's window"), nil
 	}
 
 	// Cube query path: try answering from pre-aggregated cube files before
@@ -374,14 +380,28 @@ func (b *blockpackBlock) QueryRange(ctx context.Context, req *tempopb.QueryRange
 	// remembered and only surfaced if the VI/typed-error path below ALSO declines — if VI answers
 	// the query directly, the cube's own warming state is irrelevant (we already have a good
 	// answer) and must not leak into a success response.
+	//
+	// #217 CRITICAL fix (post-review, .bob/state/217-review.md Issue 1): a cube answer that is
+	// only PARTIAL (tryQueryFromCube's ok=true but cubeResp.Status==PARTIAL, SPEC-CUBE-028's
+	// edge-truncated coverage case) must NOT be returned immediately — a cube backfill lag is
+	// orthogonal to the VI/scan path's own coverage, which may still answer the FULL requested
+	// window. cubePartialResp is remembered and only surfaced below if the VI/scan path ALSO
+	// declines for this window, mirroring cubeWarming's own "only surfaced if the path below ALSO
+	// declines" pattern one branch above, applied to a different decline reason.
 	var cubeWarming bool
+	var cubePartialResp *tempopb.QueryRangeResponse
 	if cqp := getCubeQueryPath(); cqp != nil {
 		cubeResp, ok, cubeErr := cqp.tryQueryFromCube(ctx, b.meta.TenantID, req)
-		if ok {
+		switch {
+		case ok && cubeResp.Status != tempopb.PartialStatus_PARTIAL:
 			span.SetAttributes(attribute.Bool("cube.used", true))
 			return cubeResp, nil
+		case ok:
+			span.SetAttributes(attribute.Bool("cube.partial_deferred_to_vi_scan", true))
+			cubePartialResp = cubeResp
+		default:
+			cubeWarming = errors.Is(cubeErr, ErrCubeWarming)
 		}
-		cubeWarming = errors.Is(cubeErr, ErrCubeWarming)
 	}
 	// issue #493: cube.warming is informative either way (success or decline) and costs nothing
 	// extra — cubeWarming is already a local variable by this point.
@@ -405,16 +425,27 @@ func (b *blockpackBlock) QueryRange(ctx context.Context, req *tempopb.QueryRange
 		// single blockpack.ErrValueIndexNoCoverage sentinel — issue #481 part 3 (F-4) replaced it
 		// with three distinct sentinels (ErrMetricsShapeNotAnswerable/ErrMetricsNoCoverage/
 		// ErrMetricsLegacyTimeSecZero), deleted not aliased. For a #487 slice job (IndexOnly=true)
-		// ALL three still mean the same thing this package's callers (handleError, the combiner,
-		// tests) need: "this slice job's index path declined, hard-error with
-		// ErrSliceIndexCoverageGap" — R11-AMENDED's slice-job invariant is polarity/reason-
-		// agnostic. Slice jobs take priority over the cube-warming distinction below — a narrowed
-		// window has no safe fallback either way.
+		// ALL three still mean the same thing this package's callers (the combiner, tests) need:
+		// "this slice job's index path declined — tolerate it (#217 task 1.1), never hard-error."
+		// Slice jobs take priority over the cube-warming distinction below — a narrowed window
+		// has no safe fallback either way, but that's no longer a reason to fail the WHOLE
+		// tenant-wide query over one uncovered slice.
 		if errors.Is(err, blockpack.ErrMetricsShapeNotAnswerable) ||
 			errors.Is(err, blockpack.ErrMetricsNoCoverage) ||
 			errors.Is(err, blockpack.ErrMetricsLegacyTimeSecZero) {
 			if searchOpts.IndexOnly {
-				return nil, fmt.Errorf("blockpack QueryRange: %w", ErrSliceIndexCoverageGap)
+				return queryRangePartialCoverageGapResponse("no value-index coverage for this slice's window"), nil
+			}
+			if cubePartialResp != nil {
+				// #217 CRITICAL fix: VI/scan ALSO declined to answer the full window for this
+				// tenant-wide query — cube's own partial answer is now the fallback-of-last-resort,
+				// preserving #217's original "never decline a query we have coverage for"
+				// guarantee via the correct precedence instead of an unconditional short-circuit.
+				span.SetAttributes(
+					attribute.Bool("cube.used", true),
+					attribute.Bool("cube.partial_fallback", true),
+				)
+				return cubePartialResp, nil
 			}
 			if cubeWarming && errors.Is(err, blockpack.ErrMetricsShapeNotAnswerable) {
 				// R1's self-healing story: this shape IS potentially cube-answerable (it just
@@ -511,7 +542,13 @@ func convertTraceMetricsResult(result *blockpack.TraceMetricsResult, req *tempop
 	return &tempopb.QueryRangeResponse{
 		Series: series,
 		Metrics: &tempopb.SearchMetrics{
-			InspectedBytes: uint64(result.BytesRead), //nolint:gosec
+			IndexBytesRead: uint64(result.IndexBytesRead), //nolint:gosec
+			// InspectedBytes previously always read 0 here (result.BytesRead was never
+			// populated by ExecuteTraceMetricsFromVI). Now that result.IndexBytesRead carries
+			// the real VI byte total, report it as InspectedBytes too so this path stops
+			// under-reporting query cost — an intentional behavior change for existing
+			// InspectedBytes consumers on the blockpack metrics query-range path.
+			InspectedBytes: uint64(result.IndexBytesRead), //nolint:gosec
 		},
 	}
 }
@@ -611,7 +648,7 @@ func (b *blockpackBlock) Search(ctx context.Context, req *tempopb.SearchRequest,
 	query := buildSearchQuery(req)
 
 	// Execute TraceQL query using public API
-	matches, err := b.executeQuery(ctx, query, blockpack.QueryOptions{
+	matches, _, err := b.executeQuery(ctx, query, blockpack.QueryOptions{
 		Limit: int(req.Limit),
 	})
 	if err != nil {
@@ -638,7 +675,7 @@ func (b *blockpackBlock) Search(ctx context.Context, req *tempopb.SearchRequest,
 
 // SearchTags implements the Searcher interface.
 // Column names are read from the file header index (no block I/O required).
-func (b *blockpackBlock) SearchTags(_ context.Context, scope traceql.AttributeScope, cb common.TagsCallback, _ common.MetricsCallback, _ common.SearchOptions) error {
+func (b *blockpackBlock) SearchTags(_ context.Context, scope traceql.AttributeScope, cb common.TagsCallback, mcb common.MetricsCallback, _ common.SearchOptions) error {
 	r, err := b.newReader()
 	if err != nil {
 		return fmt.Errorf("SearchTags: open reader: %w", err)
@@ -651,6 +688,10 @@ func (b *blockpackBlock) SearchTags(_ context.Context, scope traceql.AttributeSc
 		rawMap, readErr := r.ReadBlocks([]int{0})
 		if readErr == nil {
 			if raw, ok := rawMap[0]; ok {
+				// issue #218 Phase 8: len(raw) is the exact number of data-file bytes
+				// downloaded to answer this call — SearchTags never consults the value
+				// index or VCNT, so this single block-0 read is the whole story.
+				mcb(uint64(len(raw)))
 				if bwb, perr := r.ParseBlockFromBytes(raw, blockpack.WantAll(), r.BlockMeta(0)); perr == nil {
 					for key := range bwb.Block.Columns() {
 						tag := columnNameToTag(key.Name, scope)
@@ -670,7 +711,7 @@ func (b *blockpackBlock) SearchTags(_ context.Context, scope traceql.AttributeSc
 
 // SearchTagValues implements the Searcher interface
 // Extracts unique values for a given tag
-func (b *blockpackBlock) SearchTagValues(ctx context.Context, tag string, cb common.TagValuesCallback, _ common.MetricsCallback, _ common.SearchOptions) error {
+func (b *blockpackBlock) SearchTagValues(ctx context.Context, tag string, cb common.TagValuesCallback, mcb common.MetricsCallback, _ common.SearchOptions) error {
 	ctx, span := b.startBlockSpan(ctx, "vblockpack.backendBlock.SearchTagValues")
 	defer span.End()
 
@@ -680,10 +721,19 @@ func (b *blockpackBlock) SearchTagValues(ctx context.Context, tag string, cb com
 	query := "{}" // Match all spans
 
 	// Execute TraceQL query using public API
-	matches, err := b.executeQuery(ctx, query, blockpack.QueryOptions{})
+	matches, stats, err := b.executeQuery(ctx, query, blockpack.QueryOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to execute query: %w", err)
 	}
+	// issue #218 Phase 8: this path never consults the value index or VCNT, so the full
+	// scan.<step>.bytes_read total (mirroring Fetch's dataFileBytesRead sum) is the whole
+	// story — report it via the MetricsCallback exactly like Fetch reports it via
+	// DataFileBytes().
+	var dataFileBytesRead int64
+	for _, step := range stats.Steps {
+		dataFileBytesRead += step.BytesRead
+	}
+	mcb(uint64(dataFileBytesRead)) //nolint:gosec // byte counts are always non-negative
 
 	// Extract unique values and call callback (deduplicate in code)
 	seen := make(map[string]struct{})
@@ -701,17 +751,23 @@ func (b *blockpackBlock) SearchTagValues(ctx context.Context, tag string, cb com
 }
 
 // SearchTagValuesV2 implements the Searcher interface
-func (b *blockpackBlock) SearchTagValuesV2(ctx context.Context, tag traceql.Attribute, cb common.TagValuesCallbackV2, _ common.MetricsCallback, _ common.SearchOptions) error {
+func (b *blockpackBlock) SearchTagValuesV2(ctx context.Context, tag traceql.Attribute, cb common.TagValuesCallbackV2, mcb common.MetricsCallback, _ common.SearchOptions) error {
 	// Convert traceql.Attribute to column name
 	colName := tagToColumnName(tag.Name)
 	// Use match-all TraceQL query
 	query := "{}"
 
 	// Execute TraceQL query using public API
-	matches, err := b.executeQuery(ctx, query, blockpack.QueryOptions{})
+	matches, stats, err := b.executeQuery(ctx, query, blockpack.QueryOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to execute query: %w", err)
 	}
+	// issue #218 Phase 8: see SearchTagValues — same match-all scan, no VI/VCNT involved.
+	var dataFileBytesRead int64
+	for _, step := range stats.Steps {
+		dataFileBytesRead += step.BytesRead
+	}
+	mcb(uint64(dataFileBytesRead)) //nolint:gosec // byte counts are always non-negative
 
 	// Extract unique values and call V2 callback (deduplicate in code)
 	seen := make(map[string]struct{})
@@ -864,6 +920,13 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 	var matches []blockpack.SpanMatch
 	var qs blockpack.QueryStats
 	indexAnswered := false
+	// issue #218: per-category byte totals threaded into FetchSpansResponse's
+	// IndexBytes/DataFileBytes closures below. indexBytesRead accumulates both the
+	// filter-program VI path (istats.BytesRead) and the structural-index path
+	// (sistats.BytesRead) — the two are mutually exclusive per query (compiledProgram
+	// nil-ness selects one branch or the other) but summing tolerates either order.
+	var indexBytesRead int64
+	var dataFileBytesRead int64
 	// boundedAuthorized (issue #481 parts 2/3, F-8, team-lead ruling R17 — supersedes the plan's
 	// original QueryPlan.Strategy-threading assumption, which never had a wire path and would
 	// have required protobuf-generator surgery unavailable in this environment): derived LOCALLY
@@ -878,10 +941,10 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 	// case) — a query the frontend classified Selective can still decline on an individual
 	// block, and if a limit is present, bounding the read here is still an honest, budgeted
 	// answer (R2), never a wrong one. indexOnly takes ABSOLUTE priority: forces
-	// boundedAuthorized=false regardless of limit, so a #487 slice job's decline always
-	// hard-errors with ErrSliceIndexCoverageGap (R11-AMENDED), never routes to bounded — a
-	// bounded-but-partial read across an already-narrowed slice window would compound two
-	// different kinds of incompleteness.
+	// boundedAuthorized=false regardless of limit, so a #487/#217 slice job's decline is
+	// tolerated as an empty, PARTIAL-tagged result (never routes to bounded, and — since #217
+	// task 1.1 — never a hard error either) — a bounded-but-partial read across an
+	// already-narrowed slice window would compound two different kinds of incompleteness.
 	// Phase 7 (plan-scan-fallback.md) removed the #481-part-2 RecentFirstBudget bounded-scan
 	// path entirely — boundedAuthorized now ONLY selects which blockpack entry point
 	// tryIndexFetch itself calls (BuildValueIndexSourceBounded vs BuildValueIndexSource, real
@@ -928,8 +991,23 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 	// the value index is still never consulted either way, since compiledProgram's own
 	// IsMatchAllProgram-true shape has no leaf for tryIndexFetch to look up regardless of limit.
 	isMatchAll := compiledProgram != nil && blockpack.IsMatchAllProgram(compiledProgram)
+	// #201 observability: record isMatchAll's evaluated value on every Fetch that reaches a
+	// compiled program, unconditionally (not gated behind any I/O-driven "was the index used"
+	// check below). This is the exact classification bit a live coverage-gap/full-scan
+	// divergence investigation (task #201) needs to distinguish "these two queries took
+	// genuinely different dispatch branches" from "these two queries took the identical branch
+	// against different underlying coverage state" without re-running live queries to find out.
+	if compiledProgram != nil {
+		span.SetAttributes(
+			attribute.String("fetch.query", query),
+			attribute.Bool("fetch.is_match_all", isMatchAll),
+			attribute.Int("fetch.span_limit", spanLimit),
+			attribute.Bool("fetch.bounded_authorized", boundedAuthorized),
+		)
+	}
 	switch {
 	case isMatchAll && spanLimit > 0:
+		span.SetAttributes(attribute.String("fetch.dispatch_branch", "match_all_bounded_materializer"))
 		queryOpts.Limit = spanLimit
 		matches, qs, fetchErr = blockpack.QueryNewestFirstMatchAll(ctx, r, queryOpts)
 		if fetchErr != nil {
@@ -940,9 +1018,26 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 	// isMatchAll && spanLimit<=0 ("unlimited" by MaxTraces' own contract): deliberately no case
 	// here — skips both the bounded materializer (structurally requires a positive Limit) and
 	// the value-index dispatch below (nothing for it to look up), falling through to the outer
-	// switch's unbounded scan.
+	// switch's unbounded scan. #201 observability: this is the ONE remaining unbounded-scan path
+	// left in this function (every other branch either indexAnswered's or hard-errors) — flag it
+	// explicitly on the span so a future "why did this get a full scan" investigation does not
+	// have to re-derive that from reading this switch's comments again.
+	case isMatchAll:
+		span.SetAttributes(attribute.String("fetch.dispatch_branch", "match_all_unbounded_scan"))
+		slog.Warn("vblockpack Fetch: match-all query with no limit takes the unbounded full-scan path", "query", query)
 	case !isMatchAll && compiledProgram != nil:
 		im, ok, istats, idxErr := b.tryIndexFetch(ctx, r, compiledProgram, query, queryOpts, opts.IndexOnly, boundedAuthorized)
+		indexBytesRead += istats.BytesRead
+		// #201 observability: the coverage-check inputs and decline reason are recorded on every
+		// attempt, unconditionally — NOT gated behind the FilesRead>0/Used check below (that
+		// check is for the I/O-volume attributes only). A routine decline with zero files read
+		// (e.g. no VI file ever discovered for this column/window) is exactly the case a live
+		// coverage-gap/full-scan divergence investigation most needs visible on the span.
+		span.SetAttributes(
+			attribute.Int64("index.min_sec", int64(istats.MinSec)),
+			attribute.Int64("index.max_sec", int64(istats.MaxSec)),
+			attribute.String("index.decline_reason", istats.DeclineReason),
+		)
 		// Record index-path I/O on the span whenever the index was consulted (any
 		// files were read), even if it ultimately declined and we fall back to a
 		// full scan (issue #465).
@@ -956,24 +1051,41 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 		}
 		if idxErr != nil {
 			if errors.Is(idxErr, ErrSliceIndexCoverageGap) {
-				// #487 time-slice job (opts.IndexOnly): the index routinely declined, but a
-				// full scan is not a safe fallback for a narrowed-window slice job — fail
-				// the query rather than double-count/over-fetch across overlapping slices.
-				slog.Error("vblockpack Fetch: index-only slice job hit a coverage gap", "query", query, "err", idxErr)
-				return traceql.FetchSpansResponse{}, fmt.Errorf("vblockpack Fetch: %w", idxErr)
+				// #217 task 1.1: a #487 time-slice job (opts.IndexOnly) whose index routinely
+				// declined must NOT fail the whole tenant-wide query — a full scan is still not a
+				// safe fallback for a narrowed-window slice job (it could double-count/over-fetch
+				// across overlapping slices), but the correct response to "this ONE minute has no
+				// coverage" is now an empty, tolerated result for this slice, not a hard error.
+				// Record the partial signal (read back by SearchBlock, querier.go) so the wire
+				// response can carry PartialStatus=PARTIAL; return a normal, empty
+				// FetchSpansResponse instead of the error (see slice_partial_response.go).
+				span.SetAttributes(attribute.String("fetch.dispatch_branch", "tolerated_partial:slice_coverage_gap"))
+				slog.Warn("vblockpack Fetch: index-only slice job hit a coverage gap, tolerating as partial", "query", query, "err", idxErr,
+					"minSec", istats.MinSec, "maxSec", istats.MaxSec, "boundedAuthorized", boundedAuthorized)
+				markSliceCoveragePartial(ctx, "no value-index coverage for this slice's window")
+				return traceql.FetchSpansResponse{
+					Results:    &sliceSpansetIterator{},
+					Bytes:      func() uint64 { return 0 },
+					IndexBytes: func() uint64 { return uint64(indexBytesRead) },
+				}, nil
 			}
 			if errors.Is(idxErr, ErrSearchNoCoverage) {
 				// Routine decline, no bounded path authorized (no limit present) — hard error,
 				// never an implicit scan (F-7/R7).
-				slog.Error("vblockpack Fetch: index declined, no bounded path authorized", "query", query, "err", idxErr)
+				span.SetAttributes(attribute.String("fetch.dispatch_branch", "hard_error:no_coverage"))
+				slog.Error("vblockpack Fetch: index declined, no bounded path authorized", "query", query, "err", idxErr,
+					"minSec", istats.MinSec, "maxSec", istats.MaxSec, "boundedAuthorized", boundedAuthorized)
 				return traceql.FetchSpansResponse{}, fmt.Errorf("vblockpack Fetch: %w", idxErr)
 			}
 			// Authoritative-index inconsistency: fail the query, do not scan.
-			slog.Error("vblockpack Fetch: value index/data inconsistency", "query", query, "err", idxErr)
+			span.SetAttributes(attribute.String("fetch.dispatch_branch", "hard_error:index_data_inconsistency"))
+			slog.Error("vblockpack Fetch: value index/data inconsistency", "query", query, "err", idxErr,
+				"minSec", istats.MinSec, "maxSec", istats.MaxSec)
 			return traceql.FetchSpansResponse{}, fmt.Errorf("vblockpack Fetch: value index inconsistency: %w", idxErr)
 		}
 		switch {
 		case ok:
+			span.SetAttributes(attribute.String("fetch.dispatch_branch", "index_answered"))
 			matches = im
 			indexAnswered = true
 		default:
@@ -987,6 +1099,7 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 			// now covers the vr==nil category too, not just a configured-but-declining index).
 			// See TestFetch_VIDisabled_HardErrors (fetch_bounded_dispatch_test.go) for the real-
 			// write-path regression guard.
+			span.SetAttributes(attribute.String("fetch.dispatch_branch", "hard_error:vi_not_configured"))
 			slog.Error("vblockpack Fetch: value index not configured on this querier", "query", query)
 			return traceql.FetchSpansResponse{}, fmt.Errorf("vblockpack Fetch: %w", ErrMaterializedIndexBuilding)
 		}
@@ -1005,6 +1118,7 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 	// resolved) — this keeps the branch reachable only through a genuine #487 slice job.
 	if compiledProgram == nil {
 		sm, sok, sistats, sidxErr := b.tryStructuralIndexFetch(ctx, query, queryOpts, opts.IndexOnly)
+		indexBytesRead += sistats.BytesRead
 		if sistats.FilesRead > 0 || sistats.Used {
 			span.SetAttributes(
 				attribute.Bool("structural_index.used", sistats.Used),
@@ -1015,11 +1129,19 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 		}
 		if sidxErr != nil {
 			if errors.Is(sidxErr, blockpack.ErrStructuralIndexCoverageGap) {
-				// #487 time-slice job (opts.IndexOnly): the index routinely declined, but a full
-				// scan is not a safe fallback for a narrowed-window slice job — fail the query
-				// rather than double-count/over-fetch across overlapping slices.
-				slog.Error("vblockpack Fetch: structural index-only slice job hit a coverage gap", "query", query, "err", sidxErr)
-				return traceql.FetchSpansResponse{}, fmt.Errorf("vblockpack Fetch: %w", sidxErr)
+				// #217 task 1.1: structuralDeclineOutcome only ever returns this sentinel when
+				// indexOnly is true (see its own doc comment) — a #487 time-slice job whose
+				// structural index routinely declined. A full scan is still not a safe fallback
+				// for a narrowed-window slice job, but the whole tenant-wide query must not be
+				// discarded over one uncovered minute — tolerate it as an empty, PARTIAL result
+				// for this slice instead (see slice_partial_response.go).
+				slog.Warn("vblockpack Fetch: structural index-only slice job hit a coverage gap, tolerating as partial", "query", query, "err", sidxErr)
+				markSliceCoveragePartial(ctx, "no structural value-index coverage for this slice's window")
+				return traceql.FetchSpansResponse{
+					Results:    &sliceSpansetIterator{},
+					Bytes:      func() uint64 { return 0 },
+					IndexBytes: func() uint64 { return uint64(indexBytesRead) },
+				}, nil
 			}
 			// Authoritative-index inconsistency: fail the query, do not scan.
 			slog.Error("vblockpack Fetch: structural value index/data inconsistency", "query", query, "err", sidxErr)
@@ -1069,6 +1191,9 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 		// genuine structural query (index-answered structural queries return above via
 		// indexAnswered; pipeline queries and any structural decline already hard-errored above).
 		matches, qs, fetchErr = blockpack.QueryTraceQL(ctx, r, query, queryOpts)
+	}
+	for _, step := range qs.Steps {
+		dataFileBytesRead += step.BytesRead
 	}
 	if len(qs.Steps) > 0 {
 		args := []any{"query", query, "path", qs.ExecutionPath, "total", qs.TotalDuration}
@@ -1146,8 +1271,10 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 	}
 
 	return traceql.FetchSpansResponse{
-		Results: &sliceSpansetIterator{spansets: spansets},
-		Bytes:   func() uint64 { return b.meta.Size_ },
+		Results:       &sliceSpansetIterator{spansets: spansets},
+		Bytes:         func() uint64 { return b.meta.Size_ },
+		IndexBytes:    func() uint64 { return uint64(indexBytesRead) },
+		DataFileBytes: func() uint64 { return uint64(dataFileBytesRead) },
 	}, nil
 }
 
@@ -1408,7 +1535,7 @@ func columnNameToAttribute(colName string) (traceql.Attribute, bool) {
 }
 
 // FetchTagValues implements the Searcher interface
-func (b *blockpackBlock) FetchTagValues(ctx context.Context, req traceql.FetchTagValuesRequest, cb traceql.FetchTagValuesCallback, _ common.MetricsCallback, _ common.SearchOptions) error {
+func (b *blockpackBlock) FetchTagValues(ctx context.Context, req traceql.FetchTagValuesRequest, cb traceql.FetchTagValuesCallback, mcb common.MetricsCallback, _ common.SearchOptions) error {
 	ctx, span := b.startBlockSpan(ctx, "vblockpack.backendBlock.FetchTagValues")
 	defer span.End()
 
@@ -1420,10 +1547,17 @@ func (b *blockpackBlock) FetchTagValues(ctx context.Context, req traceql.FetchTa
 	query := conditionsToTraceQL(valConditions, true) // Use AND for multiple conditions
 
 	// Execute TraceQL query using public API
-	matches, err := b.executeQuery(ctx, query, blockpack.QueryOptions{})
+	matches, stats, err := b.executeQuery(ctx, query, blockpack.QueryOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to execute query: %w", err)
 	}
+	// issue #218 Phase 8: FetchTagValues never consults the value index or VCNT, so the
+	// full scan.<step>.bytes_read total is the whole story — see SearchTagValues.
+	var dataFileBytesRead int64
+	for _, step := range stats.Steps {
+		dataFileBytesRead += step.BytesRead
+	}
+	mcb(uint64(dataFileBytesRead)) //nolint:gosec // byte counts are always non-negative
 
 	// Extract column name for the requested tag
 	colName := attributeToColumnName(req.TagName)
@@ -1450,7 +1584,7 @@ func (b *blockpackBlock) FetchTagValues(ctx context.Context, req traceql.FetchTa
 }
 
 // FetchTagNames implements the Searcher interface
-func (b *blockpackBlock) FetchTagNames(ctx context.Context, req traceql.FetchTagsRequest, cb traceql.FetchTagsCallback, _ common.MetricsCallback, _ common.SearchOptions) error {
+func (b *blockpackBlock) FetchTagNames(ctx context.Context, req traceql.FetchTagsRequest, cb traceql.FetchTagsCallback, mcb common.MetricsCallback, _ common.SearchOptions) error {
 	// Flatten ConditionGroups into a single conditions slice for the query.
 	var flatConditions []traceql.Condition
 	for _, group := range req.ConditionGroups {
@@ -1461,10 +1595,17 @@ func (b *blockpackBlock) FetchTagNames(ctx context.Context, req traceql.FetchTag
 		query := conditionsToTraceQL(flatConditions, true)
 
 		// Execute TraceQL query using public API
-		matches, err := b.executeQuery(ctx, query, blockpack.QueryOptions{})
+		matches, stats, err := b.executeQuery(ctx, query, blockpack.QueryOptions{})
 		if err != nil {
 			return fmt.Errorf("failed to execute query: %w", err)
 		}
+		// issue #218 Phase 8: FetchTagNames' conditioned path never consults the value
+		// index or VCNT, so the full scan.<step>.bytes_read total is the whole story.
+		var dataFileBytesRead int64
+		for _, step := range stats.Steps {
+			dataFileBytesRead += step.BytesRead
+		}
+		mcb(uint64(dataFileBytesRead)) //nolint:gosec // byte counts are always non-negative
 
 		// Extract unique tag names from matching spans
 		seen := make(map[string]struct{})
@@ -1499,6 +1640,9 @@ func (b *blockpackBlock) FetchTagNames(ctx context.Context, req traceql.FetchTag
 		if err != nil {
 			return fmt.Errorf("failed to read blockpack file: %w", err)
 		}
+		// issue #218 Phase 8: the no-conditions path reads the entire blockpack file
+		// upfront (no VI/VCNT involved) — size is the exact real data-file bytes read.
+		mcb(uint64(size)) //nolint:gosec // file size is always non-negative
 
 		provider := &bytesReaderProvider{data: data}
 		bpr, err := blockpack.NewReaderFromProvider(provider)

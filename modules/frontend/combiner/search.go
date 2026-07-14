@@ -38,6 +38,12 @@ func NewSearch(limit int, keepMostRecent bool, marshalingFormat api.MarshallingF
 	diffTraces := map[string]struct{}{}
 	completedThroughTracker := &shardtracker.CompletionTracker{}
 	metricsCombiner := NewSearchMetricsCombiner()
+	// #217 task 1.2/1.3: search's own quit gate (below) is driven entirely by
+	// metadataCombiner.IsCompleteFor, never by any Status field, so — unlike
+	// metrics_query_range.go's pkg/traceql.QueryRangeCombiner interaction — there is no shared,
+	// cross-backend combiner here to decontaminate; accumulating the coverage-gap signal is a
+	// straightforward, additive concern.
+	partialMessages := &partialMessageAccumulator{}
 
 	c := &genericCombiner[*tempopb.SearchResponse]{
 		httpStatusCode: 200,
@@ -58,6 +64,10 @@ func NewSearch(limit int, keepMostRecent bool, marshalingFormat api.MarshallingF
 
 			metricsCombiner.Combine(partial.Metrics, resp)
 
+			if partial.Status == tempopb.PartialStatus_PARTIAL {
+				partialMessages.add(partial.Message)
+			}
+
 			return nil
 		},
 		metadata: func(resp PipelineResponse, final *tempopb.SearchResponse) error {
@@ -66,6 +76,9 @@ func NewSearch(limit int, keepMostRecent bool, marshalingFormat api.MarshallingF
 					TotalBlocks:     uint32(sj.TotalBlocks), //nolint:gosec
 					TotalJobs:       uint32(sj.TotalJobs),   //nolint:gosec
 					TotalBlockBytes: sj.TotalBytes,
+					// issue #218 Phase 3: frontend plan-time VCNT fetch total, small/often-zero by
+					// design (VCNT is planning-only selectivity metadata, not a data read).
+					VcntBytesRead: uint64(sj.VcntBytesRead), //nolint:gosec
 				}
 				metricsCombiner.CombineMetadata(sjMetrics, resp)
 
@@ -84,6 +97,7 @@ func NewSearch(limit int, keepMostRecent bool, marshalingFormat api.MarshallingF
 			if padTraceIDs {
 				padTraceIDsInResponse(final.Traces)
 			}
+			applyPartialCoverageGapSearch(final, partialMessages)
 			return final, nil
 		},
 		diff: func(current *tempopb.SearchResponse) (*tempopb.SearchResponse, error) {
@@ -120,6 +134,7 @@ func NewSearch(limit int, keepMostRecent bool, marshalingFormat api.MarshallingF
 			if padTraceIDs {
 				padTraceIDsInResponse(diff.Traces)
 			}
+			applyPartialCoverageGapSearch(diff, partialMessages)
 
 			return diff, nil
 		},

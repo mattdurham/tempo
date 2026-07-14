@@ -241,6 +241,17 @@ Back-refs: `internal/modules/queryplan/lead.go:Group.Lead`,
 
 *Added: 2026-07-07*
 
+> **SUPERSEDED by `NOTE-QP-012` (issue #217, 2026-07-13).** This note describes the pre-#217
+> adaptive/uniform-width algorithm (`adaptiveWidthSlices`/`uniformWidthSlices`/`clampWidth`/
+> `desiredSliceCount`), which was DELETED, not merely disabled or bypassed — see `NOTE-QP-012`
+> for what actually ships today (every slice forced to exactly `minSliceWidthSeconds`, 60s, wide).
+> The three-way `EstKnown`/`VCNTEmpty`/`EstMatches` semantics and the full-partition/no-gap
+> guarantee documented below are still accurate and unchanged by #217 — only the WIDTH-sizing
+> algorithm (adaptive-vs-uniform, the clamp, `desiredSliceCount`) is obsolete. Kept for historical
+> context (this note's rationale for the three-way semantics and the full-partition invariant is
+> still the authoritative explanation for those parts); do not use the width-sizing sections below
+> as a description of current behavior.
+
 **What this is.** `BuildTimeSlices(perMinute, minTS, maxTS, concurrentRequests, k)
 []TimeSlice` partitions a query window into minute-aligned `TimeSlice`s for #487's time-slice
 job sharding, sized adaptively from `valuecounts.SelectivityPerMinute`'s per-minute VCNT
@@ -371,9 +382,12 @@ root-level mirror, `TestBuildQueryPlan_HugeWindowFallsBackToBlockShardedNoPanic`
 through the public `BuildQueryPlan`/`timeslice.go` surface. See `SPECS.md` SPEC-QP-2's
 slice-count-cap bullet for the formal contract.
 
-Back-refs: `internal/modules/queryplan/slices.go:TimeSlice,BuildTimeSlices,adaptiveWidthSlices,uniformWidthSlices,clampWidth,desiredSliceCount,maxSafeMaxTS,maxSlicesPerPlan`.
-Tests: `slices_test.go` (`TestBuildTimeSlices_MinuteAligned`,
-`_AdaptiveWidthFromMinuteCounts`, `_AdaptiveWidthRespectsMaxWidthClamp`,
+Back-refs (CORRECTED 2026-07-13 — `adaptiveWidthSlices`/`uniformWidthSlices`/`clampWidth`/
+`desiredSliceCount` were deleted by #217/`NOTE-QP-012` and no longer exist; see that note for the
+current algorithm): `internal/modules/queryplan/slices.go:TimeSlice,BuildTimeSlices,maxSafeMaxTS,maxSlicesPerPlan`.
+Tests (CORRECTED 2026-07-13 — `_AdaptiveWidthFromMinuteCounts`/`_AdaptiveWidthRespectsMaxWidthClamp`
+no longer exist; see `NOTE-QP-012`'s own back-refs for the current width-forcing tests):
+`slices_test.go` (`TestBuildTimeSlices_MinuteAligned`,
 `_OrderingEstMatchesDescThenMostRecentFirstThenVCNTEmptyLast`,
 `_VCNTGapMarkedEmptyNeverSkipped`, `_EmptyMinuteCounts_UniformWidthFallback`,
 `_NearMaxUint64DoesNotOverflow`, `_NegativeCountFromNonConformingOracleClampedToZero`,
@@ -534,6 +548,15 @@ Back-refs: `internal/modules/queryplan/perminutefrom.go:VCNTPerMinuteFunc`,
 ## NOTE-QP-008: DefaultK=1 — ruling the previously-unpinned `k` multiplier in the uniform-width fallback formula (issue #487, team-lead ruling)
 
 *Added: 2026-07-07*
+
+> **PARTIALLY SUPERSEDED by `NOTE-QP-012` (issue #217, 2026-07-13).** `desiredSliceCount` and the
+> uniform-width fallback FORMULA this note rules `k`'s default for were deleted by #217 —
+> `concurrentRequests`/`k` are now unused for width/count purposes (kept in the signature only for
+> call-site stability). `DefaultK = 1` itself is UNCHANGED and still lives in `slices.go`/
+> `timeslice.go` exactly as described below (still referenced by tempo's call sites), so this
+> note's ruling and its "LANDED" implementation-status section remain accurate for the constant's
+> existence and value — only the formula that USED to consume it (`desiredSliceCount =
+> concurrentRequests * k`) is gone. See `NOTE-QP-012` for the current algorithm.
 
 **The gap.** `BuildTimeSlices`' uniform-width no-signal fallback (NOTE-QP-005) and
 `desiredSliceCount = concurrentRequests * k` both depend on a caller-supplied `k`. Issue #487's
@@ -727,3 +750,49 @@ unmodified after the refactor (confirmed via `go test ./internal/modules/querypl
 inspection.
 
 Back-ref: same files as `SPEC-QP-7`. Issue #493.
+
+## NOTE-QP-012: forced literal one-minute slice width, replacing #487's adaptive algorithm (issue #217)
+
+*Added: 2026-07-13*
+
+**What changed.** `BuildTimeSlices` no longer sizes slices adaptively (denser minutes narrower,
+up to a 1h ceiling) or falls back to a uniform width derived from `concurrentRequests*k`. Every
+slice returned is now EXACTLY `minSliceWidthSeconds` (60s) wide, unconditionally, for every call.
+The `adaptiveWidthSlices`/`uniformWidthSlices`/`clampWidth`/`desiredSliceCount` helper functions
+were deleted, not merely bypassed — there is no remaining code path that produces a
+non-60s-wide slice. `concurrentRequests`/`k` remain in `BuildTimeSlices`/`BuildQueryPlan`'s
+signatures for call-site stability (tempo's frontend still passes them through) but no longer
+influence width or count in any way.
+
+**Why (explicit user override, not re-derived from this package alone).** This task's own
+planning pass (`.bob/state/217-per-minute-dispatch-plan.md` §2.3) originally recommended
+KEEPING the adaptive/uniform defaults unchanged, reasoning that the correctness property #217
+needed ("a coverage boundary loses at most one slice's width, never the whole query") was
+already satisfied at 1h granularity, and that forcing 1-minute slicing for every window was an
+unmeasured fanout-cost increase not worth taking without a benchmark first. The user explicitly
+REJECTED that recommendation: the actual goal is bounded, PREDICTABLE query latency independent
+of the requested window's width, via MAXIMUM PARALLELISM (every minute dispatched as its own
+concurrent job) — not minimizing data loss at a coverage boundary, which was this package's own
+(now superseded) framing. The user stated they are willing to accept the resulting higher
+job-fanout/infrastructure cost to get that latency guarantee. BENCH-QP-010 (`BENCHMARKS.md`) was
+still added, decoupled from gating this decision, to get a real number for per-job overhead.
+
+**maxSlicesPerPlan raised 2000 → 50000.** Before this change, the widest a single slice could
+ever be was 3600s, so a 2000-slice cap always implied ≥83.3 days of headroom regardless of
+individual slice width. Forcing every slice to 60s means the SAME 2000 cap would instead mean at
+most ~33.3 hours before a query stops qualifying for `DispatchTimeSliced` and silently falls back
+to `DispatchBlockSharded` (unbounded latency — the opposite of #217's goal). Raised to 50,000
+(≈34.7 days) so common week-to-month-wide dashboard/investigation queries still qualify. See
+`slices.go`'s `maxSlicesPerPlan` doc comment and `BENCHMARKS.md` BENCH-QP-010 for the numbers
+supporting this ceiling (frontend-side combine overhead at 50,000 slices is ≈47ms, negligible
+next to real per-job querier round-trip cost).
+
+**What did NOT change.** The per-minute `EstMatches`/`EstKnown`/`VCNTEmpty` signal plumbing is
+untouched — a minute with real VCNT signal still gets `EstKnown=true` with its own count; a
+minute absent from `perMinute` still gets `EstKnown=true, VCNTEmpty=true` (a checked gap, not a
+hole); a plan with no VCNT signal at all still gets `EstKnown=false` uniformly. Only the WIDTH
+these facts get attached to changed — that width is now always exactly one minute rather than a
+function of the signal.
+
+Back-ref: `internal/modules/queryplan/slices.go:BuildTimeSlices,maxSlicesPerPlan`. See
+`BENCHMARKS.md` BENCH-QP-010. Issue #217.

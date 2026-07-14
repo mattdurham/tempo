@@ -793,3 +793,80 @@ new mechanism), `internal/modules/valueindex/SPECS.md` SPEC-VI-11,
 `internal/modules/viusage/SPECS.md` SPEC-VIUSAGE-6/7, `internal/modules/viusage/NOTES.md`
 NOTE-VIUSAGE-6/8 (the fuller version of both this acknowledgment and the ID-collision
 finding).
+
+## NOTE-VI-106 — colHash-manifest hook: recording (colHash -> column name) for operational visibility, best-effort, off by default (task #216)
+
+Date: 2026-07-13
+
+**Problem this closes:** VI keys its entire on-disk layout by `colHash`
+(`valueindex.ColHash`, a genuine one-way SHA-256 hash) with no metadata file anywhere mapping a
+hash back to its source column name — browsing object storage directly shows only opaque
+hash-named directories. `flushColumn` is the earliest point blockpack itself ever has
+`(tenant, colHash, colName)` together at a real object-storage write — it constructs the
+`columnBuffer` with all three already resolved (`bufferFor`, `service.go`) and successfully
+`Put`s the L0 file. Adding the manifest hook here means the manifest self-populates the moment
+a column is first actually indexed, without any new tempo-side code.
+
+**Why optional (`Config.ManifestStore` defaults to nil) rather than always-on using the
+existing `s.store`:** `ObjectPutter` (the existing, required dependency) is `Put(path, data)
+error` only — no `Get`, no context. The colHash-manifest read-modify-write
+(`colhashmanifest.RecordColumn`) genuinely needs `Get`. Rather than widening `ObjectPutter`
+itself (which would violate its own documented "write a fully-formed value index file to a
+key" scope, and would force every existing test's fake `ObjectPutter` to implement a method it
+has no use for), a second, separate, OPTIONAL dependency was added, following the exact same
+nil-is-a-legitimate-default convention this package already uses for `Registerer` and `Logger`.
+Every existing test and production call site is unaffected: `Config.ManifestStore` unset means
+`recordManifestEntry` is a zero-cost no-op.
+
+**Why this doesn't need conditional-PUT/ETag machinery, unlike this package's own future
+integration with `cube.Registry`/`viusage.Registry`:** see `colhashmanifest/NOTES.md`
+NOTE-COLMANIFEST-1 for the full argument — this manifest is advisory-only, never consulted by
+any read/write/query path, so a plain read-modify-write (accepting a rare lost update under
+true concurrency, which self-heals on the next observation) was chosen over requiring every
+caller's store to additionally implement `ConditionalPut`.
+
+**What this is NOT:** this hook does not change `flushColumn`'s real behavior in any way a
+caller without `ManifestStore` configured would ever observe — no new required config, no new
+failure mode for the real S3 write (a broken `ManifestStore` only ever produces a `Warn` log
+line), and no new read path anywhere consults this manifest.
+
+Back-refs: `internal/modules/valueindexconsumer/service.go:recordManifestEntry,ManifestStore,flushColumn`,
+`internal/modules/valueindexconsumer/config.go:Config.ManifestStore`,
+`internal/modules/colhashmanifest` (the shared registry implementation; see its own
+SPECS.md/NOTES.md), `internal/modules/valuecountscompactor/NOTES.md` NOTE-VC-019 (VCNT's
+symmetric hook, and why it lives at compaction time instead of an L0 write blockpack does not
+own), `internal/modules/valueindex/NOTES.md` NOTE-VI-107 (the cross-reference entry in the
+module this feature is conceptually "for," even though its call site lives here).
+
+## NOTE-VI-108 — `recordManifestEntry` caches confirmed-recorded `(tenant, colHash)` pairs, skipping the manifest `Get` on every repeat flush (task #216 HIGH follow-up)
+
+Date: 2026-07-13
+
+**The gap this closes (HIGH finding, go-presubmit-reviewer):** `recordManifestEntry`
+(NOTE-VI-106) originally called `colhashmanifest.RecordColumn` unconditionally on every single
+`flushColumn` invocation, and `RecordColumn` performs a full `Get` of the tenant's aggregate
+manifest file on every call — even in the overwhelmingly common steady-state case where
+`(tenant, colHash)` is already recorded and `RecordColumn`'s own no-op branch
+(SPEC-COLMANIFEST-4 point 3) only skips the `Put`, never the `Get`. Since `flushColumn` is VI's
+real L0 write path and this call sits between the real S3 `Put` and message `Ack`, this added a
+permanent extra object-storage round trip to every flush of every already-known column, forever
+— directly at odds with this feature's own "best-effort, non-critical-path" framing, even though
+it could never fail the real write (only add latency to it).
+
+**Fix:** `Service.manifestSeen` (a plain `map[string]struct{}` keyed by `tenant+"\x00"+colHash`
+— no locking needed since `Service` is single-goroutine, NOTE-VI-016) is checked BEFORE
+`recordManifestEntry` ever calls into `colhashmanifest.RecordColumn`. Once a pair is confirmed
+recorded (a nil-error `RecordColumn` call), every subsequent flush of that same column for the
+rest of this process's lifetime is a zero-I/O no-op. A `RecordColumn` failure does not populate
+the cache, so the next flush naturally retries against the real store. This turns the
+steady-state cost into O(distinct colHashes ever observed by this process) instead of
+O(flushes), matching the "write once per colHash when first seen" intent the manifest's *write*
+side (SPEC-COLMANIFEST-4) already had, extended to the *read* side.
+
+**Regression test:** `TestFlushColumn_ManifestCacheSkipsRepeatedGet`
+(`valueindexconsumer/manifest_hook_test.go`) flushes the same column 3 times and asserts the
+fake `ManifestStore`'s `Get` is called exactly once (confirmed red before this fix — 3 calls —
+and green after).
+
+Back-refs: `internal/modules/valueindexconsumer/service.go:Service.manifestSeen,recordManifestEntry`.
+See `SPECS.md` SPEC-VI-6.

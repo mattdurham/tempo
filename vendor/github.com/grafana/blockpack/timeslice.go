@@ -135,13 +135,15 @@ func ClassifyProgramVCNTWithDetail(
 // its lead (most-selective) leaf, mirroring cost's own pluggable-oracle shape, so the caller
 // never has to guess which leaf will be lead ahead of time; a resolvable-but-VCNT-blind lead
 // leaf (perMinuteForLead returning nil/empty, or no lead leaf at all) still qualifies for
-// DispatchTimeSliced with uniform-width (EstKnown=false) slices rather than falling back to
-// DispatchBlockSharded. An inverted or otherwise degenerate [minTS, maxTS] (minTS > maxTS, or
-// a range BuildTimeSlices cannot produce any slice for) also falls back to DispatchBlockSharded
-// rather than reporting DispatchTimeSliced with zero Slices. A hand-rolled perMinuteForLead
-// (as opposed to one built by TimeSliceOracle) is expected to return non-negative
-// MinuteCount.Count values; a negative Count is defensively clamped to zero rather than
-// corrupting the adaptive-width calculation.
+// DispatchTimeSliced with no-signal (EstKnown=false) slices rather than falling back to
+// DispatchBlockSharded. Every slice is forced to exactly one minute wide regardless
+// (#217/NOTE-QP-012 in internal/modules/queryplan — the pre-#217 adaptive-width algorithm was
+// removed, not merely disabled). An inverted or otherwise degenerate [minTS, maxTS] (minTS >
+// maxTS, or a range BuildTimeSlices cannot produce any slice for) also falls back to
+// DispatchBlockSharded rather than reporting DispatchTimeSliced with zero Slices. A hand-rolled
+// perMinuteForLead (as opposed to one built by TimeSliceOracle) is expected to return
+// non-negative MinuteCount.Count values; a negative Count is defensively clamped to zero rather
+// than corrupting the per-minute EstMatches signal.
 func BuildQueryPlan(
 	prog *Program, cost CostFunc, allLeavesResolvable bool,
 	perMinuteForLead func(leaf *RangeNode) []MinuteCount,

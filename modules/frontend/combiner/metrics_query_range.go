@@ -53,12 +53,33 @@ func NewQueryRange(req *tempopb.QueryRangeRequest, maxSeriesLimit int) (Combiner
 
 	metricsCombiner := NewQueryRangeMetricsCombiner()
 	lastCompletedThrough := shardtracker.TimestampNever
+	// #217 task 1.3: tracks PartialStatus=PARTIAL reported by an individual job's response
+	// (Phase 1.1's per-slice coverage-gap tolerance) SEPARATELY from
+	// pkg/traceql.QueryRangeCombiner's own maxSeriesReached tracking. That combiner (shared
+	// across every storage backend, not vblockpack-specific) already treats ANY
+	// resp.Status==PARTIAL as evidence of series-count truncation
+	// (pkg/traceql/combine.go:Combine) and gates the `quit` early-stop optimization below on
+	// it — correct for genuine max-series overflow, but WRONG for a benign per-slice coverage
+	// gap that has nothing to do with series count: letting it flow through unmodified would
+	// make ONE early-arriving coverage-gap job cause the frontend to quit waiting for the
+	// REMAINING slices' real data, truncating a correct answer instead of just annotating it
+	// partial. partialMessages accumulates the coverage-gap signal independently; the combine
+	// closure strips Status before handing the response to the shared combiner so quit/
+	// MaxSeriesReached stay driven ONLY by genuine series-count truncation.
+	partialMessages := &partialMessageAccumulator{}
 	c := &genericCombiner[*tempopb.QueryRangeResponse]{
 		httpStatusCode: 200,
 		new:            func() *tempopb.QueryRangeResponse { return &tempopb.QueryRangeResponse{} },
 		current:        &tempopb.QueryRangeResponse{Metrics: &tempopb.SearchMetrics{}},
 		combine: func(partial *tempopb.QueryRangeResponse, _ *tempopb.QueryRangeResponse, resp PipelineResponse) error {
-			combiner.Combine(partial)
+			if partial.Status == tempopb.PartialStatus_PARTIAL {
+				partialMessages.add(partial.Message)
+				stripped := *partial
+				stripped.Status = tempopb.PartialStatus_COMPLETE
+				combiner.Combine(&stripped)
+			} else {
+				combiner.Combine(partial)
+			}
 			metricsCombiner.Combine(partial.Metrics, resp)
 
 			// Track shard completion
@@ -74,6 +95,9 @@ func NewQueryRange(req *tempopb.QueryRangeRequest, maxSeriesLimit int) (Combiner
 					TotalBlocks:     uint32(qr.TotalBlocks), //nolint:gosec
 					TotalJobs:       uint32(qr.TotalJobs),   //nolint:gosec
 					TotalBlockBytes: qr.TotalBytes,
+					// issue #218 Phase 3: frontend plan-time VCNT fetch total, small/often-zero by
+					// design (VCNT is planning-only selectivity metadata, not a data read).
+					VcntBytesRead: uint64(qr.VcntBytesRead), //nolint:gosec
 				}
 				metricsCombiner.Combine(qrMetrics, resp)
 
@@ -97,6 +121,7 @@ func NewQueryRange(req *tempopb.QueryRangeRequest, maxSeriesLimit int) (Combiner
 				resp.Status = tempopb.PartialStatus_PARTIAL
 				resp.Message = maxSeriesReachedErrorMsg
 			}
+			applyPartialCoverageGap(resp, partialMessages)
 			attachExemplars(req, resp)
 			resp.Metrics = metricsCombiner.Metrics
 			return resp, nil
@@ -136,6 +161,7 @@ func NewQueryRange(req *tempopb.QueryRangeRequest, maxSeriesLimit int) (Combiner
 				resp.Status = tempopb.PartialStatus_PARTIAL
 				resp.Message = maxSeriesReachedErrorMsg
 			}
+			applyPartialCoverageGap(resp, partialMessages)
 			attachExemplars(req, resp)
 			resp.Metrics = metricsCombiner.Metrics
 

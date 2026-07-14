@@ -423,3 +423,22 @@ Back-ref: `internal/modules/queryplan/vcnt_cost.go:LeadDetail,ClassifyProgramVCN
 `internal/modules/queryplan/selectivity.go:leadDetail,classifyDetailed`;
 `timeslice.go:LeadDetail,ClassifyProgramVCNTWithDetail`; `cmd/deadcode/main.go` (anchor). See
 `NOTES.md` `NOTE-QP-011`. Issue #493.
+
+## SPEC-QP-8: `BuildTimeSlices` forces exactly one-minute-wide slices (issue #217)
+
+*Added: 2026-07-13*
+
+Every `TimeSlice` `BuildTimeSlices` returns has `End - Start == 60` (unconditionally, regardless
+of `perMinute`, `concurrentRequests`, or `k`). There is no adaptive-width or uniform-width MODE
+anymore — those algorithms were removed, not gated. The full-partition invariant (slices
+gaplessly cover `[floor(minTS), floor(maxTS)+60)`) and the `EstKnown`/`EstMatches`/`VCNTEmpty`
+three-state semantics (`SPEC-QP-2`) are unchanged; only slice WIDTH changed.
+
+`maxSlicesPerPlan` is `50000` (raised from `2000` — see `NOTE-QP-012` for the full before/after
+reasoning). A window requiring more than `50000` one-minute slices (>34.7 days) does not qualify
+for `DispatchTimeSliced` and `BuildTimeSlices` returns `nil`, which `BuildQueryPlan`'s existing
+zero-slices fallback (`SPEC-QP-3`) converts to `DispatchBlockSharded` — no new fallback
+mechanism.
+
+Back-ref: `internal/modules/queryplan/slices.go:BuildTimeSlices,maxSlicesPerPlan`. See
+`NOTE-QP-012`, `BENCHMARKS.md` BENCH-QP-010. Issue #217.

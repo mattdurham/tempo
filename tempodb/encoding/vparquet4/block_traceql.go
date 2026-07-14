@@ -1058,8 +1058,10 @@ func (b *backendBlock) Fetch(ctx context.Context, req traceql.FetchSpansRequest,
 	}
 
 	return traceql.FetchSpansResponse{
-		Results: iter,
-		Bytes:   func() uint64 { return rr.BytesRead() },
+		Results:       iter,
+		Bytes:         func() uint64 { return rr.BytesRead() },
+		IndexBytes:    func() uint64 { return 0 },
+		DataFileBytes: func() uint64 { return rr.BytesRead() },
 	}, nil
 }
 

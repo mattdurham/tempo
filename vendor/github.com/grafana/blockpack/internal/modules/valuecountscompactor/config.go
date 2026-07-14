@@ -48,6 +48,15 @@ type Config struct {
 	// occurs. It is not settable from YAML; the embedder (tempo) injects it
 	// programmatically.
 	Registerer prometheus.Registerer `yaml:"-"`
+	// ManifestStore is the optional object-storage surface used to update the best-effort
+	// colHash -> column-name audit manifest (internal/modules/colhashmanifest) after each
+	// successful merge write (NOTE-VC-020, task #216). When nil (the default), manifest
+	// recording is skipped entirely -- this is purely additive observability, never
+	// consulted by any read/write/query path, and a failure to update it never fails the
+	// real merge (mergeLevel logs a warning and continues). Not settable from YAML; the
+	// embedder (tempo) injects it programmatically. Store already satisfies this interface
+	// structurally, so most callers can simply pass the same store used for NewService.
+	ManifestStore ManifestStore `yaml:"-"`
 	// Tenants is the explicit list of tenant IDs to compact. A single entry of
 	// "*" means all tenants (discovered by listing the prefix). Must be
 	// non-empty.

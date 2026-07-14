@@ -13,11 +13,11 @@ blockevents/valueindex/valueindexconsumer/valueindexcompactor/vibuilder. See spe
 ruling (2026-07-02): `valuecounts` and `valuecountscompactor` are the analogous
 core-format/compactor-service pair for VCNT that `valueindex`/`valueindexcompactor` are for VI.
 
-`valuecounts/NOTES.md` currently holds NOTE-VC-001 through NOTE-VC-006, NOTE-VC-008, and
-NOTE-VC-011 through NOTE-VC-017 (NOTE-VC-007 was left explicitly reserved for this file — see the
-inline note in `valuecounts/NOTES.md` at that point in the sequence). This file also holds
-NOTE-VC-009, NOTE-VC-010, (as of 2026-07-10, issue #494) NOTE-VC-018, and (as of 2026-07-10)
-NOTE-VC-019. Next free ID: **NOTE-VC-020**.
+`valuecounts/NOTES.md` currently holds NOTE-VC-001 through NOTE-VC-006, NOTE-VC-008,
+NOTE-VC-011 through NOTE-VC-017, and (as of 2026-07-13, task #216) NOTE-VC-020 (NOTE-VC-007
+was left explicitly reserved for this file — see the inline note in `valuecounts/NOTES.md` at
+that point in the sequence). This file also holds NOTE-VC-009, NOTE-VC-010, NOTE-VC-018, and
+(as of 2026-07-13, task #216) NOTE-VC-019 and NOTE-VC-021. Next free ID: **NOTE-VC-022**.
 
 ---
 
@@ -303,26 +303,84 @@ Back-refs: `internal/modules/valuecountscompactor/cluster.go` (`clusterByTimeRan
 filename-format side of this change). `.bob/state/plan.md` "Deployment Notes" section (full
 sequencing detail, out of this file's scope to duplicate).
 
-## NOTE-VC-019 — value_counts relocated to a direct child of tenant, out from under indexPrefix (2026-07-10)
+## NOTE-VC-019 — colHash-manifest hook lives at compaction time, not L0 write time, because VCNT has no blockpack-owned L0 write path (task #216)
 
-VCNT's on-disk key layout changed from `<tenant>/<indexPrefix>/unique_values/<colHash>/...`
-to `<tenant>/value_counts/<colHash>/...`: `value_counts` is now a direct child of tenant, a
-sibling of the VI compactor's `indexPrefix` tree (`<tenant>/indexes/...`) and cube's own
-top-level prefix (`<tenant>/cubes/...`), rather than nested inside VI's tree under the
-now-retired `unique_values` name. No backward-compat fallback was added — this is a breaking,
-forward-only key-layout change requiring a full data wipe in every environment (same
-deployment discipline as NOTE-VC-018's own wipe requirement, issue #494).
+Date: 2026-07-13
 
-This is a genuine structural fix, not just a rename: it retires the `Config.IndexPrefix` field
-entirely from this package (VCNT no longer has any prefix concept to configure) and, more
-importantly, it makes NOTE-VI-096's live data-loss incident (VI's compactor treating VCNT's
-`unique_values` directory as one of its own column directories) **structurally impossible**
-rather than merely guarded-against — the two subsystems no longer share any directory tree,
-so `valueindexcompactor`'s special-case exclusion for `unique_values` was removed as dead code
-(it could never fire again) along with its pinning regression test.
+**The gap this closes:** VCNT keys its entire on-disk layout by `colHash`
+(`valuecounts.ColHash`) with no metadata file anywhere mapping a hash back to its source column
+name. `internal/modules/colhashmanifest` (new sibling package, see its own SPECS.md/NOTES.md)
+closes this for both VI and VCNT with one shared per-tenant manifest.
 
-Back-refs: `internal/modules/valuecountscompactor/service.go` (`buildWorkList`,
-`resolveTenants`), `internal/modules/valuecountscompactor/config.go` (removed
-`IndexPrefix`/`DefaultIndexPrefix`), `vcnt.go` (root package — `VCNTObjectKey`,
-`VCNTObjectKeyV2`, both lost their `indexPrefix` parameter). `valueindexcompactor/service.go`
-(removed the NOTE-VI-096 `unique_values` exclusion in `buildWorkList`).
+**Why `mergeLevel`, not an L0 write path, for VCNT specifically:** task #216 requires this
+manifest to populate via blockpack's OWN write paths, with no new tempo-side code required.
+For VI, blockpack genuinely owns an L0 write path
+(`internal/modules/valueindexconsumer/service.go:flushColumn` — see that package's NOTES.md
+NOTE-VI-106). For VCNT, blockpack owns NO equivalent L0 write path: the root `vcnt.go`'s own
+doc comment states plainly that it "[exposes] the minimal API tempo needs to accumulate
+per-column span counts during block writes and write L0 .vcnt files to S3" — tempo itself
+performs the actual object-storage `Put` for L0 `.vcnt` files, using blockpack's encode/key
+helper functions (`EncodeVCNTFile`, `VCNTObjectKey`/`VCNTObjectKeyV2`) but never blockpack's own
+code. `mergeLevel` (this file) is therefore the EARLIEST point blockpack's own code ever
+touches a given colHash's VCNT data via object storage at all.
+
+**Practical consequence, stated plainly:** a newly-observed VCNT column's manifest entry lags
+its true first L0 write by however long until that column's first L0→L1 compaction pass runs
+(bounded by `Config.CompactInterval`/`CompactThresholdFiles`) — this is an accepted,
+documented limitation for a LOW-priority observability feature, not a bug. `recordManifestEntry`
+only fires when `mergeLevel` actually writes a non-empty merged output
+(`len(merged) > 0`), matching this file's own established "only touch state when real work
+happened" discipline elsewhere in this package.
+
+**Why `colDir` alone is enough to derive `(tenant, colHash)` without threading new parameters
+through `compactColumn`/`mergeLevel`'s existing signatures:** `colDir` is always shaped
+`"<tenant>/<indexPrefix>/unique_values/<colHash>"` — `buildWorkList` already parses this same
+shape to populate `columnWork.tenant`/`columnWork.colDir}` separately, but that tenant is never
+threaded down into `mergeLevel` today. Rather than changing `compactColumn`/`mergeLevel`'s
+signatures (which would ripple through every existing call site and test), `tenantFromColDir`
+(new, `service.go`) re-derives `tenant` from `colDir` directly — the same "first path segment"
+extraction `valueindexconsumer.tenantFromPath` already uses for the analogous VI case, just
+applied to a different string shape.
+
+**Why `ManifestStore` is its own interface rather than reusing `Store` directly in `Config`:**
+mirrors this package's own established `Object`/`IndexObject` precedent
+(`store.go`'s doc comment: two structurally-identical-but-independently-named types across
+`valuecountscompactor` and `valueindexcompactor`, deliberately not shared) — even though any
+`Store` value already satisfies `ManifestStore` structurally with zero adapter code, giving the
+optional dependency its own minimal, purpose-scoped interface keeps `Config.ManifestStore`'s
+contract self-documenting independent of `Store`'s full (List/ListDirs/Get/Put/Delete) surface.
+
+Back-refs: `internal/modules/valuecountscompactor/service.go:recordManifestEntry,ManifestStore,tenantFromColDir,mergeLevel`,
+`internal/modules/valuecountscompactor/config.go:Config.ManifestStore`,
+`internal/modules/colhashmanifest` (the shared registry implementation),
+`internal/modules/valueindexconsumer/NOTES.md` NOTE-VI-106 (VI's symmetric hook),
+`internal/modules/valuecounts/NOTES.md` NOTE-VC-020 (the cross-reference entry in the module
+this feature is conceptually "for," even though its call site lives here), `vcnt.go` (root
+package doc comment confirming tempo, not blockpack, performs VCNT's L0 write).
+
+## NOTE-VC-021 — `recordManifestEntry` caches confirmed-recorded `(tenant, colHash)` pairs, skipping the manifest `Get` on every repeat merge (task #216 HIGH follow-up)
+
+Date: 2026-07-13
+
+**The gap this closes (HIGH finding, go-presubmit-reviewer):** `recordManifestEntry`
+(NOTE-VC-019) originally called `colhashmanifest.RecordColumn` unconditionally on every
+non-empty `mergeLevel` merge, and `RecordColumn` performs a full `Get` of the tenant's aggregate
+manifest file on every call — even in the steady-state case where `(tenant, colHash)` is already
+recorded and `RecordColumn`'s own no-op branch only skips the `Put`, never the `Get`. This added
+a permanent extra object-storage round trip to every merge of every already-known column,
+forever, sitting between the real compacted-output `Put` and the delete-of-inputs loop.
+
+**Fix:** `Service.manifestSeen` (a plain `map[string]struct{}` keyed by `tenant+"\x00"+colHash`
+— no locking needed since `Run`/`RunOnce` drive compaction sequentially with no concurrent
+goroutines touching `Service` state) is checked BEFORE `recordManifestEntry` ever calls into
+`colhashmanifest.RecordColumn`. Once a pair is confirmed recorded, every subsequent merge of
+that same column for the rest of this process's lifetime is a zero-I/O no-op. A `RecordColumn`
+failure does not populate the cache, so the next merge naturally retries against the real store.
+
+**Regression test:** `TestMergeLevel_ManifestCacheSkipsRepeatedGet`
+(`valuecountscompactor/manifest_hook_test.go`) runs two independent merges of the same column
+and asserts the fake store's manifest-path `Get` is called exactly once total (confirmed red
+before this fix — 2 calls — and green after).
+
+Back-refs: `internal/modules/valuecountscompactor/service.go:Service.manifestSeen,recordManifestEntry`.
+See `SPECS.md` SPEC-VC-5.
