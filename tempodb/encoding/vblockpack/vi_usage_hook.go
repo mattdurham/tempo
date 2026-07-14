@@ -25,11 +25,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-kit/log/level"
 	blockpack "github.com/grafana/blockpack"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/grafana/tempo/tempodb/backend"
 	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
+	"github.com/grafana/tempo/tempodb/encoding/vblockpack/jobstore"
+
+	util_log "github.com/grafana/tempo/pkg/util/log"
 )
 
 // usageRecorder is the injectable seam for #496's usage-recording hook (R3/R4),
@@ -171,6 +175,18 @@ func ConfigureViUsage(
 	} else {
 		backfillDeps = NewViBackfillDepsRaw(rawR, rawW)
 	}
+	// jobStore is the opt-in durable backend_jobs queue (#181) -- nil when
+	// Postgres isn't configured, the same nil-means-disabled convention as
+	// pgPool itself. Inserting via jobStore in onShouldBackfill below is
+	// purely additive: it does NOT replace launchViBackfill's in-process
+	// goroutine, both run (see the "does NOT replace" note on ConfigureViUsage's
+	// own doc comment) -- the durable row makes a crash mid-backfill
+	// recoverable, while the goroutine keeps today's zero-added-latency
+	// common case.
+	var jobStore *jobstore.Store
+	if pgPool != nil {
+		jobStore = jobstore.New(pgPool)
+	}
 	// var + separate assignment (not :=) is required here: onShouldBackfill's
 	// closure below calls rec.registryFor, which needs rec in scope -- a
 	// short variable declaration's RHS cannot see its own LHS identifier.
@@ -181,6 +197,18 @@ func ConfigureViUsage(
 		triggerCfg: triggerCfg,
 		pgPool:     pgPool,
 		onShouldBackfill: func(entry blockpack.Entry) {
+			if jobStore != nil {
+				if ierr := jobStore.InsertViBackfill(context.Background(), entry.Tenant, jobstore.ViBackfillDetail{
+					ColumnHash: entry.ColumnHash,
+					ColumnName: entry.ColumnName,
+					ColumnType: entry.ColumnType,
+				}); ierr != nil {
+					level.Warn(util_log.Logger).Log(
+						"msg", "vblockpack: failed to insert durable vi_backfill job",
+						"tenant", entry.Tenant, "column", entry.ColumnName, "err", ierr,
+					)
+				}
+			}
 			deps := backfillDeps
 			// registryFor(tenant) returns the SAME memoised registry the
 			// triggering RecordUse call just used (Postgres-backed when
@@ -214,7 +242,7 @@ func newViUsageObjectStoreForBackend(
 	s3cfg *s3backend.Config, rawR backend.RawReader, rawW backend.RawWriter,
 ) (blockpack.ObjectStore, error) {
 	if s3cfg != nil {
-		client, err := newViBackfillMinioClient(s3cfg)
+		client, err := newMinioClientFromS3Config(s3cfg)
 		if err != nil {
 			return nil, err
 		}

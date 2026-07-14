@@ -20,6 +20,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
+
+	"github.com/grafana/tempo/tempodb/encoding/vblockpack/migrate"
 )
 
 // newTestPostgresPool starts an ephemeral Postgres container, applies this
@@ -76,41 +78,25 @@ func newTestPostgresPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-// applySchema executes path's SQL statements verbatim against pool, split on
-// bare top-level semicolons after stripping `--` line comments first. The
-// comment-strip step is load-bearing, not cosmetic: this package's schema
-// files' comments use semicolons as ordinary English punctuation (e.g. "...as
-// two distinct things; with the repeated-use ring removed..."), which a naive
-// split-on-";" over the raw file text would misread as a statement boundary,
-// slicing a CREATE TABLE statement in half mid-comment.
+// applySchema executes path's SQL statements verbatim against pool, via the
+// shared migrate.ApplyStatements helper (2026-07-14) -- the comment-strip/
+// semicolon-split logic used to live here as a private copy, but is now
+// shared with tempodb/encoding/vblockpack/migrate's own Apply(), which needs
+// the identical behavior for backend_jobs.sql. The comment-strip step is
+// load-bearing, not cosmetic: this package's schema files' comments use
+// semicolons as ordinary English punctuation (e.g. "...as two distinct
+// things; with the repeated-use ring removed..."), which a naive split-on-";"
+// over the raw file text would misread as a statement boundary, slicing a
+// CREATE TABLE statement in half mid-comment.
 func applySchema(ctx context.Context, t *testing.T, pool *pgxpool.Pool, path string) {
 	t.Helper()
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("reading schema file %s: %v", path, err)
 	}
-	for _, stmt := range strings.Split(stripSQLLineComments(string(data)), ";") {
-		stmt = strings.TrimSpace(stmt)
-		if stmt == "" {
-			continue
-		}
-		if _, err := pool.Exec(ctx, stmt); err != nil {
-			t.Fatalf("applying schema statement from %s: %v\nstatement: %s", path, err, stmt)
-		}
+	if err := migrate.ApplyStatements(ctx, pool, string(data)); err != nil {
+		t.Fatalf("applying schema from %s: %v", path, err)
 	}
-}
-
-// stripSQLLineComments removes everything from "--" to end of line, on every
-// line. Sufficient for this package's schema files, which contain no "--"
-// sequence inside a string/identifier literal.
-func stripSQLLineComments(sql string) string {
-	lines := strings.Split(sql, "\n")
-	for i, line := range lines {
-		if idx := strings.Index(line, "--"); idx != -1 {
-			lines[i] = line[:idx]
-		}
-	}
-	return strings.Join(lines, "\n")
 }
 
 // TestNewTestPostgresPool_SmokeTest is the "does the environment even support

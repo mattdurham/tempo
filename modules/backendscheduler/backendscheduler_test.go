@@ -20,6 +20,7 @@ import (
 	"github.com/grafana/tempo/tempodb"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/backend/local"
+	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
 	"github.com/grafana/tempo/tempodb/encoding"
 	"github.com/grafana/tempo/tempodb/encoding/common"
 	"github.com/grafana/tempo/tempodb/wal"
@@ -797,4 +798,38 @@ func TestCleanupOrphanedBatchesAfterDeadJobTimeout(t *testing.T) {
 		TraceIds: [][]byte{[]byte(uuid.New().String())},
 	})
 	require.NoError(t, err, "SubmitRedaction must not return AlreadyExists after batch cleanup")
+}
+
+// TestBackendScheduler_New_NoLongerConstructsCubeOrViBackfillProviders is the
+// #181 Phase 4.3 regression guard: CubeBackfillProvider/ViBackfillProvider
+// (and their poll/ticker mechanisms) have been deleted in favor of
+// backend-worker's direct-Postgres-claim path (Phase 4.1-4.2). A non-nil
+// s3cfg used to be half of the gate that constructed CubeBackfillProvider
+// (`s3cfg != nil && len(cfg.ProviderConfig.CubeBackfill.Tenants) > 0`); that
+// gate, and the CubeBackfillConfig field it read from, no longer exist, so
+// there is no longer any config shape that could construct either deleted
+// provider. This asserts New's resulting s.providers set is exactly
+// Compaction/Retention/Redaction regardless of s3cfg being set.
+func TestBackendScheduler_New_NoLongerConstructsCubeOrViBackfillProviders(t *testing.T) {
+	cfg := Config{}
+	cfg.RegisterFlagsAndApplyDefaults("", &flag.FlagSet{})
+	tmpDir := t.TempDir()
+	cfg.LocalWorkPath = tmpDir
+
+	ctx, cancel := context.WithCancel(context.Background())
+	store, rr, ww := newStore(ctx, t, tmpDir)
+	defer func() {
+		cancel()
+		store.Shutdown()
+	}()
+
+	limits, err := overrides.NewOverrides(overrides.Config{Defaults: overrides.Overrides{}}, nil, prometheus.NewRegistry())
+	require.NoError(t, err)
+
+	s3cfg := &s3backend.Config{Bucket: "test-bucket", Region: "us-east-1"}
+
+	s, err := New(cfg, s3cfg, store, limits, rr, ww)
+	require.NoError(t, err)
+
+	require.Len(t, s.providers, 3, "only Compaction/Retention/Redaction providers should be constructed")
 }

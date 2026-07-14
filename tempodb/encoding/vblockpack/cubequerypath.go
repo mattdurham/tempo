@@ -34,8 +34,9 @@ import (
 	"github.com/grafana/tempo/pkg/traceql"
 	util_log "github.com/grafana/tempo/pkg/util/log"
 	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
+	"github.com/grafana/tempo/tempodb/encoding/vblockpack/jobstore"
+	"github.com/jackc/pgx/v5/pgxpool"
 	minio "github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
 // cubeQueryPath is the process-level cube query path manager.
@@ -55,6 +56,11 @@ type cubeQueryPath struct {
 	// createCooldown rate-limits cube creation to at most once per minute
 	// per (tenant+dims) key, preventing per-block fan-out storms.
 	createSeen map[string]time.Time
+	// jobStore is the opt-in durable backend_jobs queue (#181) -- nil when
+	// Postgres isn't configured. Inserting via jobStore in maybeCreateCube's
+	// Created branch is purely additive: it does NOT replace launchBackfill,
+	// both run.
+	jobStore *jobstore.Store
 }
 
 // objectStore returns cqp.store if injected (tests), otherwise the real minio-backed store —
@@ -79,23 +85,22 @@ var (
 )
 
 // ConfigureCubeQueryPath sets up the cube query path on the querier at startup.
-func ConfigureCubeQueryPath(enabled bool, s3cfg *s3backend.Config) {
+// pgPool is the opt-in Postgres backend for the durable backend_jobs queue
+// (#181) -- nil means "not configured," mirroring ConfigureCubeManager/
+// ConfigureViUsage's own pgPool convention.
+func ConfigureCubeQueryPath(enabled bool, s3cfg *s3backend.Config, pgPool *pgxpool.Pool) {
 	if !enabled || s3cfg == nil {
 		return
 	}
 	cubeQueryPathOnce.Do(func() {
-		endpoint := s3cfg.Endpoint
-		if endpoint == "" {
-			endpoint = "s3." + s3cfg.Region + ".amazonaws.com"
-		}
-		client, err := minio.New(endpoint, &minio.Options{
-			Creds:  credentials.NewEnvAWS(),
-			Secure: !s3cfg.Insecure,
-			Region: s3cfg.Region,
-		})
+		client, err := newMinioClientFromS3Config(s3cfg)
 		if err != nil {
 			level.Warn(util_log.Logger).Log("msg", "vblockpack: cube query path disabled", "err", err)
 			return
+		}
+		var jobStore *jobstore.Store
+		if pgPool != nil {
+			jobStore = jobstore.New(pgPool)
 		}
 		processCubeQueryPathMu.Lock()
 		processCubeQueryPath = &cubeQueryPath{
@@ -103,6 +108,7 @@ func ConfigureCubeQueryPath(enabled bool, s3cfg *s3backend.Config) {
 			bucket:     s3cfg.Bucket,
 			tenants:    make(map[string]*tenantCubeState),
 			createSeen: make(map[string]time.Time),
+			jobStore:   jobStore,
 		}
 		processCubeQueryPathMu.Unlock()
 		level.Info(util_log.Logger).Log("msg", "vblockpack: cube query path configured")
@@ -400,8 +406,46 @@ func (cqp *cubeQueryPath) maybeCreateCube(
 			"cube_id", result.Entry.CubeID,
 		)
 		cqp.invalidateCache(tenant) // reload registry next time
+		if cqp.jobStore != nil {
+			if ierr := cqp.jobStore.InsertCubeBackfill(ctx, tenant, jobstore.CubeBackfillDetail{
+				CubeID:        result.Entry.CubeID,
+				WindowMinutes: math.MaxUint32,
+			}); ierr != nil {
+				level.Warn(util_log.Logger).Log(
+					"msg", "vblockpack: failed to insert durable cube_backfill job",
+					"tenant", tenant, "cube_id", result.Entry.CubeID, "err", ierr,
+				)
+			}
+		}
 		// Kick off historical backfill from the value index.
 		launchBackfill(result.Entry)
+		return
+	}
+
+	// #181 §6.3/§9 Phase 3: the cube already exists, but a cube whose single backfill
+	// attempt exhausted its retries has no OTHER path back into backend_jobs now that
+	// the poll is gone (§5.3's coverage-gap finding) -- this query-path re-evaluation
+	// (already firing at the createSeen cadence above) is the only remaining trigger
+	// point. Cube's RegistryEntry has no explicit "backfill done" flag (unlike VI's
+	// Entry.Backfill.Done); the absence of an L0 watermark is the cheapest available
+	// heuristic for "never completed a single successful backfill pass" -- a cube that
+	// finished at least one pass has a CubeRollupL0 watermark entry (E-12a's
+	// Compactor.Execute populates it on every successful rollup write), so its absence
+	// here means backfill either never ran or never succeeded even once.
+	if cqp.jobStore == nil {
+		return
+	}
+	if _, hasL0 := result.Entry.Watermarks[blockpack.CubeRollupL0]; hasL0 {
+		return
+	}
+	if ierr := cqp.jobStore.InsertCubeBackfill(ctx, tenant, jobstore.CubeBackfillDetail{
+		CubeID:        result.Entry.CubeID,
+		WindowMinutes: math.MaxUint32,
+	}); ierr != nil {
+		level.Warn(util_log.Logger).Log(
+			"msg", "vblockpack: failed to insert durable cube_backfill retry job",
+			"tenant", tenant, "cube_id", result.Entry.CubeID, "err", ierr,
+		)
 	}
 }
 

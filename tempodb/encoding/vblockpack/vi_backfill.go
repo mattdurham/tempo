@@ -35,7 +35,6 @@ import (
 	"github.com/grafana/tempo/tempodb/backend"
 	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
 	minio "github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
 // viUsageObjectStore satisfies blockpack.ObjectStore over a minio client,
@@ -308,7 +307,7 @@ func NewViBackfillDepsS3(s3cfg *s3backend.Config) (RunViBackfillDeps, error) {
 	if s3cfg == nil {
 		return RunViBackfillDeps{}, nil
 	}
-	client, err := newViBackfillMinioClient(s3cfg)
+	client, err := newMinioClientFromS3Config(s3cfg)
 	if err != nil {
 		return RunViBackfillDeps{}, err
 	}
@@ -399,18 +398,6 @@ func launchViBackfill(entry blockpack.Entry, deps RunViBackfillDeps) {
 		)
 		_ = RunViBackfill(context.Background(), entry, deps)
 	}()
-}
-
-func newViBackfillMinioClient(s3cfg *s3backend.Config) (*minio.Client, error) {
-	endpoint := s3cfg.Endpoint
-	if endpoint == "" {
-		endpoint = "s3." + s3cfg.Region + ".amazonaws.com"
-	}
-	return minio.New(endpoint, &minio.Options{
-		Creds:  credentials.NewEnvAWS(),
-		Secure: !s3cfg.Insecure,
-		Region: s3cfg.Region,
-	})
 }
 
 func isContextErr(ctx context.Context, err error) bool {

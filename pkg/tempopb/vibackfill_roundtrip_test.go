@@ -5,12 +5,12 @@ package tempopb
 // specifically because implementing this feature revealed that JobDetail.
 // CubeBackfill (JOB_TYPE_CUBE_BACKFILL's own equivalent field, added the same
 // hand-patched way since protoc/protoc-gen-gogo are not available in this
-// environment) is declared with a protobuf tag but was never wired into
-// JobDetail's MarshalToSizedBuffer/Unmarshal/Size methods -- it is silently
-// dropped on every real gRPC round-trip despite being actively read by
-// modules/backendworker/backendworker.go's processCubeBackfillJob. Reported
-// to team lead as a standalone finding, not fixed here (cube's own code, out
-// of #496's scope). ViBackfill must not repeat that mistake.
+// environment) was declared with a protobuf tag but never wired into
+// JobDetail's MarshalToSizedBuffer/Unmarshal/Size methods -- it was silently
+// dropped on every real gRPC round-trip. #181 Phase 5 deleted CubeBackfillDetail/
+// JobDetail.CubeBackfill entirely once cube_backfill moved off this gRPC path
+// onto Postgres, so that gap no longer exists to document. ViBackfill must not
+// repeat that mistake.
 
 import (
 	"testing"
@@ -73,24 +73,4 @@ func TestJobDetail_NilViBackfill_MarshalUnmarshalRoundTrips(t *testing.T) {
 func TestJobType_ViBackfillEnumValue(t *testing.T) {
 	assert.Equal(t, JobType(5), JobType_JOB_TYPE_VI_BACKFILL)
 	assert.Equal(t, "JOB_TYPE_VI_BACKFILL", JobType_JOB_TYPE_VI_BACKFILL.String())
-}
-
-// TestJobDetail_CubeBackfill_KnownWireFormatGap documents (does not fix) the
-// standalone finding above: CubeBackfill is silently dropped by Marshal/
-// Unmarshal. This test is intentionally written to demonstrate the gap, not
-// to enforce correct behavior -- if this test ever starts failing (i.e.
-// CubeBackfill starts round-tripping), that's a sign someone fixed the gap
-// and this test (and its comment) should be deleted, not "fixed" to keep
-// failing.
-func TestJobDetail_CubeBackfill_KnownWireFormatGap(t *testing.T) {
-	original := &JobDetail{
-		Tenant:       "tenant-a",
-		CubeBackfill: &CubeBackfillDetail{CubeID: "cube-1", WindowMinutes: 60},
-	}
-	data, err := original.Marshal()
-	require.NoError(t, err)
-
-	var decoded JobDetail
-	require.NoError(t, decoded.Unmarshal(data))
-	assert.Nil(t, decoded.CubeBackfill, "documents the known gap: CubeBackfill is NOT wired into Marshal/Unmarshal/Size")
 }

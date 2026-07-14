@@ -9,10 +9,9 @@ import (
 
 // Config contains configuration for all providers
 type Config struct {
-	Retention    RetentionConfig    `yaml:"retention"`
-	Compaction   CompactionConfig   `yaml:"compaction"`
-	Redaction    RedactionConfig    `yaml:"redaction"`
-	CubeBackfill CubeBackfillConfig `yaml:"cube_backfill"`
+	Retention  RetentionConfig  `yaml:"retention"`
+	Compaction CompactionConfig `yaml:"compaction"`
+	Redaction  RedactionConfig  `yaml:"redaction"`
 }
 
 func (cfg *Config) RegisterFlagsAndApplyDefaults(prefix string, f *flag.FlagSet) {
@@ -36,7 +35,3 @@ func ValidateConfig(cfg *Config) error {
 
 	return nil
 }
-
-// CubeBackfillConfig configures the cube backfill provider.
-// It is a separate type here to decouple from the cubebackfill.go struct.
-// This is added to the main Config below.

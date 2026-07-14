@@ -30,7 +30,6 @@ import (
 	"github.com/grafana/tempo/tempodb/backend"
 	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
 	minio "github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
 const (
@@ -137,15 +136,7 @@ func ConfigureCubeManager(enabled bool, s3cfg *s3backend.Config, rawR backend.Ra
 	cubeManagerOnce.Do(func() {
 		var cm *cubeManager
 		if s3cfg != nil {
-			endpoint := s3cfg.Endpoint
-			if endpoint == "" {
-				endpoint = "s3." + s3cfg.Region + ".amazonaws.com"
-			}
-			client, err := minio.New(endpoint, &minio.Options{
-				Creds:  credentials.NewEnvAWS(),
-				Secure: !s3cfg.Insecure,
-				Region: s3cfg.Region,
-			})
+			client, err := newMinioClientFromS3Config(s3cfg)
 			if err != nil {
 				level.Warn(util_log.Logger).Log("msg", "vblockpack: cube manager disabled — S3 client init failed", "err", err)
 				return

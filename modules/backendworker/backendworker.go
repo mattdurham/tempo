@@ -2,6 +2,7 @@ package backendworker
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"math/rand"
@@ -17,6 +18,7 @@ import (
 	"github.com/grafana/dskit/services"
 	backendscheduler_client "github.com/grafana/tempo/modules/backendscheduler/client"
 	"github.com/grafana/tempo/modules/overrides"
+	"github.com/grafana/tempo/modules/postgres"
 	"github.com/grafana/tempo/modules/storage"
 	"github.com/grafana/tempo/pkg/tempopb"
 	"github.com/grafana/tempo/pkg/util/log"
@@ -25,6 +27,8 @@ import (
 	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
 	"github.com/grafana/tempo/tempodb/encoding/common"
 	vblockpack "github.com/grafana/tempo/tempodb/encoding/vblockpack"
+	"github.com/grafana/tempo/tempodb/encoding/vblockpack/jobstore"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc/codes"
 )
@@ -39,6 +43,24 @@ const (
 	ringNumTokens = 512
 
 	backendWorkerRingKey = "backend-worker"
+
+	// maxRetries is the #181 §8.1 locked default for Postgres-claimed
+	// vi_backfill/cube_backfill jobs: 5 attempts (doubling backoff from 1m,
+	// capped at 30m, per jobstore.backoffDuration) before a job is left
+	// permanently failed.
+	maxRetries = 5
+
+	// postgresJobReportTimeout bounds reportPostgresJobOutcome's final
+	// Store.Fail/Store.Complete call (2026-07-14 fix). This call must run on
+	// a FRESH context, not the job's own (possibly already-expired) ctx: if
+	// RunCubeBackfill/RunViBackfill failed because that ctx's deadline was
+	// exceeded, reusing the same expired ctx for the reporting call would
+	// make the SQL UPDATE itself fail too, leaving the row stuck in
+	// 'claimed' until its much longer (30m) lease expires -- see
+	// jobstore.claimJobSQL's lease_expires_at reclaim window. 10s is ample
+	// for a single-row UPDATE/transaction against Postgres while still
+	// bounding how long a worker can block on a reporting call gone bad.
+	postgresJobReportTimeout = 10 * time.Second
 )
 
 var ringOp = ring.NewOp([]ring.InstanceState{ring.ACTIVE}, nil)
@@ -53,6 +75,14 @@ type BackendWorker struct {
 	backendScheduler tempopb.BackendSchedulerClient
 
 	workerID string
+
+	// jobStore is nil when Postgres is not configured (cfg.Postgres == nil)
+	// -- the same nil-means-disabled convention as backendscheduler's
+	// catalogLister. Non-nil means processJobs tries a direct Postgres claim
+	// for vi_backfill/cube_backfill before falling back to the existing gRPC
+	// Next() path (#181 Phase 4).
+	jobStore *jobstore.Store
+	pgPool   *pgxpool.Pool
 
 	// Ring used for sharding tenant index writing.
 	ringLifecycler *ring.BasicLifecycler
@@ -92,6 +122,20 @@ func New(cfg Config, schedulerClientCfg backendscheduler_client.Config, s3cfg *s
 		return nil, fmt.Errorf("failed to create backend scheduler client: %w", err)
 	}
 	w.backendScheduler = schedulerClient
+
+	// Postgres job store (#181 Phase 4): opt-in, nil when cfg.Postgres is
+	// nil. Not the migration owner (backend-scheduler's New() applies
+	// backend_jobs.sql, per #181 §3.3) -- a worker only ever claims rows an
+	// already-migrated schema exposes.
+	if cfg.Postgres != nil {
+		pool, perr := postgres.NewPool(context.Background(), cfg.Postgres)
+		if perr != nil {
+			level.Warn(log.Logger).Log("msg", "postgres job store disabled -- pool init failed", "err", perr)
+		} else {
+			w.pgPool = pool
+			w.jobStore = jobstore.New(pool)
+		}
+	}
 
 	if w.isSharded() {
 		reg = prometheus.WrapRegistererWithPrefix("tempo_", reg)
@@ -235,6 +279,18 @@ func (w *BackendWorker) running(ctx context.Context) error {
 }
 
 func (w *BackendWorker) processJobs(ctx context.Context) error {
+	if w.jobStore != nil {
+		job, err := w.tryClaimPostgresJob(ctx)
+		if err != nil {
+			return err
+		}
+		if job != nil {
+			return w.dispatchPostgresJob(ctx, job)
+		}
+		// No Postgres job claimable right now -- fall through to the
+		// existing gRPC path below, unchanged.
+	}
+
 	var (
 		resp *tempopb.NextJobResponse
 		err  error
@@ -275,100 +331,152 @@ func (w *BackendWorker) processJobs(ctx context.Context) error {
 		return w.processRetentionJob(ctx, resp)
 	case tempopb.JobType_JOB_TYPE_REDACTION:
 		return w.processRedactionJob(ctx, resp)
-	case tempopb.JobType_JOB_TYPE_CUBE_BACKFILL:
-		return w.processCubeBackfillJob(ctx, resp)
-	case tempopb.JobType_JOB_TYPE_VI_BACKFILL:
-		return w.processViBackfillJob(ctx, resp)
 	default:
 		return fmt.Errorf("unknown job type: %s", resp.Type.String())
 	}
 }
 
-func (w *BackendWorker) processCubeBackfillJob(ctx context.Context, resp *tempopb.NextJobResponse) error {
-	tenant := resp.Detail.Tenant
-	if tenant == "" {
-		return w.failJob(ctx, resp.JobId, "cube backfill job missing tenant")
+// tryClaimPostgresJob tries JOB_TYPE_VI_BACKFILL then JOB_TYPE_CUBE_BACKFILL
+// (arbitrary priority order, revisit if real production data shows one
+// starving the other -- no evidence either way today). Returns (nil, nil) if
+// neither has claimable work.
+func (w *BackendWorker) tryClaimPostgresJob(ctx context.Context) (*jobstore.Job, error) {
+	job, err := w.jobStore.Claim(ctx, jobstore.JobTypeViBackfill, w.workerID)
+	if err != nil {
+		return nil, fmt.Errorf("claim vi_backfill: %w", err)
 	}
-	if resp.Detail.CubeBackfill == nil {
-		return w.failJob(ctx, resp.JobId, "cube backfill job missing detail")
-	}
-	cubeID := resp.Detail.CubeBackfill.CubeID
-
-	level.Info(log.Logger).Log("msg", "processing cube backfill job",
-		"job_id", resp.JobId, "tenant", tenant, "cube_id", cubeID)
-
-	if w.s3Cfg == nil {
-		return w.failJob(ctx, resp.JobId, "cube backfill: S3 not configured on worker")
+	if job != nil {
+		return job, nil
 	}
 
-	// Build a synthetic registry entry; RunCubeBackfill will load actual dimensions.
-	entry := blockpack.CubeRegistryEntry{
-		CubeID:     cubeID,
-		Tenant:     tenant,
-		Dimensions: []string{resp.Detail.CubeBackfill.CubeID}, // placeholder
-		Resolution: 1,
+	job, err = w.jobStore.Claim(ctx, jobstore.JobTypeCubeBackfill, w.workerID)
+	if err != nil {
+		return nil, fmt.Errorf("claim cube_backfill: %w", err)
 	}
-	// Load actual entry from registry to get dimensions.
-	entry = vblockpack.LoadCubeEntry(ctx, w.s3Cfg, tenant, cubeID, entry)
-
-	// Run backfill synchronously (the worker goroutine is already async).
-	vblockpack.RunCubeBackfill(ctx, entry, w.s3Cfg)
-
-	return w.callSchedulerWithBackoff(ctx, func(ctx context.Context) error {
-		_, err := w.backendScheduler.UpdateJob(ctx, &tempopb.UpdateJobStatusRequest{
-			JobId:  resp.JobId,
-			Status: tempopb.JobStatus_JOB_STATUS_SUCCEEDED,
-		})
-		return err
-	})
+	return job, nil
 }
 
-// processViBackfillJob executes a #496 usage-triggered VI column backfill
-// job, mirroring processCubeBackfillJob's shape. Unlike RunCubeBackfill
-// (void return), vblockpack.RunViBackfill returns an error that is
-// propagated to failJob rather than silently swallowed -- a backfill run
-// that could not persist its watermark (R7/R9) should surface as a failed
-// job, not a silent success, so the scheduler's own retry/observability
-// machinery sees it.
-func (w *BackendWorker) processViBackfillJob(ctx context.Context, resp *tempopb.NextJobResponse) error {
-	tenant := resp.Detail.Tenant
-	if tenant == "" {
-		return w.failJob(ctx, resp.JobId, "vi backfill job missing tenant")
+// dispatchPostgresJob runs job to completion and reports the result back to
+// Postgres directly (Store.Complete/Fail) -- NOT via w.backendScheduler.
+// UpdateJob. There is no scheduler-mediated status update for Postgres-
+// claimed jobs, since the scheduler was never the one that handed the job
+// out in this branch.
+func (w *BackendWorker) dispatchPostgresJob(ctx context.Context, job *jobstore.Job) error {
+	var err error
+	switch job.Type {
+	case jobstore.JobTypeViBackfill:
+		err = w.processViBackfillJobPostgres(ctx, job)
+	case jobstore.JobTypeCubeBackfill:
+		err = w.processCubeBackfillJobPostgres(ctx, job)
+	default:
+		err = fmt.Errorf("unknown postgres job type: %s", job.Type)
 	}
-	if resp.Detail.ViBackfill == nil {
-		return w.failJob(ctx, resp.JobId, "vi backfill job missing detail")
+	return w.reportPostgresJobOutcome(job.ID, err)
+}
+
+// reportPostgresJobOutcome reports a Postgres-claimed job's execution result
+// directly to w.jobStore (Complete on success, Fail-with-retry on error) --
+// never to w.backendScheduler.UpdateJob, since the scheduler never handed
+// the job out in this branch.
+//
+// The Store.Fail/Store.Complete call itself runs on a fresh, short-lived
+// context (postgresJobReportTimeout), NOT the job's own ctx passed in here
+// (2026-07-14 fix): a job that failed because ITS OWN ctx's deadline was
+// exceeded must still be able to successfully record that failure, which is
+// impossible if the reporting call reuses that same already-expired ctx.
+func (w *BackendWorker) reportPostgresJobOutcome(jobID string, jobErr error) error {
+	reportCtx, cancel := context.WithTimeout(context.Background(), postgresJobReportTimeout)
+	defer cancel()
+
+	if jobErr != nil {
+		level.Error(log.Logger).Log("msg", "postgres job failed", "job_id", jobID, "err", jobErr)
+		return w.jobStore.Fail(reportCtx, jobID, jobErr.Error(), maxRetries)
 	}
+	return w.jobStore.Complete(reportCtx, jobID)
+}
+
+// processViBackfillJobPostgres unmarshals job.Detail (JSONB) into
+// jobstore.ViBackfillDetail and runs the backfill; success/failure is
+// reported by dispatchPostgresJob's caller via w.jobStore, not
+// w.backendScheduler -- there is no gRPC-path equivalent anymore (deleted,
+// mirroring cube_backfill's earlier removal, once nothing emits
+// JOB_TYPE_VI_BACKFILL into the scheduler's job stream).
+func (w *BackendWorker) processViBackfillJobPostgres(ctx context.Context, job *jobstore.Job) error {
+	if job.Tenant == "" {
+		return fmt.Errorf("vi backfill job missing tenant")
+	}
+
+	var detail jobstore.ViBackfillDetail
+	if err := json.Unmarshal(job.Detail, &detail); err != nil {
+		return fmt.Errorf("vi backfill: unmarshal detail: %w", err)
+	}
+
 	if w.s3Cfg == nil {
-		return w.failJob(ctx, resp.JobId, "vi backfill: S3 not configured on worker")
+		return fmt.Errorf("vi backfill: S3 not configured on worker")
 	}
 
 	entry := blockpack.Entry{
-		Tenant:     tenant,
-		ColumnHash: resp.Detail.ViBackfill.ColumnHash,
-		ColumnName: resp.Detail.ViBackfill.ColumnName,
-		ColumnType: resp.Detail.ViBackfill.ColumnType,
+		Tenant:     job.Tenant,
+		ColumnHash: detail.ColumnHash,
+		ColumnName: detail.ColumnName,
+		ColumnType: detail.ColumnType,
 	}
 
-	level.Info(log.Logger).Log("msg", "processing vi backfill job",
-		"job_id", resp.JobId, "tenant", tenant, "column", entry.ColumnName)
+	level.Info(log.Logger).Log("msg", "processing vi backfill job (postgres)",
+		"job_id", job.ID, "tenant", job.Tenant, "column", entry.ColumnName)
 
 	deps, err := vblockpack.NewViBackfillDepsS3(w.s3Cfg)
 	if err != nil {
-		return w.failJob(ctx, resp.JobId, fmt.Sprintf("vi backfill: failed to construct deps: %v", err))
+		return fmt.Errorf("vi backfill: failed to construct deps: %w", err)
+	}
+
+	if err := vblockpack.RunViBackfill(ctx, entry, deps); err != nil {
+		return fmt.Errorf("vi backfill failed: %w", err)
+	}
+
+	return nil
+}
+
+// processCubeBackfillJobPostgres mirrors processViBackfillJobPostgres's shape
+// for cube_backfill: job.Detail (JSONB) is unmarshaled into
+// jobstore.CubeBackfillDetail, and success/failure is reported by
+// dispatchPostgresJob's caller via w.jobStore, never via w.backendScheduler.
+// #181 Phase 5 deleted the old gRPC-path equivalent (processCubeBackfillJob,
+// which read tempopb.JobDetail.CubeBackfill) once cube_backfill moved
+// entirely off the gRPC Next()/JobDetail path.
+func (w *BackendWorker) processCubeBackfillJobPostgres(ctx context.Context, job *jobstore.Job) error {
+	if job.Tenant == "" {
+		return fmt.Errorf("cube backfill job missing tenant")
+	}
+
+	var detail jobstore.CubeBackfillDetail
+	if err := json.Unmarshal(job.Detail, &detail); err != nil {
+		return fmt.Errorf("cube backfill: unmarshal detail: %w", err)
+	}
+
+	if w.s3Cfg == nil {
+		return fmt.Errorf("cube backfill: S3 not configured on worker")
+	}
+
+	level.Info(log.Logger).Log("msg", "processing cube backfill job (postgres)",
+		"job_id", job.ID, "tenant", job.Tenant, "cube_id", detail.CubeID)
+
+	// Load the real registry entry (dimensions, AggAttrs, filters). A missing
+	// entry is a hard, immediate failure (2026-07-14 fix) -- proceeding into
+	// RunCubeBackfill with a placeholder entry lacking AggAttrs would fail
+	// cube.Backfiller's per-minute validation on every single minute of the
+	// backfill window, burning the job's entire ctx budget for nothing.
+	entry, err := vblockpack.LoadCubeEntry(ctx, w.s3Cfg, job.Tenant, detail.CubeID)
+	if err != nil {
+		return fmt.Errorf("cube backfill: no registry entry found for cube %s: %w", detail.CubeID, err)
 	}
 
 	// Run backfill synchronously (the worker goroutine is already async).
-	if err := vblockpack.RunViBackfill(ctx, entry, deps); err != nil {
-		return w.failJob(ctx, resp.JobId, fmt.Sprintf("vi backfill failed: %v", err))
+	if err := vblockpack.RunCubeBackfill(ctx, entry, w.s3Cfg); err != nil {
+		return fmt.Errorf("cube backfill failed: %w", err)
 	}
 
-	return w.callSchedulerWithBackoff(ctx, func(ctx context.Context) error {
-		_, err := w.backendScheduler.UpdateJob(ctx, &tempopb.UpdateJobStatusRequest{
-			JobId:  resp.JobId,
-			Status: tempopb.JobStatus_JOB_STATUS_SUCCEEDED,
-		})
-		return err
-	})
+	return nil
 }
 
 func (w *BackendWorker) processCompactionJob(ctx context.Context, resp *tempopb.NextJobResponse) error {
@@ -519,6 +627,10 @@ func (w *BackendWorker) completeRedactionJob(ctx context.Context, jobID string, 
 }
 
 func (w *BackendWorker) stopping(_ error) error {
+	if w.pgPool != nil {
+		w.pgPool.Close()
+	}
+
 	if w.subservices != nil {
 		return services.StopManagerAndAwaitStopped(context.Background(), w.subservices)
 	}

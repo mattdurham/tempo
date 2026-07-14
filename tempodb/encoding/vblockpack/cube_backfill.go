@@ -10,6 +10,7 @@ package vblockpack
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"path"
 	"strings"
@@ -20,7 +21,6 @@ import (
 	util_log "github.com/grafana/tempo/pkg/util/log"
 	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
 	minio "github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
 // viBackfillSource implements blockpack.CubeValueIndexSource over S3 VI files.
@@ -259,30 +259,73 @@ numeric:
 // covered; CubeRegistry.UpdateWatermarks' own min-of-mins/max-of-maxes
 // expansion (registry.go) accumulates these into the run's full covered
 // range as newest-to-oldest processing proceeds.
+// cubeBackfillMaxConsecutiveFailures bounds how many consecutive per-minute
+// processMinute failures runCubeBackfillCore tolerates before aborting the
+// whole run, rather than burning the entire (possibly math.MaxUint32-wide)
+// backfill window on a structural failure that will deterministically recur
+// on every remaining minute (e.g. a registry entry missing required
+// AggAttrs -- 2026-07-14 fix). 5 matches maxRetries (backendworker.go), the
+// locked default for how many attempts a Postgres-claimed job gets before
+// it is left permanently failed -- reusing it here keeps a single
+// "how many failures before giving up" policy value across the codebase's
+// related retry/circuit-breaker knobs instead of introducing a second,
+// independently-tuned constant. It is also large enough that a genuinely
+// transient run of isolated failures (a bad VI object, a brief S3 hiccup)
+// is very unlikely to trip it -- the counter resets on every minute that
+// succeeds, so only an UNINTERRUPTED run of failures counts -- while a
+// structural failure (which reproduces identically on literally every
+// minute) reaches 5 in a handful of near-zero-cost iterations, long before
+// it could meaningfully burn through an unbounded window.
+const cubeBackfillMaxConsecutiveFailures = 5
+
 func runCubeBackfillCore(
 	ctx context.Context,
 	entry blockpack.CubeRegistryEntry,
 	src blockpack.CubeValueIndexSource,
 	objStore blockpack.CubeObjectStore,
 	cfg blockpack.CubeBackfillConfig,
+	currentMinute uint32,
 ) error {
 	registry := blockpack.NewCubeRegistry(objStore, entry.Tenant)
 	bf := blockpack.NewCubeBackfiller(entry, src, cfg)
-	return bf.Run(ctx, 0, func(prog blockpack.CubeBackfillProgress) error {
-		if prog.LastError == nil {
-			wm := prog.Watermark
-			if uwErr := registry.UpdateWatermarks(
-				ctx, entry.CubeID, blockpack.CubeRollupL0, wm.WatermarkMinute, wm.WatermarkMinute,
-			); uwErr != nil {
-				// A persist failure aborts the run rather than continuing to spend
-				// backfill I/O the registry cannot yet account for (R7's VI precedent,
-				// applied here too): mirrors runViBackfillCore's identical posture.
+	var consecutiveFailures int
+	return bf.Run(ctx, currentMinute, func(prog blockpack.CubeBackfillProgress) error {
+		if prog.LastError != nil {
+			// A per-minute failure is tolerated (Backfiller.Run's own doc comment:
+			// "logs and moves to the next older minute") UNLESS it is part of an
+			// uninterrupted run of cubeBackfillMaxConsecutiveFailures failures --
+			// that shape indicates a structural failure (e.g. missing AggAttrs)
+			// that will recur on every remaining minute, not a transient blip, so
+			// aborting early here avoids burning the rest of the (possibly
+			// unbounded) backfill window on work that can never succeed.
+			consecutiveFailures++
+			if consecutiveFailures >= cubeBackfillMaxConsecutiveFailures {
 				level.Warn(util_log.Logger).Log(
-					"msg", "vblockpack: cube backfill: watermark persist failed",
-					"tenant", entry.Tenant, "cube_id", entry.CubeID, "err", uwErr,
+					"msg", "vblockpack: cube backfill: aborting after consecutive per-minute failures",
+					"tenant", entry.Tenant, "cube_id", entry.CubeID,
+					"consecutive_failures", consecutiveFailures, "err", prog.LastError,
 				)
-				return uwErr
+				return fmt.Errorf(
+					"cube backfill: aborted after %d consecutive per-minute failures: %w",
+					consecutiveFailures, prog.LastError,
+				)
 			}
+			return nil
+		}
+		consecutiveFailures = 0
+
+		wm := prog.Watermark
+		if uwErr := registry.UpdateWatermarks(
+			ctx, entry.CubeID, blockpack.CubeRollupL0, wm.WatermarkMinute, wm.WatermarkMinute,
+		); uwErr != nil {
+			// A persist failure aborts the run rather than continuing to spend
+			// backfill I/O the registry cannot yet account for (R7's VI precedent,
+			// applied here too): mirrors runViBackfillCore's identical posture.
+			level.Warn(util_log.Logger).Log(
+				"msg", "vblockpack: cube backfill: watermark persist failed",
+				"tenant", entry.Tenant, "cube_id", entry.CubeID, "err", uwErr,
+			)
+			return uwErr
 		}
 		if prog.Watermark.Done {
 			metricCubeBackfillCompleted.Inc()
@@ -326,7 +369,7 @@ func launchBackfill(entry blockpack.CubeRegistryEntry) {
 			"tenant", entry.Tenant,
 			"cube_id", entry.CubeID,
 		)
-		if err := runCubeBackfillCore(context.Background(), entry, src, objStore, cfg); err != nil {
+		if err := runCubeBackfillCore(context.Background(), entry, src, objStore, cfg, 0); err != nil {
 			metricCubeBackfillFailed.Inc()
 			level.Warn(util_log.Logger).Log(
 				"msg", "vblockpack: cube backfill error",
@@ -340,23 +383,18 @@ func launchBackfill(entry blockpack.CubeRegistryEntry) {
 
 // RunCubeBackfill runs the cube backfill synchronously in the calling goroutine.
 // Unlike launchBackfill, this blocks until the backfill is complete or ctx is done.
-// Used by the backend-worker job executor.
-func RunCubeBackfill(ctx context.Context, entry blockpack.CubeRegistryEntry, s3cfg *s3backend.Config) {
+// Used by the backend-worker job executor. Returns a real error on any genuine failure
+// (S3 client construction, watermark persistence, or a BackfillEngine.Run error,
+// including context cancellation/deadline) so the caller (processCubeBackfillJobPostgres)
+// can report the job as failed rather than unconditionally as succeeded.
+func RunCubeBackfill(ctx context.Context, entry blockpack.CubeRegistryEntry, s3cfg *s3backend.Config) error {
 	if s3cfg == nil {
-		return
+		return nil
 	}
-	endpoint := s3cfg.Endpoint
-	if endpoint == "" {
-		endpoint = "s3." + s3cfg.Region + ".amazonaws.com"
-	}
-	client, err := minio.New(endpoint, &minio.Options{
-		Creds:  credentials.NewEnvAWS(),
-		Secure: !s3cfg.Insecure,
-		Region: s3cfg.Region,
-	})
+	client, err := newMinioClientFromS3Config(s3cfg)
 	if err != nil {
 		level.Warn(util_log.Logger).Log("msg", "vblockpack: RunCubeBackfill: S3 client init failed", "err", err)
-		return
+		return err
 	}
 	src := &viBackfillSource{
 		store:       newBackfillVIStore(client, s3cfg.Bucket),
@@ -372,42 +410,43 @@ func RunCubeBackfill(ctx context.Context, entry blockpack.CubeRegistryEntry, s3c
 		WindowMinutes: math.MaxUint32,
 	}
 	metricCubeBackfillStarted.Inc()
-	err = runCubeBackfillCore(ctx, entry, src, objStore, cfg)
+	err = runCubeBackfillCore(ctx, entry, src, objStore, cfg, 0)
 	if err != nil && !errors.Is(err, ctx.Err()) {
 		metricCubeBackfillFailed.Inc()
 		level.Warn(util_log.Logger).Log("msg", "vblockpack: cube backfill error",
 			"tenant", entry.Tenant, "cube_id", entry.CubeID, "err", err)
 	}
+	return err
 }
 
 // LoadCubeEntry loads the actual CubeRegistryEntry for cubeID from S3.
-// Returns the default entry if loading fails or the entry is not found.
-func LoadCubeEntry(ctx context.Context, s3cfg *s3backend.Config, tenant, cubeID string, def blockpack.CubeRegistryEntry) blockpack.CubeRegistryEntry {
+// Returns a real error if s3cfg is nil, the S3 client cannot be constructed,
+// the registry cannot be loaded, or no entry with cubeID exists in it --
+// callers must treat any of these as a hard failure (2026-07-14 fix). A
+// prior version of this function silently returned a caller-supplied
+// placeholder CubeRegistryEntry on any of these failures, which let
+// processCubeBackfillJobPostgres proceed into RunCubeBackfill with a
+// definition guaranteed to fail cube.Backfiller's per-minute "definition
+// must include duration in AggAttrs" validation on literally every minute
+// of the (possibly math.MaxUint32-wide) backfill window.
+func LoadCubeEntry(ctx context.Context, s3cfg *s3backend.Config, tenant, cubeID string) (blockpack.CubeRegistryEntry, error) {
 	if s3cfg == nil {
-		return def
+		return blockpack.CubeRegistryEntry{}, errors.New("cube registry: s3 not configured")
 	}
-	endpoint := s3cfg.Endpoint
-	if endpoint == "" {
-		endpoint = "s3." + s3cfg.Region + ".amazonaws.com"
-	}
-	client, err := minio.New(endpoint, &minio.Options{
-		Creds:  credentials.NewEnvAWS(),
-		Secure: !s3cfg.Insecure,
-		Region: s3cfg.Region,
-	})
+	client, err := newMinioClientFromS3Config(s3cfg)
 	if err != nil {
-		return def
+		return blockpack.CubeRegistryEntry{}, fmt.Errorf("cube registry: new minio client: %w", err)
 	}
 	os := &minioObjectStore{client: client, bucket: s3cfg.Bucket}
 	reg := blockpack.NewCubeRegistry(os, tenant)
 	entries, _, loadErr := reg.Load(ctx)
 	if loadErr != nil {
-		return def
+		return blockpack.CubeRegistryEntry{}, fmt.Errorf("cube registry: load: %w", loadErr)
 	}
 	for _, e := range entries {
 		if e.CubeID == cubeID {
-			return e
+			return e, nil
 		}
 	}
-	return def
+	return blockpack.CubeRegistryEntry{}, fmt.Errorf("cube registry: entry %q not found for tenant %q", cubeID, tenant)
 }

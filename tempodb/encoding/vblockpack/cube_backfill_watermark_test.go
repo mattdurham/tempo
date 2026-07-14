@@ -13,6 +13,7 @@ package vblockpack
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 
@@ -108,7 +109,7 @@ func TestRunCubeBackfillCore_CallsUpdateWatermarksOnEachProgress(t *testing.T) {
 
 	completedBefore := testutil.ToFloat64(metricCubeBackfillCompleted)
 
-	err := runCubeBackfillCore(context.Background(), entry, fakeEmptyCubeValueIndexSource{}, store, cfg)
+	err := runCubeBackfillCore(context.Background(), entry, fakeEmptyCubeValueIndexSource{}, store, cfg, 0)
 	require.NoError(t, err)
 
 	// One UpdateWatermarks (ConditionalPut) call per backfilled minute (3), on
@@ -152,7 +153,7 @@ func TestRunCubeBackfillCore_PersistFailureAbortsRun(t *testing.T) {
 		Workers:       1,
 		WindowMinutes: 3,
 	}
-	err := runCubeBackfillCore(context.Background(), entry, fakeEmptyCubeValueIndexSource{}, failing, cfg)
+	err := runCubeBackfillCore(context.Background(), entry, fakeEmptyCubeValueIndexSource{}, failing, cfg, 0)
 	require.Error(t, err)
 }
 
@@ -166,4 +167,124 @@ func (s *alwaysConflictCubeStore) Get(ctx context.Context, path string) ([]byte,
 
 func (s *alwaysConflictCubeStore) ConditionalPut(context.Context, string, []byte, string) error {
 	return blockpack.CubeErrConflict
+}
+
+// failingMinuteCubeValueIndexSource is a deterministic LookupColumn fake, keyed by minute
+// (derived from minSec/60, exactly the value processMinute always passes for a single-minute
+// call), that returns failErr for every minute in failMinutes and otherwise behaves exactly
+// like fakeEmptyCubeValueIndexSource (no data, sparse-minute success). This is the smallest
+// extension of the existing fakeEmptyCubeValueIndexSource injection seam that lets a test
+// deterministically control WHICH minutes structurally fail processMinute's dim1 lookup
+// (2026-07-14, circuit-breaker regression tests below) -- a live/fake S3 server has no
+// natural way to key a failing GET by minute without a much larger, VI-filename-parsing-aware
+// test double, and runCubeBackfillCore's own dependency-injected split exists precisely so
+// this kind of scenario is unit-testable against fakes (see its doc comment above).
+type failingMinuteCubeValueIndexSource struct {
+	failMinutes map[uint32]bool
+	failErr     error
+}
+
+func (s *failingMinuteCubeValueIndexSource) LookupColumn(
+	_ context.Context, _, _ string, minSec, _ uint64,
+) ([]blockpack.VIQueryResult, error) {
+	if s.failMinutes[uint32(minSec/60)] { //nolint:gosec // test-only, minSec always fits uint32*60
+		return nil, s.failErr
+	}
+	return nil, nil
+}
+
+// TestRunCubeBackfillCore_ScatteredTransientFailuresTolerated proves the circuit breaker
+// (cubeBackfillMaxConsecutiveFailures) does NOT trip on isolated, non-consecutive per-minute
+// failures scattered through an otherwise-healthy run: the run must still complete (Done=true,
+// no error), with the watermark covering the full window -- exactly the "a few isolated bad
+// minutes scattered through an otherwise-healthy run should NOT trip the breaker" contract.
+func TestRunCubeBackfillCore_ScatteredTransientFailuresTolerated(t *testing.T) {
+	entry := blockpack.CubeRegistryEntry{
+		CubeID:     "scattered-cube",
+		Tenant:     "tenant-a",
+		Dimensions: []string{"service.name"},
+		AggAttrs:   []string{blockpack.CubeDurationColumn},
+		Resolution: 1,
+	}
+	store := &fakeCubeRegistryObjectStore{}
+	seedCubeEntry(t, store, entry)
+	preSeedPutCalls := store.putCalls
+
+	const (
+		currentMinute = 1000
+		windowMinutes = 20 // processes minutes [980, 999]
+	)
+	// 3 scattered, non-adjacent failing minutes -- well under
+	// cubeBackfillMaxConsecutiveFailures (5) at any point since each is isolated.
+	src := &failingMinuteCubeValueIndexSource{
+		failMinutes: map[uint32]bool{995: true, 990: true, 985: true},
+		failErr:     errors.New("transient lookup failure"),
+	}
+
+	cfg := blockpack.CubeBackfillConfig{
+		Store:         &fakeCubeObjectPutter{},
+		Workers:       1,
+		WindowMinutes: windowMinutes,
+	}
+
+	err := runCubeBackfillCore(context.Background(), entry, src, store, cfg, currentMinute)
+	require.NoError(t, err, "isolated, scattered per-minute failures must not abort the run")
+
+	// One ConditionalPut per successfully-processed minute (20 total - 3 failures = 17).
+	assert.Equal(t, preSeedPutCalls+17, store.putCalls)
+
+	registry := blockpack.NewCubeRegistry(store, entry.Tenant)
+	entries, _, loadErr := registry.Load(context.Background())
+	require.NoError(t, loadErr)
+	require.Len(t, entries, 1)
+	wm, ok := entries[0].Watermarks[blockpack.CubeRollupL0]
+	require.True(t, ok)
+	assert.Equal(t, uint32(980), wm.MinMinute, "the oldest minute (980, itself a success) must still be covered")
+	assert.Equal(t, uint32(999), wm.MaxMinute, "the newest minute (999, itself a success) must still be covered")
+}
+
+// TestRunCubeBackfillCore_ConsecutiveStructuralFailuresAbortEarly proves the circuit breaker
+// DOES trip on an uninterrupted run of cubeBackfillMaxConsecutiveFailures per-minute failures
+// (the shape a structural failure like a missing-AggAttrs registry entry produces on literally
+// every remaining minute): the run must abort with a real error naming the consecutive-failure
+// count, WITHOUT ever persisting a watermark, rather than continuing to burn the rest of the
+// window on work that can never succeed.
+func TestRunCubeBackfillCore_ConsecutiveStructuralFailuresAbortEarly(t *testing.T) {
+	entry := blockpack.CubeRegistryEntry{
+		CubeID:     "consecutive-fail-cube",
+		Tenant:     "tenant-a",
+		Dimensions: []string{"service.name"},
+		AggAttrs:   []string{blockpack.CubeDurationColumn},
+		Resolution: 1,
+	}
+	store := &fakeCubeRegistryObjectStore{}
+	seedCubeEntry(t, store, entry)
+
+	const (
+		currentMinute = 1000
+		windowMinutes = 20 // would process minutes [980, 999] if never aborted
+	)
+	// The 5 newest minutes (995-999) all fail consecutively -- exactly
+	// cubeBackfillMaxConsecutiveFailures, with no interleaved success to reset the counter.
+	src := &failingMinuteCubeValueIndexSource{
+		failMinutes: map[uint32]bool{995: true, 996: true, 997: true, 998: true, 999: true},
+		failErr:     errors.New("definition must include duration in AggAttrs"),
+	}
+
+	cfg := blockpack.CubeBackfillConfig{
+		Store:         &fakeCubeObjectPutter{},
+		Workers:       1,
+		WindowMinutes: windowMinutes,
+	}
+
+	err := runCubeBackfillCore(context.Background(), entry, src, store, cfg, currentMinute)
+	require.Error(t, err, "an uninterrupted run of consecutive structural failures must abort the run")
+	assert.Contains(t, err.Error(), "aborted after 5 consecutive per-minute failures")
+
+	registry := blockpack.NewCubeRegistry(store, entry.Tenant)
+	entries, _, loadErr := registry.Load(context.Background())
+	require.NoError(t, loadErr)
+	require.Len(t, entries, 1)
+	_, ok := entries[0].Watermarks[blockpack.CubeRollupL0]
+	assert.False(t, ok, "no minute ever succeeded before the abort, so no watermark should have been persisted")
 }

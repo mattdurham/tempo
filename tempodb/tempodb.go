@@ -347,7 +347,7 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 		// RecordUsageIfNoIndexCoverage, and generalizing them would double scope for
 		// zero benefit to the stated goal. Do NOT generalize this call.
 		if cfg.Backend == backend.S3 {
-			vblockpack.ConfigureCubeQueryPath(true, cfg.S3)
+			vblockpack.ConfigureCubeQueryPath(true, cfg.S3, pgPool)
 		}
 		// #496 Fix B (go-presubmit.md/review.md CRITICAL Issue 2): the write-path
 		// targets (block-builder, backend-worker compactor) need the SAME watermark

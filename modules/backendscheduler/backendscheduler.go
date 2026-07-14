@@ -28,6 +28,7 @@ import (
 	"github.com/grafana/tempo/tempodb/backend"
 	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
 	"github.com/grafana/tempo/tempodb/blocklist"
+	"github.com/grafana/tempo/tempodb/encoding/vblockpack/migrate"
 	"github.com/jedib0t/go-pretty/v6/table"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -129,24 +130,6 @@ func New(cfg Config, s3cfg *s3backend.Config, store storage.Store, overrides ove
 		},
 	}
 
-	// Add cube backfill provider when S3 config and tenants are configured.
-	if s3cfg != nil && len(s.cfg.ProviderConfig.CubeBackfill.Tenants) > 0 {
-		cbp, cbErr := provider.NewCubeBackfillProvider(
-			s.cfg.ProviderConfig.CubeBackfill,
-			s3cfg,
-			s.work,
-			log.Logger,
-		)
-		if cbErr != nil {
-			level.Warn(log.Logger).Log("msg", "cube backfill provider disabled", "err", cbErr)
-		} else {
-			s.providers = append(s.providers, struct {
-				provider provider.Provider
-				jobs     <-chan *work.Job
-			}{provider: cbp, jobs: nil})
-		}
-	}
-
 	// File catalog lister (2026-07-11): opt-in, nil when cfg.Postgres is nil.
 	// No new binary -- piggybacks on this already-singleton process, reusing
 	// s.store.BlockMetas/Tenants (already-live, already-maintained state) on
@@ -156,6 +139,14 @@ func New(cfg Config, s3cfg *s3backend.Config, store storage.Store, overrides ove
 		if perr != nil {
 			level.Warn(log.Logger).Log("msg", "file catalog lister disabled -- postgres pool init failed", "err", perr)
 		} else {
+			// backend_jobs migration (2026-07-14, #181 Phase 0): applied
+			// idempotently on every startup, same failure posture as
+			// filecatalog.NewLister below -- degrade (warn, leave whatever
+			// depends on the migrated schema unavailable) rather than crash
+			// the process.
+			if merr := migrate.Apply(context.Background(), pool); merr != nil {
+				level.Warn(log.Logger).Log("msg", "backend_jobs schema migration failed", "err", merr)
+			}
 			s.catalogLister = filecatalog.NewLister(pool, s.store.BlockMetas, s.store.Tenants)
 		}
 	}

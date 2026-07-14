@@ -242,16 +242,6 @@ func (m *RedactionDetail) GetTraceIds() [][]byte {
 	return nil
 }
 
-// CubeBackfillDetail contains fields for a cube backfill job.
-type CubeBackfillDetail struct {
-	CubeID        string `protobuf:"bytes,1,opt,name=cube_id,json=cubeId,proto3" json:"cube_id,omitempty"`
-	WindowMinutes uint32 `protobuf:"varint,2,opt,name=window_minutes,json=windowMinutes,proto3" json:"window_minutes,omitempty"`
-}
-
-func (m *CubeBackfillDetail) Reset()         { *m = CubeBackfillDetail{} }
-func (m *CubeBackfillDetail) String() string { return m.CubeID }
-func (*CubeBackfillDetail) ProtoMessage()    {}
-
 // ViBackfillDetail contains fields for a #496 usage-triggered VI column
 // backfill job — the (tenant, column) key needed to reconstruct a
 // blockpack.Entry on the worker side (Tenant is shared via JobDetail.Tenant,
@@ -427,18 +417,15 @@ type JobDetail struct {
 	Redaction  *RedactionDetail  `protobuf:"bytes,4,opt,name=redaction,proto3" json:"redaction,omitempty"`
 	// batch_id groups the pending jobs that were created from a single SubmitRedaction
 	// call. Enables future Status/Cancel RPCs keyed on the original submission.
-	BatchId      string              `protobuf:"bytes,5,opt,name=batch_id,json=batchId,proto3" json:"batch_id,omitempty"`
-	CubeBackfill *CubeBackfillDetail `protobuf:"bytes,6,opt,name=cube_backfill,json=cubeBackfill,proto3" json:"cube_backfill,omitempty"`
+	BatchId string `protobuf:"bytes,5,opt,name=batch_id,json=batchId,proto3" json:"batch_id,omitempty"`
+	// field 6 (cube_backfill/CubeBackfillDetail) was removed -- #181 Phase 5
+	// deleted it once cube_backfill moved entirely off this gRPC/JobDetail path
+	// onto Postgres (jobstore.CubeBackfillDetail, JSON-encoded). Field number 6
+	// is retired, not reused.
+	//
 	// ViBackfill carries #496 B2's usage-triggered VI column backfill job
-	// detail. Unlike CubeBackfill (field 6, above), this field IS actually
-	// wired into MarshalToSizedBuffer/Unmarshal/Size below -- verified via a
-	// round-trip test, since CubeBackfill's own equivalent wiring was found
-	// (while implementing this) to be silently absent from all three methods,
-	// meaning JobDetail.CubeBackfill never survives a real Marshal/Unmarshal
-	// round-trip despite being actively read by backendworker.go's
-	// processCubeBackfillJob. Reported to team lead as a standalone finding
-	// (mirrors the R9 cube-watermark-persistence gap in kind); NOT fixed here
-	// as it is out of #496's scope (cube's own code).
+	// detail, and IS correctly wired into MarshalToSizedBuffer/Unmarshal/Size
+	// below (verified via a round-trip test).
 	ViBackfill *ViBackfillDetail `protobuf:"bytes,7,opt,name=vi_backfill,json=viBackfill,proto3" json:"vi_backfill,omitempty"`
 }
 

@@ -61,28 +61,11 @@ message RedactionDetail {
   repeated bytes trace_ids = 2;  // trace IDs to remove from the block
 }
 
-// CubeBackfillDetail contains fields for a cube backfill job.
-//
-// KNOWN GAP (found while implementing #496's ViBackfillDetail below, reported
-// to team lead as a standalone finding): the hand-patched backendwork.pb.go
-// declares JobDetail.cube_backfill (field 6) but never wires it into
-// MarshalToSizedBuffer/Unmarshal/Size -- it is silently dropped on every real
-// gRPC round-trip despite being read by backendworker.go's
-// processCubeBackfillJob. Not fixed here (cube's own code, out of #496's
-// scope) -- see pkg/tempopb/vibackfill_roundtrip_test.go's
-// TestJobDetail_CubeBackfill_KnownWireFormatGap, which documents (not fixes)
-// this.
-message CubeBackfillDetail {
-  string cube_id = 1;
-  uint32 window_minutes = 2;
-}
-
 // ViBackfillDetail contains fields for a #496 usage-triggered VI column
 // backfill job -- the (tenant, column) key needed to reconstruct a
 // blockpack.Entry on the worker side (tenant is shared via JobDetail.tenant,
-// not duplicated here). Unlike CubeBackfillDetail above, this field IS
-// correctly wired into JobDetail's Marshal/Unmarshal/Size (verified by a
-// round-trip test).
+// not duplicated here). Correctly wired into JobDetail's Marshal/Unmarshal/
+// Size (verified by a round-trip test).
 message ViBackfillDetail {
   string column_hash = 1;
   string column_name = 2;
@@ -103,7 +86,10 @@ message JobDetail {
   // batch_id groups the pending jobs that were created from a single SubmitRedaction
   // call. Enables future Status/Cancel RPCs keyed on the original submission.
   string batch_id = 5;
-  CubeBackfillDetail cube_backfill = 6;
+  // field 6 (cube_backfill) was removed -- #181 Phase 5 deleted CubeBackfillDetail
+  // once cube_backfill moved entirely off this gRPC/JobDetail path onto Postgres
+  // (jobstore.CubeBackfillDetail, JSON-encoded). Field number 6 is retired, not
+  // reused, per proto convention.
   ViBackfillDetail vi_backfill = 7;
 }
 

@@ -8,10 +8,16 @@ package vblockpack
 // serializes against EVERY OTHER column's update for the same tenant via one
 // shared index.json). Uses a single transaction with SELECT ... FOR UPDATE to
 // get the same atomicity RecordUseAndMaybeTrigger's evaluate-and-mutate step
-// needs, without a retry loop (Postgres's row lock makes concurrent
-// UpsertEntry calls for the SAME key queue rather than conflict-and-retry).
-// READ COMMITTED (pgx's default) is sufficient -- the atomicity boundary is
-// the transaction wrapping ONE row's lock, not a multi-row invariant.
+// needs, without a retry loop, for keys that already have a row (Postgres's
+// row lock makes concurrent UpsertEntry calls for the SAME existing key queue
+// rather than conflict-and-retry). SELECT ... FOR UPDATE cannot lock a row
+// that doesn't exist yet, though, so the create-path additionally relies on
+// INSERT ... ON CONFLICT DO NOTHING plus a re-load-under-FOR-UPDATE fallback
+// for whichever concurrent caller loses that race (see UpsertEntry) to avoid
+// a duplicate-key error and to still apply the loser's own mutation exactly
+// once. READ COMMITTED (pgx's default) is sufficient -- the atomicity
+// boundary is the transaction wrapping ONE row's lock, not a multi-row
+// invariant.
 
 import (
 	"context"
@@ -42,12 +48,18 @@ const viusageSelectOneForUpdateSQL = `
 		window_end_sec, triggered, backfill_in_progress, done, last_catalog_row_id
 	FROM viusage_entries WHERE tenant = $1 AND col_hash = $2 AND col_type = $3 FOR UPDATE`
 
+// viusageInsertSQL's ON CONFLICT target is viusage_entries' own PRIMARY KEY
+// (tenant, col_hash, col_type) -- see registries.sql. DO NOTHING lets two
+// concurrent UpsertEntry calls for the same not-yet-existing key both attempt
+// this INSERT without a duplicate-key error; the loser re-loads (and locks)
+// the winner's committed row instead (see UpsertEntry).
 const viusageInsertSQL = `
 	INSERT INTO viusage_entries (
 		tenant, col_hash, col_type, column_name, first_seen_sec, created_at,
 		lease_owner_id, lease_expires_at, watermark_sec, window_start_sec,
 		window_end_sec, triggered, backfill_in_progress, done, last_catalog_row_id
-	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+	ON CONFLICT (tenant, col_hash, col_type) DO NOTHING`
 
 const viusageUpdateSQL = `
 	UPDATE viusage_entries SET
@@ -111,8 +123,22 @@ func (s *pgViUsageEntryStore) UpsertEntry(
 			return blockpack.Entry{}, fmt.Errorf("pg viusage entrystore: entry %s/%s/%s not found", tenant, colHash, colType)
 		}
 		entry = createIfMissing()
-		if err := insertViUsageEntry(ctx, tx, entry); err != nil {
+		inserted, err := insertViUsageEntryIfAbsent(ctx, tx, entry)
+		if err != nil {
 			return blockpack.Entry{}, err
+		}
+		if !inserted {
+			// Lost the insert race: a concurrent UpsertEntry call committed the
+			// same key first. Re-load under FOR UPDATE to see (and lock) their
+			// row so this caller's mutate below still gets applied, exactly
+			// once, on top of the real row -- never silently dropped.
+			entry, found, err = loadViUsageEntryForUpdate(ctx, tx, tenant, colHash, colType)
+			if err != nil {
+				return blockpack.Entry{}, err
+			}
+			if !found {
+				return blockpack.Entry{}, fmt.Errorf("pg viusage entrystore: entry %s/%s/%s vanished after losing insert race", tenant, colHash, colType)
+			}
 		}
 	}
 	if err := mutate(&entry); err != nil {
@@ -139,17 +165,20 @@ func loadViUsageEntryForUpdate(ctx context.Context, tx pgx.Tx, tenant, colHash, 
 	return e, true, nil
 }
 
-func insertViUsageEntry(ctx context.Context, tx pgx.Tx, e blockpack.Entry) error {
-	_, err := tx.Exec(ctx, viusageInsertSQL,
+// insertViUsageEntryIfAbsent reports whether this call's INSERT actually won
+// (true) or was absorbed by ON CONFLICT DO NOTHING because a concurrent
+// caller's row for the same key already committed (false).
+func insertViUsageEntryIfAbsent(ctx context.Context, tx pgx.Tx, e blockpack.Entry) (bool, error) {
+	tag, err := tx.Exec(ctx, viusageInsertSQL,
 		e.Tenant, e.ColumnHash, e.ColumnType, e.ColumnName, e.FirstSeenSec, e.CreatedAt,
 		e.Backfill.LeaseOwnerID, e.Backfill.LeaseExpiresAt, e.Backfill.WatermarkSec,
 		e.Backfill.WindowStartSec, e.Backfill.WindowEndSec, e.Backfill.Triggered,
 		e.Backfill.BackfillInProgress, e.Backfill.Done, e.Backfill.LastCatalogRowID,
 	)
 	if err != nil {
-		return fmt.Errorf("pg viusage entrystore: insert: %w", err)
+		return false, fmt.Errorf("pg viusage entrystore: insert: %w", err)
 	}
-	return nil
+	return tag.RowsAffected() == 1, nil
 }
 
 func updateViUsageEntry(ctx context.Context, tx pgx.Tx, e blockpack.Entry) error {

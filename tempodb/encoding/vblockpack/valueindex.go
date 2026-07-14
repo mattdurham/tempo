@@ -50,6 +50,34 @@ func isMinioNoSuchKey(err error) bool {
 	return resp.Code == minioNoSuchKeyCode || resp.StatusCode == 404
 }
 
+// newMinioClientFromS3Config builds a *minio.Client for cfg, resolving credentials from
+// cfg.AccessKey/SecretKey/SessionToken first and falling back to the AWS environment.
+// Shared by every S3-backed minio.Client construction in this package (cube backfill, VI
+// backfill, this file's own value-index write path, cube manager, cube query path) --
+// consistency fix (2026-07-14): each of these previously called credentials.NewEnvAWS()
+// directly and independently, silently ignoring any explicit config-file credentials even
+// when set. minio-go's Chain.Retrieve skips a provider whose AccessKeyID/SecretAccessKey are
+// both empty, so this remains backward-compatible with existing env-var-only deployments.
+func newMinioClientFromS3Config(s3cfg *s3backend.Config) (*minio.Client, error) {
+	endpoint := s3cfg.Endpoint
+	if endpoint == "" {
+		endpoint = "s3." + s3cfg.Region + ".amazonaws.com"
+	}
+	creds := credentials.NewChainCredentials([]credentials.Provider{
+		&credentials.Static{Value: credentials.Value{
+			AccessKeyID:     s3cfg.AccessKey,
+			SecretAccessKey: s3cfg.SecretKey.String(),
+			SessionToken:    s3cfg.SessionToken.String(),
+		}},
+		&credentials.EnvAWS{},
+	})
+	return minio.New(endpoint, &minio.Options{
+		Creds:  creds,
+		Secure: !s3cfg.Insecure,
+		Region: s3cfg.Region,
+	})
+}
+
 // fileReaderProvider implements blockpack.ReaderProvider over an *os.File using
 // pread (ReadAt), so the value-index extractor can stream a freshly-written block
 // from its temp file without buffering the whole encoded block in memory.
@@ -118,7 +146,7 @@ func ConfigureValueIndex(enabled bool, s3cfg *s3backend.Config, rawW backend.Raw
 			indexPrefix = defaultValueIndexPref
 		}
 		if s3cfg != nil {
-			client, err := newMinioForValueIndex(s3cfg)
+			client, err := newMinioClientFromS3Config(s3cfg)
 			if err != nil {
 				level.Warn(util_log.Logger).Log("msg", "vblockpack: value-index write path disabled — S3 client init failed", "err", err)
 				return
@@ -156,19 +184,4 @@ func getValueIndexSink() (blockpack.ObjectPutter, string) {
 	valueIndexSinkMu.RLock()
 	defer valueIndexSinkMu.RUnlock()
 	return valueIndexSink, valueIndexPrefix
-}
-
-// newMinioForValueIndex builds a minio client for the value-index write path from
-// the trace S3 config. Credentials come from the AWS environment, matching the
-// querier-side value-index client (tempodb.go).
-func newMinioForValueIndex(cfg *s3backend.Config) (*minio.Client, error) {
-	endpoint := cfg.Endpoint
-	if endpoint == "" {
-		endpoint = "s3." + cfg.Region + ".amazonaws.com"
-	}
-	return minio.New(endpoint, &minio.Options{
-		Creds:  credentials.NewEnvAWS(),
-		Secure: !cfg.Insecure,
-		Region: cfg.Region,
-	})
 }
