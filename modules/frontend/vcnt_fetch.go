@@ -265,9 +265,27 @@ func buildQueryPlanFromProgram(
 		return nil, 0, nil
 	}
 
-	dims := make([]string, 0, len(prog.WantColumns))
+	// #205 correction, narrowed by #205 review: also request the duration-histogram variant
+	// (blockpack.VCNTDurationHistogramColumnName) of "span:duration" specifically — histogram
+	// records are written under their OWN colHash directory (colHash("span:duration#hist")),
+	// entirely separate from the bare column's own directory (colHash("span:duration"), which
+	// never has any records written under it at all). Without this widening, fetchVCNTSection
+	// never lists/downloads the histogram object, ClassifyProgramVCNTWithDetail always sees
+	// Covered=false for it, and #205's whole selectivity signal is an inert no-op through this
+	// call path regardless of what vcntwriter.go wrote.
+	//
+	// "span:duration" is the ONLY histogram-eligible column in Phase 1 (mirrors queryplan's own
+	// hardcoded durationHistogramColumn constant, vcnt_duration_cost.go) — widening every
+	// WantColumns entry (as an earlier version of this fix did) issued an extra, always-empty
+	// Find+List against every non-duration column's "#hist" directory for zero benefit, doubling
+	// unnecessary object-storage calls and undermining this whole feature's I/O-reduction goal.
+	const durationColumn = "span:duration"
+	dims := make([]string, 0, len(prog.WantColumns)+1)
 	for c := range prog.WantColumns {
 		dims = append(dims, c)
+		if c == durationColumn {
+			dims = append(dims, blockpack.VCNTDurationHistogramColumnName(c))
+		}
 	}
 
 	// issue #493 Task 4c: the only genuinely new span in this whole phase (besides Task 6's

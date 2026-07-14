@@ -802,3 +802,43 @@ Back-ref: `internal/modules/cube/router.go:RoutingResult,Route` (unchanged).
 tempo-side: `tempodb/encoding/vblockpack/backend_block.go:QueryRange` (the CRITICAL fix),
 `tempodb/encoding/vblockpack/cubequerypath.go:buildCubeQueryResponse,cubeCoveredWindow` (the HIGH
 finding, unchanged — documented only). Issue #217, review `tempo/.bob/state/217-review.md`.
+
+---
+
+## NOTE-CUBE-028: Log2Bucketize's 1<<64 overflow — a deliberate, intentional divergence from tempo's byte-for-byte port (bounds-safety fix)
+
+**Date:** 2026-07-13
+**Decision:** `Log2Bucketize` now returns the `-1` sentinel for `v>=2^63+1`, in addition to its
+pre-existing `v<2` exclusion.
+
+**Rationale:**
+
+- For a pathologically large `v` (`>=2^63+1`), the ceiling power-of-two boundary is `2^64`, which
+  does not fit in `uint64`. The original code computed `1 << (64 - bits.LeadingZeros64(v-1))`
+  unconditionally; for this input the shift count is exactly `64`, and Go's defined shift
+  semantics for a shift count `>=` the operand's bit width silently wrap the result to `0` rather
+  than raising any error. Zero is itself a plausible-looking (but wrong) boundary — it slipped
+  past `accumulator.go`'s own `if boundary != -1` guard, and `BucketIndex(0) ==
+  bits.TrailingZeros64(0) == 64` is one past `Buckets`' valid `[0,63]` array range, producing an
+  out-of-bounds write that panics on write (`accumulator.go:addAggAttrs`).
+- `v>=2^63+1` is unreachable via any real span duration or count (`2^63` nanoseconds is ~292
+  years) — SPEC-CUBE-019 already documents this package's "port of tempo's algorithm" contract as
+  applying to the realistic domain, not to adversarial/corrupted input. This fix is narrowly scoped
+  to closing that adversarial gap without touching any in-range behavior: every value in
+  `[2, 2^63]` still ceilings identically to before (verified by
+  `TestLog2Bucketize_MatchesTempoForKnownValues`, unchanged).
+- Chose the existing `-1` sentinel (matching the `v<2` convention already in this function) over
+  clamping to bucket 63, because clamping would silently misrepresent a value strictly greater than
+  `2^63` as if it were `<=2^63` — the same "wrong-but-plausible-looking value" problem this fix
+  removes, just moved from `0` to `63`.
+- **This is a deliberate, intentional divergence from tempo's own `pkg/traceql.Log2Bucketize`**,
+  which contains the same unconditional shift and does not guard this case — SPEC-CUBE-019's
+  "byte-for-byte port" invariant is retained for the realistic input domain but no longer literally
+  true for this one out-of-domain input. Not filing upstream against tempo (this project's
+  convention: findings in other repos are recorded here, not filed as external tickets).
+
+**Back-ref:** `internal/modules/cube/bucket.go:Log2Bucketize`. Test:
+`TestLog2Bucketize_PathologicallyLargeValueExcludedNotOOB` (bucket_test.go),
+`TestAccumulator_Add_PathologicallyLargeDuration_ExcludedNotOOB` (accumulator_test.go, exercises
+the real `Add`/`addAggAttrs` path and was mutation-verified to reproduce the exact pre-fix
+`index out of range [64] with length 64` panic when the fix is reverted).

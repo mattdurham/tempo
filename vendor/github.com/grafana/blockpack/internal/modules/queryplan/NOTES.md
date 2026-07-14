@@ -796,3 +796,77 @@ function of the signal.
 
 Back-ref: `internal/modules/queryplan/slices.go:BuildTimeSlices,maxSlicesPerPlan`. See
 `BENCHMARKS.md` BENCH-QP-010. Issue #217.
+
+## NOTE-QP-013: composed VCNTDurationCostFunc into the existing ClassifyProgramVCNT* family rather than new sibling entry points (issue #205)
+
+*Added: 2026-07-13*
+
+**Decision.** `VCNTDurationCostFunc` (a new `CostFunc` recognizing duration-range leaves via
+`internal/modules/valuecounts`'s new fixed-bucket histogram, Phase A) is wired into
+`ClassifyProgramVCNTWithThreshold`/`ClassifyProgramVCNTWithDetail`'s existing `cost` construction
+via a new generic combinator, `CombineCostFuncs(VCNTCostFunc(...), VCNTDurationCostFunc(...))` —
+not exposed as a new parallel `ClassifyProgramVCNTDuration*` entry point, and not merged into
+`VCNTCostFunc` itself.
+
+**Rationale.** Tracing every real call site of `ClassifyProgramVCNT*` in tempo (agentic-tempo
+branch) found exactly one: `vcnt_fetch.go:288`'s `ClassifyProgramVCNTWithDetail` call, which feeds
+the plan-time decline gate (`SelectSearchStrategy`, `SPEC-QP-6`) that rejects a query before any
+block-scan I/O happens. That call site's signature is fixed by tempo's own code, which blockpack
+cannot and does not need to change — composing the new cost func INTO the existing functions means
+tempo's already-shipped, unmodified call gets duration-range recognition automatically on the next
+ordinary blockpack revendor, with zero tempo-side code change. A new sibling entry point
+(`ClassifyProgramVCNTDurationWithDetail`, say) would have required tempo to add a second call
+site and reconcile two verdicts per query for no benefit — nothing in tempo's real code ever
+wants "duration signal only" or "equality signal only" in isolation, only the combined verdict.
+
+> **Correction (2026-07-13, Phase D):** "zero tempo-side code change" above is accurate only for
+> the *classify* call site (`ClassifyProgramVCNTWithDetail` itself, as described). It is NOT
+> accurate for the feature as a whole: the real end-to-end pipeline test (Phase D) found that
+> `vcnt_fetch.go`'s `dims` construction in `buildQueryPlanFromProgram` — a separate function, the
+> *fetch* step that runs before classify — only ever requested `prog.WantColumns`'s bare column
+> names (e.g. `"span:duration"`), never the histogram's own colHash-distinct column name
+> (`VCNTDurationHistogramColumnName("span:duration")` == `"span:duration#hist"`). Since VCNT
+> objects are stored one-directory-per-colHash, the histogram object was never fetched at all —
+> `ClassifyProgramVCNTWithDetail` always received empty histogram data, making this feature a
+> complete no-op through the real dispatch path despite passing every phase's unit tests. Fixed
+> by widening `dims` to also include each `WantColumns` entry's histogram column name (additive,
+> harmless for every non-histogram column — mirrors `fetchVCNTSection`'s own existing
+> no-coverage-tolerant convention). See `.bob/state/205-vcnt-histogram-plan.md` §2 for the same
+> correction and `vcnt_fetch_test.go`'s `TestBuildQueryPlanFromProgram_DimsWideningReachesDurationHistogramClassification`
+> for the regression guard.
+
+**Why a new file (`vcnt_duration_cost.go`) rather than editing `VCNTCostFunc` in place.** Mirrors
+this package's own established "additive file, don't touch code whose behavior must stay
+byte-identical" pattern (`perminutefrom.go`'s precedent, `NOTE-QP-007`). `VCNTCostFunc` itself is
+untouched by this change — only its two callers' `cost :=` line changed, from `VCNTCostFunc(...)`
+to `CombineCostFuncs(VCNTCostFunc(...), VCNTDurationCostFunc(...))`.
+
+**Why `CombineCostFuncs` is a separate, generic combinator rather than baking the two together
+inline.** `VCNTCostFunc` and `VCNTDurationCostFunc` are mutually exclusive by leaf shape
+by construction (equality requires `len(Values)==1`; both of `VCNTDurationCostFunc`'s recognized
+shapes require `len(Values)==0`) — there is no leaf either single-value equality OR a
+Min/Max-bearing range predicate that both functions could ever claim simultaneously. This makes
+`CombineCostFuncs`'s try-order provably inert for every REAL leaf shape today (confirmed by
+`TEST-QP-3`'s `TestVCNTCostFunc_ExistingEqualityBehavior_ByteIdenticalAfterHistogramWiring`,
+which passes regardless of which of the two functions is tried first) — but the combinator is
+still kept generic and separately tested (`TestCombineCostFuncs_TriesFirstThenSecond` et al.,
+using deliberately-overlapping stub funcs) rather than hardcoded into the two call sites, since a
+future third `CostFunc` (a per-block min/max/bloom estimator, per `CostFunc`'s own doc comment) is
+exactly the kind of extension this package's pluggable-oracle design already anticipates.
+
+**Mutation-test verification performed (per this project's standing convention, memory
+`feedback_mutation_test_review.md`).** Two separate mutations were applied and reverted:
+(1) `CombineCostFuncs`'s try-order was flipped (`second` tried before `first`) — this does NOT
+break `TestVCNTCostFunc_ExistingEqualityBehavior_ByteIdenticalAfterHistogramWiring` (confirming
+the mutual-exclusivity property above holds in practice, not just by shape-gate inspection), but
+DOES break `TestCombineCostFuncs_TriesFirstThenSecond`/`_NeverDoubleCounts` (the pure combinator
+tests using deliberately-overlapping stubs), proving `CombineCostFuncs`'s try-order semantics are
+real and tested. (2) `VCNTDurationCostFunc` was temporarily mutated to return
+`KnownCost(999)` unconditionally, bypassing all of its shape/coverage gates — this DOES break
+`TestVCNTCostFunc_ExistingEqualityBehavior_ByteIdenticalAfterHistogramWiring` for every leaf shape
+`VCNTCostFunc` alone reads as Unknown (range-min, regex, present-only, multi-value, columnless,
+unseen, missing-column), proving that test is a real, non-vacuous regression guard against a
+second cost func contributing an incorrect answer once composed in — not just against a
+try-order bug specifically.
+
+Back-ref: same files as `SPEC-QP-9`. Issue #205.

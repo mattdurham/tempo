@@ -87,6 +87,18 @@ func (a *vcntAccumulator) addTrace(trace *tempopb.Trace) {
 				if span.Status != nil && span.Status.Code != 0 {
 					a.inc(bucket, "span:status", encodeInt64VCNT(int64(span.Status.Code)))
 				}
+				// #205: fixed-16-bucket span:duration histogram. Malformed spans
+				// (EndTimeUnixNano < StartTimeUnixNano or unset) clamp to a 0ns
+				// duration rather than being dropped (never-drop-records principle),
+				// which floors into bucket 0 by construction of the boundary array.
+				durNanos := int64(span.EndTimeUnixNano) - int64(span.StartTimeUnixNano) //nolint:gosec
+				if durNanos < 0 {
+					durNanos = 0
+				}
+				durMillis := uint64(durNanos) / 1_000_000
+				boundary := blockpack.VCNTDurationBucketBoundaryMillis(durMillis)
+				a.inc(bucket, blockpack.VCNTDurationHistogramColumnName("span:duration"),
+					blockpack.VCNTDurationHistogramValue(boundary))
 			}
 		}
 	}

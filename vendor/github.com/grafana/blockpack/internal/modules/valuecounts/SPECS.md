@@ -16,7 +16,7 @@ module's SPECS.md numbers from 1, per the established convention in
 independent per-file counters). IDs are assigned in ascending order and never reused or
 renumbered; superseded entries are marked `[SUPERSEDED by SPEC-VC-N]` rather than deleted.
 
-Next free ID: **SPEC-VC-8**.
+Next free ID: **SPEC-VC-9**.
 
 ---
 
@@ -310,3 +310,70 @@ Back-refs: `internal/modules/valuecounts/filename.go` (`FormatFilenameV2`, `Pars
 loop, `mergeLevel`'s `TimeRange` call before writing the merged output's v2 filename — see
 `valuecountscompactor` SPEC-VC-3). Tests: `filename_v2_test.go`, `timerange_test.go` — see
 `TESTS.md` TEST-VC-9/TEST-VC-10.
+
+---
+
+## SPEC-VC-8: Duration histogram — 16-bucket array, discrete assignment, never-drop guarantee, value encoding
+*Added: 2026-07-13*
+
+**Contract (issue #205, Phase A):** `DurationBucketBoundsMillis [16]uint64` is a fixed,
+hardcoded array of bucket lower-boundaries in milliseconds — `{0, 1, 5, 10, 50, 100, 500, 1_000,
+5_000, 10_000, 30_000, 60_000, 300_000, 600_000, 1_800_000, 3_600_000}` — never derived from a
+formula and never shared with `internal/modules/cube`'s own `Log2Bucketize` scheme (a different,
+incompatible boundary set for a different consumer; see NOTE-VC-022).
+
+`BucketIndex(valueMillis uint64) int` returns the largest index `i` such that
+`DurationBucketBoundsMillis[i] <= valueMillis` (floor semantics). Because
+`DurationBucketBoundsMillis[0] == 0`, every non-negative `valueMillis` maps to a valid index —
+this is the never-drop-by-construction guarantee: no input can fail to place into some bucket, and
+no separate clamp/guard code is needed. Index 15 (the 1hr boundary) is the sole open-ended
+catch-all for every value `>= 1hr` — there is no separate tail bucket.
+
+**Discrete, not cumulative:** `BucketIndex` identifies exactly ONE bucket per value. A caller
+that increments a histogram from a sample increments exactly `Counts[BucketIndex(v)]` and no
+other bucket's counter — this is a discrete/density histogram, not a cumulative/CDF one. The
+read-side `EstimateThreshold`/`EstimateBetween` (below) separately SUM a contiguous range of
+these already-discrete buckets as an estimation technique — that summing never changes how
+`Counts` was populated and must not be conflated with the storage layer being cumulative.
+
+**Value encoding:** `EncodeHistogramValue`/`decodeHistogramValue` are the canonical
+`Record.Value` encoding for a bucket boundary — a fixed 8-byte little-endian `uint64`, deliberately
+not `valueindex.CanonicalValue` (these 16 synthetic values are never compared against or sorted
+alongside any other column's values; `ColumnName` alone already scopes every VCNT read).
+`decodeHistogramValue` returns `ok=false` (never panics) for any value that isn't exactly 8 bytes,
+per SPEC-ROOT-001's no-panic rule. `EncodeHistogramValue` is exported (Phase B0, #205) so the root
+package (`vcnt.go`) can re-export it as `VCNTDurationHistogramValue` for tempo's writer; the decode
+side stays unexported since only this package's own `DurationHistogramInRange` needs it.
+
+`HistogramColumnName(column string) string` returns `column + "#hist"` — the synthetic VCNT
+column name a duration histogram's records are stored under. Collision-free: no existing VCNT
+column name contains `#`, and OTLP attribute keys structurally cannot either.
+
+`DurationHistogramInRange(data []byte, dir []ChunkDirEntry, column string, minTS, maxTS uint64)
+(DurationHistogram, error)` decodes `[minTS, maxTS]` via the existing `DecodeTimeRange`, filters
+to `ColumnName == HistogramColumnName(column)`, decodes each record's `Value` into a boundary and
+maps it to its array index via an exact-match lookup (a decoded boundary matching none of the 16
+known values is a corrupt/unrecognized record — skipped, never causing an error or a panic), sums
+`Count` per bucket, and drops a bucket to `0` (never negative) when its net sum is `<= 0` —
+mirroring `sumLiveValues`'s liveness rule (NOTE-VC-001/004). This per-bucket zero-floor is
+retention/compaction accounting, not a violation of the never-drop principle above (that
+principle governs write-time sample classification, not read-time live-count accounting — see
+NOTE-VC-022 for the full audit). `Covered` is `true` iff at least one histogram record for
+`column` existed in the decoded window, regardless of whether every bucket ended up net-zero
+(mirrors `ColumnTotalInRange`'s own `Covered` semantics exactly).
+
+`EstimateThreshold(op TimeCompareOp, thresholdMillis uint64) (count int64, known bool)` and
+`EstimateBetween(loMillis, hiMillis uint64) (count int64, known bool)` approximate a
+`>`/`>=`/`<`/`<=`/`between` predicate by summing a contiguous range of buckets. Per the
+over-estimate rule (#205 §0.1): the bucket straddling a threshold is always counted IN FULL
+(never excluded) — an over-estimate only ever costs a missed I/O-reduction opportunity at plan
+time, never a wrong answer, since the downstream block-scan/value-index path always re-verifies
+the real data regardless of dispatch strategy. `EstimateBetween` caps the degenerate case (both
+bounds landing in the same bucket) at that single bucket's own count, never double-counting it.
+`TimeCompareOp.OpEQ` (equality) is always `known=false` — genuinely unestimable at any resolution
+finer than a bucket width.
+
+Back-refs: `internal/modules/valuecounts/histogram.go` (`DurationBucketBoundsMillis`,
+`BucketIndex`, `HistogramColumnName`, `DurationHistogram`, `DurationHistogramInRange`,
+`TimeCompareOp`, `EstimateThreshold`, `EstimateBetween`, `sumRange`). Tests: `histogram_test.go`
+— see `TESTS.md` TEST-VC-11. `NOTES.md` NOTE-VC-022.

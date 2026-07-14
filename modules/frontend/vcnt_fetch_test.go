@@ -268,12 +268,14 @@ func TestFetchVCNTSection_BoundaryTouchingWindowsIncluded(t *testing.T) {
 // gate the fetch, not the other way around).
 type countingRawReader struct {
 	backend.RawReader
-	findCalls int
-	readCalls int
+	findCalls    int
+	readCalls    int
+	findKeypaths []backend.KeyPath
 }
 
 func (c *countingRawReader) Find(ctx context.Context, keypath backend.KeyPath, f backend.FindFunc) error {
 	c.findCalls++
+	c.findKeypaths = append(c.findKeypaths, keypath)
 	return c.RawReader.Find(ctx, keypath, f)
 }
 
@@ -554,6 +556,98 @@ func TestBuildQueryPlanFromProgram_AttachesLeadDetail(t *testing.T) {
 	require.Equal(t, int64(1000), total.AsInt64())
 }
 
+// TestBuildQueryPlanFromProgram_DimsWideningReachesDurationHistogramClassification is #205's
+// dims-widening regression test (the mechanism-level fix this task's own real-pipeline testing
+// uncovered, not part of the original plan doc's §2 claim -- see this task's final report for
+// the full correction). Before the fix, `dims` (fetchVCNTSection's column list) was built purely
+// from prog.WantColumns, which for `{ duration >= 1ms }` is {"span:duration"} only --
+// "span:duration#hist" (the histogram's own, separately-colHash'd directory) was never
+// requested, so fetchVCNTSection never found/downloaded the histogram object no matter what
+// vcntwriter.go had written, and ClassifyProgramVCNTWithDetail's leadDetail.HasLead was always
+// false for a duration leaf.
+//
+// This test asserts the MECHANISM directly, not just the downstream decline outcome D1/D2 check:
+// leadDetail.HasLead can only be true for a duration RANGE leaf if VCNTDurationCostFunc returned
+// a Known cost, which itself requires valuecounts.DurationHistogramInRange to have returned
+// Covered=true over data fetchVCNTSection actually downloaded -- i.e. plan.lead_column/
+// plan.lead_index_cost/plan.lead_column_total being present and correct on the span IS the
+// "histogram object reached classification" proof, mirroring
+// TestBuildQueryPlanFromProgram_AttachesLeadDetail's established pattern exactly but for the
+// duration-histogram column instead of an ordinary equality column. hasLimit=true (like that
+// sibling test) avoids the separate LowSelectivity-no-limit decline path so the plan stays
+// non-nil and inspectable.
+func TestBuildQueryPlanFromProgram_DimsWideningReachesDurationHistogramClassification(t *testing.T) {
+	rec := recordedSpansFrontend(t)
+	restore := vblockpack.ConfigureValueIndexQueryForTest(emptyVIStore{}, testIndexPrefix)
+	defer restore()
+
+	rawR, rawW := newLocalRawReadWriter(t)
+	// 900/1000 spans (90%) have duration 2ms (>= 1ms); 100/1000 have duration 0ms (< 1ms).
+	writeVCNTObject(t, rawW, blockpack.VCNTDurationHistogramColumnName("span:duration"),
+		durationHistogramVCNTObj(t, 60, map[uint64]int64{2: 900, 0: 100}))
+
+	ctx, span := tracer.Start(context.Background(), "test.caller")
+	plan, _, err := buildQueryPlan(ctx, rawR, "tenant-a", nil, `{ duration >= 1ms }`, 0, 200, 1000, true /* hasLimit */)
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+	span.End()
+
+	s, ok := frontendSpanByName(rec.Ended(), "test.caller")
+	require.True(t, ok)
+	attrs := frontendAttrs(s)
+
+	col, ok := attrs["plan.lead_column"]
+	require.True(t, ok, "leadDetail.HasLead must be true -- the histogram object must have reached ClassifyProgramVCNTWithDetail")
+	require.Equal(t, "span:duration", col.AsString())
+	cost, ok := attrs["plan.lead_index_cost"]
+	require.True(t, ok)
+	require.Equal(t, int64(900), cost.AsInt64(), "EstimateThreshold(GTE, 1ms) must sum exactly the 900 spans in buckets >= boundary 1ms")
+	total, ok := attrs["plan.lead_column_total"]
+	require.True(t, ok)
+	require.Equal(t, int64(1000), total.AsInt64())
+}
+
+// TestBuildQueryPlanFromProgram_DimsWideningDoesNotReachNonDurationHistogramDirectory is #205
+// review's HIGH-fix regression test: the dims widening above must be gated to "span:duration"
+// only. An earlier version of the fix appended blockpack.VCNTDurationHistogramColumnName(c) for
+// EVERY prog.WantColumns entry, so a query over a plain string attribute (never
+// histogram-eligible) still issued a Find against that attribute's own "#hist" colHash
+// directory — an extra, always-empty object-storage List call for zero benefit, doubling
+// unnecessary I/O per non-duration predicate column. Asserted directly at the mechanism level
+// (which colHash directories fetchVCNTSection's Find fan-out actually queried), not via a
+// downstream outcome proxy.
+func TestBuildQueryPlanFromProgram_DimsWideningDoesNotReachNonDurationHistogramDirectory(t *testing.T) {
+	restore := vblockpack.ConfigureValueIndexQueryForTest(emptyVIStore{}, testIndexPrefix)
+	defer restore()
+
+	rawR, rawW := newLocalRawReadWriter(t)
+	writeVCNTObject(t, rawW, "span.http.method",
+		vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 9, "POST": 1}))
+
+	counting := &countingRawReader{RawReader: rawR}
+	plan, _, err := buildQueryPlan(context.Background(), counting, "tenant-a", nil, `{ span.http.method = "GET" }`, 0, 200, 1000, true)
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+
+	nonDurationHistColHash := blockpack.VCNTColHash(blockpack.VCNTDurationHistogramColumnName("span.http.method"))
+	plainColHash := blockpack.VCNTColHash("span.http.method")
+
+	var sawPlainDim, sawNonDurationHistDim bool
+	for _, kp := range counting.findKeypaths {
+		require.NotEmpty(t, kp)
+		colHash := kp[len(kp)-1]
+		switch colHash {
+		case plainColHash:
+			sawPlainDim = true
+		case nonDurationHistColHash:
+			sawNonDurationHistDim = true
+		}
+	}
+	require.True(t, sawPlainDim, "sanity: the query's own column must still be fetched")
+	require.False(t, sawNonDurationHistDim,
+		"a non-duration column's #hist colHash directory must never be queried -- it can never have histogram records")
+}
+
 // TestFetchVCNTFetch_EmitsChildSpanWithFileStats (issue #493 Task 4c) drives the REAL
 // buildQueryPlanFromProgram entry point (via buildQueryPlan, R7) and asserts the
 // "frontend.vcntFetch" child span carries files.count/bytes.read matching the real objects
@@ -732,6 +826,78 @@ func TestBuildQueryPlanFromProgram_RunsIndependentlyOfCheckIndexCoverageOutcome(
 // (nil, nil). After #217, the SAME watermark state has zero effect on CheckIndexCoverage — this
 // test proves buildQueryPlan now returns a non-nil DispatchTimeSliced plan for that exact
 // scenario, letting each resulting per-minute slice decide its own coverage locally.
+// durationHistogramVCNTObj encodes a self-describing .vcnt object for span:duration's synthetic
+// histogram column (issue #205), mirroring vcntObj's hand-built-fixture convention but keying
+// each Record.Value by the real blockpack.VCNTDurationHistogramValue encoding for a given
+// duration-in-milliseconds sample (converted to its bucket boundary via
+// blockpack.VCNTDurationBucketBoundaryMillis first) rather than a raw string -- Go strings can
+// hold arbitrary bytes, so string(VCNTDurationHistogramValue(...)) round-trips through vcntObj's
+// []byte(v) conversion exactly like any other column's value would.
+func durationHistogramVCNTObj(t *testing.T, timeStart uint64, countsByDurationMillis map[uint64]int64) []byte {
+	t.Helper()
+	values := make(map[string]int64, len(countsByDurationMillis))
+	for durationMillis, count := range countsByDurationMillis {
+		boundary := blockpack.VCNTDurationBucketBoundaryMillis(durationMillis)
+		values[string(blockpack.VCNTDurationHistogramValue(boundary))] = count
+	}
+	return vcntObj(t, blockpack.VCNTDurationHistogramColumnName("span:duration"), timeStart, values)
+}
+
+// TestBuildQueryPlanFromProgram_DurationLowSelectivityNoLimit_DeclinesBeforeDispatch is #205
+// Phase D2's explicit I/O-reduction regression test: the job-count-level proof that a
+// low-selectivity, no-limit duration predicate never reaches block-job dispatch at all.
+//
+// Query operator note: uses `>=` (GTE), not the plan doc's illustrative `>` (GT) --
+// unrelated to #205 itself, this is a pre-existing constraint from task #204's value-index
+// millisecond-decidability gate (vibuilder's decidableTimeBucketThreshold): a GT threshold is
+// only decidable when its raw-nanosecond value ends in exactly `...999999` (vanishingly rare in
+// practice), so `{ duration > 1ms }` fails vibuilder.LeafIndexable/AllLeavesIndexable and never
+// even reaches CheckIndexCoverage's pass -- buildQueryPlanFromProgram returns (nil, 0, nil) via
+// the EARLIER "not_indexable" short-circuit (vcnt_fetch.go:261-266), before fetchVCNTSection or
+// classification run at all, regardless of #205. `>=` at a round-millisecond threshold (r==0) IS
+// decidable, so it is the correct operator for a test that wants to reach #205's own
+// classification/decline logic specifically. (#205 does not touch, and should not need to touch,
+// this decidability gate -- confirmed pre-existing/unrelated.)
+//
+// BEFORE this feature (#205): tempo's vcntwriter.go never wrote ANY VCNT signal for
+// span:duration (only span:name/kind/status), so VCNTDurationCostFunc did not exist and
+// ClassifyProgramVCNTWithDetail's cost oracle had nothing to recognize a duration-range leaf
+// with -- `{ duration >= 1ms }` ALWAYS classified UnknownSelectivity regardless of the real
+// underlying distribution, SelectSearchStrategy's planTimeDecline never fired for it, and
+// buildQueryPlanFromProgram fell through to the ordinary cost/perMinuteForLead/BuildQueryPlan
+// flow, returning a real, non-nil DispatchTimeSliced plan (one job per minute in the query
+// window, per #217) -- i.e. real per-block-job dispatch and its accompanying object-storage I/O,
+// for a predicate that (per this test's fixture) 900/1000 spans -- 90% -- actually match.
+//
+// AFTER this feature (AND after the dims-widening correction this task's own real-pipeline
+// testing found necessary -- see TestBuildQueryPlanFromProgram_DimsWideningReachesDuration
+// HistogramClassification above and this task's final report; the plan doc's §2 "zero
+// tempo-side change" claim was incomplete without it): the same fixture's histogram now lets
+// VCNTDurationCostFunc answer the leaf's cost, ClassifyProgramVCNTWithDetail classifies
+// LowSelectivity (90% >= the default 0.5 fraction), and buildQueryPlanFromProgram's existing,
+// UNMODIFIED decline gate (vcnt_fetch.go:305-312) returns ErrPlanTimeLowSelectivityNoLimit with
+// a nil plan -- dispatching ZERO block jobs. The literal zero-io_ops proof for this mechanism is
+// that no job/plan slice is ever constructed: err is non-nil and plan is nil, so no code path
+// past this point could issue a single block fetch.
+func TestBuildQueryPlanFromProgram_DurationLowSelectivityNoLimit_DeclinesBeforeDispatch(t *testing.T) {
+	restore := vblockpack.ConfigureValueIndexQueryForTest(emptyVIStore{}, testIndexPrefix)
+	defer restore()
+
+	rawR, rawW := newLocalRawReadWriter(t)
+	tenant := "tenant-a"
+	// 900/1000 spans (90%) have duration 2ms (>= 1ms); 100/1000 (10%) have duration 0ms (< 1ms)
+	// -- a clean, non-straddling split at the query's own 1ms threshold (1ms is exactly boundary
+	// index 1 of the 16-value array), matching Phase D1's real-pipeline fixture.
+	writeVCNTObject(t, rawW, blockpack.VCNTDurationHistogramColumnName("span:duration"),
+		durationHistogramVCNTObj(t, 60, map[uint64]int64{2: 900, 0: 100}))
+
+	plan, _, err := buildQueryPlan(context.Background(), rawR, tenant, nil,
+		`{ duration >= 1ms }`, 0, 200, 1000, false /* hasLimit */)
+	require.Error(t, err, "a resolvable, LowSelectivity duration predicate with no limit must plan-time-decline")
+	require.True(t, errors.Is(err, ErrPlanTimeLowSelectivityNoLimit))
+	require.Nil(t, plan, "the returned plan must be nil -- zero block jobs constructed, the literal zero-io_ops proof")
+}
+
 func TestBuildQueryPlan_HalfWindowBackfill_NowDispatchesTimeSlicedInsteadOfDeclining(t *testing.T) {
 	restore := vblockpack.ConfigureValueIndexQueryForTest(emptyVIStore{}, testIndexPrefix)
 	defer restore()

@@ -673,3 +673,71 @@ Back-refs: `internal/modules/colhashmanifest` (the shared registry — see its o
 NOTES.md for the full contract), `internal/modules/valuecountscompactor/NOTES.md` NOTE-VC-019
 (the actual VCNT-side call site and hook rationale), `internal/modules/valueindex/NOTES.md`
 NOTE-VI-107 (VI's symmetric cross-reference entry), `filename.go:ColHash`.
+
+---
+
+## NOTE-VC-022 — Duration histogram: 16-bucket hardcoded array chosen over cube's log2 scheme; over-estimate direction locked in (issue #205, Phase A)
+
+Date: 2026-07-13
+
+**Why a fresh, hardcoded 16-value millisecond array instead of reusing
+`internal/modules/cube/bucket.go`'s `Log2Bucketize`.** Two designs were explored and rejected
+before this one: (1) an 8-bucket hand-picked SLO-aligned scheme (the original brainstorm), and
+(2) reusing cube's own 64-slot power-of-two-in-nanoseconds `Log2Bucketize` boundaries directly, or
+a "custom 0 bucket + 31 `Log2Bucketize` buckets" variant. Both alternates to the final design were
+rejected because cube's own boundaries serve a different consumer (real
+`histogram_over_time()`/quantile ANSWERS, which must stay byte-identical to tempo's
+`pkg/traceql.Log2Bucketize` — SPEC-CUBE-019) and waste almost the entire bucket budget crossing
+from nanoseconds into low seconds, leaving no resolution for common query thresholds like
+`duration > 10s`. The final 16-entry array is structurally the original 8-bucket brainstorm idea,
+doubled for finer resolution, with zero dependency on `cube`'s code — `internal/modules/cube` is
+explicitly out of scope for this feature and is not modified by it.
+
+**Discrete, not cumulative — why this needed its own explicit statement.** "Floor semantics"
+alone is ambiguous between a discrete/density histogram (one sample increments exactly one
+bucket) and a cumulative/CDF histogram (one sample increments every bucket on one side of it).
+This design is discrete: a write-side sample increments exactly `Counts[BucketIndex(v)]`, never a
+range. `EstimateThreshold`/`EstimateBetween` (SPEC-VC-8) separately SUM a contiguous range of
+these already-discrete buckets at READ time as an estimation technique over an approximate
+predicate — this is a distinct layer from write-time storage and must not be conflated with it.
+
+**Over-estimate direction, locked in.** For `>`/`>=`/`<`/`<=`/`between`, the bucket straddling a
+non-boundary threshold is counted as fully matching (over-estimate), never excluded
+(under-estimate). An over-estimate only ever costs a missed I/O-reduction opportunity at
+plan-time selectivity classification (the planner keeps the safer, more-expensive default); it
+never causes a wrong answer, since the downstream block-scan/value-index path always re-verifies
+the real data regardless of dispatch strategy. Equality is always unestimable
+(`TimeCompareOp.OpEQ` -> `known=false`) — no resolution finer than a bucket width exists.
+
+**Never-drop-records audit.** `DurationBucketBoundsMillis[0] == 0` means `BucketIndex` always
+finds at least bucket 0 for any non-negative input — the never-drop-by-construction guarantee
+holds by the array's own shape, with no extra runtime guard code. Separately,
+`DurationHistogramInRange`'s per-bucket "drop net `<= 0` to zero" rule (mirroring
+`sumLiveValues`/NOTE-VC-001) is retention/compaction accounting, not sample classification: a
+bucket's live count reaching zero because every write netted against a matching deletion delta
+means the bucket genuinely has zero live spans right now — reporting it as absent is correct, not
+a dropped record. The never-drop principle governs write-time sample classification (Phase B,
+out of this repo's scope — tempo's `vcntwriter.go`), not this orthogonal retention model.
+
+**Why `TimeCompareOp` is exported from this package** rather than reusing
+`internal/modules/vibuilder`'s own unrelated, unexported `timeCompareOp`: that type solves a
+different, unrelated decidability problem (VI's own exact-lookup gate) and is not visible outside
+its package; this package's read primitive needs its own operator type so a future caller (the
+Phase C `queryplan` cost-function adapter) can construct one without introducing a dependency on
+`vibuilder`.
+
+**Separately flagged, out-of-scope, pre-existing finding in `internal/modules/cube`'s own shipped
+code** (unrelated to this feature, found incidentally while evaluating and rejecting reuse of its
+`Log2Bucketize`, kept here per this project's "note it, tell the user, don't file a ticket
+unprompted" convention for out-of-scope gaps): for a pathologically large Int64/Duration aggAttr
+value (`v >= 2^63+1` — unreachable with any real span duration, since `2^63`ns is roughly 292
+years, but not provably unreachable for corrupted/adversarial input), `Log2Bucketize`'s internal
+`1 << (64 - bits.LeadingZeros64(v-1))` shift wraps to `0` under Go's defined shift semantics for a
+count `>= 64` on a `uint64`, so `cube/accumulator.go`'s own `if boundary != -1` guard does not
+catch it and `BucketIndex(0) == bits.TrailingZeros64(0) == 64` — one past cube's own valid
+`[1,63]` slot range, an out-of-bounds index into `agg.Buckets[64]`. Not fixed here; `cube` is
+out of scope for this task (see this package's own histogram.go and SPEC-VC-8 — no file under
+`internal/modules/cube/` is touched by #205's Phase A).
+
+Back-refs: `internal/modules/valuecounts/histogram.go`. `SPECS.md` SPEC-VC-8. Tests:
+`histogram_test.go` — see `TESTS.md` TEST-VC-11. Issue #205, Phase A.

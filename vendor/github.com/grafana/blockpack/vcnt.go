@@ -126,6 +126,29 @@ func VCNTRecordTimeRange(records []VCNTRecord) (minSec, maxSec uint64) {
 	return valuecounts.TimeRange(records)
 }
 
+// VCNTDurationHistogramColumnName returns the synthetic VCNT column name a duration
+// histogram's records are stored under for the given real column name (e.g.
+// "span:duration" -> "span:duration#hist"). Tempo's writer keys its accumulator map
+// under this name (#205).
+func VCNTDurationHistogramColumnName(column string) string {
+	return valuecounts.HistogramColumnName(column)
+}
+
+// VCNTDurationBucketBoundaryMillis returns the lower-boundary, in milliseconds, of the one
+// fixed bucket durationMillis falls into (#205's floor rule). Tempo's writer must use this
+// SAME rule the read side (valuecounts.DurationHistogramInRange) uses, so a span's duration is
+// never bucketed differently on write than it is interpreted on read.
+func VCNTDurationBucketBoundaryMillis(durationMillis uint64) uint64 {
+	return valuecounts.DurationBucketBoundsMillis[valuecounts.BucketIndex(durationMillis)]
+}
+
+// VCNTDurationHistogramValue returns the canonical Record.Value encoding for a duration
+// histogram bucket boundary (#205) — the exact inverse of what
+// valuecounts.DurationHistogramInRange decodes.
+func VCNTDurationHistogramValue(boundaryMillis uint64) []byte {
+	return valuecounts.EncodeHistogramValue(boundaryMillis)
+}
+
 // VCNTObjectKeyV2 returns the full S3 object key for a .vcnt file using the v2 filename
 // format, which embeds the file's wall-clock time range (issue #494):
 //

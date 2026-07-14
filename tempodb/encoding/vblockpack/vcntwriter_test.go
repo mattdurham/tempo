@@ -379,6 +379,206 @@ func TestVCNTFlush_WritesV2KeyFormatWithGenuineRange(t *testing.T) {
 	assert.Equal(t, uint64(180), meta.WallMaxSec)
 }
 
+// durationBucketBoundsMillisForTest mirrors blockpack's finalized 16-entry
+// DurationBucketBoundsMillis array (#205 plan §1) so tests can assert on the
+// ABSENCE of records for every non-target bucket without importing blockpack's
+// internal/modules/valuecounts package (not importable from this module tree).
+// These are literal spec values, not a reimplementation of production logic.
+var durationBucketBoundsMillisForTest = [16]uint64{
+	0, 1, 5, 10, 50, 100, 500,
+	1_000, 5_000, 10_000, 30_000,
+	60_000, 300_000, 600_000,
+	1_800_000, 3_600_000,
+}
+
+// durationSpan is one span's start/end timestamps for duration-histogram test fixtures.
+type durationSpan struct {
+	startNano uint64
+	endNano   uint64
+	name      string
+}
+
+// traceWithDurationSpansAt builds a single-ResourceSpans trace with one span per
+// durationSpan, each carrying both StartTimeUnixNano and EndTimeUnixNano.
+func traceWithDurationSpansAt(spans ...durationSpan) *tempopb.Trace {
+	spanPBs := make([]*tempotrace.Span, 0, len(spans))
+	for _, s := range spans {
+		spanPBs = append(spanPBs, &tempotrace.Span{
+			Name:              s.name,
+			StartTimeUnixNano: s.startNano,
+			EndTimeUnixNano:   s.endNano,
+		})
+	}
+	return &tempopb.Trace{
+		ResourceSpans: []*tempotrace.ResourceSpans{{
+			ScopeSpans: []*tempotrace.ScopeSpans{{Spans: spanPBs}},
+		}},
+	}
+}
+
+// findHistogramRecord returns the record under histCol whose Value matches boundaryMillis, or
+// nil if absent — used to assert absence (not just presence) for the discreteness pin.
+func findHistogramRecord(records []blockpack.VCNTRecord, histCol string, boundaryMillis uint64) *blockpack.VCNTRecord {
+	want := string(blockpack.VCNTDurationHistogramValue(boundaryMillis))
+	for i, r := range records {
+		if r.ColumnName == histCol && string(r.Value) == want {
+			return &records[i]
+		}
+	}
+	return nil
+}
+
+// TestVCNTAccumulator_DurationHistogram_BucketsBySpanDuration proves each span's duration is
+// bucketed via VCNTDurationBucketBoundaryMillis and recorded under
+// VCNTDurationHistogramColumnName("span:duration"), with exact (boundary, count) pairs — one
+// span landing exactly on a boundary (10s, bucket 9), one past the 1hr catch-all (bucket 15),
+// and one at a small exact boundary (50ms, bucket 4).
+func TestVCNTAccumulator_DurationHistogram_BucketsBySpanDuration(t *testing.T) {
+	const nsPerMs = 1_000_000
+	trace := traceWithDurationSpansAt(
+		durationSpan{startNano: 0, endNano: 10_000 * nsPerMs, name: "ten-seconds"},                // duration 10s -> boundary 10_000 (bucket 9)
+		durationSpan{startNano: 0, endNano: (3_600_000 + 500) * nsPerMs, name: "past-one-hour"},    // duration 3,600.5s -> boundary 3_600_000 (bucket 15)
+		durationSpan{startNano: 0, endNano: 50 * nsPerMs, name: "fifty-millis"},                   // duration 50ms -> boundary 50 (bucket 4)
+	)
+
+	acc := newVCNTAccumulator()
+	acc.addTrace(trace)
+	records := acc.snapshot()
+
+	histCol := blockpack.VCNTDurationHistogramColumnName("span:duration")
+
+	tenSec := findHistogramRecord(records, histCol, 10_000)
+	require.NotNil(t, tenSec, "expected a histogram record for the 10s-exactly span's boundary")
+	assert.Equal(t, int64(1), tenSec.Count)
+
+	pastHour := findHistogramRecord(records, histCol, 3_600_000)
+	require.NotNil(t, pastHour, "expected a histogram record for the past-1hr span's boundary (catch-all bucket 15)")
+	assert.Equal(t, int64(1), pastHour.Count)
+
+	fiftyMs := findHistogramRecord(records, histCol, 50)
+	require.NotNil(t, fiftyMs, "expected a histogram record for the 50ms-exactly span's boundary")
+	assert.Equal(t, int64(1), fiftyMs.Count)
+}
+
+// TestVCNTAccumulator_DurationHistogram_12ms_OnlyBucket3IncrementsOthersStayZero is the
+// discreteness pin (#205 plan §1.1): a single 12ms-duration span must increment ONLY bucket
+// index 3 (boundary 10ms, since 10 <= 12 < 50) — every other bucket must be absent from the
+// snapshot entirely, not merely present-with-zero (the accumulator never creates a map entry
+// for a bucket it didn't increment).
+func TestVCNTAccumulator_DurationHistogram_12ms_OnlyBucket3IncrementsOthersStayZero(t *testing.T) {
+	const nsPerMs = 1_000_000
+	trace := traceWithDurationSpansAt(
+		durationSpan{startNano: 0, endNano: 12 * nsPerMs, name: "twelve-millis"},
+	)
+
+	acc := newVCNTAccumulator()
+	acc.addTrace(trace)
+	records := acc.snapshot()
+
+	histCol := blockpack.VCNTDurationHistogramColumnName("span:duration")
+
+	target := findHistogramRecord(records, histCol, 10)
+	require.NotNil(t, target, "expected exactly one histogram record at boundary 10 (bucket 3) for a 12ms span")
+	assert.Equal(t, int64(1), target.Count)
+
+	for _, boundary := range durationBucketBoundsMillisForTest {
+		if boundary == 10 {
+			continue
+		}
+		other := findHistogramRecord(records, histCol, boundary)
+		assert.Nilf(t, other, "boundary %d must be entirely absent from the snapshot for a 12ms span, got %+v", boundary, other)
+	}
+}
+
+// TestVCNTAccumulator_DurationHistogram_MalformedEndBeforeStart_ClampedToBucket0NotDropped
+// proves the never-drop-records guard (#205 plan §6 point 2): a malformed span with
+// EndTimeUnixNano < StartTimeUnixNano must still produce exactly one histogram record, clamped
+// to bucket 0 (boundary 0), never zero records.
+func TestVCNTAccumulator_DurationHistogram_MalformedEndBeforeStart_ClampedToBucket0NotDropped(t *testing.T) {
+	trace := traceWithDurationSpansAt(
+		durationSpan{startNano: 1_000_000_000, endNano: 500_000_000, name: "malformed"},
+	)
+
+	acc := newVCNTAccumulator()
+	acc.addTrace(trace)
+	records := acc.snapshot()
+
+	histCol := blockpack.VCNTDurationHistogramColumnName("span:duration")
+
+	target := findHistogramRecord(records, histCol, 0)
+	require.NotNil(t, target, "malformed end-before-start span must clamp to bucket 0, not be dropped")
+	assert.Equal(t, int64(1), target.Count)
+
+	for _, boundary := range durationBucketBoundsMillisForTest {
+		if boundary == 0 {
+			continue
+		}
+		other := findHistogramRecord(records, histCol, boundary)
+		assert.Nilf(t, other, "only bucket 0 should be incremented for a clamped malformed span, got %+v", other)
+	}
+}
+
+// TestVCNTAccumulator_DurationHistogram_UnsetEndTime_ClampedToBucket0NotDropped is the sibling
+// malformed-input case: EndTimeUnixNano == 0 (unset) must clamp identically to bucket 0.
+func TestVCNTAccumulator_DurationHistogram_UnsetEndTime_ClampedToBucket0NotDropped(t *testing.T) {
+	trace := traceWithDurationSpansAt(
+		durationSpan{startNano: 1_000_000_000, endNano: 0, name: "unset-end"},
+	)
+
+	acc := newVCNTAccumulator()
+	acc.addTrace(trace)
+	records := acc.snapshot()
+
+	histCol := blockpack.VCNTDurationHistogramColumnName("span:duration")
+
+	target := findHistogramRecord(records, histCol, 0)
+	require.NotNil(t, target, "unset EndTimeUnixNano span must clamp to bucket 0, not be dropped")
+	assert.Equal(t, int64(1), target.Count)
+
+	for _, boundary := range durationBucketBoundsMillisForTest {
+		if boundary == 0 {
+			continue
+		}
+		other := findHistogramRecord(records, histCol, boundary)
+		assert.Nilf(t, other, "only bucket 0 should be incremented for an unset-end-time span, got %+v", other)
+	}
+}
+
+// TestVCNTFlush_DurationHistogram_CrossBlockMinuteCoalescing mirrors
+// TestVCNTFlush_CrossBlockMinuteCoalescing for histogram rows: two independent accumulator+flush
+// cycles, each with one span landing in the same wall-clock minute AND the same duration bucket,
+// must produce .vcnt records that share the exact same (ColumnName, TimeStart, TimeEnd, Value)
+// key and compact into a single summed record under blockpack.CompactVCNTRecords.
+func TestVCNTFlush_DurationHistogram_CrossBlockMinuteCoalescing(t *testing.T) {
+	store := newFakeVCNTStore()
+	const nsPerMs = 1_000_000
+	const nsPerSec = 1_000_000_000
+
+	accA := newVCNTAccumulator()
+	accA.addTrace(traceWithDurationSpansAt(durationSpan{
+		startNano: 65 * nsPerSec, endNano: 65*nsPerSec + 10_000*nsPerMs, name: "op-a",
+	})) // bucket 60, duration 10s -> boundary 10_000
+	accA.flush(store, "tenant1")
+
+	accB := newVCNTAccumulator()
+	accB.addTrace(traceWithDurationSpansAt(durationSpan{
+		startNano: 68 * nsPerSec, endNano: 68*nsPerSec + 10_000*nsPerMs, name: "op-a",
+	})) // also bucket 60, same duration bucket, independent flush
+	accB.flush(store, "tenant1")
+
+	histCol := blockpack.VCNTDurationHistogramColumnName("span:duration")
+	decoded := store.recordsForColumn(histCol)
+	require.NotEmpty(t, decoded, "flush must have written histogram records to the fake store")
+
+	merged := blockpack.CompactVCNTRecords(decoded)
+	require.Len(t, merged, 1,
+		"two independent flushes landing in the same minute+bucket must compact into exactly one record")
+	assert.Equal(t, uint64(60), merged[0].TimeStart)
+	assert.Equal(t, uint64(60), merged[0].TimeEnd)
+	assert.Equal(t, int64(2), merged[0].Count)
+	assert.Equal(t, blockpack.VCNTDurationHistogramValue(10_000), merged[0].Value)
+}
+
 // TestVCNTFlush_KeyRangeCorrectDespiteMapIterationOrder is the mandatory adversarial test
 // (issue #494, R5, mirrors R3's requirement applied to tempo's write call site): accumulator
 // state is populated directly (bypassing addTrace) so the fixture doesn't depend on

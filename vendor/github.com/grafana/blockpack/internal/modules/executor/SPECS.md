@@ -728,7 +728,6 @@ back-ref: `RecordFileIO`/`Stats`) — the total byte size of value-index files d
 resolving the query. Zero for a non-production `ValueIndexSource` test fake that doesn't track
 file I/O. No caller referenced the old `BytesRead` name (verified repo-wide); this is a rename,
 not an additive field.
-```
 
 ### 10.3 Supported Functions `[SUPERSEDED — see SPEC-VIS-2: only count_over_time()/rate() without group-by survive, via ExecuteTraceMetricsFromVI]`
 

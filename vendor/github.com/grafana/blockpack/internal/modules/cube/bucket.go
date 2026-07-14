@@ -21,13 +21,21 @@ const BucketCount = 64
 
 // Log2Bucketize returns the ceiling power-of-two boundary for v, or -1 when v < 2 (the sample is
 // excluded from any histogram entirely — ported byte-for-byte from tempo's
-// pkg/traceql.Log2Bucketize).
+// pkg/traceql.Log2Bucketize) or when v >= 2^63+1 (the ceiling boundary would be 2^64, which
+// overflows uint64's 1<<64 to 0 per Go's shift semantics rather than any in-range value — a
+// pathological/corrupted input, unreachable via any real span duration or count, excluded via the
+// same -1 sentinel as the v<2 case rather than silently wrapping into an out-of-bounds bucket).
 func Log2Bucketize(v uint64) float64 {
 	if v < 2 {
 		return -1
 	}
 
-	return float64(uint64(1) << (64 - bits.LeadingZeros64(v-1)))
+	shift := 64 - bits.LeadingZeros64(v-1)
+	if shift >= 64 {
+		return -1
+	}
+
+	return float64(uint64(1) << shift)
 }
 
 // BucketIndex returns the dense-array slot (1-63) for a boundary value produced by Log2Bucketize.

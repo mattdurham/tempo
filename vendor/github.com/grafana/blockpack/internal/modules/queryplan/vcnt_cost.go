@@ -49,17 +49,42 @@ func VCNTCostFunc(data []byte, dir []valuecounts.ChunkDirEntry, minTS, maxTS uin
 // It returns ok=false for a leaf with no column (an unresolvable node) or a column
 // the VCNT section has no live record for; the classifier then reads that leaf as
 // UnknownSelectivity. Like VCNTCostFunc it performs no object-storage I/O.
+//
+// SPEC-QP-9: falls back to leaf.Column's duration histogram total (#205) only when the bare
+// discrete-value lookup has no coverage at all — see durationColumnTotalFallback.
 func VCNTColumnTotalFunc(data []byte, dir []valuecounts.ChunkDirEntry, minTS, maxTS uint64) ColumnTotalFunc {
 	return func(leaf *vm.RangeNode) (int64, bool) {
 		if leaf == nil || leaf.Column == "" {
 			return 0, false
 		}
 		ct, err := valuecounts.ColumnTotalInRange(data, dir, leaf.Column, minTS, maxTS)
-		if err != nil || !ct.Covered {
-			return 0, false
+		if err == nil && ct.Covered {
+			return ct.Total, true
 		}
-		return ct.Total, true
+		// Histogram fallback (#205): leaf.Column has no bare discrete-value VCNT coverage at
+		// all today but MAY have a fixed-bucket histogram under HistogramColumnName(leaf.Column)
+		// (span:duration, Phase 1's sole eligible column). DurationHistogramInRange applies the
+		// same NOTE-VC-001 drop-if-<=0-per-bucket rule ColumnTotalInRange already applies per
+		// value, so Counts is non-negative by construction and a plain sum needs no extra clamp.
+		return durationColumnTotalFallback(data, dir, leaf.Column, minTS, maxTS)
 	}
+}
+
+// durationColumnTotalFallback sums column's duration histogram buckets into a single total, for
+// VCNTColumnTotalFunc's histogram fallback path. Returns ok=false when column has no histogram
+// coverage either — the caller then reads UnknownSelectivity, same as any other uncovered column.
+func durationColumnTotalFallback(
+	data []byte, dir []valuecounts.ChunkDirEntry, column string, minTS, maxTS uint64,
+) (int64, bool) {
+	h, err := valuecounts.DurationHistogramInRange(data, dir, column, minTS, maxTS)
+	if err != nil || !h.Covered {
+		return 0, false
+	}
+	var total int64
+	for _, c := range h.Counts {
+		total += c
+	}
+	return total, true
 }
 
 // ClassifyProgramVCNT is the single consumer entry point that composes the VCNT cost
@@ -108,7 +133,10 @@ func ClassifyProgramVCNTWithThreshold(
 	minTS, maxTS uint64,
 	fraction float64,
 ) Selectivity {
-	cost := VCNTCostFunc(data, dir, minTS, maxTS)
+	cost := CombineCostFuncs(
+		VCNTCostFunc(data, dir, minTS, maxTS),
+		VCNTDurationCostFunc(data, dir, minTS, maxTS),
+	)
 	g, ok := Plan(prog, cost)
 	if !ok {
 		return UnknownSelectivity
@@ -156,7 +184,10 @@ func ClassifyProgramVCNTWithDetail(
 	dir []valuecounts.ChunkDirEntry,
 	minTS, maxTS uint64,
 ) (Selectivity, LeadDetail) {
-	cost := VCNTCostFunc(data, dir, minTS, maxTS)
+	cost := CombineCostFuncs(
+		VCNTCostFunc(data, dir, minTS, maxTS),
+		VCNTDurationCostFunc(data, dir, minTS, maxTS),
+	)
 	g, ok := Plan(prog, cost)
 	if !ok {
 		return UnknownSelectivity, LeadDetail{}

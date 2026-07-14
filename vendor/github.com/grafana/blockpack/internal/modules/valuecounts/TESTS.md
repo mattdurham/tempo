@@ -11,7 +11,7 @@ SPEC-ROOT-009 — this file's own sequence, numbering from 1, independent of
 `internal/modules/valuecountscompactor/TESTS.md`'s own separate `TEST-VC-N` sequence). IDs are
 assigned in ascending order and never reused or renumbered.
 
-Next free ID: **TEST-VC-11**.
+Next free ID: **TEST-VC-12**.
 
 ---
 
@@ -201,3 +201,57 @@ with the mandatory R3 adversarial guard against assuming `TimeEnd` is sort-order
 **Spec invariants tested:** SPEC-VC-7.
 
 Back-ref: `internal/modules/valuecounts/timerange_test.go`. Issue #494, task A1/#91.
+
+---
+
+## TEST-VC-11: histogram_test.go — duration histogram bucket primitives, decode, and estimation
+*Added: 2026-07-13*
+
+**Scenario:** Locks in SPEC-VC-8's contract for the 16-bucket duration histogram (#205, Phase A):
+floor-semantics bucket assignment, the never-drop-by-construction property, the value encoding
+round-trip, per-bucket liveness accounting on decode, and the over-estimate direction of the
+threshold/between estimators.
+
+**Setup/Assertions (`histogram_test.go`):**
+
+- `TestBucketIndex_Zero_ReturnsBucket0` — pins the never-drop-by-construction property directly:
+  `BucketIndex(0) == 0`.
+- `TestBucketIndex_ExactBoundaries` — table-driven over all 16 `DurationBucketBoundsMillis`
+  values, each maps to its own index exactly.
+- `TestBucketIndex_10SecondsExactly_ReturnsBucket9` — boundary-inclusive floor semantics.
+- `TestBucketIndex_59Minutes_ReturnsBucket14NotBucket15` — `BucketIndex(3_540_000) == 14`, not
+  yet the 1hr catch-all.
+- `TestBucketIndex_OneHourExactly_ReturnsBucket15`.
+- `TestBucketIndex_OneHundredHours_StillReturnsBucket15` — the open-ended catch-all, no separate
+  tail bucket.
+- `TestBucketIndex_BetweenBoundaries` — values strictly between each of several adjacent boundary
+  pairs, proving the floor search works for non-exact hits, not just exact ones.
+- `TestHistogramColumnName_Format` — `HistogramColumnName("span:duration") ==
+  "span:duration#hist"`.
+- `TestEncodeDecodeHistogramValue_RoundTrip` — the 8-byte little-endian encoding round-trips all
+  16 boundary values exactly.
+- `TestDurationHistogramInRange_SumsPerBucketDropsNonPositive` — hand-built histogram `Record`s
+  with a mix of positive and net-negative per-bucket sums; asserts a net-zero bucket and a
+  net-negative bucket both read as exactly `0` (never negative), `Covered=true` overall. Also
+  serves as this phase's discrete-not-cumulative mutation guard: a decode implementation that
+  wrongly spreads one record's `Count` into every bucket `<= idx` (a cumulative/CDF-style read)
+  instead of only `Counts[idx]` fails this test (verified by deliberate mutation — see NOTE-VC-022).
+- `TestDurationHistogramInRange_UncoveredColumnReturnsCoveredFalse`.
+- `TestDurationHistogramInRange_CorruptValueSkippedNoPanic` — a malformed `Value` (wrong byte
+  length) is skipped, not panicked on, and does not corrupt a valid sibling record's bucket
+  (SPEC-ROOT-001's no-panic rule).
+- `TestEstimateThreshold_GreaterThan_OverEstimatesStraddledBucket` /
+  `TestEstimateThreshold_LessThan_OverEstimatesStraddledBucket` — a threshold strictly inside a
+  bucket's range; asserts the straddled bucket is counted IN FULL, and explicitly asserts the
+  result differs from the under-estimate that would exclude it (a shape-only check could pass for
+  the wrong reason). Verified by deliberate mutation (excluding the straddled bucket) — see
+  NOTE-VC-022.
+- `TestEstimateThreshold_Equality_AlwaysUnknown`.
+- `TestEstimateBetween_CappedAtSingleBucket_DegenerateCase` — both bounds landing in the same
+  bucket does not double-count past that bucket's own count.
+- `TestEstimateBetween_MultiBucket_SumsBothBoundaryBucketsInFull` — a genuinely multi-bucket range
+  sums both boundary buckets in full.
+
+**Spec invariants tested:** SPEC-VC-8.
+
+Back-ref: `internal/modules/valuecounts/histogram_test.go`. Issue #205, Phase A.

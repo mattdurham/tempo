@@ -435,8 +435,12 @@ byte-for-byte port of tempo's `pkg/traceql.Log2Bucketize`/`Log2QuantileWithBucke
 `cube` package must never import `tempo`. `BucketCount=64`: slot 0 is always zero (the smallest
 non-excluded boundary is `2^1=2`, matching `Log2Bucketize`'s own `v<2` exclusion, which returns
 the `-1` sentinel); slots 1-63 hold counts for boundary `2^k`. `Log2Bucketize(v)` returns the
-ceiling power-of-two boundary for `v`, or `-1` when `v<2` (excluded from any histogram entirely).
-`BucketIndex`/`BucketMax` are exact inverses of each other over the valid `[1,63]` slot range.
+ceiling power-of-two boundary for `v`, or `-1` when `v<2` (excluded from any histogram entirely)
+**or when `v>=2^63+1`** (the true ceiling boundary would be `2^64`, which overflows `uint64`'s
+`1<<64` to `0` per Go's defined shift-count-`>=`-width semantics rather than any in-range value;
+this is a deliberate, intentional divergence from tempo's own `Log2Bucketize`, which does not
+guard this case — see NOTE-CUBE-028). `BucketIndex`/`BucketMax` are exact inverses of each other
+over the valid `[1,63]` slot range.
 `Log2QuantileFromBuckets(p, buckets)` walks buckets in ascending index order accumulating counts
 until `ceil(p*total)` samples (minimum 1) are consumed, returning `(0,-1)` for an invalid `p`
 (NaN/<0/>1) or all-empty buckets, an exact `BucketMax(bucket)` when the accumulated count lands

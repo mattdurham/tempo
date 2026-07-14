@@ -20,7 +20,10 @@ ascending order and never reused or renumbered; superseded entries are marked `[
 SPEC-QP-N]` rather than deleted. `queryplan/NOTES.md`'s own entries use the separate `NOTE-QP-00N`
 counter (module-local to this package only, not shared with any other module).
 
-Next free ID: **SPEC-QP-7**.
+Next free ID: **SPEC-QP-10**. (Corrected 2026-07-13: this line had drifted stale at
+`SPEC-QP-7` even though `SPEC-QP-8` already existed below — issue #217 added it without updating
+this line. `SPEC-QP-9` below is confirmed correct against the file's actual last header, not
+against this line, per this project's standing ID-drift-checking convention.)
 
 ---
 
@@ -442,3 +445,57 @@ mechanism.
 
 Back-ref: `internal/modules/queryplan/slices.go:BuildTimeSlices,maxSlicesPerPlan`. See
 `NOTE-QP-012`, `BENCHMARKS.md` BENCH-QP-010. Issue #217.
+
+---
+
+## SPEC-QP-9: `VCNTDurationCostFunc` / `CombineCostFuncs` / histogram-fallback `ColumnTotalFunc` (issue #205)
+
+*Added: 2026-07-13*
+
+**`VCNTDurationCostFunc(data, dir, minTS, maxTS) CostFunc`** (`vcnt_duration_cost.go`) is
+`VCNTCostFunc`'s range-predicate sibling for the histogram-eligible column
+(`durationHistogramColumn = "span:duration"`, Phase 1's sole eligible column — a single hardcoded
+string comparison, not a map). It recognizes exactly two leaf shapes on that column, both mutually
+exclusive with `leafEqualityValue`'s equality shape by construction (equality requires
+`len(Values)==1`; both shapes below require `len(Values)==0`):
+
+- **Single-bound** (`Min` XOR `Max` set, no `Values`/`Pattern`/`RequirePresent`): maps to
+  `valuecounts.OpGT`/`OpGTE`/`OpLT`/`OpLTE` per `MinInclusive`/`MaxInclusive`, converts the raw
+  nanosecond `Value.Data` to milliseconds via plain integer division (`nanos/1_000_000`,
+  negative-clamped to 0) — deliberately NOT `vibuilder`'s
+  `intOrDedicatedColType`/`decidableTimeBucketThreshold` decidability logic, which solves a
+  different, unrelated exact-lookup problem and has no bearing on this histogram's
+  intentionally-approximate, over-estimating semantics — and answers via
+  `valuecounts.DurationHistogram.EstimateThreshold`.
+- **Between** (both `Min` and `Max` set, same other constraints): answers via
+  `DurationHistogram.EstimateBetween`.
+
+Any other leaf shape (equality, no Min/Max, a column other than `durationHistogramColumn`, or a
+column with no histogram coverage at all — `DurationHistogramInRange`'s `Covered=false`) returns
+`UnknownCost()`.
+
+**`CombineCostFuncs(first, second CostFunc) CostFunc`** (`vcnt_duration_cost.go`) tries `first`,
+and only falls through to `second` when `first` returns `Unknown` — never both, and never sums or
+blends the two. Generic: usable with any two `CostFunc`s, not specific to VCNT/duration.
+
+**Composition (`vcnt_cost.go`):** `ClassifyProgramVCNTWithThreshold` and
+`ClassifyProgramVCNTWithDetail` both build their `cost` oracle as
+`CombineCostFuncs(VCNTCostFunc(data, dir, minTS, maxTS), VCNTDurationCostFunc(data, dir, minTS, maxTS))`
+instead of `VCNTCostFunc` alone. No signature change to either function — tempo's existing,
+unmodified `ClassifyProgramVCNTWithDetail` call site starts recognizing duration-range leaves with
+zero tempo-side code change (see `NOTE-QP-013`).
+
+**Histogram fallback (`VCNTColumnTotalFunc`, `vcnt_cost.go`):** tries the bare discrete-value
+`valuecounts.ColumnTotalInRange(data, dir, leaf.Column, ...)` lookup first; only when that has no
+coverage (`Covered=false` or an error) does it fall back to summing
+`valuecounts.DurationHistogramInRange(data, dir, leaf.Column, ...).Counts` into a single total via
+`durationColumnTotalFallback`. A column with bare coverage is never affected by this fallback
+(zero regression risk for every pre-existing production column, `TEST-QP-3`'s
+`..._PrefersBareColumnWhenBothExist`); a column with ONLY histogram coverage (the real
+`span:duration` production shape — no bare-value VCNT records for it exist or are planned) now
+gets a real `ColumnTotal` instead of always reading `ok=false` (`TEST-QP-3`'s
+`..._HistogramFallback_UsedOnlyWhenBareColumnUncovered`).
+
+Back-ref: `internal/modules/queryplan/vcnt_duration_cost.go:VCNTDurationCostFunc,CombineCostFuncs,durationRangeLeafShape,durationBetweenLeafShape,durationValueMillis`;
+`internal/modules/queryplan/vcnt_cost.go:ClassifyProgramVCNTWithThreshold,ClassifyProgramVCNTWithDetail,VCNTColumnTotalFunc,durationColumnTotalFallback`.
+See `NOTE-QP-013`, `TESTS.md` `TEST-QP-3`. Issue #205.

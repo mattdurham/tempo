@@ -252,4 +252,11 @@ phase's ID-routing convention (FOOTGUN 5, `.bob/state/spec-knowledge-phase-e.md`
 |----|------|------|---------------------------|
 | TEST-CUBE-103 | `TestReader_BytesRead_ReportsExactInputLength` | reader_test.go | Setup: a real cube file built via Writer.AddAggCell→Encode, opened both via OpenReaderFromBytes(data) and via OpenReader(path) (data written to a temp file first). Assertion: BytesRead() equals exactly len(data) for both open paths — mutation-verified (an off-by-one mutation on BytesRead()'s return was confirmed to fail this test, then reverted). |
 
-**Next free ID: TEST-CUBE-104.**
+## TEST-CUBE-104/105 — Log2Bucketize 1<<64 overflow bounds-safety fix (NOTE-CUBE-028)
+
+| ID | Test | File | Scenario/Setup/Assertions |
+|----|------|------|---------------------------|
+| TEST-CUBE-104 | `TestLog2Bucketize_PathologicallyLargeValueExcludedNotOOB` | bucket_test.go | v=2^63 still ceilings correctly to bucket 63 (the largest valid boundary); v=2^63+1 and v=MaxUint64 both return the -1 sentinel instead of the pre-fix 1<<64-wraps-to-0 result. |
+| TEST-CUBE-105 | `TestAccumulator_Add_PathologicallyLargeDuration_ExcludedNotOOB` | accumulator_test.go | A span whose duration is the smallest float64 strictly greater than 2^63 flows through the real Add→addAggAttrs path without panicking; SampleCount/Sum still reflect the sample but every Buckets[] slot stays zero. Mutation-verified: reverting the bucket.go fix reproduces the exact pre-fix `index out of range [64] with length 64` panic at accumulator.go's Buckets write. |
+
+**Next free ID: TEST-CUBE-106.**

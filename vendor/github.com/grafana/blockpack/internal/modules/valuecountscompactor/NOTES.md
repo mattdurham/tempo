@@ -14,10 +14,11 @@ ruling (2026-07-02): `valuecounts` and `valuecountscompactor` are the analogous
 core-format/compactor-service pair for VCNT that `valueindex`/`valueindexcompactor` are for VI.
 
 `valuecounts/NOTES.md` currently holds NOTE-VC-001 through NOTE-VC-006, NOTE-VC-008,
-NOTE-VC-011 through NOTE-VC-017, and (as of 2026-07-13, task #216) NOTE-VC-020 (NOTE-VC-007
-was left explicitly reserved for this file — see the inline note in `valuecounts/NOTES.md` at
-that point in the sequence). This file also holds NOTE-VC-009, NOTE-VC-010, NOTE-VC-018, and
-(as of 2026-07-13, task #216) NOTE-VC-019 and NOTE-VC-021. Next free ID: **NOTE-VC-022**.
+NOTE-VC-011 through NOTE-VC-017, NOTE-VC-020, and (as of 2026-07-13, issue #205 Phase A)
+NOTE-VC-022 (NOTE-VC-007 was left explicitly reserved for this file — see the inline note in
+`valuecounts/NOTES.md` at that point in the sequence). This file also holds NOTE-VC-009,
+NOTE-VC-010, NOTE-VC-018, and (as of 2026-07-13, task #216) NOTE-VC-019 and NOTE-VC-021. Next
+free ID: **NOTE-VC-023**.
 
 ---
 
