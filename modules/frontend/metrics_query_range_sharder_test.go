@@ -356,6 +356,72 @@ func TestMetricsQueryRangeSharder_TimeSlicedDispatch_SkipsNonOverlappingBlockSli
 	require.Equal(t, jobMetadata.TotalJobs, sumShardJobs, "sum of per-shard TotalJobs must equal the overall TotalJobs")
 }
 
+// TestMetricsQueryRangeSharder_TimeSlicedDispatch_SkipDispatchSlice_NoJobDispatchedAndTotalJobsExcludesIt
+// (issue #499 Phase 3) mirrors the search-sharder test of the same name (search_sharder_test.go)
+// through timeSlicedJobsFunc's SHARED code path — this test doubles as the metrics-combiner-
+// safety regression guard (decision #3 of the #499 plan): the concrete, executable proof that
+// jobMetadata.TotalJobs stays consistent with the SkipDispatch decision, the precondition the
+// metrics-combiner investigation identified as the only thing standing between "safe" and
+// "silently wrong" for a skipped minute's contribution to a count_over_time/rate/sum_over_time
+// result.
+func TestMetricsQueryRangeSharder_TimeSlicedDispatch_SkipDispatchSlice_NoJobDispatchedAndTotalJobsExcludesIt(t *testing.T) {
+	block := backend.NewBlockMeta("test", uuid.New(), "wdwad")
+	block.StartTime = time.Unix(100, 0)
+	block.EndTime = time.Unix(300, 0)
+	block.Size_ = defaultTargetBytesPerRequest
+	block.TotalRecords = 1
+	block.ReplicationFactor = backend.MetricsGeneratorReplicationFactor
+
+	s := &queryRangeSharder{
+		logger: log.NewNopLogger(),
+		cfg:    QueryRangeSharderConfig{StreamingShards: defaultMostRecentShards},
+		reader: &mockReader{metas: []*backend.BlockMeta{block}},
+	}
+
+	searchReq := tempopb.QueryRangeRequest{
+		Query: "{} | count_over_time()",
+		Start: uint64(100 * time.Second),
+		End:   uint64(300 * time.Second),
+		Step:  uint64(10 * time.Second),
+	}
+
+	// Both slices genuinely overlap the block's [100, 300] window — the ONLY reason slice2 must
+	// not dispatch a job is SkipDispatch, not overlaps.
+	plan := &blockpack.QueryPlan{
+		Strategy: blockpack.DispatchTimeSliced,
+		Slices: []blockpack.TimeSlice{
+			{Start: 200, End: 300, SkipDispatch: true},
+			{Start: 100, End: 200, SkipDispatch: false},
+		},
+	}
+
+	reqCh := make(chan pipeline.Request)
+	ctx := context.Background()
+	pipelineRequest := pipeline.NewHTTPRequest(httptest.NewRequest("GET", "/", nil))
+	jobMetadata := &combiner.QueryRangeJobResponse{}
+	cutoff := time.Unix(1000, 0)
+
+	go s.backendRequests(ctx, "test", pipelineRequest, searchReq, cutoff, defaultTargetBytesPerRequest, plan, reqCh, jobMetadata)
+
+	var gotReqs []*tempopb.QueryRangeRequest
+	for pr := range reqCh {
+		parsed, err := api.ParseQueryRangeRequest(pr.HTTPRequest())
+		require.NoError(t, err)
+		gotReqs = append(gotReqs, parsed)
+	}
+
+	require.Len(t, gotReqs, 1, "only the non-SkipDispatch slice must produce a job")
+	require.Equal(t, uint64(100*time.Second), gotReqs[0].Start)
+	require.Equal(t, uint64(200*time.Second), gotReqs[0].End)
+
+	require.Equal(t, len(gotReqs), jobMetadata.TotalJobs, "TotalJobs must exclude the SkipDispatch slice's job")
+	var sumShardJobs int
+	for _, sh := range jobMetadata.Shards {
+		sumShardJobs += int(sh.TotalJobs)
+	}
+	require.Equal(t, jobMetadata.TotalJobs, sumShardJobs, "sum of per-shard TotalJobs must equal the overall TotalJobs")
+}
+
 // TestMetricsQueryRangeSharder_BlockShardedDispatch_UnchangedWhenStrategyIsBlockSharded pins
 // the parity-and-fallback-first discipline for metrics: a nil plan, and a plan whose Strategy
 // is the zero-value DispatchBlockSharded, must both produce identical job counts to today's

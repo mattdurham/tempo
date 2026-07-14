@@ -78,14 +78,16 @@ func (s *pgCubeEntryStore) Load(ctx context.Context, tenant string) ([]blockpack
 }
 
 // AddEntry registers entry for tenant, idempotent on entry.CubeID already
-// existing and enforcing maxCubes -- mirrors blobEntryStore.addEntry's exact
-// contract. Serialized per-tenant via pg_advisory_xact_lock: unlike viusage's
+// existing -- mirrors blobEntryStore.addEntry's exact contract. The cardinality
+// gate this used to also enforce was removed repo-wide by blockpack issue #497
+// (see blockpack NOTE-CUBE-029); cube count per tenant is now unbounded here
+// too. Serialized per-tenant via pg_advisory_xact_lock: unlike viusage's
 // UpsertEntry (which always has an existing-or-about-to-exist row to SELECT
 // ... FOR UPDATE), the FIRST cube for a tenant has no row to lock, so the
-// idempotency-check-then-maxCubes-check-then-insert sequence needs an
-// explicit advisory lock instead to prevent two concurrent first-cube
-// registrations from both passing the maxCubes check.
-func (s *pgCubeEntryStore) AddEntry(ctx context.Context, tenant string, entry blockpack.CubeRegistryEntry, maxCubes int) error {
+// idempotency-check-then-insert sequence needs an explicit advisory lock
+// instead to prevent two concurrent registrations of the same new CubeID from
+// both passing the "not present" check before either INSERT commits.
+func (s *pgCubeEntryStore) AddEntry(ctx context.Context, tenant string, entry blockpack.CubeRegistryEntry) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("pg cube entrystore: begin: %w", err)
@@ -96,33 +98,13 @@ func (s *pgCubeEntryStore) AddEntry(ctx context.Context, tenant string, entry bl
 		return fmt.Errorf("pg cube entrystore: advisory lock: %w", err)
 	}
 
-	var count int
 	var alreadyPresent bool
-	rows, err := tx.Query(ctx, `SELECT cube_id FROM cube_entries WHERE tenant = $1`, tenant)
-	if err != nil {
-		return fmt.Errorf("pg cube entrystore: count: %w", err)
+	row := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM cube_entries WHERE tenant = $1 AND cube_id = $2)`, tenant, entry.CubeID)
+	if err := row.Scan(&alreadyPresent); err != nil {
+		return fmt.Errorf("pg cube entrystore: exists check: %w", err)
 	}
-	for rows.Next() {
-		var cubeID string
-		if scanErr := rows.Scan(&cubeID); scanErr != nil {
-			rows.Close()
-			return fmt.Errorf("pg cube entrystore: count scan: %w", scanErr)
-		}
-		count++
-		if cubeID == entry.CubeID {
-			alreadyPresent = true
-		}
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("pg cube entrystore: count rows: %w", err)
-	}
-
 	if alreadyPresent {
 		return nil // idempotent, mirrors blobEntryStore.addEntry
-	}
-	if count >= maxCubes {
-		return &blockpack.CubeErrLimitReached{Limit: maxCubes}
 	}
 
 	dimensions, err := json.Marshal(entry.Dimensions)

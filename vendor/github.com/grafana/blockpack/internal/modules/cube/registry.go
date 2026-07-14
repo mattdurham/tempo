@@ -10,11 +10,7 @@ package cube
 import (
 	"context"
 	"errors"
-	"fmt"
 )
-
-// MaxCubesPerTenant is the default maximum number of active cubes per tenant.
-const MaxCubesPerTenant = 1000
 
 // indexVersion is the current version of the index.json wire format.
 const indexVersion = 1
@@ -58,15 +54,13 @@ type cubeIndex struct {
 type Registry struct {
 	store  entryStore // was: store ObjectStore (2026-07-11 entryStore refactor)
 	tenant string
-	// maxCubes is the per-tenant active-cube limit.
-	maxCubes int
 }
 
 // NewRegistry creates a Registry for the given tenant backed by store. Public signature
 // unchanged by the 2026-07-11 entryStore refactor — internally wraps store in a
 // blobEntryStore (today's S3/Local/GCS/Azure conditional-PUT path, behavior-preserving).
 func NewRegistry(store ObjectStore, tenant string) *Registry {
-	return &Registry{store: &blobEntryStore{store: store}, tenant: tenant, maxCubes: MaxCubesPerTenant}
+	return &Registry{store: &blobEntryStore{store: store}, tenant: tenant}
 }
 
 // Load fetches and decodes the current index. Returns an empty index when the file does
@@ -97,11 +91,10 @@ func (r *Registry) IsActive(ctx context.Context, cubeID string) (bool, error) {
 
 // Add appends def to the index using a conditional-PUT retry loop.
 // If def.CubeID is already present the call is a no-op and returns nil.
-// Returns ErrLimitReached when the per-tenant cube limit would be exceeded.
 // NOTE-CUBE-009: up to 5 retries with 50 ms base, doubling each time (now inside
 // blobEntryStore.addEntry — see entry_store.go's 2026-07-11 entryStore refactor).
 func (r *Registry) Add(ctx context.Context, def RegistryEntry) error {
-	return r.store.addEntry(ctx, r.tenant, def, r.maxCubes)
+	return r.store.addEntry(ctx, r.tenant, def)
 }
 
 // Remove deletes the cube with the given ID from the index using conditional-PUT retry
@@ -120,13 +113,4 @@ func (r *Registry) Remove(ctx context.Context, cubeID string) error {
 // this write-time bookkeeping.
 func (r *Registry) UpdateWatermarks(ctx context.Context, cubeID string, level, minMinute, maxMinute uint32) error {
 	return r.store.updateWatermarksEntry(ctx, r.tenant, cubeID, level, minMinute, maxMinute)
-}
-
-// ErrLimitReached is returned when the per-tenant cube limit would be exceeded.
-type ErrLimitReached struct {
-	Limit int
-}
-
-func (e *ErrLimitReached) Error() string {
-	return fmt.Sprintf("cube registry: per-tenant cube limit (%d) reached", e.Limit)
 }

@@ -2,7 +2,6 @@ package vblockpack
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -118,7 +117,7 @@ func TestPgViUsageEntryStore_Load_ReturnsAllRowsForTenant_NotOtherTenants(t *tes
 	}
 }
 
-func TestPgCubeEntryStore_AddEntry_IdempotentAndMaxCubesEnforced(t *testing.T) {
+func TestPgCubeEntryStore_AddEntry_IdempotentAndUnboundedCubeCount(t *testing.T) {
 	pool := newTestPostgresPool(t)
 	store := newPgCubeEntryStore(pool)
 	ctx := context.Background()
@@ -127,11 +126,11 @@ func TestPgCubeEntryStore_AddEntry_IdempotentAndMaxCubesEnforced(t *testing.T) {
 		CubeID: "cube1", Tenant: "tenant-a", Dimensions: []string{"resource.service.name"},
 		AggAttrs: []string{"duration"}, Resolution: 1, CreatedAt: 100,
 	}
-	if err := store.AddEntry(ctx, "tenant-a", entry, 10); err != nil {
+	if err := store.AddEntry(ctx, "tenant-a", entry); err != nil {
 		t.Fatalf("AddEntry (first): %v", err)
 	}
 	// Idempotent: adding the same CubeID again must be a no-op, not an error.
-	if err := store.AddEntry(ctx, "tenant-a", entry, 10); err != nil {
+	if err := store.AddEntry(ctx, "tenant-a", entry); err != nil {
 		t.Fatalf("AddEntry (idempotent repeat): %v", err)
 	}
 
@@ -143,16 +142,19 @@ func TestPgCubeEntryStore_AddEntry_IdempotentAndMaxCubesEnforced(t *testing.T) {
 		t.Fatalf("expected exactly 1 entry after idempotent repeat, got %d", len(entries))
 	}
 
-	// maxCubes=1 is already reached; a genuinely new CubeID must be rejected.
+	// No cardinality gate (blockpack #497): a second, genuinely new CubeID for the
+	// same tenant must succeed unconditionally.
 	second := entry
 	second.CubeID = "cube2"
-	err = store.AddEntry(ctx, "tenant-a", second, 1)
-	if err == nil {
-		t.Fatal("expected CubeErrLimitReached when maxCubes is already reached, got nil")
+	if err := store.AddEntry(ctx, "tenant-a", second); err != nil {
+		t.Fatalf("AddEntry (second distinct cube, no limit): %v", err)
 	}
-	var limitErr *blockpack.CubeErrLimitReached
-	if !errors.As(err, &limitErr) {
-		t.Fatalf("expected *blockpack.CubeErrLimitReached, got: %v", err)
+	entries, err = store.Load(ctx, "tenant-a")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries after adding a second distinct cube, got %d", len(entries))
 	}
 }
 
@@ -166,7 +168,7 @@ func TestPgCubeEntryStore_RemoveEntry_IdempotentOnAbsent(t *testing.T) {
 	}
 
 	entry := blockpack.CubeRegistryEntry{CubeID: "cube1", Tenant: "tenant-a", Dimensions: []string{"x"}, AggAttrs: []string{"duration"}, Resolution: 1}
-	if err := store.AddEntry(ctx, "tenant-a", entry, 10); err != nil {
+	if err := store.AddEntry(ctx, "tenant-a", entry); err != nil {
 		t.Fatalf("AddEntry: %v", err)
 	}
 	if err := store.RemoveEntry(ctx, "tenant-a", "cube1"); err != nil {
@@ -187,7 +189,7 @@ func TestPgCubeEntryStore_UpdateWatermarksEntry_MinOfMinsMaxOfMaxes(t *testing.T
 	ctx := context.Background()
 
 	entry := blockpack.CubeRegistryEntry{CubeID: "cube1", Tenant: "tenant-a", Dimensions: []string{"x"}, AggAttrs: []string{"duration"}, Resolution: 1}
-	if err := store.AddEntry(ctx, "tenant-a", entry, 10); err != nil {
+	if err := store.AddEntry(ctx, "tenant-a", entry); err != nil {
 		t.Fatalf("AddEntry: %v", err)
 	}
 

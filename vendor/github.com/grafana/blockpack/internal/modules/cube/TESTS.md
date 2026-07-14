@@ -163,13 +163,13 @@ Landed across the `f9c39e74` epic commit (2026-06-29) and the #480 filter-identi
 | TEST-CUBE-033 | `TestRegistry_AddIdempotent` | registry_test.go | Adding the same CubeID twice yields one entry |
 | TEST-CUBE-034 | `TestRegistry_ConcurrentAddSameID` | registry_test.go | Concurrent Add with the same CubeID produces exactly one entry |
 | TEST-CUBE-035 | `TestRegistry_RemoveIdempotent` | registry_test.go | Remove deletes the cube; removing an absent cube is a no-op |
-| TEST-CUBE-036 | `TestRegistry_PerTenantLimitEnforced` | registry_test.go | Per-tenant limit enforced before Add |
+| TEST-CUBE-036 | `TestRegistry_NoLimitEnforced_UnboundedCubeCount` | registry_test.go | No per-tenant cube-count limit (removed, issue #497): adding 1500 distinct cubes for one tenant via `Registry.Add` succeeds with no error, and `Load` returns all 1500 |
 | TEST-CUBE-037 | `TestRegistry_IsActive` | registry_test.go | IsActive returns correct results |
 | TEST-CUBE-038 | `TestRegistry_IndexJSONValid` | registry_test.go | index.json is valid JSON with a version field |
 | TEST-CUBE-039 | `TestCreationTrigger_FirstQueryCreates` | trigger_test.go | First query for a pattern triggers cube creation |
 | TEST-CUBE-040 | `TestCreationTrigger_SecondCallNoDuplicate` | trigger_test.go | Second call for the same pattern returns the existing entry, not a duplicate |
 | TEST-CUBE-041 | `TestCreationTrigger_CardinalityRejectionPropagates` | trigger_test.go | Cardinality-gate rejection propagates as an error |
-| TEST-CUBE-042 | `TestCreationTrigger_LimitBeforeCardinality` | trigger_test.go | Per-tenant limit checked before the cardinality gate |
+| TEST-CUBE-042 | `TestTrigger_NoLimitEnforced_UnboundedCubeCount` | trigger_test.go | No per-tenant cube-count limit (removed, issue #497): `CreationTrigger.TryCreate` registers 1100 distinct patterns for one tenant with no error, and the registry ends up holding all 1100 |
 | TEST-CUBE-043 | `TestCreationTrigger_ConcurrentFirstQueries` | trigger_test.go | Concurrent first queries for the same pattern produce exactly one entry |
 | TEST-CUBE-044 | `TestBackfiller_SingleDimWritesFile` | backfill_test.go | Single-dimension backfill writes a cube file for a minute with data |
 | TEST-CUBE-045 | `TestBackfiller_EmptyMinuteWritesNothing` | backfill_test.go | Empty minute writes nothing (sparse cube) |

@@ -312,3 +312,71 @@ func TestBackendRequests_TimeSliced_SkippedOverlapCounted(t *testing.T) {
 	require.True(t, ok)
 	assert.EqualValues(t, 1, jobsSkipped.AsInt64(), "1 block x 2 slices = 2 candidates, 1 dispatched, 1 skipped")
 }
+
+// TestBackendRequests_TimeSliced_SkipDispatchAndOverlapSkipsCountedSeparately (issue #499
+// holistic-review LOW finding) proves dispatch.jobs_skipped_overlap no longer silently absorbs
+// SkipDispatch-driven skips once a genuine SkipDispatch=true slice is present alongside a
+// genuine overlap-driven skip: three slices against one block — one dispatches (overlaps, not
+// skipped), one is skipped purely by SkipDispatch (it DOES overlap the block), one is skipped
+// purely by overlap (it does NOT overlap the block and has SkipDispatch=false) — so the two
+// skip reasons must land in two distinct, independently-correct attributes rather than one
+// conflated subtraction.
+func TestBackendRequests_TimeSliced_SkipDispatchAndOverlapSkipsCountedSeparately(t *testing.T) {
+	rec := recordedSpansFrontend(t)
+
+	bm := backend.NewBlockMeta("test", uuid.New(), "wdwad")
+	bm.StartTime = time.Unix(100, 0)
+	bm.EndTime = time.Unix(200, 0)
+	bm.Size_ = 1024
+	bm.TotalRecords = 1
+
+	s := &asyncSearchSharder{
+		cfg:    SearchSharderConfig{MostRecentShards: defaultMostRecentShards},
+		reader: &mockReader{metas: []*backend.BlockMeta{bm}},
+	}
+
+	r := httptest.NewRequest("GET", "/?tags=foo%3Dbar&limit=50&start=100&end=500", nil)
+	searchReq, err := api.ParseSearchRequest(r)
+	require.NoError(t, err)
+
+	plan := &blockpack.QueryPlan{
+		Strategy: blockpack.DispatchTimeSliced,
+		Slices: []blockpack.TimeSlice{
+			{Start: 100, End: 150},                     // overlaps the block, dispatches
+			{Start: 150, End: 200, SkipDispatch: true}, // overlaps the block, but SkipDispatch-skipped
+			{Start: 300, End: 400},                     // does not overlap the block, overlap-skipped
+		},
+	}
+
+	reqCh := make(chan pipeline.Request)
+	ctx, span := tracer.Start(context.Background(), "test.caller")
+	pipelineRequest := pipeline.NewHTTPRequest(r)
+	searchJobResponse := &combiner.SearchJobResponse{}
+
+	go s.backendRequests(ctx, "test", pipelineRequest, searchReq, searchJobResponse, plan, false, reqCh, func(error) {})
+
+	jobCount := 0
+	for range reqCh {
+		jobCount++
+	}
+	span.End()
+
+	require.Equal(t, 1, jobCount, "only the non-SkipDispatch, overlapping (block, slice) pair dispatches")
+
+	got, ok := frontendSpanByName(rec.Ended(), "test.caller")
+	require.True(t, ok)
+	attrs := frontendAttrs(got)
+
+	jobsTotal, ok := attrs["dispatch.jobs_total"]
+	require.True(t, ok)
+	assert.EqualValues(t, 1, jobsTotal.AsInt64())
+
+	jobsSkippedOverlap, ok := attrs["dispatch.jobs_skipped_overlap"]
+	require.True(t, ok)
+	assert.EqualValues(t, 1, jobsSkippedOverlap.AsInt64(),
+		"only the genuinely-non-overlapping (block, slice3) pair counts as an overlap skip -- the SkipDispatch-skipped pair must NOT be double-counted here")
+
+	jobsSkippedVCNT, ok := attrs["dispatch.jobs_skipped_vcnt_confident_zero"]
+	require.True(t, ok, "a SkipDispatch=true slice was present, so this attribute must be emitted")
+	assert.EqualValues(t, 1, jobsSkippedVCNT.AsInt64(), "1 block x 1 SkipDispatch slice = 1 pair skipped for that reason")
+}

@@ -842,3 +842,77 @@ pre-existing `v<2` exclusion.
 `TestAccumulator_Add_PathologicallyLargeDuration_ExcludedNotOOB` (accumulator_test.go, exercises
 the real `Add`/`addAggAttrs` path and was mutation-verified to reproduce the exact pre-fix
 `index out of range [64] with length 64` panic when the fix is reverted).
+
+---
+
+## NOTE-CUBE-029: per-tenant active-cube limit removed entirely, not deprecated-and-kept (issue #497)
+
+*Added: 2026-07-14*
+
+**Decision:** The per-tenant active-cube cardinality gate is removed. `MaxCubesPerTenant`
+(the exported default-1000 constant, `registry.go`), `Registry.maxCubes` (the field it seeded),
+`TriggerConfig.MaxCubesPerTenant` (the override, `trigger.go`), and `ErrLimitReached` (the typed
+error, `registry.go`) are all DELETED outright — not left behind as unused/dead fields, and not
+kept as a deprecated-but-inert compat shim. Active cube count per tenant is now unbounded.
+
+**Where the gate lived (now removed):** the `len(cubes) >= maxCubes` check + `ErrLimitReached`
+return existed at two call sites — `blobEntryStore.addEntry` (`entry_store.go`, reached via
+`Registry.Add`) and `CreationTrigger.TryCreate` (`trigger.go`, checked before the cardinality
+gate to avoid paying VCNT I/O cost when the tenant was already "full"). Both checks are gone;
+`TryCreate`'s cardinality gate (`SPEC-CUBE-013`) is now the only gate a new cube must pass.
+
+**Signature propagation:** `maxCubes int` is now unused everywhere it appeared, so it was removed
+from the parameter list rather than left as a dead parameter — `entryStore.addEntry`,
+`blobEntryStore.addEntry`, the exported `EntryStore.AddEntry` interface method, and
+`externalEntryStoreAdapter.addEntry` all drop the parameter together (one signature change
+propagated to every implementer/caller, including the root package's `cube_ingest.go`
+re-exports and its `pubAPICubeEntryStore` test fake in `cube_ingest_publicapi_test.go`). Root
+package's `CubeErrLimitReached` alias (`cube_ingest.go`) and its `cmd/deadcode/main.go` anchor
+reference are removed for the same reason — there is no longer an underlying type to alias.
+
+**Accepted cost-model change (holistic-review finding, not just a count ceiling):**
+`MaxCubesPerTenant` was not only a cardinality ceiling — it was also an implicit bound on the
+COST of every `Add`/`TryCreate` call. `blobEntryStore.addEntry` does a full
+Get+unmarshal+linear-scan+marshal+`ConditionalPut` of the entire per-tenant `index.json` blob on
+every call (O(n) per write, O(n²) to populate a tenant from scratch); `CreationTrigger.TryCreate`
+performs several of these full round trips synchronously on the query path for the first query
+matching a new pattern. With no ceiling, both costs are now unbounded in the number of active
+cubes for a tenant — measured at ~3.3s for 1500 sequential `Add` calls and ~5.7s for 1100
+sequential `TryCreate` calls against an in-memory store double (pure CPU, not I/O latency). This
+tradeoff is accepted as part of #497's explicit intent (remove limits, no compat, no reduced
+functionality to preserve a bound) — it is not an oversight, but it is a real, load-bearing
+consequence worth a deployment ever running into pathological per-tenant cube growth should
+watch for (elevated cube-registration latency, not just unbounded storage), not merely "the count
+ceiling is gone."
+
+**Rationale:**
+
+- This project's standing no-backward-compat rule (reaffirmed for #481's scan-fallback removal,
+  #490's trace-by-id format removal, #491's `Cell`-type deletion) applies identically here: once a
+  limit is deleted, nothing referencing it survives as a dead-but-compiling artifact "just in
+  case." A field or error type with no remaining caller is exactly the kind of maintenance-risk
+  dead code this rule exists to prevent.
+- `ErrLimitReached` was checked via `grep` before removal to confirm nothing UNRELATED depended on
+  it — its only real production consumers were the two enforcement sites this change deletes, plus
+  the mechanical root-package alias/test-fake mirror of the same contract. No other caller in
+  either this repo depended on it for an unrelated reason.
+- Cross-referenced context: issue #182 (prior cube-cardinality-control discussion) and issue #497
+  (this removal's tracking issue) both concern the same per-tenant cube-count ceiling; #497 is the
+  authoritative decision to remove it outright rather than raise or reconfigure the default.
+
+**Test changes:** `TestRegistry_LimitReached` (registry_test.go, TEST-CUBE-036) and
+`TestTrigger_LimitEnforced` (trigger_test.go, TEST-CUBE-042) — both of which asserted
+`ErrLimitReached` once a small `maxCubes` was hit — are replaced, not merely deleted, by
+`TestRegistry_NoLimitEnforced_UnboundedCubeCount` and
+`TestTrigger_NoLimitEnforced_UnboundedCubeCount`, which each register well beyond the old default
+(1500 and 1100 cubes respectively, for one tenant) via the real `Registry.Add`/`CreationTrigger.
+TryCreate` call sites and assert no error and a matching final registry count — proving the NEW
+unbounded behavior at both former enforcement points, not just the absence of the old test.
+
+**Back-ref:** `internal/modules/cube/registry.go:Registry`,
+`internal/modules/cube/entry_store.go:entryStore,blobEntryStore,EntryStore,
+externalEntryStoreAdapter`, `internal/modules/cube/trigger.go:TriggerConfig,CreationTrigger.
+TryCreate`; `cube_ingest.go:CubeTriggerConfig`; `cmd/deadcode/main.go`. Tests:
+`internal/modules/cube/registry_test.go:TestRegistry_NoLimitEnforced_UnboundedCubeCount`,
+`internal/modules/cube/trigger_test.go:TestTrigger_NoLimitEnforced_UnboundedCubeCount`. Issues
+#182, #497.

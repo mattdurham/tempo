@@ -316,7 +316,7 @@ func (s *queryRangeSharder) backendRequests(ctx context.Context, tenantID string
 			// timeSlicedJobsFunc signature change).
 			advancementPoints = append(advancementPoints, advancementPoint{jobs: jobs, bytes: sz, completedThroughSeconds: completedThroughTime})
 		}, nil)
-		attachDispatchSpanInfo(ctx, jobMetadata.TotalJobs, len(blocks)*len(plan.Slices), advancementPoints)
+		attachDispatchSpanInfo(ctx, jobMetadata.TotalJobs, len(blocks)*len(plan.Slices), len(blocks)*countSkipDispatchSlices(plan.Slices), advancementPoints)
 
 		go func() {
 			s.buildTimeSlicedMetricsBackendRequests(ctx, tenantID, parent, backendReq, firstShardIdx, blockIter, reqCh, getExemplarsForBlock)

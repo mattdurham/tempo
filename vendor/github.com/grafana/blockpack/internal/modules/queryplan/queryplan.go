@@ -102,6 +102,14 @@ type QueryPlan struct {
 // record.
 // NOTE-QP-006: the lazy perMinuteForLead resolution sequencing and the zero-value-is-safe-
 // default property.
+// SPEC-QP-12/NOTE-QP-016 (issue #499, Phase 3): the every-AND-conjoined-leaf SkipDispatch
+// resolution below, including the oracle-call dedup when the lead leaf is itself AND-conjoined
+// to root. Worked example of SkipDispatch/EstMatches disagreeing on the same slice: AND(L1, L2)
+// where L1 wins Lead() with a real, positive per-minute count for minute M, but L2 (not lead,
+// still AND-conjoined) confidently reports zero for M — the resulting slice for M has
+// EstMatches>0 (from L1, via perMinute below) AND SkipDispatch=true (from L2's veto, via
+// andConjoinedSignals below): the AND is false the moment L2 is false, regardless of what L1's
+// own optimistic count says.
 func BuildQueryPlan(
 	prog *vm.Program, cost CostFunc, allLeavesResolvable bool,
 	perMinuteForLead func(leaf *vm.RangeNode) []valuecounts.MinuteCount,
@@ -111,11 +119,35 @@ func BuildQueryPlan(
 	if !ok || !allLeavesResolvable {
 		return QueryPlan{Strategy: DispatchBlockSharded}
 	}
+	// UNCHANGED: lead-leaf per-minute signal drives EstMatches/EstKnown/VCNTEmpty only.
 	var perMinute []valuecounts.MinuteCount
-	if lead, leadOK := g.Lead(); leadOK && perMinuteForLead != nil {
+	lead, leadOK := g.Lead()
+	if leadOK && perMinuteForLead != nil {
 		perMinute = perMinuteForLead(lead.Node)
 	}
-	slices := BuildTimeSlices(perMinute, minTS, maxTS, concurrentRequests, k)
+
+	// NEW (issue #499, Phase 3): every AND-conjoined-to-root leaf independently gates
+	// SkipDispatch — an OR-combined-across-leaves signal, fully independent of which leaf is
+	// lead. De-duplication: if the lead leaf is ALSO AND-conjoined to root (the common case for a
+	// pure-AND query), reuse perMinute above rather than calling perMinuteForLead(lead.Node) a
+	// second time for the same leaf — avoids one redundant oracle scan per plan for the most
+	// common query shape.
+	var andConjoinedSignals [][]valuecounts.MinuteCount
+	if perMinuteForLead != nil {
+		for _, l := range collectANDConjoinedLeaves(g) {
+			if leadOK && l.Node == lead.Node {
+				if len(perMinute) > 0 {
+					andConjoinedSignals = append(andConjoinedSignals, perMinute)
+				}
+				continue
+			}
+			if sig := perMinuteForLead(l.Node); len(sig) > 0 {
+				andConjoinedSignals = append(andConjoinedSignals, sig)
+			}
+		}
+	}
+
+	slices := BuildTimeSlices(perMinute, andConjoinedSignals, minTS, maxTS, concurrentRequests, k)
 	if len(slices) == 0 {
 		// An otherwise-qualified plan (Plan() ok, allLeavesResolvable) that still yields zero
 		// Slices (e.g. an inverted minTS > maxTS) must not report DispatchTimeSliced — that

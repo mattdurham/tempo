@@ -870,3 +870,242 @@ second cost func contributing an incorrect answer once composed in — not just 
 try-order bug specifically.
 
 Back-ref: same files as `SPEC-QP-9`. Issue #205.
+
+---
+
+## NOTE-QP-014: every-AND-conjoined-leaf enumeration, not a narrower "is the lead leaf itself
+globally decisive" check (issue #499, Phase 2)
+
+*Added: 2026-07-14*
+
+**Why `collectANDConjoinedLeaves` enumerates every AND-conjoined leaf rather than answering a
+narrower "is THE LEAD leaf specifically globally decisive" question.** An earlier design (see
+`.bob/state/499-adaptive-timeslice-brainstorm.md`, "Part A") proposed a single-target primitive —
+`leadIsGloballyDecisive`/`leafAncestryIsANDOnly` — answering only whether whichever leaf
+`Group.Lead()` happens to pick is itself AND-conjoined to the root. That design is superseded: the
+skip mechanism's real requirement (issue #499 Phase 3) is "does ANY AND-conjoined leaf
+confidently show zero for this minute," independent of which leaf wins `Lead()`. Once the skip
+decision is driven by the FULL SET of AND-conjoined leaves rather than by whichever leaf happens
+to be lead, there is no remaining need to ask "is THE LEAD leaf specifically decisive" — the lead
+leaf might not even be part of the AND-conjoined set at all (e.g. nested under an OR, exactly the
+adversarial case `TestCollectANDConjoinedLeaves_ExcludesLeavesNestedUnderOR` pins), and that's
+fine, because the skip mechanism never keys off the lead leaf's identity. The narrower,
+single-target check remains a valid, simple function if some future need for it arises (trivially
+derivable from `collectANDConjoinedLeaves` via a membership check against `Lead()`'s result), but
+nothing in the current design calls for keeping both.
+
+**Why this is safe alongside `leadLeaf`'s existing "recurse into sub-groups unconditionally"
+behavior, without changing it.** `leadLeaf` (`selectivity.go`) answers a PRIORITY/BOUND question
+("which leaf, anywhere in the tree, is most selective") for two existing, non-correctness-gating
+callers (`classifyDetailed`'s selectivity fraction, `BuildQueryPlan`'s per-minute
+dispatch-priority signal) — a leaf nested inside an OR branch's AND sub-group is a legitimate,
+intentional answer to that question (its own doc comment and `lead_test.go`'s
+`TestGroupLead_FindsLowestKnownCostAcrossSubGroups` fixture pin this explicitly).
+`collectANDConjoinedLeaves` answers a different, CORRECTNESS-gating question ("which leaves,
+independently, prove the whole conjunction is false when zero") for which that same
+OR-nested leaf must be excluded — its own zero says nothing about the plan's OR branch as a
+whole. Both facts about the exact same leaf are simultaneously true and non-contradictory because
+they are two different, independently-scoped questions over the same tree; this is why
+`collectANDConjoinedLeaves` is a wholly new, additive tree walk (`and_conjoined.go`) rather than a
+change to `leadLeaf`'s own recursion rule, and why `TestCollectANDConjoinedLeaves_ExcludesLeavesNestedUnderOR`
+deliberately rigs the excluded leaf ("user") to ALSO win `Lead()` by cost — proving the exclusion
+holds even in that adversarial case, not just when the excluded leaf happens to be non-lead.
+`TestGroupLead_FindsLowestKnownCostAcrossSubGroups`, `TestClassifyLeadLeafNestedInORBranch`, and
+`TestClassifyUsesMostSelectiveLead` all continue to pass with zero edits to their own assertions —
+the diff introducing `collectANDConjoinedLeaves` touches no existing file (`plan.go`, `lead.go`,
+`selectivity.go`) at all.
+
+**Why a new file (`and_conjoined.go`) rather than adding to `plan.go`.** Mirrors this package's
+own established "additive file, don't touch code whose behavior must stay byte-identical" pattern
+(`perminutefrom.go`'s precedent, `NOTE-QP-007`; `vcnt_duration_cost.go`'s precedent, `NOTE-QP-013`)
+— `collectANDConjoinedLeaves` is a small, self-contained, stateless tree walk with no reason to
+share a file with `Plan`/`planAndNodes`/`planOrNode`.
+
+**Mutation-test verification performed (per this project's standing convention, memory
+`feedback_mutation_test_review.md`), though not required by the Phase 2 plan (Phase 3's later
+OR-safety integration test re-proves the same property).** The `if g.Kind != GroupAND { return
+nil }` guard was temporarily removed; confirmed this DOES break
+`TestCollectANDConjoinedLeaves_ExcludesLeavesNestedUnderOR` (it starts incorrectly including
+`region`/`user`/`env`), then the guard was restored and the full package test suite reconfirmed
+green.
+
+Back-ref: `internal/modules/queryplan/and_conjoined.go:collectANDConjoinedLeaves`. See
+`SPEC-QP-10`, `TESTS.md` `TEST-QP-4`. Issue #499.
+
+---
+
+## NOTE-QP-015: TimeSliceOracle composes BOTH cost and per-minute duration oracles together, never independently (issue #499, Phase 1)
+
+*Added: 2026-07-14*
+
+**Decision.** `TimeSliceOracle` (root `timeslice.go`) now returns
+`CombineCostFuncs(VCNTCostFunc(...), VCNTDurationCostFunc(...))` for its `CostFunc` AND
+`CombinePerMinuteFuncs(VCNTPerMinuteFunc(...), VCNTDurationPerMinuteFunc(...))` for its per-minute
+callback — both new duration-aware compositions land in the same change, wired together.
+
+**Rationale — the lead-flip regression risk this composition avoids.** #205 composed
+`VCNTDurationCostFunc` into `ClassifyProgramVCNTWithThreshold`/`WithDetail`'s `cost` construction
+only (NOTE-QP-013) — deliberately NOT into `TimeSliceOracle`, because `TimeSliceOracle`'s cost
+feeds `Group.Lead()`'s leaf-selection (`queryplan.go:115`), and a `Known` cost of ANY magnitude
+always outranks an `Unknown` one (SPEC-QP-1). Composing `VCNTDurationCostFunc` into
+`TimeSliceOracle`'s `cost` ALONE (without also composing a per-minute duration oracle) would let a
+duration-range leaf legitimately win `Lead()` whenever it is genuinely more selective than every
+equality leaf in the plan — but `perMinuteForLead` would still be the bare, un-composed
+`VCNTPerMinuteFunc`, which rejects a Min/Max-bearing leaf outright (`nil`). The result: every
+slice in that plan degrades to `EstKnown=false` (no per-slice signal at all) — a MEASURABLE
+regression versus today's shipped behavior, where the SAME query's equality leaf (losing lead
+selection only because the duration leaf was cost-Unknown pre-#499) at least carried real
+per-minute signal. This is the exact "Approach 1 (rejected)" scenario the #499 brainstorm and this
+package's own mutation-test convention require guarding against explicitly, not just documenting.
+
+**Why both compositions must ship together, never staged.** There is no safe intermediate state:
+shipping the cost composition alone is strictly worse than shipping neither (it can only ever
+LOSE per-minute signal for some queries, never gain any), and shipping the per-minute composition
+alone would have not been exercised at all in practice (a duration leaf can only be resolved via
+`perMinuteForLead` once it has already won `Lead()`, which requires the cost composition to exist
+first). The two are therefore inseparable in this design, not merely conventionally bundled.
+
+**Mirrors #205's own `CombineCostFuncs` precedent structurally, with a new generic
+`CombinePerMinuteFuncs` combinator rather than folding the fallback inline** — same
+try-first-then-second, never-both, never-merge semantics, same reason (equality and duration-range
+leaf shapes are mutually exclusive by construction, so try-order is provably inert for every real
+leaf shape today, confirmed by `TestTimeSliceOracle_ComposedFuncs_ByteIdenticalForPreExistingEqualityFixtures`),
+same "keep it generic and separately tested with deliberately-overlapping stubs" rationale (a
+future third per-minute oracle is exactly the kind of extension this shape anticipates).
+
+**Mutation-test verification performed (per this project's standing convention, memory
+`feedback_mutation_test_review.md`).** `TimeSliceOracle`'s per-minute composition was temporarily
+reverted to the bare, un-composed `VCNTPerMinuteFunc` (cost composition left intact) — confirmed
+this DOES break
+`TestBuildQueryPlan_DurationLeafBecomesLeadWhenGenuinelyMoreSelective_CarriesRealPerMinuteSignal`'s
+assertion that the composed `perMinuteForLead` callback returns non-empty real per-minute signal
+for the duration leaf that won lead (it returned empty instead) — reproducing the exact
+"Approach 1 (rejected)" regression this composition exists to prevent. Reverted after confirming
+the failure; the correct, fully-composed form was restored and re-confirmed passing.
+
+Back-ref: `timeslice.go:TimeSliceOracle` (root package);
+`internal/modules/queryplan/vcnt_duration_perminute.go:VCNTDurationPerMinuteFunc,CombinePerMinuteFuncs`.
+See `SPEC-QP-11`, `TESTS.md` `TEST-QP-5`. Issue #499, Phase 1.
+
+---
+
+## NOTE-QP-016: TimeSlice.SkipDispatch — every-AND-conjoined-leaf veto, the freshness margin, and the absent-vs-present-zero conflation being deliberate for this field only (issue #499, Phase 3)
+
+*Added: 2026-07-14*
+
+**Decision: every AND-conjoined leaf gates SkipDispatch, not just the lead leaf.** The original
+brainstorm considered a narrower design ("is the lead leaf itself globally decisive") but this was
+superseded by the multi-leaf design before this phase even began (see `SPEC-QP-10`'s own doc
+comment) — a lead leaf is chosen by CHEAPEST cost, which has nothing to do with which leaf's
+per-minute signal is most trustworthy for proving a minute empty. `AND(L1, L2)` is false the
+moment EITHER conjunct is false, independent of which one happens to be cheapest — so restricting
+the veto check to the lead leaf alone would miss every case where a non-lead conjunct is the one
+that's actually zero for a given minute while the lead leaf's own count is positive (the exact
+scenario `TestBuildQueryPlan_SkipsSliceWhenNonLeadANDConjoinedLeafIsConfidentZero_EvenWhenLeadLeafHasMatches`
+pins). `collectANDConjoinedLeaves` (`SPEC-QP-10`, Phase 2) already exists for exactly this
+purpose — Phase 3 is its first real consumer.
+
+**A leaf with zero coverage anywhere contributes nothing, by design.** `BuildQueryPlan`'s
+`len(sig) > 0` gate before appending to `andConjoinedSignals` (`queryplan.go`) means a leaf whose
+oracle can never say anything about ANY minute (a VCNT-inestimable shape, or genuinely no
+coverage in the whole window) is excluded from the checked set entirely, not treated as "zero
+everywhere." Without this gate, a single coverage-blind AND-conjoined leaf would silently veto
+every minute in the plan — turning `SkipDispatch` from a targeted, per-minute optimization into an
+accidental blanket disable of dispatch for the whole query. This distinction mattered enough that
+the OR-safety test (`TestBuildQueryPlan_NeverSkipsSliceWhenNonANDConjoinedLeafIsConfidentZero`)
+had to be rewritten mid-implementation once this session: an earlier draft used a `nil` return to
+represent "confidently zero for this leaf's minute," which turned out to be indistinguishable from
+"no coverage at all" and could not actually detect a broken `collectANDConjoinedLeaves` guard —
+the fix was to have the test leaf return a non-empty signal covering a DIFFERENT minute, so
+`len(sig) > 0` still holds and the OR-exclusion is the only thing standing between veto and no
+veto. Recorded here so a future test author doesn't repeat the same non-distinguishing mutation.
+
+**The freshness margin (decision #9, `skipDispatchFreshnessMarginSeconds = 900`, 15 minutes,
+anchored to `maxTS`).** A minute's VCNT signal is only queryable once its block is flushed
+(blockbuilder's `ConsumeCycleDuration`, tempo default 5 minutes) AND the querier has noticed the
+new block exists (`tempodb.DefaultBlocklistPoll`, also 5 minutes default) — a worst-case default
+lag of ~10 minutes from "span occurs" to "its VCNT signal is visible to a plan-building query."
+15 minutes gives 1.5x headroom over that worst case, chosen to match this project's own
+already-established margin for a directly comparable block-lifecycle timing concern
+(`compaction_window >= 15m` for 3-minute block cycles, project memory). Anchored to `maxTS` rather
+than `time.Now()` specifically so `BuildTimeSlices`/`BuildQueryPlan` remain pure, deterministic
+functions of their inputs — no new wall-clock parameter, no new signature-level API surface. The
+saturating-subtraction edge case (a `maxTS` smaller than the margin) deliberately resolves to
+"every minute ineligible," never "every minute eligible" — the safe direction to err in for a
+correctness-affecting gate.
+
+**Accepted residual risk: the freshness margin covers write-latency only, not VCNT-pipeline data
+loss (holistic-review finding, deliberately not further mitigated in this phase).** The margin's
+900s is derived purely from block-flush + blocklist-poll latency (the "span occurs" → "VCNT signal
+becomes visible" delay for a genuinely fresh minute). It has no relationship to, and does not
+protect against, a SEPARATE failure mode: a VCNT record for an already-flushed, already-queryable,
+non-empty minute later going missing due to a fault in the VCNT pipeline itself — e.g.
+`valuecountscompactor`'s documented quarantine-after-permanent-decode-failure path, or a merge
+whose `store.Delete` retries exhaust with a partial/duplicated remainder. Before this phase, an
+absent-from-signal minute could only ever cost dispatch PRIORITY (`VCNTEmpty`, self-correcting —
+the slice is still eventually dispatched). This phase is the first time absent-from-signal can cost
+CORRECTNESS (`SkipDispatch`, never dispatched, no self-correction, for any window arbitrarily far
+in the past) — meaning `SkipDispatch`'s safety now depends on an assumption
+(absence-implies-proven-zero) that VCNT-pipeline record loss could violate, independent of the
+OR-ancestry and freshness-margin safeguards above. This is accepted as a known, explicitly
+documented gap rather than fixed here: there is no evidence this failure mode fires at a
+meaningful rate in production (it requires a separate, pre-existing operational fault — VCNT's own
+compactor doc (`internal/modules/valuecountscompactor/doc.go`) already establishes that ordinary
+compaction/retention timing is not a source of false-zero absence, since net-sum merge accounting
+is VCNT's sole retention signal; only pipeline FAILURE modes are the residual concern), and closing
+it properly (e.g. requiring a leaf to additionally prove "my own coverage is exhaustive back to
+`minTS`," not just freshness-margin exclusion) is a larger design question than this phase's scope.
+Revisit if VCNT quarantine/decode-failure events are ever observed to correlate with a
+`SkipDispatch`-eligible time range in production.
+
+**Why `cm[m] == 0` conflating absent-and-present-zero is correct here, unlike `EstKnown`/
+`VCNTEmpty`'s own careful distinction elsewhere in this file.** `EstKnown` must distinguish "no
+oracle ever looked" from "oracle looked and found zero" because that distinction drives dispatch
+PRIORITY ordering (a caller treats them differently). `SkipDispatch` asks a different question —
+"does at least one AND-conjoined leaf CERTIFY zero for this minute" — for which absent-from-signal
+and present-with-zero mean the exact same thing (both oracles' own liveness-drop contracts,
+`SelectivityPerMinute`/`DurationHistogramPerMinuteInRange`, never emit a live `Count: 0` entry, so
+in practice every "confident zero" IS an absence) — there is no third state to distinguish for a
+pure yes/no correctness verdict.
+
+**Oracle-call dedup (decision #4/§5.2, approved).** When the lead leaf is itself AND-conjoined to
+root (the common pure-AND case), `BuildQueryPlan` reuses the already-resolved `perMinute` value
+instead of calling `perMinuteForLead(lead.Node)` a second time — avoiding one redundant oracle
+scan per plan for the most common query shape. Shipped uncapped (decision #6): the number of
+extra `perMinuteForLead` calls this phase adds is bounded by the AND-conjoined leaf count, which
+for realistic queries is small (a handful of leaves); a call-count cap can be added later if a
+real benchmark shows it's needed, mirroring `BENCH-QP-010`'s own "measure first" precedent.
+
+**Fallout to `SPEC-QP-3`'s existing `perMinuteForLead` call-cardinality contract.** Before this
+phase, `perMinuteForLead` was guaranteed to be called at most once total, only for the lead leaf,
+and never at all when `Lead()` returned `ok=false`. This phase widens that: `perMinuteForLead` may
+now additionally be called once per non-lead AND-conjoined leaf, including when `Lead()` fails
+entirely (a plan with no Known-cost leaf can still have AND-conjoined leaves whose own per-minute
+signal is worth checking for `SkipDispatch`). This surfaced as a real, breaking change to an
+existing test, `TestBuildQueryPlan_QualifiesWithUniformSlicesWhenNoLeafIsVCNTEstimable` — its old
+`perMinuteForLeadCalled` assertion had to be removed (the call now legitimately happens); the
+test's other assertions (`Strategy`, `EstKnown`, and a new `SkipDispatch` check) are unchanged and
+still pass. See `SPEC-QP-3`'s own 2026-07-14 amendment for the corrected contract text.
+
+**Mutation-test verification performed (all three, per this project's mutation-test convention,
+`feedback_mutation_test_review.md`):**
+1. **OR-safety:** `collectANDConjoinedLeaves`'s `if g.Kind != GroupAND { return nil }` guard was
+   temporarily removed; confirmed `TestBuildQueryPlan_NeverSkipsSliceWhenNonANDConjoinedLeafIsConfidentZero`
+   fails (`SkipDispatch` incorrectly becomes `true`, the exact OR-leak/data-loss signature this
+   test exists to catch); guard restored, test re-confirmed passing.
+2. **Veto (lead-leaf-only gate):** `BuildQueryPlan`'s multi-leaf `andConjoinedSignals` loop was
+   temporarily replaced with a deliberately-wrong lead-leaf-only gate (`andConjoinedSignals =
+   [perMinute]` when the lead leaf itself has signal, nothing otherwise); confirmed
+   `TestBuildQueryPlan_SkipsSliceWhenNonLeadANDConjoinedLeafIsConfidentZero_EvenWhenLeadLeafHasMatches`
+   fails (`SkipDispatch` incorrectly stays `false`); reverted to the real multi-leaf loop, test
+   re-confirmed passing.
+3. **Freshness margin:** the `if m < freshnessCutoff` guard in `BuildTimeSlices` was temporarily
+   removed (always evaluate `andCounts` regardless of proximity to `maxTS`); confirmed
+   `TestBuildTimeSlices_NeverSkipsDispatchWithinFreshnessMarginOfMaxTS`'s near-`maxTS` assertion
+   fails (`SkipDispatch` incorrectly becomes `true` inside the margin); guard restored, test
+   re-confirmed passing.
+
+Back-ref: `internal/modules/queryplan/slices.go:TimeSlice.SkipDispatch,BuildTimeSlices,skipDispatchFreshnessMarginSeconds`;
+`internal/modules/queryplan/queryplan.go:BuildQueryPlan`;
+`internal/modules/queryplan/skip_dispatch_test.go`. See `SPEC-QP-12`, `TESTS.md` `TEST-QP-6`.
+Issue #499, Phase 3.

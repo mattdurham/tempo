@@ -283,7 +283,12 @@ shape.
 `Registry` persists the per-tenant cube index in object storage with S3 conditional-PUT concurrency
 control. Concurrent writers compute the same deterministic CubeID; only one conditional PUT succeeds —
 the rest see a 412/ErrConflict and re-read. Up to 5 exponential-backoff retries (50ms base, doubling).
-`Add` is idempotent. `Remove` is idempotent. Per-tenant limit (default 1000) enforced before Add.
+`Add` is idempotent. `Remove` is idempotent.
+
+**[UPDATED, 2026-07-14 — issue #497]** There is no per-tenant active-cube limit. The
+`MaxCubesPerTenant` constant, `Registry.maxCubes` field, and `ErrLimitReached` error type were
+REMOVED outright (this project's no-backward-compat convention — no deprecated-but-kept field, no
+compat shim); `addEntry`/`AddEntry` no longer take a `maxCubes` parameter. See `NOTE-CUBE-029`.
 
 **Back-ref:** `internal/modules/cube/registry.go:Registry`; `internal/modules/cube/entry_store.go:entryStore,blobEntryStore,EntryStore,externalEntryStoreAdapter,NewRegistryFromEntryStore`.
 
@@ -292,15 +297,18 @@ the rest see a 412/ErrConflict and re-read. Up to 5 exponential-backoff retries 
 ## SPEC-CUBE-015: CreationTrigger — first-query cube-creation path (issue #446)
 
 **Invariant:** `CreationTrigger.TryCreate` registers a new cube for `(tenant, dims, filters)`
-on the first query that pattern receives, gated by (1) the per-tenant active-cube limit
-(checked before any VCNT I/O, to avoid paying the cardinality-gate cost when the tenant is
-already full) and (2) the cardinality gate (`SPEC-CUBE-013`) against caller-supplied VCNT
-data. On success the cube is added to the `Registry` via idempotent conditional-PUT
-(`SPEC-CUBE-014`); a `TriggerResult.Created` flag distinguishes "this call registered it" from
-"another concurrent caller already had." `TryCreate` never blocks the query response — the
-caller is responsible for any async forward-ingest/backfill after a successful create. Returns
-`*CardinalityError` on gate rejection, `*ErrLimitReached` when the per-tenant limit is
-exhausted, or a wrapped storage error otherwise.
+on the first query that pattern receives, gated by the cardinality gate (`SPEC-CUBE-013`)
+against caller-supplied VCNT data. On success the cube is added to the `Registry` via
+idempotent conditional-PUT (`SPEC-CUBE-014`); a `TriggerResult.Created` flag distinguishes
+"this call registered it" from "another concurrent caller already had." `TryCreate` never
+blocks the query response — the caller is responsible for any async forward-ingest/backfill
+after a successful create. Returns `*CardinalityError` on gate rejection, or a wrapped storage
+error otherwise.
+
+**[UPDATED, 2026-07-14 — issue #497]** There is no per-tenant active-cube limit gate. Active
+cube count per tenant is unbounded — `TriggerConfig.MaxCubesPerTenant` and the
+`*ErrLimitReached` return were REMOVED outright, not kept as a dead/unused field. See
+`NOTE-CUBE-029`.
 
 **Addendum (2026-07-08, issue #491, task E-4/E-7):** `TryCreate` gains an `aggAttrs
 []AggAttrDef` parameter and calls `validateDefinition(Definition{AggAttrs: aggAttrs})` as its

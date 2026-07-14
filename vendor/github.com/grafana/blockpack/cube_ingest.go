@@ -189,14 +189,11 @@ func NewCubeCreationTrigger(reg *CubeRegistry, cfg cube.TriggerConfig) *CubeCrea
 	return cube.NewCreationTrigger(reg, cfg)
 }
 
-// CubeTriggerConfig parameterises the creation trigger (cardinality limits + max cubes).
+// CubeTriggerConfig parameterises the creation trigger (cardinality limits).
 type CubeTriggerConfig = cube.TriggerConfig
 
 // CubeTriggerResult is returned by CubeCreationTrigger.TryCreate.
 type CubeTriggerResult = cube.TriggerResult
-
-// CubeErrLimitReached is returned when the per-tenant cube limit is exhausted.
-type CubeErrLimitReached = cube.ErrLimitReached
 
 // CubeCompactor merges small L0 cube files and rolls up to L1/L2.
 type CubeCompactor = cube.Compactor

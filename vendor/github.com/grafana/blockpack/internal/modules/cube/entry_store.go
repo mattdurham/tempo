@@ -33,9 +33,10 @@ type entryStore interface {
 	// external Load call site, all of which discard the etag and either linear-scan or
 	// aggregate the result).
 	load(ctx context.Context, tenant string) ([]RegistryEntry, error)
-	// addEntry registers entry for tenant, idempotent on entry.CubeID already existing
-	// and enforcing maxCubes — mirrors Registry.Add's exact current contract.
-	addEntry(ctx context.Context, tenant string, entry RegistryEntry, maxCubes int) error
+	// addEntry registers entry for tenant, idempotent on entry.CubeID already existing —
+	// mirrors Registry.Add's exact current contract. There is no per-tenant cube-count
+	// limit (removed, issue #497): active cube count per tenant is unbounded.
+	addEntry(ctx context.Context, tenant string, entry RegistryEntry) error
 	// removeEntry deletes the entry with cubeID for tenant, a no-op if already absent —
 	// mirrors Registry.Remove's exact current contract.
 	removeEntry(ctx context.Context, tenant, cubeID string) error
@@ -84,8 +85,9 @@ func (s *blobEntryStore) load(ctx context.Context, tenant string) ([]RegistryEnt
 }
 
 // addEntry is Registry.Add's former body, moved verbatim (NOTE-CUBE-009: up to 5
-// retries with 50ms base, doubling each time).
-func (s *blobEntryStore) addEntry(ctx context.Context, tenant string, entry RegistryEntry, maxCubes int) error {
+// retries with 50ms base, doubling each time). No per-tenant cube-count limit is enforced
+// (removed, issue #497) — active cube count per tenant is unbounded.
+func (s *blobEntryStore) addEntry(ctx context.Context, tenant string, entry RegistryEntry) error {
 	const maxRetries = 5
 	backoff := 50 * time.Millisecond
 
@@ -99,10 +101,6 @@ func (s *blobEntryStore) addEntry(ctx context.Context, tenant string, entry Regi
 			if c.CubeID == entry.CubeID {
 				return nil
 			}
-		}
-		// Per-tenant limit.
-		if len(cubes) >= maxCubes {
-			return &ErrLimitReached{Limit: maxCubes}
 		}
 		cubes = append(cubes, entry)
 		data, err := json.Marshal(cubeIndex{Version: indexVersion, Cubes: cubes})
@@ -232,7 +230,7 @@ func (s *blobEntryStore) updateWatermarksEntry(
 // operation) rather than viusage's single generic UpsertEntry.
 type EntryStore interface {
 	Load(ctx context.Context, tenant string) ([]RegistryEntry, error)
-	AddEntry(ctx context.Context, tenant string, entry RegistryEntry, maxCubes int) error
+	AddEntry(ctx context.Context, tenant string, entry RegistryEntry) error
 	RemoveEntry(ctx context.Context, tenant, cubeID string) error
 	UpdateWatermarksEntry(ctx context.Context, tenant, cubeID string, level, minMinute, maxMinute uint32) error
 }
@@ -249,9 +247,8 @@ func (a *externalEntryStoreAdapter) addEntry(
 	ctx context.Context,
 	tenant string,
 	entry RegistryEntry,
-	maxCubes int,
 ) error {
-	return a.AddEntry(ctx, tenant, entry, maxCubes)
+	return a.AddEntry(ctx, tenant, entry)
 }
 
 func (a *externalEntryStoreAdapter) removeEntry(ctx context.Context, tenant, cubeID string) error {
@@ -269,5 +266,5 @@ func (a *externalEntryStoreAdapter) updateWatermarksEntry(
 // Registry's own public methods (Load/Add/Remove/UpdateWatermarks) are byte-identical
 // regardless of which constructor built it.
 func NewRegistryFromEntryStore(store EntryStore, tenant string) *Registry {
-	return &Registry{store: &externalEntryStoreAdapter{store}, tenant: tenant, maxCubes: MaxCubesPerTenant}
+	return &Registry{store: &externalEntryStoreAdapter{store}, tenant: tenant}
 }

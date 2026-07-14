@@ -16,7 +16,7 @@ module's SPECS.md numbers from 1, per the established convention in
 independent per-file counters). IDs are assigned in ascending order and never reused or
 renumbered; superseded entries are marked `[SUPERSEDED by SPEC-VC-N]` rather than deleted.
 
-Next free ID: **SPEC-VC-9**.
+Next free ID: **SPEC-VC-10**.
 
 ---
 
@@ -377,3 +377,44 @@ Back-refs: `internal/modules/valuecounts/histogram.go` (`DurationBucketBoundsMil
 `BucketIndex`, `HistogramColumnName`, `DurationHistogram`, `DurationHistogramInRange`,
 `TimeCompareOp`, `EstimateThreshold`, `EstimateBetween`, `sumRange`). Tests: `histogram_test.go`
 — see `TESTS.md` TEST-VC-11. `NOTES.md` NOTE-VC-022.
+
+---
+
+## SPEC-VC-9: DurationHistogramPerMinuteInRange / MinuteDurationHistogram — per-minute duration histogram contract
+*Added: 2026-07-14*
+
+**Contract (issue #499, Phase 1):** `DurationHistogramPerMinuteInRange(data []byte, dir
+[]ChunkDirEntry, column string, minTS, maxTS uint64) ([]MinuteDurationHistogram, error)` is
+`DurationHistogramInRange`'s (SPEC-VC-8) per-minute sibling, mirroring `SelectivityPerMinute`'s
+(SPEC-VC-6) exact relationship to `SelectivityInRange`: instead of collapsing `[minTS, maxTS]`
+into one `DurationHistogram`, it buckets the SAME histogram records (`ColumnName ==
+HistogramColumnName(column)`) by `Record.TimeStart` and returns one `MinuteDurationHistogram{
+Minute, Histogram}` per distinct LIVE minute, sorted ascending by `Minute`. Two records sharing
+the same `TimeStart` but different boundary values both contribute to that ONE minute's
+`Histogram.Counts` at their respective bucket indices — the grouping key is `TimeStart` alone, not
+`(TimeStart, boundary)`.
+
+**Liveness rule (binding, same as SPEC-VC-6):** a minute whose EVERY bucket nets to `<= 0` is
+dropped from the result entirely — never retained as an all-zero, `Covered: true` entry. This
+mirrors `SelectivityPerMinute`'s per-minute liveness rule exactly (NOTE-VC-001/016), applied here
+per-minute across all 16 buckets rather than to a single scalar sum. A minute with at least one
+net-positive bucket is retained, with every other (net-`<=`-0) bucket in that minute's own
+`Histogram.Counts` floored to `0` (never negative) — mirroring `DurationHistogramInRange`'s
+per-bucket floor rule (SPEC-VC-8).
+
+**No coverage returns empty, never an error:** a column with no histogram records at all in the
+window returns `(nil or empty slice, nil error)` — mirrors `SelectivityPerMinute`'s own
+uncovered-column contract exactly, never a defined-error case.
+
+**Same 16 fixed boundaries:** reuses `DurationBucketBoundsMillis`/`boundaryToIndex` unchanged — no
+new boundary scheme is introduced for the per-minute variant.
+
+**No files opened:** like every other function in this file, it operates only on the
+already-decoded VCNT section (`data`/`dir`) and opens no blockpack data files.
+
+`MinuteDurationHistogram{Minute uint64; Histogram DurationHistogram}` is the per-minute-histogram
+pair type — `DurationHistogram`'s own contract (SPEC-VC-8) is unchanged and reused as-is.
+
+Back-refs: `internal/modules/valuecounts/histogram_perminute.go` (`DurationHistogramPerMinuteInRange`,
+`MinuteDurationHistogram`). Tests: `histogram_perminute_test.go` — see `TESTS.md` TEST-VC-12. Issue
+#499, Phase 1. See `NOTES.md` NOTE-VC-023.

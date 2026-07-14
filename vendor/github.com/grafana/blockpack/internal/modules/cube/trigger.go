@@ -18,8 +18,6 @@ import (
 type TriggerConfig struct {
 	// CardinalityLimits overrides the default cardinality limits. Zero value → defaults.
 	CardinalityLimits CardinalityLimits
-	// MaxCubesPerTenant overrides the per-tenant active-cube limit (default 1000).
-	MaxCubesPerTenant int
 }
 
 // TriggerResult is returned by CreationTrigger.TryCreate on success.
@@ -38,9 +36,6 @@ type CreationTrigger struct {
 
 // NewCreationTrigger creates a CreationTrigger backed by the given registry.
 func NewCreationTrigger(registry *Registry, cfg TriggerConfig) *CreationTrigger {
-	if cfg.MaxCubesPerTenant > 0 {
-		registry.maxCubes = cfg.MaxCubesPerTenant
-	}
 	if cfg.CardinalityLimits.MaxDistinctPerDim == 0 {
 		cfg.CardinalityLimits = DefaultCardinalityLimits()
 	}
@@ -51,16 +46,20 @@ func NewCreationTrigger(registry *Registry, cfg TriggerConfig) *CreationTrigger 
 // query for that pattern. It:
 //  0. Validates aggAttrs includes duration (validateDefinition, E-4's single enforcement
 //     point — this is call site #2, delegating rather than duplicating the check).
-//  1. Checks the per-tenant cube limit.
+//  1. Checks whether this exact pattern is already registered (idempotency short-circuit —
+//     skips the cardinality gate entirely for a pre-existing cube).
 //  2. Runs the cardinality gate (including aggAttrs' byte-cost, E-7) using the supplied VCNT
 //     data+dir and time window.
-//  3. If all pass, adds the cube to the registry via conditional-PUT (idempotent).
+//  3. Validates the computed CubeID is well-formed, then adds the cube to the registry via
+//     conditional-PUT (idempotent on a 412 conflict).
+//
+// There is no per-tenant active-cube limit (removed, issue #497): active cube count per
+// tenant is unbounded.
 //
 // Returns (result, nil) on success — result.Created distinguishes a fresh registration
 // from a pre-existing entry found after a 412 conflict.
 // Returns (zero, *DefinitionError) when aggAttrs omits duration.
 // Returns (zero, *CardinalityError) when the gate rejects the pattern.
-// Returns (zero, *ErrLimitReached) when the per-tenant limit is exhausted.
 // Returns (zero, err) on storage errors.
 //
 // The caller is responsible for any async backfill — TryCreate never blocks the
@@ -87,22 +86,16 @@ func (t *CreationTrigger) TryCreate(
 		aggAttrNames[i] = a.Column
 	}
 
-	// Step 1: check the per-tenant active-cube count before the cardinality gate to
-	// avoid paying the VCNT I/O cost when the slot is already exhausted.
+	// Step 1: check whether this exact pattern is already registered.
 	cubes, _, err := t.registry.Load(ctx)
 	if err != nil {
 		return TriggerResult{}, fmt.Errorf("cube trigger: load index: %w", err)
 	}
-	// Check whether this exact pattern is already registered.
 	cubeID := ComputeCubeID(tenant, dims, filters, aggAttrNames)
 	for _, c := range cubes {
 		if c.CubeID == cubeID {
 			return TriggerResult{Entry: c}, nil // already exists
 		}
-	}
-	// Limit check.
-	if len(cubes) >= t.registry.maxCubes {
-		return TriggerResult{}, &ErrLimitReached{Limit: t.registry.maxCubes}
 	}
 
 	// Step 2: cardinality gate (including aggAttrs' byte-cost, E-7).
@@ -128,7 +121,7 @@ func (t *CreationTrigger) TryCreate(
 	// Add via conditional-PUT. Registry.Add is idempotent: on a 412 conflict it retries,
 	// re-reads the index, and returns nil if another querier already registered the same ID.
 	if addErr := t.registry.Add(ctx, entry); addErr != nil {
-		// ErrLimitReached or storage errors propagate.
+		// Storage errors propagate.
 		return TriggerResult{}, fmt.Errorf("cube trigger: register: %w", addErr)
 	}
 

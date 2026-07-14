@@ -741,3 +741,53 @@ out of scope for this task (see this package's own histogram.go and SPEC-VC-8 �
 
 Back-refs: `internal/modules/valuecounts/histogram.go`. `SPECS.md` SPEC-VC-8. Tests:
 `histogram_test.go` — see `TESTS.md` TEST-VC-11. Issue #205, Phase A.
+
+---
+
+## NOTE-VC-023 — DurationHistogramPerMinuteInRange: the per-minute sibling of DurationHistogramInRange (issue #499, Phase 1)
+
+Date: 2026-07-14
+
+`DurationHistogramPerMinuteInRange(data, dir, column, minTS, maxTS)` closes the gap #205's own
+Phase E deferred: `DurationHistogramInRange` (SPEC-VC-8) collapses `[minTS, maxTS]` into one
+scalar-per-bucket histogram, which is exactly what `VCNTDurationCostFunc` (`queryplan`) needs for
+plan-time cost, but gives `queryplan`'s per-minute oracle (`VCNTPerMinuteFunc`'s sibling,
+`VCNTDurationPerMinuteFunc`) nothing to work with — there was no way to see WHICH minutes in the
+window actually carry live duration-bucketed spans, the exact signal #487's time-slice
+`EstMatches`/`EstKnown`/`VCNTEmpty` per-slice fields need for a duration-range lead leaf.
+
+### Why this mirrors SelectivityPerMinute, not a new design
+
+`SelectivityPerMinute` (NOTE-VC-016) already solved the identical problem for equality leaves:
+bucket the same underlying records by `Record.TimeStart` instead of collapsing them, applying the
+SAME liveness rule (`NOTE-VC-001`). This function is the direct duration-histogram analog —
+`DurationHistogramInRange`'s per-bucket, per-window sum becomes `DurationHistogramPerMinuteInRange`'s
+per-bucket, per-minute sum, with one `MinuteDurationHistogram` per distinct live minute rather than
+one `MinuteCount` per distinct live minute. No independent design was needed; the shape was
+locked by precedent.
+
+### The liveness-rule fork this decision resolves
+
+Two options existed for a minute whose every bucket nets to `<= 0` (a live positive write
+coalesced against an equal-magnitude retention delta, exactly `SelectivityPerMinute`'s own
+`DropsNetNonPositiveMinutes` scenario applied per-bucket): (a) drop the minute entirely, or (b)
+retain it as an all-zero `MinuteDurationHistogram{Covered: true}` entry. **Locked: (a), drop
+entirely** — mirrors `SelectivityPerMinute` exactly, and the sole downstream consumer
+(`VCNTDurationPerMinuteFunc`) only ever wants live minutes with a positive estimate; retaining an
+all-zero entry here would just push the identical filter into that caller instead of eliminating
+it, with no benefit and one extra place a future caller could get the filter wrong.
+
+### Why grouped by TimeStart alone, not (TimeStart, boundary)
+
+A single minute typically carries MANY histogram records — one per boundary that had any live
+sample that minute (up to all 16). Grouping by `(TimeStart, boundary)` would produce up to 16
+separate `MinuteDurationHistogram` entries per minute, defeating the whole point of a fixed
+16-bucket array (which exists so a caller gets ONE aggregate view per minute, not per bucket).
+Grouping by `TimeStart` alone — accumulating every boundary's count into the SAME minute's
+`Histogram.Counts` array — is the only shape that matches `DurationHistogram`'s own contract
+(SPEC-VC-8): one `DurationHistogram` per (column, window), just with "window" narrowed from the
+whole query range to a single minute.
+
+Back-refs: `DurationHistogramPerMinuteInRange`, `MinuteDurationHistogram` in
+`histogram_perminute.go`. `SPECS.md` SPEC-VC-9. Tests: `histogram_perminute_test.go` — see
+`TESTS.md` TEST-VC-12. Issue #499, Phase 1.

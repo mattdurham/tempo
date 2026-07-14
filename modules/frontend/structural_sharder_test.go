@@ -141,6 +141,57 @@ func TestSearchSharder_StructuralTimeSlicedDispatch_SkipsSliceWithNoOverlappingB
 	require.Equal(t, uint32(150), gotReqs[0].SearchReq.End)
 }
 
+// TestStructuralSharder_TimeSlicedDispatch_SkipDispatchSlice_NoJobDispatchedAndTotalJobsExcludesIt
+// (issue #499 Phase 3) mirrors this file's own SkipsSliceWithNoOverlappingBlocks test, but for the
+// NEW SkipDispatch gate rather than a lack of overlapping blocks: a block overlaps BOTH slices
+// below, yet the SkipDispatch=true slice must still contribute zero jobs, through
+// structuralTimeSlicedJobsFunc's ONE-job-per-slice model (not per (block, slice) pair) — proving
+// the gate is checked regardless of how many blocks would otherwise have carried the slice.
+func TestStructuralSharder_TimeSlicedDispatch_SkipDispatchSlice_NoJobDispatchedAndTotalJobsExcludesIt(t *testing.T) {
+	bm := backend.NewBlockMeta("test", uuid.New(), "wdwad")
+	bm.StartTime = time.Unix(100, 0)
+	bm.EndTime = time.Unix(200, 0) // overlaps both slices below.
+	bm.Size_ = defaultTargetBytesPerRequest
+	bm.TotalRecords = 1
+
+	s := &asyncSearchSharder{
+		cfg:    SearchSharderConfig{MostRecentShards: defaultMostRecentShards},
+		reader: &mockReader{metas: []*backend.BlockMeta{bm}},
+	}
+
+	r := httptest.NewRequest("GET", "/?tags=foo%3Dbar&limit=50&start=100&end=200", nil)
+	searchReq, err := api.ParseSearchRequest(r)
+	require.NoError(t, err)
+
+	plan := &blockpack.QueryPlan{
+		Strategy: blockpack.DispatchTimeSliced,
+		Slices: []blockpack.TimeSlice{
+			{Start: 150, End: 200, SkipDispatch: true},
+			{Start: 100, End: 150, SkipDispatch: false},
+		},
+	}
+
+	reqCh := make(chan pipeline.Request)
+	ctx, cancelCause := context.WithCancelCause(context.Background())
+	pipelineRequest := pipeline.NewHTTPRequest(r)
+	searchJobResponse := &combiner.SearchJobResponse{}
+
+	go s.backendRequests(ctx, "test", pipelineRequest, searchReq, searchJobResponse, plan, true, reqCh, cancelCause)
+
+	var gotReqs []*tempopb.SearchBlockRequest
+	for pr := range reqCh {
+		parsed, err := api.ParseSearchBlockRequest(pr.HTTPRequest())
+		require.NoError(t, err)
+		gotReqs = append(gotReqs, parsed)
+	}
+	require.NoError(t, ctx.Err())
+
+	require.Equal(t, 1, searchJobResponse.TotalJobs, "the SkipDispatch slice must dispatch no job")
+	require.Len(t, gotReqs, 1)
+	require.Equal(t, uint32(100), gotReqs[0].SearchReq.Start)
+	require.Equal(t, uint32(150), gotReqs[0].SearchReq.End)
+}
+
 // TestSearchSharder_StructuralTimeSlicedDispatch_AttachesDispatchSpanInfo (go-presubmit/holistic
 // MEDIUM finding, issue #493) drives the REAL asyncSearchSharder.backendRequests entry point (R7)
 // down the structural (planIsStructural=true) branch with a tracer installed -- search_sharder.go's

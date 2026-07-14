@@ -260,7 +260,7 @@ func (s *asyncSearchSharder) backendRequests(ctx context.Context, tenantID strin
 			}, nil)
 			// One candidate per SLICE for the structural dispatch model (never per (block,
 			// slice) pair — see structuralTimeSlicedJobsFunc's own doc comment).
-			attachDispatchSpanInfo(ctx, resp.TotalJobs, len(plan.Slices), advancementPoints)
+			attachDispatchSpanInfo(ctx, resp.TotalJobs, len(plan.Slices), countSkipDispatchSlices(plan.Slices), advancementPoints)
 
 			go func() {
 				buildStructuralTimeSlicedBackendRequests(ctx, tenantID, parent, searchReq, firstShardIdx, blockIter, reqCh, errFn)
@@ -285,7 +285,7 @@ func (s *asyncSearchSharder) backendRequests(ctx context.Context, tenantID strin
 			advancementPoints = append(advancementPoints, advancementPoint{jobs: jobs, bytes: sz, completedThroughSeconds: completedThroughTime})
 		}, nil)
 		// One candidate per (block, slice) pair for the plain time-sliced dispatch model.
-		attachDispatchSpanInfo(ctx, resp.TotalJobs, len(blocks)*len(plan.Slices), advancementPoints)
+		attachDispatchSpanInfo(ctx, resp.TotalJobs, len(blocks)*len(plan.Slices), len(blocks)*countSkipDispatchSlices(plan.Slices), advancementPoints)
 
 		go func() {
 			buildTimeSlicedBackendRequests(ctx, tenantID, parent, searchReq, firstShardIdx, blockIter, reqCh, errFn)
@@ -699,6 +699,14 @@ func timeSlicedJobsFunc(blocks []*backend.BlockMeta, slices []blockpack.TimeSlic
 
 			overlappingJobs := 0
 			for _, slice := range slices {
+				// issue #499: SkipDispatch is a prior, separate gate from overlaps — a
+				// blockpack-VCNT-signal-driven skip, never folded into the time-bounds overlap
+				// check itself. Checked first, identically for the job COUNT below and the
+				// jobIterCallback dispatch, mirroring the SAME "single source of truth" discipline
+				// this function's own doc comment already establishes for overlaps.
+				if slice.SkipDispatch {
+					continue
+				}
 				if overlaps != nil && !overlaps(b, slice) {
 					continue
 				}

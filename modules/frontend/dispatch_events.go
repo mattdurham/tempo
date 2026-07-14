@@ -10,11 +10,26 @@ import (
 	"context"
 	"sort"
 
+	"github.com/grafana/blockpack"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
 
 const maxAdvancementSpanEvents = 20
+
+// countSkipDispatchSlices returns how many slices have SkipDispatch set — the per-slice count a
+// caller multiplies by its own per-slice candidate weight (1 block per pair for
+// timeSlicedJobsFunc, 1 for structuralTimeSlicedJobsFunc) to get jobsSkippedBySkipDispatch for
+// attachDispatchSpanInfo (issue #499 holistic-review finding).
+func countSkipDispatchSlices(slices []blockpack.TimeSlice) int {
+	n := 0
+	for _, s := range slices {
+		if s.SkipDispatch {
+			n++
+		}
+	}
+	return n
+}
 
 // attachDispatchSpanInfo attaches R2's scalar dispatch-count attributes (INCLUDING
 // dispatch.jobs_skipped_overlap) and the capped, evenly-sampled completedThroughSeconds
@@ -22,26 +37,33 @@ const maxAdvancementSpanEvents = 20
 // models with a genuine 1-job-per-surviving-candidate overlap filter: timeSlicedJobsFunc
 // ((block, slice) pairs) and structuralTimeSlicedJobsFunc (slices only — one job per slice,
 // never per (block, slice), see that function's own doc comment). totalCandidatePairs is the
-// full candidate count BEFORE that filter; jobsSkippedByOverlap = totalCandidatePairs -
-// jobsDispatched (clamped to 0) is only a MEANINGFUL skip count when each surviving candidate
-// produces EXACTLY one job — see attachDispatchSpanInfoNoOverlapFilter's own doc comment for why
-// backendJobsFunc (which can produce MANY jobs per block via page-splitting) must use that
-// sibling function instead, never this one (reviewer-2 finding: the subtraction formula silently
-// clamps to a misleading 0 whenever jobsDispatched > totalCandidatePairs, which is the COMMON
-// case for backendJobsFunc, not a rare edge case, once any block is large enough to page-split).
+// full candidate count BEFORE any filter; jobsSkippedBySkipDispatch (issue #499 holistic-review
+// finding) is the caller-precomputed candidate count already known to be excluded by a
+// SkipDispatch=true slice specifically (independent of block/slice overlap) — pass 0 for any
+// dispatch model that predates #499 or otherwise has no SkipDispatch concept.
+// jobsSkippedByOverlap = totalCandidatePairs - jobsDispatched - jobsSkippedBySkipDispatch
+// (clamped to 0) is only a MEANINGFUL skip count when each surviving candidate produces EXACTLY
+// one job — see attachDispatchSpanInfoNoOverlapFilter's own doc comment for why backendJobsFunc
+// (which can produce MANY jobs per block via page-splitting) must use that sibling function
+// instead, never this one (reviewer-2 finding: the subtraction formula silently clamps to a
+// misleading 0 whenever jobsDispatched > totalCandidatePairs, which is the COMMON case for
+// backendJobsFunc, not a rare edge case, once any block is large enough to page-split).
 //
 // See attachDispatchSpanInfoCommon's own doc comment for the shared jobs_total/
 // jobs_cancelled_undispatched/position/event behavior both entry points share.
-func attachDispatchSpanInfo(ctx context.Context, jobsDispatched, totalCandidatePairs int, points []advancementPoint) {
+func attachDispatchSpanInfo(ctx context.Context, jobsDispatched, totalCandidatePairs, jobsSkippedBySkipDispatch int, points []advancementPoint) {
 	span := trace.SpanFromContext(ctx)
 	if !span.IsRecording() {
 		return
 	}
-	jobsSkippedByOverlap := totalCandidatePairs - jobsDispatched
+	jobsSkippedByOverlap := totalCandidatePairs - jobsDispatched - jobsSkippedBySkipDispatch
 	if jobsSkippedByOverlap < 0 {
 		jobsSkippedByOverlap = 0
 	}
 	span.SetAttributes(attribute.Int("dispatch.jobs_skipped_overlap", jobsSkippedByOverlap))
+	if jobsSkippedBySkipDispatch > 0 {
+		span.SetAttributes(attribute.Int("dispatch.jobs_skipped_vcnt_confident_zero", jobsSkippedBySkipDispatch))
+	}
 	attachDispatchSpanInfoCommon(ctx, span, jobsDispatched, points)
 }
 

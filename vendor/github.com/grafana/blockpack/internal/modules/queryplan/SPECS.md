@@ -20,7 +20,7 @@ ascending order and never reused or renumbered; superseded entries are marked `[
 SPEC-QP-N]` rather than deleted. `queryplan/NOTES.md`'s own entries use the separate `NOTE-QP-00N`
 counter (module-local to this package only, not shared with any other module).
 
-Next free ID: **SPEC-QP-10**. (Corrected 2026-07-13: this line had drifted stale at
+Next free ID: **SPEC-QP-13**. (Corrected 2026-07-13: this line had drifted stale at
 `SPEC-QP-7` even though `SPEC-QP-8` already existed below — issue #217 added it without updating
 this line. `SPEC-QP-9` below is confirmed correct against the file's actual last header, not
 against this line, per this project's standing ID-drift-checking convention.)
@@ -61,12 +61,18 @@ bullet added, "narrower than 60s" exception removed (proven unreachable), negati
 clamp bullet added, slice-count cap bullet added (Fix 6, the boundary story now has three
 parts: minute floor, MaxUint64 saturation, slice-count cap). Amended again 2026-07-07
 (team-lead ruling, T-phase design question): DefaultK=1 ruling bullet added, implementation
-pending.*
+pending. Amended 2026-07-14 (issue #499, Phase 3): `andConjoinedSignals` parameter and
+`SkipDispatch` field added — see `SPEC-QP-12` for `SkipDispatch`'s own full contract. This is an
+ADDITIVE change, not a removal: the full-partition guarantee below (every minute still gets
+exactly one `TimeSlice`) is unchanged — a caller opts into treating a `SkipDispatch`-marked slice
+as unfetchable, the partition itself never shrinks.*
 
-**Contract:** `BuildTimeSlices(perMinute []valuecounts.MinuteCount, minTS, maxTS uint64,
-concurrentRequests, k int) []TimeSlice` partitions `[minTS, maxTS]` into a fully-covering,
-minute-aligned, non-overlapping sequence of `TimeSlice{Start, End uint64; EstMatches int64;
-EstKnown bool; VCNTEmpty bool}` values, `[Start, End)` half-open.
+**Contract:** `BuildTimeSlices(perMinute []valuecounts.MinuteCount, andConjoinedSignals
+[][]valuecounts.MinuteCount, minTS, maxTS uint64, concurrentRequests, k int) []TimeSlice`
+partitions `[minTS, maxTS]` into a fully-covering, minute-aligned, non-overlapping sequence of
+`TimeSlice{Start, End uint64; EstMatches int64; EstKnown bool; VCNTEmpty bool; SkipDispatch bool}`
+values, `[Start, End)` half-open. `andConjoinedSignals` feeds `SkipDispatch` only — see
+`SPEC-QP-12` for its own contract; every other rule below is unchanged by its addition.
 
 **Rules:**
 - `minTS > maxTS` returns `nil`.
@@ -74,7 +80,14 @@ EstKnown bool; VCNTEmpty bool}` values, `[Start, End)` half-open.
 - **Full coverage, no gaps (binding):** the returned slices always exactly and contiguously
   cover the minute-floored `[minTS, maxTS]` window with zero holes.
 - Every slice's width is in `[60, 3600]` seconds inclusive; the post-floor window is always
-  `>= 60s` when `minTS <= maxTS`, so no narrower slice is ever produced.
+  `>= 60s` when `minTS <= maxTS`, so no narrower slice is ever produced. **Superseded 2026-07-14
+  (issue #499 holistic review, pre-existing #217 drift caught in passing):** the adaptive-width
+  half of this range no longer exists — `SPEC-QP-8`/`NOTE-QP-012` (issue #217) forced every
+  slice to exactly `minSliceWidthSeconds` (60s); `BuildTimeSlices` itself documents that "the #487
+  adaptive/uniform width algorithms this doc comment used to describe are removed, not merely
+  disabled." The `>= 60s` lower bound above still holds; the `<= 3600s` upper bound is moot since
+  width is now always exactly 60s. Left in place rather than deleted per this file's own
+  mark-superseded-don't-silently-delete convention.
 - **Overflow saturation (binding):** if `maxTS` exceeds `maxSafeMaxTS` (=
   `math.MaxUint64 - maxSliceWidthSeconds - minSliceWidthSeconds`; unreachable with real
   unix-second timestamps — this ceiling sits near 2^64), `maxTS` is silently saturated down to
@@ -138,6 +151,9 @@ See `NOTES.md` NOTE-QP-005, NOTE-QP-008 (`DefaultK`). Tests: `slices_test.go` (i
 `TestBuildTimeSlices_NegativeCountFromNonConformingOracleClampedToZero`,
 `TestBuildTimeSlices_HugeWindowIsCappedNotPanicking`,
 `TestBuildTimeSlices_RealisticLongWindowStillSlicesNormally`, `TestDefaultK_IsOne`). Issue #487.
+`SkipDispatch`/`andConjoinedSignals` (issue #499, Phase 3) tests: `slices_test.go`
+(`TestBuildTimeSlices_NilAndConjoinedSignals_SkipDispatchAlwaysFalse`,
+`TestBuildTimeSlices_NeverSkipsDispatchWithinFreshnessMarginOfMaxTS`) — see `SPEC-QP-12`.
 
 ---
 
@@ -177,13 +193,27 @@ Strategy DispatchStrategy}`.
   is `BuildTimeSlices`'s output (SPEC-QP-2) called with `perMinute` resolved as follows: if
   `g.Lead()` (SPEC-QP-1) returns `ok=true` and `perMinuteForLead != nil`, `perMinute =
   perMinuteForLead(lead.Node)`; otherwise `perMinute` is `nil`, which drives `BuildTimeSlices`'s
-  uniform-width fallback per SPEC-QP-2.
+  uniform-width fallback per SPEC-QP-2. **Amended 2026-07-14 (issue #499, Phase 3):**
+  `BuildTimeSlices`'s second parameter, `andConjoinedSignals`, is resolved separately from
+  `collectANDConjoinedLeaves(g)` (SPEC-QP-10), reusing the already-resolved lead-leaf signal
+  above when the lead leaf is itself AND-conjoined to root (the dedup optimization, SPEC-QP-12)
+  and calling `perMinuteForLead` once more for every other AND-conjoined leaf. This drives
+  `SkipDispatch` per SPEC-QP-12 only — it has no effect on `EstMatches`/`EstKnown`/`VCNTEmpty`,
+  which are governed exclusively by `perMinute` as described above.
 - `k` is forwarded unchanged to `BuildTimeSlices` — `BuildQueryPlan` does not special-case it.
   See `SPEC-QP-2`'s `DefaultK` ruling for the recommended default when a caller has no better
   value to supply.
-- `perMinuteForLead` is called at most once per `BuildQueryPlan` call, and only for the
-  identified lead leaf — never for any other leaf, never before `Lead()` has run, and never at
-  all when `allLeavesResolvable` is false or `Lead()` returns `ok=false`.
+- `perMinuteForLead` is called at most once per `BuildQueryPlan` call FOR THE LEAD LEAF
+  specifically — never before `Lead()` has run, and never at all (for any leaf) when
+  `allLeavesResolvable` is false. **Amended 2026-07-14 (issue #499, Phase 3, SPEC-QP-12):** this
+  bullet's older, stricter form ("never for any other leaf... never... when `Lead()` returns
+  `ok=false`") no longer holds — `perMinuteForLead` MAY now additionally be called once for every
+  leaf `collectANDConjoinedLeaves(g)` returns that is NOT the lead leaf (SkipDispatch's own
+  resolution, independent of whether `Lead()` succeeds at all), including when `Lead()` returns
+  `ok=false` (a plan with no Known-cost leaf can still have AND-conjoined leaves needing their own
+  per-minute check). The lead leaf itself is still resolved at most once (the dedup optimization,
+  `SPEC-QP-12`) — this amendment widens the SET of leaves `perMinuteForLead` may be called for, it
+  does not remove the at-most-once-per-leaf guarantee.
 - The zero-value `QueryPlan{}` has `Strategy == DispatchBlockSharded` (Go's int zero value for
   `DispatchStrategy`) — the safe default requires no explicit construction.
 - When `Strategy == DispatchTimeSliced` and every `TimeSlice.EstKnown` in `Slices` is `false`
@@ -499,3 +529,152 @@ gets a real `ColumnTotal` instead of always reading `ok=false` (`TEST-QP-3`'s
 Back-ref: `internal/modules/queryplan/vcnt_duration_cost.go:VCNTDurationCostFunc,CombineCostFuncs,durationRangeLeafShape,durationBetweenLeafShape,durationValueMillis`;
 `internal/modules/queryplan/vcnt_cost.go:ClassifyProgramVCNTWithThreshold,ClassifyProgramVCNTWithDetail,VCNTColumnTotalFunc,durationColumnTotalFallback`.
 See `NOTE-QP-013`, `TESTS.md` `TEST-QP-3`. Issue #205.
+
+---
+
+## SPEC-QP-10: `collectANDConjoinedLeaves` — OR-ancestry-aware leaf enumeration (issue #499, Phase 2)
+
+*Added: 2026-07-14*
+
+**`collectANDConjoinedLeaves(g Group) []PlannedLeaf`** (`and_conjoined.go`) returns every leaf in
+`g`'s tree whose path from `g` down to that leaf passes through zero `GroupOR` groups — i.e. every
+leaf that is AND-conjoined all the way to `g`'s own root. It explicitly checks `sub.Kind` at every
+recursion level (`if g.Kind != GroupAND { return nil }`, applied at each recursive call, not just
+the top) rather than relying on `Plan()`'s current "an AND group's sub-groups are always OR
+groups" construction invariant (`planAndNodes`/`planOrNode`, `plan.go`) — so it stays correct even
+if a future refactor of that construction changes the incidental structure.
+
+**Contract:**
+- A pure-AND tree with no `GroupOR` anywhere returns every leaf in the tree, order-independent.
+- Any leaf sitting under a `GroupOR` — at any nesting depth — is excluded, along with every other
+  leaf nested beneath that same `GroupOR`, regardless of whether an inner sub-group further below
+  the `GroupOR` is itself `GroupAND` (recursion into the `GroupOR` itself returns `nil`
+  immediately, so nothing beneath it is ever visited).
+- `collectANDConjoinedLeaves(Group{})` (the zero value, `Kind == GroupAND`) returns `nil`, not a
+  panic or an empty-but-non-nil slice.
+- A nested pure-AND composite that `Plan()`'s own `planAndNodes` flattening rule already merges
+  into a single `GroupAND` (never its own `SubGroup` entry) contributes every one of its leaves —
+  "nested AND" (fully collected) and "nested under an OR" (excluded) are the only two shapes that
+  matter to this function.
+
+**Never changes `leadLeaf`/`Group.Lead()`'s own behavior.** This is a wholly separate, additive
+tree walk with no shared state or control flow with `leadLeaf` (`selectivity.go`) or `Lead()`
+(`lead.go`) — confirmed by a zero-diff to either file. It is consulted only by the new
+skip-computation path issue #499 Phase 3 adds to `BuildQueryPlan` (`queryplan.go`), never by
+`Classify`/`classifyDetailed` (`selectivity.go`'s production caller of `leadLeaf`, line ~131) or by
+`BuildQueryPlan`'s existing lead-leaf dispatch-priority resolution (`queryplan.go`'s
+`perMinuteForLead(lead.Node)` call, line ~115). Each AND-conjoined leaf this function returns is
+independently sufficient to prove a minute's whole-plan match count is zero when its own
+per-minute signal is confidently zero for that minute, since an AND is false the moment any one
+conjunct is false — regardless of any sibling OR branch or any other AND-conjoined leaf. This is
+distinct from, and does not narrow or widen, `leadLeaf`'s own "most-selective leaf across the
+whole tree" contract (`SPEC-QP-1`), which recurses into sub-groups unconditionally for a different
+(priority/bound) purpose and correctly considers a leaf nested inside an OR branch's AND sub-group
+as a legitimate lead candidate — `collectANDConjoinedLeaves` would exclude that exact same leaf
+from its own returned set, and both facts are simultaneously true and non-contradictory (see
+`NOTE-QP-014`).
+
+Back-ref: `internal/modules/queryplan/and_conjoined.go:collectANDConjoinedLeaves`. See
+`NOTE-QP-014`, `TESTS.md` `TEST-QP-4`. Issue #499.
+---
+
+## SPEC-QP-11: `VCNTDurationPerMinuteFunc` / `CombinePerMinuteFuncs` — per-minute duration signal, and `TimeSliceOracle`'s composed pair (issue #499, Phase 1)
+*Added: 2026-07-14*
+
+**`VCNTDurationPerMinuteFunc(data, dir, minTS, maxTS) func(*vm.RangeNode) []valuecounts.MinuteCount`**
+(`vcnt_duration_perminute.go`) is `VCNTPerMinuteFunc`'s (SPEC-QP-4) range-predicate sibling for the
+histogram-eligible column, mirroring `VCNTDurationCostFunc`'s (SPEC-QP-9) relationship to
+`VCNTCostFunc`. It recognizes exactly the same two leaf shapes `VCNTDurationCostFunc` recognizes
+(reusing `durationRangeLeafShape`/`durationBetweenLeafShape` directly, same package, unexported —
+never duplicated) and answers via `valuecounts.DurationHistogramPerMinuteInRange` plus the SAME
+`EstimateThreshold`/`EstimateBetween` estimators `VCNTDurationCostFunc` uses — a thin adapter, not
+a second implementation.
+
+**Contract:** returns `nil` for any leaf shape those extractors reject (equality, non-histogram
+column, or any other non-range shape) — mutually exclusive with `VCNTPerMinuteFunc`'s equality
+shape by construction, the same guarantee `VCNTDurationCostFunc`/`VCNTCostFunc` rely on. A minute
+whose estimate is unknown or `<= 0` is excluded from the returned slice entirely — never a
+`Count: 0` entry — mirroring `VCNTPerMinuteFunc`'s own "absent minute vs. zero-count minute is not
+a meaningful distinction to this contract" liveness convention, applied per-minute. Performs no
+object-storage I/O: `data`/`dir` are already-decoded in-memory bytes, identical to
+`VCNTDurationCostFunc`'s own inputs.
+
+**`CombinePerMinuteFuncs(first, second func(*vm.RangeNode) []valuecounts.MinuteCount) func(*vm.RangeNode) []valuecounts.MinuteCount`**
+(`vcnt_duration_perminute.go`) mirrors `CombineCostFuncs`'s (SPEC-QP-9) try-first-then-second
+semantics for the per-minute callback shape: tries `first`, and only falls through to `second`
+when `first` returns a `nil` or empty (`len() == 0`) result — never both, never merges/concatenates
+the two. Generic: usable with any two per-minute callbacks, not specific to VCNT/duration.
+
+**`TimeSliceOracle`'s composed pair (root `timeslice.go`):** since issue #499 Phase 1,
+`TimeSliceOracle` returns `queryplan.CombineCostFuncs(VCNTCostFunc(...), VCNTDurationCostFunc(...))`
+and `queryplan.CombinePerMinuteFuncs(VCNTPerMinuteFunc(...), VCNTDurationPerMinuteFunc(...))`
+instead of the bare pre-#499 `VCNTCostFunc`/`VCNTPerMinuteFunc` pair — **both compositions are
+wired together in the same change, never independently.** Composing cost alone (without the
+per-minute composition) would let a duration-range leaf legitimately win `Lead()` by cost while
+still returning zero per-minute signal (the un-composed `VCNTPerMinuteFunc` only recognizes
+equality leaves, so it returns `nil` for a Min/Max-bearing leaf) — a strict regression versus
+`TimeSliceOracle`'s own pre-#499 behavior (every slice degrading to `EstKnown=false`) for a query
+that used to get real per-slice signal from its equality-cost-Unknown duration leaf's fallback path.
+`TimeSliceOracle`'s own exported signature is unchanged by this — only its internal composition.
+
+Back-ref: `internal/modules/queryplan/vcnt_duration_perminute.go:VCNTDurationPerMinuteFunc,CombinePerMinuteFuncs`;
+`timeslice.go:TimeSliceOracle` (root package). See `NOTE-QP-015`, `TESTS.md` `TEST-QP-5`. Issue #499, Phase 1.
+
+---
+
+## SPEC-QP-12: `TimeSlice.SkipDispatch` — multi-leaf, freshness-margin-gated dispatch-skip contract (issue #499, Phase 3)
+
+*Added: 2026-07-14*
+
+**Contract:** `TimeSlice.SkipDispatch bool` (`slices.go`) is `true` for a given slice if and only
+if BOTH of the following hold:
+
+1. At least one leaf in `collectANDConjoinedLeaves(g)` (`SPEC-QP-10`) — independent of which leaf
+   is `Lead()` — has a confidently-zero per-minute signal for that slice's covered minute. A
+   signal is "confidently zero" for a minute when the leaf's own `[]valuecounts.MinuteCount`
+   (resolved via `perMinuteForLead`, `BuildQueryPlan`) is either absent for that minute or present
+   with `Count <= 0` — the two are equivalent for this question (see the implementation note
+   below; this is a DELIBERATE departure from `EstKnown`/`VCNTEmpty`'s own absent-vs-zero
+   distinction, which exists for a different reason).
+2. That minute's `Start` is NOT within `skipDispatchFreshnessMarginSeconds` (900s / 15 minutes,
+   `slices.go`) of the query's own `maxTS` — anchored to `maxTS`, never wall-clock `time.Now()`,
+   so `BuildTimeSlices`/`BuildQueryPlan` remain pure functions of their inputs. A `maxTS` smaller
+   than the margin makes every minute ineligible (the safe direction), never every minute
+   eligible.
+
+**A leaf whose per-minute signal is entirely empty/nil (no coverage at all, e.g. a
+VCNT-inestimable shape) contributes NOTHING to the veto** — `BuildQueryPlan`'s own
+`len(sig) > 0` gate (`queryplan.go`) excludes it from the checked set entirely, so a
+coverage-blind leaf can never accidentally veto every minute in the window just because its
+oracle never returns anything. Only a leaf that DOES have per-minute coverage somewhere, but is
+absent/zero for THIS specific minute, counts as a confident zero for that minute.
+
+**Independence from `EstMatches`/`EstKnown`/`VCNTEmpty` (binding):** `SkipDispatch` is computed
+from an entirely different leaf set (every AND-conjoined leaf) than `EstMatches`/`EstKnown`/
+`VCNTEmpty` (the lead leaf only) and the two CAN legitimately disagree on the same slice —
+`SkipDispatch=true` can co-occur with `EstMatches>0` when a non-lead AND-conjoined leaf vetoes a
+lead leaf's own positive count (an AND is false the moment any one conjunct is false, regardless
+of what any other conjunct — including the lead — reports). A caller MUST check `SkipDispatch`
+unconditionally, never gated on or inferred from `EstMatches`/`EstKnown`/`VCNTEmpty`.
+
+**Additive, not a removal (amends `SPEC-QP-2`):** the full-partition guarantee is unchanged —
+every minute still gets exactly one `TimeSlice`; `SkipDispatch` only marks a slice as
+caller-skippable, it never removes it from the returned partition.
+
+**`BuildQueryPlan`'s resolution (`queryplan.go`), including the oracle-call dedup:** for every
+leaf `collectANDConjoinedLeaves(g)` returns, if that leaf IS the lead leaf (`g.Lead()`), its
+already-resolved `perMinute` value (the same one driving `EstMatches`) is reused rather than
+calling `perMinuteForLead` a second time for the same leaf; every other AND-conjoined leaf is
+resolved via a fresh `perMinuteForLead` call. This widens `perMinuteForLead`'s own call-cardinality
+contract — see `SPEC-QP-3`'s 2026-07-14 amendment.
+
+**`BuildTimeSlices`'s mechanism (`slices.go`):** `andConjoinedSignals [][]valuecounts.MinuteCount`
+(one entry per AND-conjoined leaf's own signal) is precomputed into one zero-lookup map per leaf,
+outside the per-minute loop; the freshness cutoff (`maxTS - skipDispatchFreshnessMarginSeconds`,
+saturating at 0) is computed once; the per-minute loop then does only map lookups, never re-scans.
+`andConjoinedSignals == nil` (every pre-#499 caller's shape) means the veto loop never executes —
+`SkipDispatch` is `false` for every slice, byte-identical to pre-#499 behavior.
+
+Back-ref: `internal/modules/queryplan/slices.go:TimeSlice.SkipDispatch,BuildTimeSlices,skipDispatchFreshnessMarginSeconds`;
+`internal/modules/queryplan/queryplan.go:BuildQueryPlan`. See `NOTE-QP-016`, `TESTS.md` `TEST-QP-6`,
+`SPEC-QP-2` (amended), `SPEC-QP-3` (amended), `SPEC-QP-10` (`collectANDConjoinedLeaves`). Issue #499, Phase 3.

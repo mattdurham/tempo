@@ -172,10 +172,29 @@ func BuildQueryPlan(
 // It performs no object-storage I/O: data/dir are the caller's already-decoded VCNT section
 // bytes (e.g. from VCNTBuildSectionFromObjects), identical to VCNTSelectivityInRange's own
 // inputs.
+//
+// Since issue #499 Part 1, both returned callbacks are composed pairs — CostFunc via
+// queryplan.CombineCostFuncs(VCNTCostFunc, VCNTDurationCostFunc) and the per-minute callback via
+// queryplan.CombinePerMinuteFuncs(VCNTPerMinuteFunc, VCNTDurationPerMinuteFunc) — so a
+// histogram-eligible duration-range leaf (e.g. `span:duration > 100ms`) can win Lead() AND still
+// carry real per-minute signal, rather than always losing lead-selection to any equality leaf
+// (cost-Unknown leaves always sort last) while lacking a per-minute oracle of its own. The two
+// compositions are wired together deliberately, never independently: composing cost alone would
+// let a duration leaf legitimately win lead while still returning zero per-minute signal (nil
+// from the un-composed VCNTPerMinuteFunc, since it only recognizes equality leaves) — a strict
+// regression versus this function's pre-#499 behavior. See NOTE-QP-015.
 func TimeSliceOracle(
 	data []byte, dir []VCNTChunkDirEntry, minTS, maxTS uint64,
 ) (CostFunc, func(leaf *RangeNode) []MinuteCount) {
-	return queryplan.VCNTCostFunc(data, dir, minTS, maxTS), queryplan.VCNTPerMinuteFunc(data, dir, minTS, maxTS)
+	cost := queryplan.CombineCostFuncs(
+		queryplan.VCNTCostFunc(data, dir, minTS, maxTS),
+		queryplan.VCNTDurationCostFunc(data, dir, minTS, maxTS),
+	)
+	perMinute := queryplan.CombinePerMinuteFuncs(
+		queryplan.VCNTPerMinuteFunc(data, dir, minTS, maxTS),
+		queryplan.VCNTDurationPerMinuteFunc(data, dir, minTS, maxTS),
+	)
+	return cost, perMinute
 }
 
 // AllLeavesIndexable reports whether EVERY leaf in prog's predicate tree has a shape the value

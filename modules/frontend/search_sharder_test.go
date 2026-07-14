@@ -896,6 +896,68 @@ func TestSearchSharder_TimeSlicedDispatch_SkipsNonOverlappingBlockSlicePairs(t *
 	require.Equal(t, resp.TotalJobs, sumShardJobs, "sum of per-shard TotalJobs must equal the overall TotalJobs")
 }
 
+// TestSearchSharder_TimeSlicedDispatch_SkipDispatchSlice_NoJobDispatchedAndTotalJobsExcludesIt
+// (issue #499 Phase 3) mirrors TestSearchSharder_TimeSlicedDispatch_SkipsNonOverlappingBlockSlicePairs's
+// own shape and assertion structure, but for the NEW blockpack.TimeSlice.SkipDispatch gate rather
+// than a non-overlapping (block, slice) pair: one block whose window overlaps TWO slices; one
+// slice has SkipDispatch=true, the other SkipDispatch=false. SkipDispatch must be checked as a
+// prior, separate gate from overlaps (both slices genuinely overlap the block here) — no job may
+// ever be dispatched for the SkipDispatch=true slice, and TotalJobs/Shard.TotalJobs must reflect
+// that exclusion, exactly the same #161 job-count-vs-dispatch consistency discipline overlaps
+// already required, now also covering this gate.
+func TestSearchSharder_TimeSlicedDispatch_SkipDispatchSlice_NoJobDispatchedAndTotalJobsExcludesIt(t *testing.T) {
+	block := backend.NewBlockMeta("test", uuid.New(), "wdwad")
+	block.StartTime = time.Unix(100, 0)
+	block.EndTime = time.Unix(300, 0)
+	block.Size_ = defaultTargetBytesPerRequest
+	block.TotalRecords = 1
+
+	s := &asyncSearchSharder{
+		cfg:    SearchSharderConfig{MostRecentShards: defaultMostRecentShards},
+		reader: &mockReader{metas: []*backend.BlockMeta{block}},
+	}
+
+	r := httptest.NewRequest("GET", "/?tags=foo%3Dbar&limit=50&start=100&end=300", nil)
+	searchReq, err := api.ParseSearchRequest(r)
+	require.NoError(t, err)
+
+	// Both slices genuinely overlap the block's [100, 300] window — the ONLY reason slice2 must
+	// not dispatch a job is SkipDispatch, not overlaps.
+	plan := &blockpack.QueryPlan{
+		Strategy: blockpack.DispatchTimeSliced,
+		Slices: []blockpack.TimeSlice{
+			{Start: 200, End: 300, SkipDispatch: true},
+			{Start: 100, End: 200, SkipDispatch: false},
+		},
+	}
+
+	reqCh := make(chan pipeline.Request)
+	ctx, cancelCause := context.WithCancelCause(context.Background())
+	pipelineRequest := pipeline.NewHTTPRequest(r)
+	resp := &combiner.SearchJobResponse{}
+
+	go s.backendRequests(ctx, "test", pipelineRequest, searchReq, resp, plan, false, reqCh, cancelCause)
+
+	var gotReqs []*tempopb.SearchBlockRequest
+	for pr := range reqCh {
+		parsed, err := api.ParseSearchBlockRequest(pr.HTTPRequest())
+		require.NoError(t, err)
+		gotReqs = append(gotReqs, parsed)
+	}
+	require.NoError(t, ctx.Err())
+
+	require.Len(t, gotReqs, 1, "only the non-SkipDispatch slice must produce a job")
+	require.Equal(t, uint32(100), gotReqs[0].SearchReq.Start)
+	require.Equal(t, uint32(200), gotReqs[0].SearchReq.End)
+
+	require.Equal(t, len(gotReqs), resp.TotalJobs, "TotalJobs must exclude the SkipDispatch slice's job")
+	var sumShardJobs int
+	for _, sh := range resp.Shards {
+		sumShardJobs += int(sh.TotalJobs)
+	}
+	require.Equal(t, resp.TotalJobs, sumShardJobs, "sum of per-shard TotalJobs must equal the overall TotalJobs")
+}
+
 // TestSearchSharder_TimeSlicedDispatch_CacheKeyUsesWholeQueryWindowNotSliceWindow pins the
 // holistic-review HIGH fix: buildTimeSlicedBackendRequests must compute the job cache key from
 // the whole, unnarrowed query window (searchReq.Start/End), not the slice-narrowed subReq.Start/

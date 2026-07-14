@@ -111,6 +111,11 @@ func structuralTimeSlicedJobsFunc(
 		slicesInShard := 0
 
 		for _, slice := range slices {
+			// issue #499: SkipDispatch is a prior, separate gate from overlaps — see
+			// search_sharder.go's timeSlicedJobsFunc for the identical discipline and rationale.
+			if slice.SkipDispatch {
+				continue
+			}
 			carrier, carrierSize := firstOverlappingBlock(blocks, slice, overlaps)
 			if carrier == nil {
 				continue // nothing exists yet to search for this slice

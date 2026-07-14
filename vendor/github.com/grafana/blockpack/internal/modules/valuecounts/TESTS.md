@@ -11,7 +11,7 @@ SPEC-ROOT-009 — this file's own sequence, numbering from 1, independent of
 `internal/modules/valuecountscompactor/TESTS.md`'s own separate `TEST-VC-N` sequence). IDs are
 assigned in ascending order and never reused or renumbered.
 
-Next free ID: **TEST-VC-12**.
+Next free ID: **TEST-VC-13**.
 
 ---
 
@@ -255,3 +255,37 @@ threshold/between estimators.
 **Spec invariants tested:** SPEC-VC-8.
 
 Back-ref: `internal/modules/valuecounts/histogram_test.go`. Issue #205, Phase A.
+
+---
+
+## TEST-VC-12: histogram_perminute_test.go — per-minute duration histogram bucketing and liveness
+*Added: 2026-07-14*
+
+**Scenario:** `DurationHistogramPerMinuteInRange` (SPEC-VC-9) must bucket histogram records by
+`Record.TimeStart` into one `MinuteDurationHistogram` per distinct live minute, apply the
+all-bucket-net-`<=`-0 liveness drop per minute (not per bucket), preserve every boundary seen at a
+given minute in that ONE minute's own `Histogram.Counts`, sort ascending by `Minute`, and read an
+uncovered column as empty, never an error.
+
+**Setup/Assertions (`histogram_perminute_test.go`):**
+
+- `TestDurationHistogramPerMinuteInRange_BucketsByMinuteMirrorsSelectivityPerMinute` — two minutes
+  (60, 120), two boundaries each; asserts two ascending-`Minute` `MinuteDurationHistogram` results,
+  each with the correct bucket-indexed counts.
+- `TestDurationHistogramPerMinuteInRange_DropsAllZeroMinuteEntirely` — a minute whose only bucket
+  nets to zero (a live write + an equal-magnitude retention delta) is absent from the result
+  entirely, never retained as an all-zero `Covered: true` entry (decision #4, locked liveness
+  rule); a genuinely live sibling minute still survives.
+- `TestDurationHistogramPerMinuteInRange_UncoveredColumnReturnsEmptyNotError` — a column with no
+  histogram records at all returns an empty result and a nil error.
+- `TestDurationHistogramPerMinuteInRange_SortedAscendingByMinute` — records inserted out of minute
+  order (300, 60, 120); asserts ascending-`Minute` output.
+- `TestDurationHistogramPerMinuteInRange_MultipleBucketsSameMinute_AllPreservedInOneEntry` — two
+  different boundaries at the SAME minute both land in that one minute's `Histogram.Counts` at
+  their respective indices — proves the grouping key is `TimeStart` alone, not `(TimeStart,
+  boundary)`.
+
+**Spec invariants tested:** SPEC-VC-9.
+
+Back-ref: `internal/modules/valuecounts/histogram_perminute_test.go`. Issue #499, Phase 1. See
+`NOTES.md` NOTE-VC-023.

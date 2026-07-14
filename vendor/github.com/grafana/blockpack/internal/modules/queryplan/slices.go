@@ -39,6 +39,37 @@ const (
 	// rather than producing a wrapped, corrupted End < Start.
 	maxSafeMaxTS = math.MaxUint64 - 2*minSliceWidthSeconds
 
+	// skipDispatchFreshnessMarginSeconds (issue #499, locked default — a best-reasoned default,
+	// not a measured-optimal one, per this project's own convention for exactly this kind of
+	// tunable, mirroring #181's retry-backoff numbers) is how close to the query's own maxTS a
+	// minute must be before SkipDispatch is unconditionally forced false, regardless of what any
+	// AND-conjoined leaf's oracle reports.
+	//
+	// Reasoning: a minute's VCNT signal is only queryable once the block containing it is
+	// completed and flushed, which happens once per consume cycle — blockbuilder's
+	// ConsumeCycleDuration, default 5 minutes (modules/blockbuilder/config.go:85, tempo repo) — a
+	// span landing near the START of a cycle can wait nearly the full cycle before its block (and
+	// therefore its VCNT record) exists at all. Once flushed, a querier must also notice the new
+	// block exists — governed by tempodb.DefaultBlocklistPoll, also 5 minutes
+	// (tempodb/config.go:27, tempo repo). Worst-case default lag from "span occurs" to "its VCNT
+	// signal is visible to a plan-building query" is therefore approximately
+	// ConsumeCycleDuration + BlocklistPoll ~= 10 minutes, plus encode/upload/propagation slack not
+	// captured by either constant alone.
+	//
+	// 15 minutes (900s) comfortably exceeds that ~10-minute worst case (1.5x) and matches this
+	// project's own already-established safety margin for a directly comparable block-lifecycle
+	// timing concern (compaction_window must be >= 15m for 3-min block cycles in this project's
+	// real dev-03 deployment) rather than inventing an unrelated number. Anchored to maxTS, not
+	// wall-clock time.Now(), so BuildTimeSlices/BuildQueryPlan remain pure functions of their
+	// inputs (deterministic, no new `now` parameter, no new signature-level API surface) — for a
+	// live/recent query (maxTS close to real "now"), this correctly protects the last 15 minutes
+	// of VCNT signal from being trusted for a skip decision; for a purely historical query (maxTS
+	// far in the past), the ONLY cost is that the last 15 minutes of that OLD window are also
+	// never skip-eligible — a small, bounded, per-query inefficiency (a handful of extra
+	// dispatched jobs at the tail of the window, never a correctness issue, never unbounded),
+	// which is the safe direction to err in.
+	skipDispatchFreshnessMarginSeconds = 15 * 60
+
 	// maxSlicesPerPlan caps how many TimeSlices a single BuildTimeSlices call will ever
 	// attempt to allocate.
 	//
@@ -101,7 +132,28 @@ type TimeSlice struct {
 	// written yet for this recent window" (brainstorm risk 2), distinct from "no signal was ever
 	// fetched" (EstKnown=false). Callers must never skip a VCNTEmpty slice, only deprioritize it;
 	// an EstKnown=false slice carries no basis for deprioritizing at all.
+	//
+	// Narrow, additive exception (issue #499, Phase 3): SkipDispatch (below) IS a sanctioned skip
+	// signal, computed from a wholly different leaf set (every AND-conjoined-to-root leaf, never
+	// just the lead leaf VCNTEmpty is derived from) and gated by its own freshness margin. This
+	// does not reverse or narrow the "never skip on VCNTEmpty alone" rule above — a caller must
+	// still never treat VCNTEmpty as a skip signal by itself; SkipDispatch is the only field whose
+	// contract permits skipping a slice.
 	VCNTEmpty bool
+	// SkipDispatch is true when at least one leaf that is AND-conjoined all the way to the plan's
+	// root (collectANDConjoinedLeaves, and_conjoined.go) has a confidently-zero per-minute signal
+	// for this slice's covered minute, AND that minute is outside the freshness margin
+	// (skipDispatchFreshnessMarginSeconds, anchored to maxTS) — proving the WHOLE conjunction is
+	// false for that minute, independent of what any other leaf (including the LEAD leaf) reports.
+	// SkipDispatch and EstMatches/EstKnown/VCNTEmpty are fully independent signals computed from
+	// different leaf sets (every AND-conjoined leaf, vs. only the lead leaf) and CAN legitimately
+	// disagree on the same slice: SkipDispatch=true can co-occur with EstMatches>0 when a non-lead
+	// conjunct vetoes a lead leaf's own optimistic count (see BuildQueryPlan's doc comment for the
+	// worked example). Callers (tempo's dispatch functions) must check SkipDispatch
+	// unconditionally, never gated on EstMatches/EstKnown/VCNTEmpty.
+	//
+	// SPEC-QP-12.
+	SkipDispatch bool
 }
 
 // BuildTimeSlices partitions [minTS, maxTS] into minute-aligned TimeSlices, each EXACTLY
@@ -127,12 +179,25 @@ type TimeSlice struct {
 // list per the shard-array-order/dispatch-order decoupling this design requires (brainstorm-c.md
 // risk 1).
 //
+// andConjoinedSignals (issue #499, Phase 3) is one per-minute signal per leaf that is
+// AND-conjoined all the way to the plan's root (collectANDConjoinedLeaves), independent of
+// perMinute/the lead leaf. A minute is SkipDispatch-eligible when at least one of these signals
+// is confidently zero for it (absent or a present Count<=0 — both mean the same thing, see the
+// implementation note below) AND the minute is outside skipDispatchFreshnessMarginSeconds of
+// maxTS. nil/empty means no AND-conjoined leaf ever offered a checkable signal — SkipDispatch is
+// false for every slice in that case (byte-identical to every pre-#499 caller).
+//
 // SPEC-QP-2: full-partition invariant, EstKnown/VCNTEmpty/EstMatches three-state semantics.
+// SPEC-QP-12: SkipDispatch's own contract, independence from EstMatches/EstKnown/VCNTEmpty, and
+// the freshness-margin mechanism.
 // NOTE-QP-005: ordering rationale (chronological-not-priority) and the EstKnown=false
 // degenerate-case dispatch-order note.
 // NOTE-QP-012: the #217 forced-1-minute-width override and the resulting maxSlicesPerPlan raise.
+// NOTE-QP-016: the every-AND-conjoined-leaf veto design, the freshness margin's reasoning, and
+// the absent-vs-present-zero conflation being deliberate for this field only.
 func BuildTimeSlices(
-	perMinute []valuecounts.MinuteCount, minTS, maxTS uint64, concurrentRequests, k int,
+	perMinute []valuecounts.MinuteCount, andConjoinedSignals [][]valuecounts.MinuteCount,
+	minTS, maxTS uint64, concurrentRequests, k int,
 ) []TimeSlice {
 	_, _ = concurrentRequests, k // #217/NOTE-QP-012: retained for signature stability only.
 	if minTS > maxTS {
@@ -181,20 +246,66 @@ func BuildTimeSlices(
 		counts[c.Minute] = count
 	}
 
+	// One zero-lookup map per AND-conjoined leaf's own signal, precomputed once outside the
+	// per-minute loop below (issue #499, Phase 3) — mirrors counts above exactly (same
+	// clamp-negative-to-zero defensiveness, same non-negative contract), so the per-minute loop
+	// only ever does map lookups, never re-scans.
+	andCounts := make([]map[uint64]int64, len(andConjoinedSignals))
+	for i, sig := range andConjoinedSignals {
+		mp := make(map[uint64]int64, len(sig))
+		for _, c := range sig {
+			count := c.Count
+			if count < 0 {
+				count = 0
+			}
+			mp[c.Minute] = count
+		}
+		andCounts[i] = mp
+	}
+
+	// skipDispatchFreshnessMarginSeconds (§5.1b): any minute whose Start is within the margin of
+	// maxTS is never SkipDispatch-eligible, regardless of what any AND-conjoined leaf's oracle
+	// reports. Saturating subtraction: a maxTS smaller than the margin (tiny/test windows near
+	// epoch 0) makes freshnessCutoff 0, so the `m < freshnessCutoff` guard below is never true for
+	// any minute — every minute is treated as within the margin (ineligible), the safe direction,
+	// rather than wrongly treating a tiny maxTS as "far enough in the past" to trust.
+	var freshnessCutoff uint64
+	if maxTS > skipDispatchFreshnessMarginSeconds {
+		freshnessCutoff = maxTS - skipDispatchFreshnessMarginSeconds
+	}
+
 	n := (end - start) / minSliceWidthSeconds
 	slices := make([]TimeSlice, 0, n)
 	for m := start; m < end; m += minSliceWidthSeconds {
+		skipDispatch := false
+		if m < freshnessCutoff {
+			for _, cm := range andCounts {
+				// cm[m] == 0 covers BOTH a minute absent from this leaf's own per-minute signal
+				// (the leaf's oracle never emits a live entry for it, per every oracle's own
+				// liveness-drop contract) and a minute present with Count 0 — both mean the same
+				// "confidently zero" fact for THIS question (unlike EstKnown/VCNTEmpty, which
+				// must distinguish "no oracle ever looked" from "oracle looked and found zero" for
+				// dispatch-PRIORITY ordering; SkipDispatch needs only a yes/no CORRECTNESS
+				// verdict, so there is no third state to distinguish here).
+				if cm[m] == 0 {
+					skipDispatch = true
+					break // per-minute early exit: sufficient once any one leaf confirms zero
+				}
+			}
+		}
+
 		if !haveSignal {
-			slices = append(slices, TimeSlice{Start: m, End: m + minSliceWidthSeconds})
+			slices = append(slices, TimeSlice{Start: m, End: m + minSliceWidthSeconds, SkipDispatch: skipDispatch})
 			continue
 		}
 		count := counts[m] // zero value for a minute genuinely absent from perMinute — a gap.
 		slices = append(slices, TimeSlice{
-			Start:      m,
-			End:        m + minSliceWidthSeconds,
-			EstMatches: count,
-			EstKnown:   true,
-			VCNTEmpty:  count == 0,
+			Start:        m,
+			End:          m + minSliceWidthSeconds,
+			EstMatches:   count,
+			EstKnown:     true,
+			VCNTEmpty:    count == 0,
+			SkipDispatch: skipDispatch,
 		})
 	}
 	reverseSlices(slices)
