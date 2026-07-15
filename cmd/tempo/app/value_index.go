@@ -8,6 +8,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -54,16 +55,19 @@ func newMinioFromS3Cfg(cfg *s3cfg.Config) (*minio.Client, error) {
 // redeclare (issue #216/#507): a ctx-scoped whole-object Get/Put. Declared here, rather
 // than importing colhashmanifest directly (an internal blockpack package tempo cannot
 // import), so toVICConsumerCfg/toVCNTCompactorCfg can accept and assign it structurally --
-// any value satisfying this method set (blockpack.NewPgColumnManifestStore's return value,
-// or the plain *tempoVCCStore object-store adapter already defined below) is directly
-// assignable to either Config's ManifestStore field with no further wrapping.
+// blockpack.NewPgColumnManifestStore's return value is directly assignable to either
+// Config's ManifestStore field with no further wrapping. Postgres is a hard requirement
+// (2026-07-15) for both callers now -- the blob-backed *tempoVCCStore fallback this
+// interface originally existed to accommodate (issue #507's either/or design) has been
+// retired; see initValueIndexConsumer/initValueIndexCompactor.
 type manifestStore interface {
 	Get(ctx context.Context, key string) ([]byte, error)
 	Put(ctx context.Context, key string, data []byte) error
 }
 
-// toVICConsumerCfg converts the Tempo config struct to the blockpack consumer config.
-// manifestStore is nil when no manifest recording is configured (see initValueIndexConsumer).
+// toVICConsumerCfg converts the Tempo config struct to the blockpack consumer config. ms is
+// always non-nil in production (initValueIndexConsumer hard-fails before reaching this call if
+// Postgres isn't configured); tests may still pass nil to confirm the pass-through.
 func toVICConsumerCfg(cfg common.ValueIndexConsumerConfig, ms manifestStore) vicconsumer.Config {
 	return vicconsumer.Config{
 		Enabled:            cfg.Enabled,
@@ -161,38 +165,34 @@ func (t *App) initValueIndexConsumer() (services.Service, error) {
 		return services.NewIdleService(nil, nil), nil
 	}
 
+	// Postgres is a hard requirement (2026-07-15) for the column-manifest store. Column-manifest
+	// recording (colhashmanifest, task #216) was shipped in blockpack but never wired to a
+	// production ManifestStore before issue #507 -- flushColumn correctly no-ops on a nil
+	// ManifestStore, so recording was silently disabled for every tenant. #507 originally added
+	// a blob-backed *tempoVCCStore fallback for deployments without Postgres configured; that
+	// either/or was retired once Postgres became mandatory across the whole cube/value-index
+	// pipeline (issue #504's registry, this consumer's manifest store) -- fail fast instead of
+	// silently degrading.
+	pgCfg := t.cfg.StorageConfig.Trace.Postgres
+	if pgCfg == nil {
+		return nil, errors.New("value-index-consumer: postgres is not configured; the column-manifest store requires it")
+	}
+
 	s3Client, err := newMinioFromS3Cfg(t.cfg.StorageConfig.Trace.S3)
 	if err != nil {
 		return nil, fmt.Errorf("value-index-consumer: create S3 client: %w", err)
 	}
 	bucket := t.cfg.StorageConfig.Trace.S3.Bucket
 
-	// Column-manifest recording (colhashmanifest, task #216) was shipped in blockpack but
-	// never wired to a production ManifestStore before this (issue #507) -- flushColumn
-	// correctly no-ops on a nil ManifestStore, so recording was silently disabled for every
-	// tenant. Prefer the Postgres-backed store (blockpack#506) when cfg.Postgres is
-	// configured, mirroring the same opt-in pattern initValueIndexCompactor already uses for
-	// cube's registry below. When Postgres isn't configured, fall back to the plain S3-backed
-	// *tempoVCCStore adapter (defined below): its Get/Put methods already match
-	// colhashmanifest.Store's exact shape (ctx-scoped whole-object read/write), so no new
-	// blockpack API and no new tempo adapter type is needed for the blob path -- blockpack's
-	// colhashmanifest package has no exported blob-backed constructor of its own yet (it never
-	// had a production caller before this wiring).
-	var pgPool *pgxpool.Pool
-	var manStore manifestStore
-	if pgCfg := t.cfg.StorageConfig.Trace.Postgres; pgCfg != nil {
-		pgPool, err = postgres.NewPool(context.Background(), pgCfg)
-		if err != nil {
-			return nil, fmt.Errorf("value-index-consumer: create postgres pool for column manifest: %w", err)
-		}
-		if err := blockpack.ApplyColumnManifestSchema(context.Background(), pgPool); err != nil {
-			pgPool.Close()
-			return nil, fmt.Errorf("value-index-consumer: apply column manifest schema: %w", err)
-		}
-		manStore = blockpack.NewPgColumnManifestStore(pgPool)
-	} else {
-		manStore = &tempoVCCStore{client: s3Client, bucket: bucket}
+	pgPool, err := postgres.NewPool(context.Background(), pgCfg)
+	if err != nil {
+		return nil, fmt.Errorf("value-index-consumer: create postgres pool for column manifest: %w", err)
 	}
+	if err := blockpack.ApplyColumnManifestSchema(context.Background(), pgPool); err != nil {
+		pgPool.Close()
+		return nil, fmt.Errorf("value-index-consumer: apply column manifest schema: %w", err)
+	}
+	manStore := blockpack.NewPgColumnManifestStore(pgPool)
 
 	vicCfg := toVICConsumerCfg(bp.ValueIndexConsumer, manStore)
 	// Expose consumer pipeline metrics on the default registry.
@@ -206,9 +206,7 @@ func (t *App) initValueIndexConsumer() (services.Service, error) {
 	var consumerCloser func()
 	rc, cerr := vicconsumer.NewRedisConsumer(vicCfg)
 	if cerr != nil {
-		if pgPool != nil {
-			pgPool.Close()
-		}
+		pgPool.Close()
 		return nil, fmt.Errorf("value-index-consumer: create redis consumer: %w", cerr)
 	}
 	consumer = rc
@@ -220,9 +218,7 @@ func (t *App) initValueIndexConsumer() (services.Service, error) {
 	svc, err := vicconsumer.NewService(vicCfg, consumer, extractor, store)
 	if err != nil {
 		consumerCloser()
-		if pgPool != nil {
-			pgPool.Close()
-		}
+		pgPool.Close()
 		return nil, fmt.Errorf("value-index-consumer: create service: %w", err)
 	}
 
@@ -230,9 +226,7 @@ func (t *App) initValueIndexConsumer() (services.Service, error) {
 		func(ctx context.Context) error { return svc.Run(ctx) },
 		func(_ error) error {
 			consumerCloser()
-			if pgPool != nil {
-				pgPool.Close()
-			}
+			pgPool.Close()
 			return nil
 		},
 	), nil
@@ -248,6 +242,19 @@ func (t *App) initValueIndexCompactor() (services.Service, error) {
 		return services.NewIdleService(nil, nil), nil
 	}
 
+	// Postgres is a hard requirement (2026-07-15) for both the cube scheduler's registry
+	// (issue #504) and the VCNT compactor's column-manifest recording (issue #507) -- there is
+	// no longer a blob-backed fallback for either. This check exists because, unlike
+	// block-builder/backend-worker/querier, this target never calls tempodb.New()/
+	// validateConfig at all (it's a standalone module with no "store" dependency), so nothing
+	// else catches a missing Postgres config before it silently degrades. VI compactor alone
+	// (vccCfg.Enabled, no cube/VCNT) doesn't need Postgres.
+	needsPostgres := (bp.CubeCompactorEnabled && len(bp.CubeTenants) > 0) || bp.ValueCountCompactor.Enabled
+	pgCfg := t.cfg.StorageConfig.Trace.Postgres
+	if needsPostgres && pgCfg == nil {
+		return nil, errors.New("value-index-compactor: postgres is not configured; required for the cube scheduler and/or value-count compactor's manifest recording")
+	}
+
 	s3Client, err := newMinioFromS3Cfg(t.cfg.StorageConfig.Trace.S3)
 	if err != nil {
 		return nil, fmt.Errorf("value-index-compactor: create S3 client: %w", err)
@@ -258,20 +265,15 @@ func (t *App) initValueIndexCompactor() (services.Service, error) {
 	exister := &tempoVCCExister{client: s3Client, bucket: bucket}
 	vcntStore := &tempoVCNTStore{store: store}
 
-	// pgPool backs the cube scheduler's registry (issue #504: Postgres is now the only
-	// supported cube registry backend, no blob/index.json fallback) and, when configured, the
-	// Postgres-backed column-manifest store (issue #507, below). Constructed whenever
-	// cfg.Postgres is configured, not just when the cube scheduler will run -- tempodb/
-	// config.go's validateConfig hard-fails at startup if CubeTenants is non-empty with
-	// cfg.Postgres == nil, so cfg.Postgres is guaranteed non-nil whenever the cube branch below
-	// is reached; widening the condition to cfg.Postgres != nil also lets the VCNT compactor's
-	// manifest recording use the Postgres-backed store even when cube itself is disabled. This
-	// is a SEPARATE pgxpool.Pool from the one tempodb.New's readerWriter owns internally (that
-	// field is unexported, and this module has no reference to the concrete *readerWriter, only
-	// the Reader/Writer/Compactor interfaces) -- mirrors modules/backendworker's own identical
-	// cfg.Postgres != nil -> postgres.NewPool pattern for the same reason.
+	// pgPool backs the cube scheduler's registry and the VCNT compactor's column-manifest store.
+	// Constructed whenever cfg.Postgres is configured (not just when needsPostgres is true above)
+	// so it's also available if an operator configures Postgres for a deployment that doesn't
+	// strictly require it yet. This is a SEPARATE pgxpool.Pool from the one tempodb.New's
+	// readerWriter owns internally (that field is unexported, and this module has no reference to
+	// the concrete *readerWriter, only the Reader/Writer/Compactor interfaces) -- mirrors
+	// modules/backendworker's own identical cfg.Postgres != nil -> postgres.NewPool pattern.
 	var pgPool *pgxpool.Pool
-	if pgCfg := t.cfg.StorageConfig.Trace.Postgres; pgCfg != nil {
+	if pgCfg != nil {
 		pgPool, err = postgres.NewPool(context.Background(), pgCfg)
 		if err != nil {
 			return nil, fmt.Errorf("value-index-compactor: create postgres pool: %w", err)
@@ -282,15 +284,13 @@ func (t *App) initValueIndexCompactor() (services.Service, error) {
 		}
 	}
 
-	// Column-manifest recording (colhashmanifest, task #216) -- see initValueIndexConsumer's
-	// identical comment for the Postgres-vs-blob decision (issue #507). The VI compactor
+	// Column-manifest recording (colhashmanifest, task #216). The VI compactor
 	// (viccompactor.Config) has no ManifestStore field; only the VCNT compactor
-	// (vcntcompactor.Config) records manifest entries.
+	// (vcntcompactor.Config) records manifest entries, and needsPostgres above already
+	// guarantees pgPool is non-nil whenever bp.ValueCountCompactor.Enabled is true.
 	var manStore manifestStore
-	if pgPool != nil {
+	if bp.ValueCountCompactor.Enabled {
 		manStore = blockpack.NewPgColumnManifestStore(pgPool)
-	} else {
-		manStore = store
 	}
 	vcntCfg := toVCNTCompactorCfg(bp.ValueCountCompactor, manStore)
 

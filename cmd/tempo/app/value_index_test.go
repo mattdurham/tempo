@@ -28,8 +28,9 @@ func (f *fakeManifestStore) Put(_ context.Context, key string, data []byte) erro
 
 // TestToVICConsumerCfg_ManifestStore confirms toVICConsumerCfg (issue #507) actually wires
 // the supplied manifestStore into vicconsumer.Config.ManifestStore, and that it is left nil
-// when the caller passes nil (the "manifest recording disabled" case initValueIndexConsumer
-// falls into when neither Postgres nor an object store is configured for it).
+// when the caller passes nil (initValueIndexConsumer itself never does this in production
+// since 2026-07-15 -- Postgres is a hard requirement -- but the pass-through is still worth
+// locking in directly).
 func TestToVICConsumerCfg_ManifestStore(t *testing.T) {
 	cfg := common.ValueIndexConsumerConfig{Enabled: true}
 
@@ -62,13 +63,4 @@ func TestToVCNTCompactorCfg_ManifestStore(t *testing.T) {
 		out := toVCNTCompactorCfg(cfg, nil)
 		assert.Nil(t, out.ManifestStore)
 	})
-}
-
-// TestTempoVCCStore_SatisfiesManifestStore locks in the structural-typing decision behind
-// issue #507's blob-backed fallback: tempoVCCStore (the existing S3-backed VI/VCNT compactor
-// object store) is used directly as the ManifestStore when no Postgres pool is configured, with
-// no wrapper type and no blockpack change. If tempoVCCStore's Get/Put signatures ever drift
-// from colhashmanifest.Store's shape, this assignment stops compiling.
-func TestTempoVCCStore_SatisfiesManifestStore(t *testing.T) {
-	var _ manifestStore = &tempoVCCStore{}
 }
