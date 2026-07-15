@@ -15,7 +15,7 @@ from `internal/modules/valueindex/SPECS.md`'s own independent `SPEC-VI-N` sequen
 module's SPECS.md numbers from 1). IDs are assigned in ascending order and never reused or
 renumbered; superseded entries are marked `[SUPERSEDED by SPEC-VI-N]` rather than deleted.
 
-Next free ID: **SPEC-VI-8**.
+Next free ID: **SPEC-VI-9**.
 
 ---
 
@@ -237,7 +237,11 @@ different column name colliding with `"trace:id"`'s hash is a cryptographic hash
 not a realistic concern, no runtime guard exists for it, and none is added by this entry.
 
 **`mergeTraceLevel` crash-safety contract (mirrors `mergeLevel`'s write-then-delete ordering,
-SPEC-VI-1):**
+SPEC-VI-1): [SUPERSEDED by SPEC-VI-8, 2026-07-14]** — steps 2, 3, and 6 below described the
+fully in-memory `valueindex.DecodeTraceGroups`/`MergeTraceGroups` implementation, replaced by a
+disk-streaming redesign (issue #500) to fix a production OOM; see SPEC-VI-8 for the current
+contract. Steps 1, 4, and 5's OBSERVABLE BEHAVIOR are unchanged (still true today) — only their
+underlying mechanism changed, per SPEC-VI-8.
 1. Sort inputs by key for deterministic ordering; `outputLevel = files[0].level + 1`.
 2. Fetch and `valueindex.DecodeTraceGroups` each input. **A decode failure on one input file is
    NOT fatal to the merge** — that one file is skipped (counted, logged via
@@ -260,14 +264,89 @@ SPEC-VI-1):**
    place preserves the option to investigate a possible producer-side bug. A `Put` failure
    leaves every input untouched (`TestMergeTraceLevel_PutFailureKeepsInputs`), identical
    ordering guarantee to `mergeLevel`.
-6. The merged output's filename embeds `[wallMinSec, wallMaxSec]` computed directly from the
-   in-memory merged `[]TraceGroup` (`traceGroupWallRange`) — `TraceGroup` files carry no footer
-   to decode a range back out of (unlike `BucketGroup`'s `DecodeBucketFooter`), mirroring
-   `valueindexconsumer`'s identical approach at flush time
+6. [SUPERSEDED by SPEC-VI-8] The merged output's filename embeds `[wallMinSec, wallMaxSec]`
+   computed directly from the in-memory merged `[]TraceGroup` (`traceGroupWallRange`) —
+   `TraceGroup` files carry no footer to decode a range back out of (unlike `BucketGroup`'s
+   `DecodeBucketFooter`), mirroring `valueindexconsumer`'s identical approach at flush time
    (`valueindexconsumer/SPECS.md` SPEC-VI-2).
 
 Back-refs: `internal/modules/valueindexcompactor/service.go:compactColumn` (dispatch site),
 `internal/modules/valueindexcompactor/traceindex_dispatch.go:isTraceIndexColDir`,
-`:mergeTraceLevel`, `:traceGroupWallRange`. See `valueindex/SPECS.md` SPEC-VI-6 (the widened
+`:mergeTraceLevel`. See `valueindex/SPECS.md` SPEC-VI-6 (the widened
 `MergeTraceGroups` this function calls) and root `SPEC.md` SPEC-ROOT-018 (the read-side
 counterpart this write-side work makes possible).
+
+---
+
+## SPEC-VI-8: `mergeTraceLevel` disk-streaming wiring contract (issue #500)
+*Added: 2026-07-14*
+
+**What changed from SPEC-VI-7's original contract.** `mergeTraceLevel` (`traceindex_dispatch.go`)
+now stages each input to local disk and decodes it one block at a time, exactly mirroring
+`mergeLevel`'s own disk-streaming wiring (SPEC-VI-1) for the sibling `BucketGroup` format,
+replacing the previous fully-in-memory `valueindex.DecodeTraceGroups` +
+`valueindex.MergeTraceGroups` call sequence (SPEC-VI-7 steps 2/3/6, now superseded). This fixes a
+confirmed production OOM (`value-index-compactor` pods, `tempo-dev-test-03`, fleet-wide
+`OOMKilled`/exit 137/self-reinforcing crash loop as the uncompacted backlog grows) once a
+tenant/column's TraceGroup backlog gets large — the same failure class SPEC-VI-1's own
+BucketGroup fix (NOTE-VI-046) addressed for that format two months earlier.
+
+**Per-input flow (replaces SPEC-VI-7 step 2):** for each input file, `s.store.Get` (unchanged,
+still exactly once per input) → `writeLocalTempInput(os.TempDir(), data)` (the SAME
+format-agnostic helper `mergeLevel` already uses, `diskstage.go`, reused as-is, no changes) →
+`valueindex.NewDiskTraceGroupFileIterator(ctx, tmpPath, checker)`. Three outcomes, matching
+`mergeLevel`'s own `NewDiskBucketFileIterator` handling for the first two, but DIVERGING for the
+third (deliberately preserving `mergeTraceLevel`'s own pre-existing corrupt-file policy — see
+`valueindex/NOTES.md` NOTE-VI-109 for the full rationale):
+
+1. **Success** (`it != nil, err == nil`): appended to both the iterator list and the
+   post-merge delete-candidate list (`validFiles`).
+2. **Bad magic** (`it == nil, err == nil`): not a v2 "VTG2" file at all. The staged local temp
+   input is removed; the file is counted (`compactorOpDecode`), logged via `slog.Warn`, and
+   excluded from BOTH the iterator list and `validFiles` — left in place on the store, never
+   deleted. There is no longer a "known-legacy, safe-to-delete" case for this format (the v1
+   flat-blob rollover window has closed, NOTE-VI-079) — unlike `mergeLevel`'s BucketGroup
+   sibling, where an analogous bad-magic file IS still deleted (it is unconditionally included
+   in `mergeLevel`'s own unfiltered final delete loop over the original `files` list).
+3. **Genuine decode error** (`it == nil, err != nil` — a corrupt footer/string-table/
+   block-directory): same skip-not-delete treatment as case 2. This is the one point where
+   `mergeTraceLevel` genuinely diverges from `mergeLevel`'s posture: `mergeLevel` treats the
+   analogous `NewDiskBucketFileIterator` error as FATAL, aborting the whole merge
+   (`return fmt.Errorf(...)`); `mergeTraceLevel` does not, preserving its own pre-existing policy
+   (this same behavior, unchanged, previously applied to a `DecodeTraceGroups` failure under
+   SPEC-VI-7 step 2).
+
+**Merge (replaces SPEC-VI-7 step 3):** `valueindex.StreamCompactTraceGroups(ctx, iterators, 0,
+s.cfg.MaxOutputBytes, tmpDir, output)` — the heap-based k-way streaming merge
+(`valueindex/SPECS.md` SPEC-VI-15) replaces the single in-memory `MergeTraceGroups` call.
+`tmpDir` is a single local variable (`tmpDir := os.TempDir()`) shared with the input-staging
+`writeLocalTempInput(tmpDir, data)` calls above, rather than each call site hardcoding
+`os.TempDir()` independently — see `valueindexcompactor/NOTES.md` NOTE-VI-110 for why this
+matters (deploy-side disk provisioning for this StatefulSet is a separate, ongoing infra
+decision; this keeps the code ready for whichever mount path that decision lands on, without a
+second code change). `output` reads the local temp output file, decodes ONLY its fixed-size
+footer (`valueindex.DecodeTraceFooter`) for the `[wallMinSec, wallMaxSec]` range (replaces
+SPEC-VI-7 step 6's `traceGroupWallRange` computed from an in-memory `[]TraceGroup` — the
+streaming path never holds the full merged set in memory to compute that range from), formats a
+V2 filename, and `Put`s to the store — mirroring `mergeLevel`'s NOTE-VI-037 pattern exactly,
+avoiding a second full decode of the just-written output.
+
+**Zero-output guard and write-then-delete ordering (SPEC-VI-7 steps 4/5, OBSERVABLE BEHAVIOR
+UNCHANGED, still true):** `StreamCompactTraceGroups` itself never calls `output` when there is
+nothing to emit, so the zero-output guard falls out of the streaming primitive's own contract
+rather than an explicit `len(merged) == 0` check. Write-then-delete ordering is unchanged: only
+`validFiles` (case 1 above) are deleted, only after a successful `StreamCompactTraceGroups` call.
+
+**Retention stats are now real, not always `(0, 0)`.** Every iterator implements the existing
+`StatsProvider` interface (`valueindex/stream_compaction.go`, reused unmodified); `mergeTraceLevel`
+aggregates `Retained`/`Dropped` across all iterators post-merge, identical to `mergeLevel`'s own
+pattern (SPEC-VI-7's predecessor implementation always reported `(0, 0)` since the in-memory
+`MergeTraceGroups` call never returned per-file counts — a real observability improvement, not
+just a refactor).
+
+Back-refs: `internal/modules/valueindexcompactor/traceindex_dispatch.go:mergeTraceLevel`. See
+`valueindex/SPECS.md` SPEC-VI-14/SPEC-VI-15 (the new disk iterator and streaming merge this
+wires up) and `valueindex/NOTES.md` NOTE-VI-109 (the full design-decision writeup, including the
+deliberate corrupt-file-handling divergence from `mergeLevel`) and this package's own
+NOTE-VI-110 (the caller-side wiring change, mutation-test record, and deploy-side ephemeral disk
+change).

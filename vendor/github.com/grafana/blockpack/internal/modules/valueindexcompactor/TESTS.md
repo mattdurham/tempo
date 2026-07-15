@@ -11,7 +11,7 @@ SPEC-ROOT-009 — distinct from the `NOTE-VI-N` numbering in `NOTES.md`, and ind
 `internal/modules/valueindex/TESTS.md`'s own `TEST-VI-N` sequence — each module's TESTS.md
 numbers from 1). IDs are assigned in ascending order and never reused or renumbered.
 
-Next free ID: **TEST-VI-20**.
+Next free ID: **TEST-VI-21**.
 
 ---
 
@@ -497,3 +497,41 @@ input keys, runs `RunOnce`.
 **Spec invariants tested:** SPEC-VI-7 point 2 (hard Get failure vs. decode failure distinction).
 
 Back-ref: `internal/modules/valueindexcompactor/traceindex_dispatch_test.go:TestMergeTraceLevel_GetErrorAbortsMerge`.
+
+---
+
+## TEST-VI-20: `mergeTraceLevel`'s disk-streaming wiring preserves every pre-existing behavioral contract (issue #500)
+*Added: 2026-07-14*
+
+**Scenario:** all seven pre-existing `mergeTraceLevel` tests (TEST-VI-13 through TEST-VI-19,
+`traceindex_dispatch_test.go`) continue to pass unchanged against the disk-streaming rewrite
+(SPEC-VI-8) — proving the crash-safety, retention-filtering, corrupt-file-skip, and
+`CompactMaxInputFiles`-capping contracts are all observably identical to the pre-rewrite
+implementation, with only the underlying decode/merge mechanism changed.
+
+**New tests added for the disk-staging mechanism itself, mirroring `diskstage_test.go`'s and
+`mergelevel_crash_test.go`'s BucketGroup-side coverage:**
+
+- `TestMergeTraceLevel_LocalDiskWriteFailureLeavesS3Untouched`
+  (`mergetracelevel_diskstage_test.go`): a local disk write failure (`TMPDIR` pointed at a
+  non-existent directory) aborts the merge with no `Put`/`Delete` calls and every input surviving
+  for retry.
+- `TestMergeTraceLevel_GetPutCallCountsUnchanged`: `s.store.Get` is called exactly once per input
+  file and `s.store.Put` exactly once for the single merged output — the local-disk staging this
+  task introduces is local I/O only and adds/removes no remote object-store calls.
+- `TestMergeTraceLevel_PutFailureLeavesNoTempFiles`: a `Put` failure surfacing from inside
+  `StreamCompactTraceGroups`' output callback leaks no local `vi-merge-*.tmp` files (neither the
+  per-input staged files nor the per-output merge-result file), on top of leaving every input
+  untouched (already covered by `TestMergeTraceLevel_PutFailureKeepsInputs`).
+- `TestMergeTraceLevel_MemoryBoundedRegardlessOfInputCount`
+  (`valueindex/stream_trace_compaction_scaling_test.go` — lives in the `valueindex` package, not
+  here, since it needs `encodeTraceGroups`'s unexported small-block-size test knob; see
+  TEST-VI-25 in that package's `TESTS.md`): the memory-boundedness proof for this task, exercised
+  through the real `mergeTraceLevel`-equivalent `StreamCompactTraceGroups` entry point.
+
+**Spec invariants tested:** SPEC-VI-8 (the new disk-streaming wiring contract), SPEC-VI-1's
+crash-safety ordering (mirrored for this format), TEST-VI-13 through TEST-VI-19 (unchanged
+contracts, re-verified).
+
+Back-refs: `internal/modules/valueindexcompactor/mergetracelevel_diskstage_test.go`,
+`internal/modules/valueindexcompactor/traceindex_dispatch_test.go` (pre-existing, unchanged).

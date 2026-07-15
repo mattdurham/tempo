@@ -1821,3 +1821,88 @@ Back-refs: `internal/modules/colhashmanifest` (the shared registry — see its o
 NOTES.md for the full contract), `internal/modules/valueindexconsumer/NOTES.md` NOTE-VI-106
 (the actual VI-side call site and hook rationale), `internal/modules/valuecounts/NOTES.md`
 NOTE-VC-020 (VCNT's symmetric cross-reference entry), `hash.go:ColHash`.
+
+## NOTE-VI-109 — Disk-streaming TraceGroup compaction: `diskTraceGroupFileIterator` + `StreamCompactTraceGroups` (issue #500)
+
+Date: 2026-07-14
+
+**The problem.** `valueindexcompactor.mergeTraceLevel` OOM'd `value-index-compactor` pods on
+`tempo-dev-test-03` (fleet-wide `OOMKilled`, exit 137, self-reinforcing crash loop as the
+uncompacted-file backlog grows) because it loaded every same-level TraceGroup file fully into
+memory (`valueindex.DecodeTraceGroups`) before calling the map-based, whole-input-in-memory
+`MergeTraceGroups`. The sibling BucketGroup path already solved this exact problem (NOTE-VI-046/
+NOTE-VI-052/NOTE-VI-077, `disk_iterator.go` + `stream_compaction.go`); this note documents
+mirroring that design for the TraceGroup ("VTG2") format.
+
+**What was built.** `disk_trace_iterator.go`'s `diskTraceGroupFileIterator` /
+`NewDiskTraceGroupFileIterator` — a lazy, block-at-a-time iterator staged on local disk, eagerly
+decoding only footer/string-table/block-directory at construction, then one block's groups at a
+time on `Advance` — plus `stream_trace_compaction.go`'s `StreamCompactTraceGroups` — a heap-based
+k-way merge across N such iterators, streaming merged output to a local temp file block-by-block.
+Both mirror their BucketGroup counterparts' architecture, ownership/cleanup contracts, and coding
+conventions closely; see SPEC-VI-14/SPEC-VI-15 for the binding contracts and the two REAL,
+documented differences (`TraceGroupIterator` is a distinct interface from `GroupIterator`, and
+`collectTraceContributionsAtKey` is a single combined phase, not `stream_compaction.go`'s
+two-phase collect/advance split) — both differences are consequences of `TraceGroup`'s merge key
+(`TraceID` alone) being coarser than each input file's own per-group uniqueness key, unlike
+`BucketGroup`'s `(TimeSec, CanonicalValue)` key which is both at once.
+
+**`traceindex.go` was not modified.** `encodeTraceBlock`, `traceBlockTimeRange`,
+`EncodeStringTable`, and `appendTraceBlockIndex` are all reused directly by the new streaming
+output writer; only the footer-byte-layout assembly (`writeTraceFileTail`) was newly written
+(mirroring `encodeTraceGroups`'s own footer bytes exactly, verified by the equivalence test) —
+avoiding any risk to `EncodeTraceGroups`' own existing byte-for-byte test coverage. The existing
+in-memory `MergeTraceGroups` function is unchanged and still used directly by other/small-input
+callers; `StreamCompactTraceGroups` is a new, additive alternative, not a replacement of it.
+
+**Behavioral deviation from the BucketGroup path's error-handling posture, deliberately
+preserved from `mergeTraceLevel`'s own pre-existing contract.** `mergeLevel`
+(`valueindexcompactor/service.go`) treats any `NewDiskBucketFileIterator` error (beyond the
+`(nil, nil)` legacy-skip case) as fatal, aborting the WHOLE merge. `mergeTraceLevel` does NOT
+mirror this: it treats a `NewDiskTraceGroupFileIterator` error the same way its OWN pre-existing
+code already treated a `DecodeTraceGroups` failure — skip this one file (leave it in place, do
+NOT delete it), continue merging the rest. This is `mergeTraceLevel`'s own long-standing,
+intentional policy (its doc comment already documented "a corrupt file is deliberately left in
+place rather than deleted... retrying can't fix a genuinely malformed payload"), preserved
+unchanged by this task, not a new choice introduced here.
+
+**A genuinely new failure mode this task's streaming redesign introduces, accepted as a
+trade-off (same one the BucketGroup path already accepted).** The old, atomic `DecodeTraceGroups`
+call meant a file's corruption was ALWAYS caught upfront, before any merge work began. The new
+lazy, block-at-a-time decode only catches whole-file-level corruption (bad footer/string-table/
+block-directory, or a corrupt first block) at construction time — the same timing as before.
+Corruption in a LATER block (block index > 0) is now only discovered lazily, mid-merge, via
+`Advance`; when that happens, `StreamCompactTraceGroups`' generic k-way-merge error propagation
+(inherited for free from mirroring `stream_compaction.go`'s architecture) aborts the WHOLE merge,
+not just that one file — a strictly rarer, but real, difference from the old per-file-atomic
+skip. This exactly mirrors the trade-off the BucketGroup path's own streaming redesign already
+made and shipped with (NOTE-VI-052); no special-casing was added to avoid it here either.
+
+**Mutation testing performed (per this project's `feedback_mutation_test_review.md`
+convention).** Two deliberate bugs were introduced, confirmed to fail the relevant test, then
+reverted:
+
+1. Span dedup: changed `mergeTraceGroupsAtKey`'s `if _, dup := seenSpan[s.SpanID]; dup { continue
+   }` to unconditionally append every span (removing the dedup check, while still populating
+   `seenSpan` so the variable stays used) —
+   `TestStreamCompactTraceGroups_MatchesMergeTraceGroups` failed (span count 4 vs. expected 3;
+   diff showed the duplicate `SpanID(1)` span from the losing input surviving alongside the
+   winning one). Reverted; test passes again.
+2. Block-boundary cutting: changed `traceStreamWriter.add`'s flush trigger from `len(w.pending)
+   >= w.groupsPerBlock` to `len(w.pending) > w.groupsPerBlock` (an off-by-one on the block-cut
+   threshold) — `TestStreamCompactTraceGroups_GroupsPerBlockCutting` failed (2 blocks written
+   instead of the expected `ceil(5/2)=3`). Reverted; test passes again.
+   (An initial attempt at a different rotation-related mutation — removing the `blockCut &&`
+   guard from the `maxOutputBytes` rotation check so it evaluates on every merged key, not only
+   right after a block is cut — was tried first and found NOT to be caught by any existing test:
+   `finalizeTraceOutputFile` always flushes `pending` before finalizing, so evaluating the
+   rotation check more eagerly does not by itself corrupt or lose any data with this
+   implementation, only changes how eagerly a rotation boundary can land. This was a genuinely
+   untested claim in an earlier draft of this note and has been corrected here rather than left
+   as an unverified assertion.)
+
+Back-refs: `internal/modules/valueindex/disk_trace_iterator.go`,
+`internal/modules/valueindex/stream_trace_compaction.go`,
+`internal/modules/valueindexcompactor/traceindex_dispatch.go:mergeTraceLevel` (NOTE-VI-110, the
+caller-side wiring). See SPEC-VI-14/SPEC-VI-15 (`SPECS.md`) and TEST-VI-23/24/25 (`TESTS.md`).
+Issue #500.

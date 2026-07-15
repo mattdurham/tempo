@@ -15,6 +15,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"path"
 	"sort"
 
@@ -35,27 +36,32 @@ func isTraceIndexColDir(colDir string) bool {
 }
 
 // mergeTraceLevel reads all TraceGroup files at one level, merges + dedups +
-// retention-filters them via valueindex.MergeTraceGroups, writes the merged
-// output at level+1, then deletes only the inputs it successfully decoded and
-// incorporated. Mirrors mergeLevel's write-then-delete crash-safety ordering.
+// retention-filters them via valueindex.StreamCompactTraceGroups, writes the
+// merged output at level+1, then deletes only the inputs it successfully
+// decoded and incorporated. Mirrors mergeLevel's write-then-delete
+// crash-safety ordering and its disk-streaming input-staging design
+// (NOTE-VI-109, issue #500): inputs are staged to local disk one at a time as
+// they are fetched, and each input's decoded representation is bounded to one
+// block at a time via a disk-backed lazy iterator
+// (valueindex.NewDiskTraceGroupFileIterator) -- peak decoded memory is bounded
+// by the number of concurrently-open iterators times one block, not by the
+// number or total size of input files. This replaces the prior fully
+// in-memory MergeTraceGroups call site (still used directly by other/small-
+// input callers; see NOTE-VI-109).
 //
-// Scope boundary (plan.md Stage 3, brainstorm Key Decision): MergeTraceGroups
-// is in-memory only for v1 -- no disk-streaming k-way-merge iterator for
-// TraceGroup files, unlike the BucketGroup path's StreamCompactBucketFiles.
-// TraceGroup files are expected to stay far smaller than BucketGroup files
-// (compact per-trace pointers vs. full value postings); revisit only if
-// post-deployment telemetry shows otherwise.
-//
-// A file that fails valueindex.DecodeTraceGroups is skipped, not treated as
-// fatal -- the merge proceeds with the remaining valid files. Unlike a
-// successfully-decoded file (always deleted once incorporated, even if every
-// span it carried was later dropped by retention), a corrupt file is
+// A file that fails to construct a valid iterator (bad magic, or a genuine
+// decode error in its footer/string table/block directory) is skipped, not
+// treated as fatal -- the merge proceeds with the remaining valid files.
+// Unlike a successfully-decoded file (always deleted once incorporated, even
+// if every span it carried was later dropped by retention), such a file is
 // deliberately left in place rather than deleted: retrying can't fix a
 // genuinely malformed payload, but deleting it would destroy the only copy of
 // data that might be recoverable, or might reveal a producer-side bug worth
 // investigating. It simply sits at its level, excluded from future batches
 // once the level's file count drops below CompactThresholdFiles, without
-// blocking progress on the rest of the column.
+// blocking progress on the rest of the column. A hard valueindexcompactor.IndexStore.Get
+// failure (as opposed to a decode failure) is fatal and aborts the whole merge, matching
+// mergeLevel's own Get-failure posture.
 func (s *Service) mergeTraceLevel(ctx context.Context, colDir string, files []levelFile) error {
 	mergeStart := s.now()
 
@@ -67,9 +73,24 @@ func (s *Service) mergeTraceLevel(ctx context.Context, colDir string, files []le
 		checker = newCachingRefChecker(s.exister)
 	}
 
-	allGroups := make([][]valueindex.TraceGroup, 0, len(files))
+	// tmpDir is the single source of truth for where this merge stages local files, threaded
+	// into both the input-side writeLocalTempInput calls below and the output-side
+	// StreamCompactTraceGroups call -- os.TempDir() today, but kept as one local variable
+	// (rather than each call site independently hardcoding os.TempDir()) so it is trivially
+	// swappable for a config-driven mount path once one exists (deploy-side disk provisioning
+	// for value-index-compactor, e.g. a PVC via volumeClaimTemplate, is being handled
+	// separately -- an emptyDir is unsafe here given this StatefulSet's 20 replicas can be
+	// co-scheduled on the same nodes).
+	tmpDir := os.TempDir()
+
+	iterators := make([]valueindex.TraceGroupIterator, 0, len(files))
 	validFiles := make([]levelFile, 0, len(files))
 	var corrupted int
+	defer func() {
+		for _, it := range iterators {
+			_ = it.Close()
+		}
+	}()
 	for _, f := range files {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -79,44 +100,79 @@ func (s *Service) mergeTraceLevel(ctx context.Context, colDir string, files []le
 			s.metrics.incError(compactorOpGet)
 			return fmt.Errorf("valueindexcompactor: get %q: %w", f.key, err)
 		}
-		groups, derr := valueindex.DecodeTraceGroups(data)
-		if derr != nil {
+		tmpPath, err := writeLocalTempInput(tmpDir, data)
+		if err != nil {
+			return fmt.Errorf("valueindexcompactor: stage %q locally: %w", f.key, err)
+		}
+		it, ierr := valueindex.NewDiskTraceGroupFileIterator(ctx, tmpPath, checker)
+		if ierr != nil {
+			// A genuinely corrupt trace-index file (footer/string-table/block-directory
+			// decode failure) is skipped, not fatal -- mergeTraceLevel's own long-standing
+			// contract (unlike mergeLevel's BucketGroup sibling, which treats the analogous
+			// NewDiskBucketFileIterator error as aborting the whole merge): retrying can't fix
+			// a genuinely malformed payload, so the file is left in place for investigation.
+			_ = os.Remove(tmpPath)
 			corrupted++
 			s.metrics.incError(compactorOpDecode)
-			slog.Warn("valueindexcompactor: skipping corrupt trace index input",
-				"key", f.key, "err", derr)
+			slog.Warn("valueindexcompactor: skipping corrupt trace index input", "key", f.key, "err", ierr)
 			continue
 		}
-		allGroups = append(allGroups, groups)
+		if it == nil {
+			// Bad magic -- not a v2 "VTG2" file at all. Same skip-not-delete treatment as a
+			// genuine decode error: the v1 flat-blob rollover window has closed (NOTE-VI-079),
+			// so there is no longer a "safe to discard, known-legacy" case for this format.
+			_ = os.Remove(tmpPath)
+			corrupted++
+			s.metrics.incError(compactorOpDecode)
+			slog.Warn("valueindexcompactor: skipping non-v2 trace index input", "key", f.key)
+			continue
+		}
+		iterators = append(iterators, it)
 		validFiles = append(validFiles, f)
 	}
 
-	merged, err := valueindex.MergeTraceGroups(ctx, checker, allGroups...)
+	var written int
+	err := valueindex.StreamCompactTraceGroups(ctx, iterators, 0, s.cfg.MaxOutputBytes, tmpDir, func(outPath string) error {
+		//nolint:gosec // G304: outPath is StreamCompactTraceGroups' own local temp output file, not user input
+		data, rerr := os.ReadFile(outPath)
+		if rerr != nil {
+			return fmt.Errorf("valueindexcompactor: read local output %q: %w", outPath, rerr)
+		}
+		// Footer-only decode for the wall-clock time range -- mirrors mergeLevel's
+		// NOTE-VI-037 use of the BucketGroup footer, avoiding a second full decode of the
+		// just-written output.
+		var wallMinSec, wallMaxSec uint64
+		if ft, ferr := valueindex.DecodeTraceFooter(data); ferr == nil {
+			wallMinSec, wallMaxSec = ft.MinTimeSec, ft.MaxTimeSec
+		}
+		key := path.Join(colDir, valueindex.FormatFilenameV2(outputLevel, wallMinSec, wallMaxSec, valueindex.NewID()))
+		if perr := s.store.Put(ctx, key, data); perr != nil {
+			s.metrics.incError(compactorOpPut)
+			return fmt.Errorf("valueindexcompactor: put %q: %w", key, perr)
+		}
+		written++
+		return nil
+	})
 	if err != nil {
-		s.metrics.incError(compactorOpGet)
 		return fmt.Errorf("valueindexcompactor: merge trace groups %q: %w", colDir, err)
 	}
 
-	var written int
-	if len(merged) > 0 {
-		data, eerr := valueindex.EncodeTraceGroups(merged)
-		if eerr != nil {
-			s.metrics.incError(compactorOpPut)
-			return fmt.Errorf("valueindexcompactor: encode trace groups %q: %w", colDir, eerr)
+	// Every iterator is fully drained by a successful StreamCompactTraceGroups call, so each
+	// disk-backed iterator's cumulative per-file retention stats now reflect a complete total
+	// -- mirrors mergeLevel's identical post-hoc StatsProvider aggregation.
+	var stats valueindex.CompactStats
+	for _, it := range iterators {
+		if sp, ok := it.(valueindex.StatsProvider); ok {
+			fstats := sp.Stats()
+			stats.Retained += fstats.Retained
+			stats.Dropped += fstats.Dropped
 		}
-		wallMinSec, wallMaxSec := traceGroupWallRange(merged)
-		key := path.Join(colDir, valueindex.FormatFilenameV2(outputLevel, wallMinSec, wallMaxSec, valueindex.NewID()))
-		if err := s.store.Put(ctx, key, data); err != nil {
-			s.metrics.incError(compactorOpPut)
-			return fmt.Errorf("valueindexcompactor: put %q: %w", key, err)
-		}
-		written = 1
 	}
 
 	// Delete only the inputs that were successfully decoded and incorporated
 	// into the merge -- write-then-delete crash safety, identical ordering
-	// guarantee to mergeLevel. Corrupt files (see doc comment above) are left
-	// in place.
+	// guarantee to mergeLevel. Corrupt/non-v2 files (see doc comment above) are
+	// left in place.
 	var firstErr error
 	var deleted int
 	for _, f := range validFiles {
@@ -131,27 +187,9 @@ func (s *Service) mergeTraceLevel(ctx context.Context, colDir string, files []le
 	}
 
 	s.metrics.observeMerge(s.now().Sub(mergeStart))
-	s.metrics.addMergeCounts(len(validFiles), written, deleted, 0, 0)
+	s.metrics.addMergeCounts(len(validFiles), written, deleted, stats.Retained, stats.Dropped)
 	if corrupted > 0 {
 		s.metrics.incSkipped(corrupted)
 	}
 	return firstErr
-}
-
-// traceGroupWallRange returns the min/max TimeSec across groups, embedded in
-// the merged output's filename (mirrors mergeLevel's NOTE-VI-037 use of the
-// BucketGroup footer's MinTimeSec/MaxTimeSec) so DiscoverIndexFiles can prune
-// compacted trace-index files by time. TraceGroup files carry no footer
-// (Finding 2), so the range is computed directly from the in-memory groups.
-func traceGroupWallRange(groups []valueindex.TraceGroup) (minSec, maxSec uint64) {
-	for i := range groups {
-		t := groups[i].TimeSec
-		if i == 0 || t < minSec {
-			minSec = t
-		}
-		if i == 0 || t > maxSec {
-			maxSec = t
-		}
-	}
-	return minSec, maxSec
 }

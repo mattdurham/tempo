@@ -337,6 +337,13 @@ func assembleBucketFileBytes(body []byte, dir []BlockDirEntry, table *StringTabl
 // begins). assembleBucketFileBytes itself is not modified — this is a new sibling function,
 // since assembleBucketFileBytes has an existing, unrelated caller (EncodeBucketFile) outside
 // this task's scope.
+//
+// TraceGroup format; different magic/footer-size constants and block-index encoders (this
+// format's BucketFileMagic/bucketFooterSize/appendBlockIndex vs. the sibling's
+// TraceFileMagic/traceFooterSize/appendTraceBlockIndex) prevent sharing without adding an
+// abstraction layer that serves only these two call sites.
+//
+//nolint:dupl // intentional mirror of writeTraceFileTail (stream_trace_compaction.go) for the
 func writeBucketFileTail(
 	bw *bufio.Writer,
 	dir []BlockDirEntry,

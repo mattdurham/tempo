@@ -6,7 +6,8 @@
 #   ./deploy-blockpack.sh                   # auto-increments from current deployed revision
 #
 # Rolls: block-builder (statefulset), backend-worker (statefulset), querier (deployment),
-#        query-frontend (deployment), live-store-zone-a/b (statefulset)
+#        query-frontend (deployment), live-store-zone-a/b (statefulset),
+#        value-index-compactor (statefulset)
 
 set -euo pipefail
 
@@ -107,6 +108,10 @@ kubectl set image statefulset/live-store-zone-b -n "$NAMESPACE" "live-store=${IM
 kubectl rollout restart statefulset/live-store-zone-a -n "$NAMESPACE"
 kubectl rollout restart statefulset/live-store-zone-b -n "$NAMESPACE"
 
+echo "--- Updating value-index-compactor ---"
+kubectl set image statefulset/value-index-compactor -n "$NAMESPACE" "value-index-compactor=${IMAGE}"
+kubectl rollout restart statefulset/value-index-compactor -n "$NAMESPACE"
+
 # Wait for readiness
 echo "--- Waiting for pods to be ready ---"
 kubectl wait --for=condition=Ready pod/block-builder-0 -n "$NAMESPACE" --timeout=120s
@@ -115,12 +120,18 @@ kubectl rollout status deployment/querier -n "$NAMESPACE" --timeout=120s
 kubectl rollout status deployment/query-frontend -n "$NAMESPACE" --timeout=120s
 kubectl wait --for=condition=Ready pod/live-store-zone-a-0 -n "$NAMESPACE" --timeout=120s
 kubectl wait --for=condition=Ready pod/live-store-zone-b-0 -n "$NAMESPACE" --timeout=120s
+# value-index-compactor has 20 replicas and is already known to be crash-looping (OOMKilled) --
+# don't block the whole deploy on full-fleet readiness; just confirm pod-0 comes up on the new
+# image so the rollout itself is verified, and let the caller inspect fleet health separately.
+kubectl wait --for=condition=Ready pod/value-index-compactor-0 -n "$NAMESPACE" --timeout=120s || \
+    echo "    WARNING: value-index-compactor-0 not Ready within 120s -- check fleet health separately"
 
 echo ""
 echo "==> Deploy complete: ${IMAGE}"
-echo "    block-builder:   $(kubectl get pod block-builder-0 -n $NAMESPACE -o jsonpath='{.spec.containers[0].image}')"
-echo "    backend-worker:  $(kubectl get pod backend-worker-0 -n $NAMESPACE -o jsonpath='{.spec.containers[0].image}')"
-echo "    querier:         $(kubectl get deployment querier -n $NAMESPACE -o jsonpath='{.spec.template.spec.containers[0].image}')"
-echo "    query-frontend:  $(kubectl get deployment query-frontend -n $NAMESPACE -o jsonpath='{.spec.template.spec.containers[0].image}')"
-echo "    live-store-a:    $(kubectl get pod live-store-zone-a-0 -n $NAMESPACE -o jsonpath='{.spec.containers[0].image}')"
-echo "    live-store-b:    $(kubectl get pod live-store-zone-b-0 -n $NAMESPACE -o jsonpath='{.spec.containers[0].image}')"
+echo "    block-builder:        $(kubectl get pod block-builder-0 -n $NAMESPACE -o jsonpath='{.spec.containers[0].image}')"
+echo "    backend-worker:       $(kubectl get pod backend-worker-0 -n $NAMESPACE -o jsonpath='{.spec.containers[0].image}')"
+echo "    querier:              $(kubectl get deployment querier -n $NAMESPACE -o jsonpath='{.spec.template.spec.containers[0].image}')"
+echo "    query-frontend:       $(kubectl get deployment query-frontend -n $NAMESPACE -o jsonpath='{.spec.template.spec.containers[0].image}')"
+echo "    live-store-a:         $(kubectl get pod live-store-zone-a-0 -n $NAMESPACE -o jsonpath='{.spec.containers[0].image}')"
+echo "    live-store-b:         $(kubectl get pod live-store-zone-b-0 -n $NAMESPACE -o jsonpath='{.spec.containers[0].image}')"
+echo "    value-index-compactor: $(kubectl get statefulset value-index-compactor -n $NAMESPACE -o jsonpath='{.spec.template.spec.containers[0].image}') ($(kubectl get pods -n $NAMESPACE -l app=value-index-compactor --no-headers 2>/dev/null | grep -c Running || echo '?')/$(kubectl get statefulset value-index-compactor -n $NAMESPACE -o jsonpath='{.spec.replicas}') Running)"

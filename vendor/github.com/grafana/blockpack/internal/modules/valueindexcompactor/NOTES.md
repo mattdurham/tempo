@@ -624,3 +624,57 @@ than left in place. NOTE-VI-095 (`valueindex/NOTES.md`, the filename-suffix-vali
 is unaffected and remains in place as its own independent defense-in-depth layer.
 
 Back-ref: `internal/modules/valueindexcompactor/service.go:buildWorkList`.
+
+## NOTE-VI-110 — `mergeTraceLevel` rewired onto the disk-streaming TraceGroup path (issue #500, 2026-07-14)
+
+`mergeTraceLevel` (`traceindex_dispatch.go`) previously loaded every same-level TraceGroup file
+fully into memory (`valueindex.DecodeTraceGroups`) before calling the map-based, whole-input
+`valueindex.MergeTraceGroups`. This OOM'd `value-index-compactor` pods on `tempo-dev-test-03`
+(fleet-wide `OOMKilled`, exit 137, self-reinforcing crash loop as the uncompacted backlog grows)
+once a tenant/column's TraceGroup backlog got large — the exact same failure class NOTE-VI-046/
+NOTE-VI-052 already fixed for the sibling `BucketGroup` path two months earlier. It is now wired
+onto `valueindex.NewDiskTraceGroupFileIterator` + `valueindex.StreamCompactTraceGroups`
+(`valueindex/NOTES.md` NOTE-VI-109), mirroring `mergeLevel`'s own disk-streaming wiring
+(NOTE-VI-052) almost exactly. See SPEC-VI-8 (`SPECS.md`) for the full binding contract, including
+the one deliberate, documented divergence from `mergeLevel`'s posture: a genuine
+`NewDiskTraceGroupFileIterator` decode error is skipped (file left in place, not deleted),
+not fatal — preserving `mergeTraceLevel`'s own pre-existing corrupt-file policy rather than
+adopting `mergeLevel`'s BucketGroup-side "abort the whole merge" posture.
+
+**Mutation testing performed** (per this project's `feedback_mutation_test_review.md`
+convention — reintroduce the exact bug a test claims to catch, confirm it fails, then revert):
+the two mutations are on the shared `valueindex` package code this function now calls
+(`mergeTraceGroupsAtKey`'s span dedup, and `traceStreamWriter.add`'s block-cutting threshold) —
+see `valueindex/NOTES.md` NOTE-VI-109 for the specific bugs introduced, the tests that caught
+them, and confirmation both were reverted. A third mutation specific to THIS package's own
+wiring was also performed: commenting out the `it == nil` bad-magic skip branch's `continue`
+(making a bad-magic file fall through into `iterators`/`validFiles` as if it had constructed
+successfully) — `TestMergeTraceLevel_CorruptInputSkippedNotAborted` failed (asserts the corrupt
+key remains un-deleted; with the mutation it was deleted instead, since it would incorrectly
+enter `validFiles`). Reverted; test passes again.
+
+**Deploy-side disk provisioning is deliberately NOT handled by a code-side `deploy-blockpack.sh`
+change.** `value-index-compactor` has zero writable volumes today (confirmed live: only a
+read-only `config` ConfigMap mount), so `os.CreateTemp`/`os.TempDir()`'s default currently
+resolves onto the container's tiny default root-filesystem writable layer — wrong for a fix
+whose whole point is staging potentially large (tens/hundreds of MB to GB) temp files for a big
+backlog. An `emptyDir` patch (mirroring the pre-existing querier `blockpack-cache` pattern) was
+tried first and rejected by team-lead review: `emptyDir` is backed by node-local disk, and with
+`value-index-compactor` running 20 replicas potentially co-scheduled on the same nodes, that
+risks overwhelming node disk capacity fleet-wide — a hard no for this cluster, not specific to
+this StatefulSet. The actual provisioning mechanism (likely a PVC via `volumeClaimTemplate`,
+which needs different handling than a strategic-merge patch since `volumeClaimTemplates` are
+immutable after StatefulSet creation) is being worked out separately, as an infra decision, not
+baked into this package's code.
+
+**What this package's code does instead: thread a `tmpDir` parameter, don't hardcode a path.**
+Both `mergeTraceLevel`'s input-side staging (`writeLocalTempInput`, pre-existing, already took a
+`dir` parameter) and the new output-side `valueindex.StreamCompactTraceGroups` call (which
+gained a `tmpDir` parameter for exactly this reason, see `valueindex/SPECS.md` SPEC-VI-15) are
+driven from one local `tmpDir := os.TempDir()` variable in `mergeTraceLevel` — `os.TempDir()`
+today, but a single call site to swap out once a real mount path is decided, rather than needing
+to hunt down every `os.CreateTemp`/`os.TempDir()` call independently.
+
+Back-refs: `internal/modules/valueindexcompactor/traceindex_dispatch.go:mergeTraceLevel`. See
+`valueindex/NOTES.md` NOTE-VI-109 and this package's own SPEC-VI-8 (`SPECS.md`), TEST-VI-20
+(`TESTS.md`). Issue #500.

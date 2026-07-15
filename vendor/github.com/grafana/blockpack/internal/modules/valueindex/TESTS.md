@@ -10,7 +10,7 @@ Entries in this file use the module-local, sequential prefix `TEST-VI-N` (file-s
 SPEC-ROOT-009 — distinct from the `NOTE-VI-N` numbering in `NOTES.md`). IDs are assigned in
 ascending order and never reused or renumbered.
 
-Next free ID: **TEST-VI-23**.
+Next free ID: **TEST-VI-26**.
 
 ---
 
@@ -592,3 +592,72 @@ comparators, with no additional or missing flooring logic introduced by the rang
 **Assertion:** the feature under test produces the expected non-empty match set from realistically-written data — specifically exercising at least one ORDINARY attribute-column predicate (not only the `span:id`/`trace:id` sentinel columns), since those are the columns where `SpanID` is unpopulated and any accidental SpanID-keyed join would silently fail.
 
 See EX-36 (`internal/modules/executor/TESTS.md`) for D4/D6's own instance of this new test class. Issue #489, task #12.
+
+---
+
+## TEST-VI-23: `diskTraceGroupFileIterator` — lazy, block-at-a-time decode and per-block retention filtering (issue #500)
+
+**Scenario:** `NewDiskTraceGroupFileIterator` (SPEC-VI-14) must decode a v2 "VTG2" file's groups
+in `(TraceID ASC, TimeSec ASC)` order across block boundaries, matching a whole-file
+`DecodeTraceGroups` decode of the same bytes exactly (`TestNewDiskTraceGroupFileIterator_SingleBlock`,
+`_CrossBlockOrder`, `_EmptyFile`); return `(nil, nil)` (never a typed-nil interface) for a
+bad-magic file (`_BadMagicReturnsTrueNilInterface`); and, the memory-boundedness proof this
+task requires, defer decoding block 1 until `Advance` actually crosses into it —
+`_CorruptBlockLazyAborts` corrupts only block 1, confirming construction (which eagerly decodes
+only block 0) succeeds and the corruption is only discovered lazily at the later `Advance`, which
+would be impossible if block 1 had been eagerly decoded up front.
+
+**Retention filtering:** `_RetentionFiltering` proves `filterDeadSpansBlock`'s per-block,
+shared-live-cache filtering drops the exact same spans as `MergeTraceGroups`' own whole-input
+filtering on identical input+checker, probing each distinct SourceRef exactly once per file
+(mirrors TEST-VI's BucketGroup-side `TestFilterDeadRefsBlock_MatchesWholeFileFiltering`), and
+that `Stats()` (the reused `StatsProvider` interface) reports the correct retained/dropped counts.
+
+Back-refs: `internal/modules/valueindex/disk_trace_iterator_test.go`.
+
+---
+
+## TEST-VI-24: `StreamCompactTraceGroups` — equivalence with `MergeTraceGroups` (issue #500)
+
+**Scenario:** `TestStreamCompactTraceGroups_MatchesMergeTraceGroups` is the mandatory equivalence
+proof for SPEC-VI-15 (mirrors the BucketGroup side's golden-snapshot equivalence test): two disk-
+backed input files, one of which holds the SAME `TraceID` at two different `TimeSec` values
+(exercising the combined pop-advance-repush collection loop SPEC-VI-15 describes, since
+`TraceGroup`'s merge key omits `TimeSec`) plus a duplicate `SpanID` across files that must resolve
+to "first input wins," are run through `StreamCompactTraceGroups` and compared via
+`require.Equal` against `MergeTraceGroups` on the identical raw inputs — asserting exact
+equality, not just non-crash. `TestStreamCompactTraceGroups_RetentionFilteringMatchesMergeTraceGroups`
+extends this to a configured `RefChecker`, proving per-block filtering (inside each disk
+iterator) plus the streaming merge together match `MergeTraceGroups`' single-pass filter+merge.
+
+**Also covered in the same file:** `_SingleFileNoMerging`, `_GroupsPerBlockCutting` (block-count
+assertion via footer+block-index decode, read from the callback's `path` before the temp file is
+removed), `_MaxOutputBytesSplits` (rotation triggers, no groups lost/duplicated across rotated
+files), `_EdgeCases` (empty iterators, canceled context).
+
+Back-refs: `internal/modules/valueindex/stream_trace_compaction_test.go`.
+
+---
+
+## TEST-VI-25: `StreamCompactTraceGroups` — peak memory bounded regardless of input file count (issue #500)
+
+**Scenario:** `TestStreamCompactTraceGroups_MemoryBoundedRegardlessOfInputCount` is the
+TraceGroup-format sibling of `valueindexcompactor`'s
+`TestMergeLevel_MemoryBoundedRegardlessOfInputCount`: K disk-backed `diskTraceGroupFileIterator`s
+(K=5 vs K=50, each file holding 2000 groups split into 100 blocks of 20 groups) are drained
+through one `StreamCompactTraceGroups` call while a background goroutine samples
+`runtime.MemStats.HeapAlloc` (forcing a GC before each sample); the minimum peak-heap-delta
+across 11 trials at K=50 must stay under 4x the K=5 minimum, despite a 10x increase in input file
+count — proving peak decoded memory is bounded by one block per iterator, not by input file
+count or total size. Skipped under `-race` (measurement-tool limitation, not a correctness
+concern — see `measureMergeLevelPeakHeapBytes`'s doc comment,
+`valueindexcompactor/mergelevel_scaling_test.go`, for the full rationale this test reuses
+unchanged). Measured 2026-07-14: K=5 -> ~1.4MB, K=50 -> ~1.6MB (~1.15x).
+
+**Why this lives in `valueindex`, not `valueindexcompactor`:** it needs
+`encodeTraceGroups(groups, perBlock)`'s small-block-size test-only knob (unexported); there is no
+trace-format equivalent of `writer.go`'s `FlushBucket(ctx, groupsPerBlock)` a
+`valueindexcompactor`-level test could use instead to get a small `groupsPerBlock` without
+patching `shared.ValueIndexTraceGroupsPerBlock` itself.
+
+Back-refs: `internal/modules/valueindex/stream_trace_compaction_scaling_test.go`.

@@ -14,7 +14,7 @@ across the whole value-index pipeline's NOTES.md files by established convention
 assigned in ascending order and never reused or renumbered; superseded entries are marked
 `[SUPERSEDED by SPEC-VI-N]` rather than deleted.
 
-Next free ID: **SPEC-VI-14**.
+Next free ID: **SPEC-VI-16**.
 
 ---
 
@@ -824,3 +824,102 @@ Back-refs: `internal/modules/valueindex/hash.go:TruncateTimeValueToMillis`, root
 `valueindex_extract.go:truncateTimeValueToMillis` (delegates), `internal/modules/vibuilder/
 builder.go:intOrDedicatedColType` (delegates). See `vibuilder/NOTES.md` NOTE-VI-107 for the full
 discovery narrative and `vibuilder/SPECS.md` SPEC-VB-6 for the binding read-side contract.
+
+---
+
+## SPEC-VI-14: `TraceGroupIterator` / `NewDiskTraceGroupFileIterator` — lazy, block-at-a-time disk iteration over a v2 "VTG2" TraceGroup file (issue #500)
+*Added: 2026-07-14*
+
+**Contract:** `NewDiskTraceGroupFileIterator(ctx, path, checker) (TraceGroupIterator, error)`
+(`disk_trace_iterator.go`) mirrors `NewDiskBucketFileIterator`'s (SPEC-VI-7's disk-iterator
+sibling) construction/decode/ownership contract exactly, for the TraceGroup format: eagerly
+decodes header magic, footer, string table, and block directory (bounded cost regardless of
+file size), then decodes forward until it finds a block with at least one (optionally
+retention-filtered) group. `(nil, nil)` — never a typed-nil pointer wrapped in the interface —
+signals a bad-magic (not v2 "VTG2") file, the same skip-don't-abort signal
+`NewDiskBucketFileIterator` uses for a legacy pre-v2 file. Peak decoded memory per input file is
+bounded to one block, verified by `TestNewDiskTraceGroupFileIterator_CorruptBlockLazyAborts`
+(TEST-VI-23) and `TestStreamCompactTraceGroups_MemoryBoundedRegardlessOfInputCount` (TEST-VI-25).
+
+**`TraceGroupIterator` is intentionally NOT `GroupIterator`.** Read while implementing this
+task: forcing `TraceGroup` through `GroupIterator`'s `BucketGroup`-typed `Peek()` would need a
+lossy adapter, for no reuse benefit, because of two real differences:
+
+1. Merge key shape: `BucketGroup`'s merge key `(TimeSec, CanonicalValue)` is also each input
+   file's own per-group uniqueness key (SPEC-VI-3); `TraceGroup`'s merge key is `TraceID` alone
+   (`TimeSec` is deliberately excluded — `MergeTraceGroups`, `traceindex.go`, collapses every
+   group sharing a `TraceID` regardless of `TimeSec` into one output group). A single input file
+   can hold multiple consecutive groups sharing one `TraceID`, which SPEC-VI-3's per-file
+   uniqueness assumption forbids for `BucketGroup`.
+2. No `StringTable()` method: unlike `BucketBlockRef.SourceID` (a `uint16` meaningful only
+   relative to its own file's `StringTable`), `SpanEntry.SourceRef` is already resolved to a
+   plain string at decode time (`decodeTraceGroupAt` calls `table.Lookup` once, eagerly) — a
+   decoded `TraceGroup` carries no further table-dependent state for a `StringTable()` accessor
+   to expose.
+
+`TraceGroupIterator`'s method set is therefore `Peek() (*TraceGroup, bool)`, `Advance(ctx)`,
+`Err() error`, `Close() error` — no `StringTable()`. `diskTraceGroupFileIterator` also
+implements the existing `StatsProvider` interface (`stream_compaction.go`) unmodified — no
+TraceGroup-specific stats interface was needed.
+
+Back-refs: `internal/modules/valueindex/disk_trace_iterator.go:TraceGroupIterator,
+NewDiskTraceGroupFileIterator, diskTraceGroupFileIterator, filterDeadSpansBlock,
+countTraceSpans`. Tests: `disk_trace_iterator_test.go` (TEST-VI-23).
+
+---
+
+## SPEC-VI-15: `StreamCompactTraceGroups` — heap-based k-way streaming merge for TraceGroup files (issue #500)
+*Added: 2026-07-14*
+
+**Contract:** `StreamCompactTraceGroups(ctx, iterators []TraceGroupIterator, groupsPerBlock int,
+maxOutputBytes int64, tmpDir string, output func(path string) error) error`
+(`stream_trace_compaction.go`) is the TraceGroup-format sibling of `StreamCompactBucketFiles`
+(SPEC-VI-2): a heap-based k-way merge across N already-decoded, already-filtered
+`TraceGroupIterator`s, emitting merged `TraceGroup`s in `(TraceID ASC, TimeSec ASC)` order, cut
+into blocks of at most `groupsPerBlock` groups (`groupsPerBlock <= 0` defaults to
+`shared.ValueIndexTraceGroupsPerBlock`). Output is staged through a local temp file exactly as
+`StreamCompactBucketFiles` does — a `bufio.Writer` over a fresh `os.CreateTemp(tmpDir,
+"vi-merge-out-*.tmp")` file written block-by-block, removed via defer after `output` returns —
+and supports the same `maxOutputBytes` block-boundary-only rotation (NOTE-VI-077's role, mirrored
+by `projectedTraceFileSize`).
+
+**`tmpDir` is an explicit parameter, unlike `StreamCompactBucketFiles`' hardcoded
+`os.CreateTemp("", ...)`.** The input-staging side (`writeLocalTempInput`,
+`valueindexcompactor/diskstage.go`) already took a `dir` parameter; this output-side path did
+not, until this task added it — so a future caller can point local staging at a specific mount
+path (e.g. a PVC) instead of always assuming the container's default `/tmp`. Pass `""` to fall
+back to `os.TempDir()`, matching `os.CreateTemp`'s own empty-string convention. See NOTE-VI-109
+for why this matters: an `emptyDir`-based fix was considered and rejected (node-local disk risk
+with `value-index-compactor`'s 20 replicas potentially co-scheduled) — the actual disk-
+provisioning mechanism is a separate, ongoing infra decision, and this parameter exists so this
+package's code does not need to change again once that decision lands.
+
+**Merge semantics match `MergeTraceGroups` exactly** (verified by the equivalence test,
+`TestStreamCompactTraceGroups_MatchesMergeTraceGroups`, TEST-VI-24): `TimeSec` of a merged group
+is the minimum across every contributing group; spans are deduplicated by `SpanID` with
+first-occurrence-wins semantics, where "first" means the same order `MergeTraceGroups` itself
+processes inputs — ascending original-input-slice index, then each input's own natural
+`(TraceID, TimeSec)`-sorted encounter order.
+
+**Collection loop is a single combined phase, not `stream_compaction.go`'s two-phase split.**
+`collectContributionsAtKey`/`advanceContributors` (SPEC-VI-3) rely on the merge key being unique
+per input file, which does not hold for `TraceGroup` (see SPEC-VI-14). This file's
+`collectTraceContributionsAtKey` instead pops the heap root, takes its group as a contribution,
+advances that one iterator immediately, and re-pushes it onto the heap if it is still live —
+including when it is STILL at the same `TraceID` (a different `TimeSec`), which the same
+while-loop condition then pops again in the same call. Contributions are ordered `(priority ASC)`
+via `traceIterEntry.priority` (each iterator's original slice index), making the collected order
+exactly match `MergeTraceGroups`' own input-order iteration without a separate sort step.
+
+**Output tail assembly reuses `traceindex.go`'s existing helpers unmodified** —
+`encodeTraceBlock`, `traceBlockTimeRange`, `EncodeStringTable`, `appendTraceBlockIndex` — rather
+than duplicating or refactoring them; only the footer-byte-layout (`writeTraceFileTail`) is
+newly written, mirroring `encodeTraceGroups`'s own footer assembly byte-for-byte but writing
+incrementally to a `bufio.Writer` instead of one in-memory `[]byte`, exactly as
+`writeBucketFileTail` (`bucketfile.go`) does for the BucketGroup format. No changes were made to
+`traceindex.go` itself.
+
+Back-refs: `internal/modules/valueindex/stream_trace_compaction.go:StreamCompactTraceGroups,
+traceIteratorHeap, collectTraceContributionsAtKey, mergeTraceGroupsAtKey, traceStreamWriter,
+writeTraceFileTail`. Tests: `stream_trace_compaction_test.go` (TEST-VI-24),
+`stream_trace_compaction_scaling_test.go` (TEST-VI-25).
