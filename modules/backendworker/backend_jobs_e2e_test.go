@@ -26,8 +26,11 @@ package backendworker
 // onShouldBackfill closure performs exactly these two actions (trigger the entry, insert
 // the durable row) together; this test performs them the same way, just via the public
 // blockpack API instead of vblockpack's unexported wrapper. Cube backfill mirrors this
-// with blockpack.NewCubeRegistry(...).Add for the same reason (cube's real trigger,
-// TryCreate, is also unexported and unreachable from this package).
+// with blockpack.NewPgCubeRegistry(...).Add for the same reason (cube's real trigger,
+// TryCreate, is also unexported and unreachable from this package) -- issue #504
+// (2026-07-15): cube's registry is Postgres-only now (no blob/index.json fallback), so
+// this seeds into the SAME real Postgres container newTestPostgresPoolAndDSN already
+// provisions for the job queue, not a separate blob-backed fixture.
 
 import (
 	"bytes"
@@ -138,6 +141,11 @@ func newTestPostgresPoolAndDSN(t *testing.T) (*pgxpool.Pool, string) {
 	t.Cleanup(pool.Close)
 
 	require.NoError(t, migrate.Apply(ctx, pool))
+	// Issue #504: cube's registry is Postgres-only now (no blob/index.json fallback) --
+	// blockpack.ApplyCubeSchema creates cube_entries, needed by this file's
+	// TestE2E_CubeBackfill_* tests, which seed real registry fixtures via
+	// blockpack.NewPgCubeRegistry against this same pool.
+	require.NoError(t, blockpack.ApplyCubeSchema(ctx, pool))
 	return pool, dsn
 }
 
@@ -326,10 +334,8 @@ func TestE2E_CubeBackfill_WorkerClaimsAndExecutesWithoutGRPC(t *testing.T) {
 	ctx := context.Background()
 	pool, dsn := newTestPostgresPoolAndDSN(t)
 	s3cfg := newFakeS3Config(t, "e2e-worker-cube-bucket")
-	client := newTestMinioClient(t, s3cfg)
 
 	tenant := "e2e-worker-cube-tenant"
-	cubeStore := &testMinioObjectStore{client: client, bucket: s3cfg.Bucket, notFoundErr: blockpack.CubeErrNotFound}
 	entry := blockpack.CubeRegistryEntry{
 		CubeID:     "e2e-cube-1",
 		Tenant:     tenant,
@@ -337,7 +343,7 @@ func TestE2E_CubeBackfill_WorkerClaimsAndExecutesWithoutGRPC(t *testing.T) {
 		AggAttrs:   []string{blockpack.CubeDurationColumn},
 		Resolution: 1,
 	}
-	cubeRegistry := blockpack.NewCubeRegistry(cubeStore, tenant)
+	cubeRegistry := blockpack.NewPgCubeRegistry(pool, tenant)
 	require.NoError(t, cubeRegistry.Add(ctx, entry))
 
 	store := jobstore.New(pool)
@@ -374,47 +380,43 @@ func TestE2E_CubeBackfill_WorkerClaimsAndExecutesWithoutGRPC(t *testing.T) {
 
 // TestE2E_CubeBackfill_FailureThenReclaimSucceeds is #181 Phase 6.3's cube_backfill
 // mirror of TestE2E_ViBackfill_FailureThenReclaimSucceeds (2026-07-14 fix). The failure
-// trigger here is deliberately NOT "cube ID never added to the registry" (or an
-// unreachable S3 backend, which fails LoadCubeEntry the same way): before the 2026-07-14
-// compounding-bug fix (see TestE2E_CubeBackfill_NoRegistryEntry_FailsFastNotBurningCtx
-// below for that scenario's own dedicated coverage), either of those made
-// processCubeBackfillJobPostgres fall back to its own placeholder CubeRegistryEntry
-// (Dimensions=[cubeID], no AggAttrs), which failed cube.Backfiller's per-minute
-// "definition must include duration in AggAttrs" validation on literally every minute
-// forever without ever aborting. This test wants to exercise RunCubeBackfill's OWN
-// error-propagation fix in isolation, so it seeds a real, well-formed entry via
-// CubeRegistry.Add (found successfully by LoadCubeEntry, exactly like
-// TestE2E_CubeBackfill_WorkerClaimsAndExecutesWithoutGRPC's own setup) and then blocks
-// writes on the fake S3 server (reads remain unaffected):
-// RunCubeBackfill's very first progressFn callback still succeeds processMinute (no VI
-// data, not itself an error) but genuinely fails the watermark-persist ConditionalPut --
-// a real error from real logic, immediately, on the first minute. Before this fix,
-// RunCubeBackfill had a void return and processCubeBackfillJobPostgres unconditionally
-// returned nil, so this exact failure was reported to Postgres as succeeded; this test
+// trigger here is deliberately NOT "cube ID never added to the registry" (that scenario's
+// own dedicated coverage is TestE2E_CubeBackfill_NoRegistryEntry_FailsFastNotBurningCtx
+// below, which fails FAST inside LoadCubeEntry, before RunCubeBackfill is ever reached) --
+// this test wants LoadCubeEntry to succeed (a real, well-formed-looking entry IS found) and
+// the SUBSEQUENT run to genuinely fail instead.
+//
+// 2026-07-15 migration (issue #504): cube's registry is Postgres-only now (no
+// blob/index.json fallback), so the pre-migration failure trigger (blocking S3 PUTs to
+// make the registry's own blob ConditionalPut genuinely fail) no longer applies --
+// watermark persistence goes through Postgres, entirely unaffected by S3 write
+// availability. The seeded entry here deliberately omits AggAttrs (a genuinely
+// malformed-but-loadable registry entry, e.g. from a partially-written trigger): LoadCubeEntry
+// still finds it (Load doesn't validate content), but cube.Backfiller's per-minute
+// "definition must include duration in AggAttrs" validation then genuinely fails EVERY
+// minute, tripping the circuit breaker (cubeBackfillMaxConsecutiveFailures=5) and aborting
+// with a real error -- exactly the same structural-failure shape
+// TestRunCubeBackfillCore_ConsecutiveStructuralFailuresAbortEarly
+// (tempodb/encoding/vblockpack/cube_backfill_watermark_test.go) proves at the unit level, now
+// proven through the real worker dispatch path. Before RunCubeBackfill's 2026-07-14
+// error-propagation fix, this exact failure was reported to Postgres as succeeded; this test
 // proves it now reaches Store.Fail with a scheduled retry instead.
 func TestE2E_CubeBackfill_FailureThenReclaimSucceeds(t *testing.T) {
 	ctx := context.Background()
 	pool, dsn := newTestPostgresPoolAndDSN(t)
-	s3cfg, fakeSrv := newFakeS3ConfigWithServer(t, "e2e-worker-cube-retry-bucket")
+	s3cfg := newFakeS3Config(t, "e2e-worker-cube-retry-bucket")
 
 	tenant := "e2e-worker-cube-retry-tenant"
 	cubeID := "e2e-cube-retry-1"
-	client := newTestMinioClient(t, s3cfg)
-	cubeStore := &testMinioObjectStore{client: client, bucket: s3cfg.Bucket, notFoundErr: blockpack.CubeErrNotFound}
 	entry := blockpack.CubeRegistryEntry{
 		CubeID:     cubeID,
 		Tenant:     tenant,
 		Dimensions: []string{"resource.service.name"},
-		AggAttrs:   []string{blockpack.CubeDurationColumn},
+		// AggAttrs deliberately omitted -- see doc comment above.
 		Resolution: 1,
 	}
-	cubeRegistry := blockpack.NewCubeRegistry(cubeStore, tenant)
+	cubeRegistry := blockpack.NewPgCubeRegistry(pool, tenant)
 	require.NoError(t, cubeRegistry.Add(ctx, entry))
-
-	// Block writes AFTER seeding: LoadCubeEntry's own read still finds this well-formed
-	// entry (GET/LIST are unaffected), but RunCubeBackfill's first watermark-persist PUT
-	// now genuinely fails.
-	fakeSrv.SetBlockPuts(true)
 
 	store := jobstore.New(pool)
 	require.NoError(t, store.InsertCubeBackfill(ctx, tenant, jobstore.CubeBackfillDetail{
@@ -446,7 +448,7 @@ func TestE2E_CubeBackfill_FailureThenReclaimSucceeds(t *testing.T) {
 	require.Equal(t, string(jobstore.StatusFailed), status,
 		"a real RunCubeBackfill failure must be reported to Postgres as failed, not silently succeeded")
 	require.Equal(t, 1, retries)
-	require.Contains(t, lastErr, "cube registry: put")
+	require.Contains(t, lastErr, "aborted after 5 consecutive per-minute failures")
 	require.WithinDuration(t, time.Now().Add(2*time.Minute), nextRetryAt, 10*time.Second,
 		"retry 1 must be scheduled at approximately +2m per the locked doubling-backoff policy (backoffDuration(1)=2m)")
 }

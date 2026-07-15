@@ -222,4 +222,4 @@ and repeated flushes of an already-recorded column must not re-issue the manifes
 
 Back-ref: `internal/modules/valueindexconsumer/manifest_hook_test.go`. See `colhashmanifest/
 TESTS.md` TEST-COLMANIFEST-15 (the package-level counterpart of the hanging-store test) and
-`NOTES.md` NOTE-VI-108.
+`NOTES.md` NOTE-VI-118.

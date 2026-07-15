@@ -16,7 +16,6 @@ Entries use the module-local, sequential prefix `TEST-VIUSAGE-N`, independent of
 TESTS.md files (see `SPECS.md`'s ID-convention section). IDs are assigned in ascending order
 and never reused or renumbered.
 
-Next free ID: **TEST-VIUSAGE-42**.
 
 ## TEST-VIUSAGE-1 through 4: `BackfillState.CoversRange` / `ColumnWatermark.CoversRange` boundary conditions, plus their cross-implementation parity test
 *Added: 2026-07-10. Updated: 2026-07-10 (task #117 landed the parity test flagged below as a recommended follow-up; the gap is now resolved.)*
@@ -426,3 +425,15 @@ unregistered entry (mirrors `RenewLease`/`UpdateWatermark`'s own not-found contr
 
 Back-ref: `internal/modules/viusage/registry_test.go:TestRegistry_UpdateCatalogCursor_
 MonotonicOnly,_NotFoundReturnsError`.
+
+## TEST-VIUSAGE-42..46 — Native Postgres EntryStore (issue #506)
+
+| ID | Test | File | What it pins |
+|---|---|---|---|
+| TEST-VIUSAGE-42 | `TestPgEntryStore_UpsertEntry_CreateThenMutate` | pg_entry_store_test.go | UpsertEntry creates a missing entry via createIfMissing, then a subsequent call mutates the existing row; both persist correctly |
+| TEST-VIUSAGE-43 | `TestPgEntryStore_UpsertEntry_MissingNoCreateIfMissing_Errors` | pg_entry_store_test.go | UpsertEntry against a missing entry with nil createIfMissing returns an error rather than silently no-oping |
+| TEST-VIUSAGE-44 | `TestPgEntryStore_Load_ReturnsAllRowsForTenant_NotOtherTenants` | pg_entry_store_test.go | Load returns exactly one tenant's rows, never leaking another tenant's entries |
+| TEST-VIUSAGE-45 | `TestPgEntryStore_UpsertEntry_ConcurrentTriggersConvergeOnOneWinner` | pg_entry_store_test.go | 20 goroutines racing UpsertEntry on a pre-seeded, already-existing row converge on exactly one distinct LeaseOwnerID -- the SELECT...FOR UPDATE-guarded read-modify-write race. Mutation-verified (see NOTE-VIUSAGE-14): the row must be PRE-SEEDED for this test to actually exercise FOR UPDATE's protection -- a fresh-key race is already correctly serialized by INSERT...ON CONFLICT DO NOTHING regardless of FOR UPDATE, and does not reproduce the bug when the guard is removed |
+| TEST-VIUSAGE-46 | `TestViUsageRegistry_BlobAndPgBackends_IdenticalBehavior` | pg_blob_differential_test.go | Runs the identical seed/RenewLease/UpdateWatermark/UpdateCatalogCursor(advancing-then-regressing) sequence against both a blob-backed and Postgres-backed Registry; asserts resulting entries are field-equal, with explicit attention to SPEC-VIUSAGE-9's monotonic-cursor no-op on both backends -- proves SPEC-VIUSAGE-10's behavioral-identity invariant end-to-end |
+
+**Next free ID: TEST-VIUSAGE-47.**

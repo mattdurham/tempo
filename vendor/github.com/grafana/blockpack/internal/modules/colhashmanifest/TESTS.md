@@ -15,7 +15,6 @@ ID-convention precedent. IDs are assigned in ascending order and never reused or
 pass (review-consolidator Issue 4 / MEDIUM), per CLAUDE.md's standing permission to create spec
 files under `internal/modules/`.
 
-Next free ID: **TEST-COLMANIFEST-16**.
 
 ---
 
@@ -205,3 +204,15 @@ These are documented in full in each of those packages' own `TESTS.md` files, no
 here, since the scenarios being locked in are those packages' own hook contracts
 (SPEC-VI-5/SPEC-VI-6, SPEC-VC-4/SPEC-VC-5) — this package's own `TEST-COLMANIFEST-N` entries
 above cover only `colhashmanifest`'s own public API in isolation.
+
+## TEST-COLMANIFEST-16..20 — Native Postgres Store (issue #506)
+
+| ID | Test | File | Scenario/Setup/Assertions |
+|----|------|------|---------------------------|
+| TEST-COLMANIFEST-16 | `TestPgStore_PutThenGet_RoundTrips` | pg_store_test.go | Put then Get on the same key returns exactly the bytes stored |
+| TEST-COLMANIFEST-17 | `TestPgStore_Get_MissingKey_ReturnsError` | pg_store_test.go | Get on a missing key returns a non-nil error (any shape — SPEC-COLMANIFEST-2's deliberately loose contract, no specific error type asserted) |
+| TEST-COLMANIFEST-18 | `TestPgStore_Put_Overwrites` | pg_store_test.go | A second Put to the same key overwrites the first — no versioning/ETag, last Put wins |
+| TEST-COLMANIFEST-19 | `TestRecordColumn_BlobAndPgBackends_IdenticalBehavior` | pg_blob_differential_test.go | Runs the identical RecordColumn call sequence (first-seen SourceVI, repeat SourceVI no-op, upgrade to SourceBoth via SourceVCNT, new colHash) against both a blob-backed and Postgres-backed Store; asserts resulting Load() sets are field-equal, with explicit attention to FirstSeenAtSec never being mutated by the SourceBoth upgrade on either backend — proves SPEC-COLMANIFEST-6's behavioral-identity invariant end-to-end |
+| TEST-COLMANIFEST-20 | `TestRecordColumn_PgStore_HangingQueryRespectsCtxTimeout` | pg_hanging_query_test.go | A concurrent goroutine holds an uncommitted transaction locking RecordColumn's target key; RecordColumn's own Put call blocks on the row lock and must still return a real, non-nil, propagated error within manifestOpTimeout + slack — proves SPEC-COLMANIFEST-6's hanging-query requirement, mirroring TEST-COLMANIFEST-15's discipline for the blob-backed case |
+
+**Next free ID: TEST-COLMANIFEST-21.**

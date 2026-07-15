@@ -36,10 +36,10 @@ import (
 	util_log "github.com/grafana/tempo/pkg/util/log"
 )
 
-// usageRecorder is the injectable seam for #496's usage-recording hook (R3/R4),
-// mirroring cqp.objectStore()'s existing DI pattern: production code goes through the
-// process-level singleton (getViUsageRecorder/ConfigureViUsageRecorder, wired by B3),
-// tests inject a fake implementing this interface directly.
+// usageRecorder is the injectable seam for #496's usage-recording hook (R3/R4):
+// production code goes through the process-level singleton
+// (getViUsageRecorder/ConfigureViUsageRecorder, wired by B3), tests inject a fake
+// implementing this interface directly.
 type usageRecorder interface {
 	RecordUse(ctx context.Context, tenant, colName, colType string, now time.Time) (blockpack.TriggerResult, error)
 }

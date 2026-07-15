@@ -518,7 +518,7 @@ func encodeBucketBlock(b *BucketBlock) []byte {
 // postings and so cannot under-count results), but must NOT silently skip any other
 // decode error — a corrupt v2 file dropped from an otherwise-authoritative index
 // query silently under-counts, the exact silent-partial-result bug class the
-// trace-by-id review caught in findTraceGroupInCandidates (NOTE-VI-046).
+// trace-by-id review caught in findTraceGroupInCandidates (NOTE-VI-115).
 // Recognize with errors.Is(err, ErrNotBucketFile).
 var ErrNotBucketFile = errors.New("valueindex: not a bucket file (bad magic)")
 
@@ -539,7 +539,7 @@ func DecodeBucketFile(data []byte) (*BucketFile, error) {
 	if len(data) < 5+bucketFooterSize {
 		// Too short to even hold a header magic + footer: it cannot be a v2 file, so
 		// classify as ErrNotBucketFile — a caller iterating a discovered file set may
-		// skip it (a stray/empty object holds no v2 postings). NOTE-VI-046.
+		// skip it (a stray/empty object holds no v2 postings). NOTE-VI-115.
 		return nil, fmt.Errorf("valueindex: bucket file too short (%d bytes): %w", len(data), ErrNotBucketFile)
 	}
 	if binary.LittleEndian.Uint32(data[:4]) != BucketFileMagic {
@@ -561,7 +561,7 @@ func DecodeBucketFile(data []byte) (*BucketFile, error) {
 	// whose sum wraps uint64 and slips past a naive `off+len > len(data)` check, then
 	// panics the decode goroutine on the slice below. Checking each term against
 	// len(data) first (offsets/lengths individually cannot legitimately exceed the file
-	// size) makes the subsequent sum overflow-free (NOTE-VI-046).
+	// size) makes the subsequent sum overflow-free (NOTE-VI-115).
 	dataLen := uint64(len(data))
 	if strOff > dataLen || strLen > dataLen || strOff+strLen > dataLen ||
 		blockIdxOff > dataLen || blockIdxLen > dataLen || blockIdxOff+blockIdxLen > dataLen {

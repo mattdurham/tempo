@@ -165,6 +165,12 @@ func buildSchedL0Bytes(t *testing.T, id [16]byte, minute uint32) []byte {
 }
 
 // schedTestCube sets up a registered cube plus its file store/compactor for scheduler tests.
+// Deliberately kept on blockpack.NewCubeRegistry's blob backend (issue #504's test-migration
+// review, 2026-07-15): this file's tests drive processCube/CubeCompactor directly against a
+// standalone Registry+fixture, never through CubeScheduler.processTenant's own Postgres-backed
+// registry construction (ConfigureCubeScheduler's pgPool) -- a real Postgres testcontainer
+// would add test weight for zero additional coverage of the rollup/compaction logic under
+// test here.
 type schedTestCube struct {
 	id        [16]byte
 	hexID     string

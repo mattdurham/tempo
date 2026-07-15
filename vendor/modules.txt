@@ -837,6 +837,7 @@ github.com/grafana/blockpack/internal/modules/valueindexcompactor
 github.com/grafana/blockpack/internal/modules/valueindexconsumer
 github.com/grafana/blockpack/internal/modules/vibuilder
 github.com/grafana/blockpack/internal/modules/viusage
+github.com/grafana/blockpack/internal/pgschema
 github.com/grafana/blockpack/internal/s3provider
 github.com/grafana/blockpack/internal/traceqlparser
 github.com/grafana/blockpack/internal/vm

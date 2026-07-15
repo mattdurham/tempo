@@ -193,5 +193,14 @@ func validateConfig(cfg *Config) error {
 		return fmt.Errorf("block version validation failed: %w", err)
 	}
 
+	// issue #504: the cube registry is Postgres-only now (no blob/index.json fallback), so
+	// enabling cube ingest for any tenant without a configured Postgres pool is a broken
+	// config, not a silently-degraded one -- fail fast at startup rather than let
+	// vblockpack.ConfigureCubeManager/ConfigureCubeScheduler/ConfigureCubeQueryPath panic or
+	// silently no-op the first time they actually try to touch the registry.
+	if len(cfg.Block.Blockpack.CubeTenants) > 0 && cfg.Postgres == nil {
+		return errors.New("blockpack.cube_tenants is non-empty but postgres is not configured: the cube registry requires postgres (issue #504)")
+	}
+
 	return nil
 }

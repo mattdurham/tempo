@@ -743,3 +743,85 @@ NewRegistryFromEntryStore`; `registry.go:blobEntryStore` (SPEC-VIUSAGE-4's updat
 (`valueindex_usage_test.go`).
 
 ---
+
+## NOTE-VIUSAGE-13 Addendum (2026-07-15)
+
+**This note's claim that "blockpack's go.mod gains zero new dependencies from this work" is
+superseded by issue #506.** #506 adds `github.com/jackc/pgx/v5` directly to blockpack's go.mod so
+that blockpack can own native Postgres `EntryStore` implementations for both cube and viusage
+(plus a new colhashmanifest Postgres `Store`), rather than tempo owning them exclusively. This
+reversal is well-motivated by the evidence bar NOTE-VIUSAGE-1 itself set when deferring this exact
+question: at that time only one Postgres implementation existed (viusage's, in tempo); #506
+arrives with a second (cube, already shipped in tempo) and third (colhashmanifest, new) real
+Postgres-implementing consumer, which is the "two working implementations" evidence bar
+NOTE-VIUSAGE-1 explicitly named as the trigger for revisiting this. The `EntryStore` interface
+itself, and the blob-backed `NewRegistry` path, are unchanged and remain fully supported — this is
+an additive reversal of an ownership-location decision, not a removal of the blob-backed option.
+See spec-oracle-506's own review (`.bob/state/spec-oracle-506-review.md`) for the full analysis,
+and NOTE-VIUSAGE-14 for the concrete implementation this addendum accompanies.
+
+---
+
+## NOTE-VIUSAGE-14 — Native Postgres EntryStore implementation added (issue #506); mutation test exposed a race the ported test never actually exercised
+
+Date: 2026-07-15
+
+**Decision:** `pg_entry_store.go` adds `PgEntryStore{pool}` / `NewPgEntryStore(pool)`, a native
+Postgres-backed implementation of `EntryStore` (SPEC-VIUSAGE-4), ported verbatim from tempo's
+`tempodb/encoding/vblockpack/pg_entrystore.go` (viusage half, 2026-07-11). `NewPgRegistry(pool,
+tenant)` (`registry.go`) is a one-call convenience wrapper. `ApplySchema(ctx, pool)` (`//go:embed
+schema.sql`) applies `viusage_entries`'s schema only — `viusage_query_log` is deliberately excluded
+(Open Decision D2: it is Postgres-backend-only schema with no corresponding blockpack read/write
+code today; porting a table nothing writes to would be dead weight and a false signal that it's
+load-bearing).
+
+**Load-bearing mechanism preserved verbatim:** `UpsertEntry`'s create-path uses `INSERT ... ON
+CONFLICT DO NOTHING` (not a retry loop) because `SELECT ... FOR UPDATE` cannot lock a row that
+doesn't exist yet; the race loser re-loads under `FOR UPDATE` to see and lock the winner's
+committed row so its own `mutate` closure still applies exactly once, never silently dropped. For
+an already-existing key, `SELECT ... FOR UPDATE` alone provides the atomicity SPEC-VIUSAGE-4's
+"mutate invoked once PER RETRY ATTEMPT against freshly-reloaded state" contract requires.
+
+**Mutation-testing finding, worth recording since it corrects an inherited assumption:** the
+concurrency regression test, when ported in its ORIGINAL shape (N racers all targeting a
+not-yet-existing key), did NOT reproduce a failure when `FOR UPDATE` was removed — verified
+empirically across 5 repeated runs, always passed. Root cause: the create path's `INSERT ... ON
+CONFLICT DO NOTHING` is ALREADY correctly serialized by Postgres regardless of any `SELECT`
+locking clause — a concurrent `INSERT` targeting an uncommitted conflicting key blocks until that
+other transaction resolves, independent of `FOR UPDATE`. The ported test's exact race shape never
+actually exercised what `FOR UPDATE` guards against (the read-modify-write path for an
+ALREADY-EXISTING row). Fixed by pre-seeding the row before launching the N racers, so they take
+the `found=true`/`FOR UPDATE`-guarded path instead — with that fix, the mutation test reliably
+fails as expected (20 distinct `LeaseOwnerID`s, the classic lost-update anomaly) when `FOR UPDATE`
+is removed, and passes when restored. This finding is specific to viusage's PG entryStore; cube's
+own analogous concurrency test (NOTE-CUBE-030) exercises the create-path race directly and did not
+have this issue, because cube's `AddEntry` genuinely has no `SELECT ... FOR UPDATE` step to
+protect on the create path at all — its equivalent protection is the advisory lock, which IS
+exercised by a fresh-key race.
+
+**Back-refs:** `internal/modules/viusage/pg_entry_store.go:PgEntryStore,NewPgEntryStore,
+ApplySchema,UpsertEntry`, `internal/modules/viusage/registry.go:NewPgRegistry`,
+`internal/modules/viusage/schema.sql`, `valueindex_usage.go:NewPgViUsageEntryStore,
+NewPgViUsageRegistry,ApplyViUsageSchema`. Tests: `pg_entry_store_test.go`,
+`pg_blob_differential_test.go`. See SPEC-VIUSAGE-10. Issue #506.
+
+### Addendum (2026-07-15): schema-drift risk between `schema.sql` and tempo's `registries.sql`
+
+`schema.sql` was ported verbatim from tempo's own
+`tempodb/encoding/vblockpack/schema/registries.sql` (`viusage_entries` section) and is, as of this
+writing, byte-identical to it (confirmed by direct diff during the #506 holistic review). This is
+kept in sync **by convention only — there is no automated check, CI diff, or shared source file
+between the two repos.** If tempo's copy of `registries.sql` is ever modified (e.g. a new column
+or index added to `viusage_entries`), blockpack's `schema.sql` must be updated to match by hand,
+and vice versa; nothing today would catch a silent divergence, and whichever `ApplySchema`/
+`migrate.Apply` call happens to run first against a fresh database "wins" the initial table shape.
+This is not a live bug — both `CREATE TABLE IF NOT EXISTS`/`CREATE INDEX IF NOT EXISTS` statements
+are idempotent, so calling both against the same database today is a safe no-op — but it is a real,
+currently-undocumented gap for the future. Whoever eventually migrates tempo's call sites onto
+blockpack's `NewPgViUsageEntryStore`/`ApplyViUsageSchema` (the stated next step after #506) should,
+at that point, retire tempo's own copy of the `viusage_entries` section of `registries.sql` and
+treat blockpack's `schema.sql` as the sole source of truth — this closes the gap permanently. Until
+that happens, treat any change to either file as requiring a manual check of the other.
+`viusage_query_log` remains out of scope for this addendum (Open Decision D2, above — it has no
+blockpack-side schema at all, ported or otherwise). See go-presubmit.md / review.md Issue 2 (#506
+holistic review) for the finding that prompted this addendum.

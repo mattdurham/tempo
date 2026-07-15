@@ -85,7 +85,7 @@ func readBucketFileTail(src RangedSource, footer BucketFooter, size int64) ([]Bl
 	// offset to ReadAt below. Checking each term against sz first (an offset/length
 	// individually cannot legitimately exceed the file size) makes the subsequent sum
 	// overflow-free — the same pattern DecodeBucketFile already uses for its own footer-offset
-	// validation (bucketfile.go:DecodeBucketFile, NOTE-VI-046). This path is reachable from
+	// validation (bucketfile.go:DecodeBucketFile, NOTE-VI-115). This path is reachable from
 	// QueryBucketFileRanged on object-storage bucket files fetched over the network, not only
 	// from disk_iterator.go's trusted local compaction temp files, so it must not be weaker
 	// than DecodeBucketFile's whole-file check.
@@ -123,7 +123,7 @@ func readBucketFileTail(src RangedSource, footer BucketFooter, size int64) ([]Bl
 	// writeBucketFileTail write body, then string table, then block index, then footer), so
 	// StringTableOff is the same "region that can legally contain block bodies" bound
 	// DecodeBucketFile already checks against (bucketfile.go:DecodeBucketFile: `end > strOff`,
-	// NOTE-VI-046). Validated once, here, for every directory entry, so both consumers only
+	// NOTE-VI-115). Validated once, here, for every directory entry, so both consumers only
 	// ever see already-validated entries and need no bounds check of their own.
 	strOff := footer.StringTableOff
 	for i := range dir {

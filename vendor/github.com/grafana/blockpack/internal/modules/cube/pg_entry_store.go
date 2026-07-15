@@ -1,29 +1,48 @@
-package vblockpack
+package cube
 
-// pg_entrystore_cube.go — Postgres-backed blockpack.CubeEntryStore implementation
-// (mirrors pg_entrystore.go's viusage implementation, 2026-07-11). One row per
-// cube_id in cube_entries. Unlike viusage's single generic UpsertEntry, cube's
-// three write operations (Add/Remove/UpdateWatermarks) have genuinely different
+// pg_entry_store.go — native Postgres-backed EntryStore implementation, ported
+// verbatim from tempo's tempodb/encoding/vblockpack/pg_entrystore_cube.go
+// (2026-07-11), package-adjusted to live directly inside package cube (no more
+// blockpack.-qualification needed since this package now defines
+// RegistryEntry/ResolutionWatermark/EntryStore natively). One row per cube_id
+// in cube_entries. Unlike viusage's single generic UpsertEntry, cube's three
+// write operations (Add/Remove/UpdateWatermarks) have genuinely different
 // list-mutation semantics -- mirrored here with one method per operation, per
-// blockpack's own entryStore design (R1: match cube's actual usage pattern
-// rather than forcing a generic create-or-mutate primitive it doesn't need).
+// entry_store.go's own R1 design note.
+//
+// SPEC-CUBE-031: PgEntryStore must be behaviorally identical to blobEntryStore
+// for every Registry public method -- see pg_blob_differential_test.go.
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
 
-	blockpack "github.com/grafana/blockpack"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/grafana/blockpack/internal/pgschema"
 )
 
-// pgCubeEntryStore satisfies blockpack.CubeEntryStore over a *pgxpool.Pool.
-type pgCubeEntryStore struct{ pool *pgxpool.Pool }
+//go:embed schema.sql
+var cubeSchemaSQL string
 
-func newPgCubeEntryStore(pool *pgxpool.Pool) *pgCubeEntryStore {
-	return &pgCubeEntryStore{pool: pool}
+// ApplySchema applies cube_entries' schema (and its tenant index) against
+// pool. Exported, never called automatically by any constructor -- the
+// embedding application calls it once at its own startup, mirroring tempo's
+// own migrate.Apply precedent.
+func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
+	return pgschema.ApplyStatements(ctx, pool, cubeSchemaSQL)
+}
+
+// PgEntryStore satisfies EntryStore over a *pgxpool.Pool.
+type PgEntryStore struct{ pool *pgxpool.Pool }
+
+// NewPgEntryStore constructs a PgEntryStore over pool, satisfying EntryStore.
+func NewPgEntryStore(pool *pgxpool.Pool) *PgEntryStore {
+	return &PgEntryStore{pool: pool}
 }
 
 const cubeSelectAllSQL = `
@@ -35,38 +54,39 @@ type cubeRowScanner interface {
 	Scan(dest ...any) error
 }
 
-func scanCubeEntry(row cubeRowScanner) (blockpack.CubeRegistryEntry, error) {
-	var e blockpack.CubeRegistryEntry
+func scanCubeEntry(row cubeRowScanner) (RegistryEntry, error) {
+	var e RegistryEntry
 	var dimensions, filters, aggAttrs, watermarks []byte
 	err := row.Scan(&e.CubeID, &e.Tenant, &dimensions, &filters, &aggAttrs, &e.Resolution, &e.CreatedAt, &watermarks)
 	if err != nil {
-		return blockpack.CubeRegistryEntry{}, err
+		return RegistryEntry{}, err
 	}
 	if err := json.Unmarshal(dimensions, &e.Dimensions); err != nil {
-		return blockpack.CubeRegistryEntry{}, fmt.Errorf("decoding dimensions: %w", err)
+		return RegistryEntry{}, fmt.Errorf("decoding dimensions: %w", err)
 	}
 	if err := json.Unmarshal(filters, &e.Filters); err != nil {
-		return blockpack.CubeRegistryEntry{}, fmt.Errorf("decoding filters: %w", err)
+		return RegistryEntry{}, fmt.Errorf("decoding filters: %w", err)
 	}
 	if err := json.Unmarshal(aggAttrs, &e.AggAttrs); err != nil {
-		return blockpack.CubeRegistryEntry{}, fmt.Errorf("decoding agg_attrs: %w", err)
+		return RegistryEntry{}, fmt.Errorf("decoding agg_attrs: %w", err)
 	}
 	if len(watermarks) > 0 {
 		if err := json.Unmarshal(watermarks, &e.Watermarks); err != nil {
-			return blockpack.CubeRegistryEntry{}, fmt.Errorf("decoding watermarks: %w", err)
+			return RegistryEntry{}, fmt.Errorf("decoding watermarks: %w", err)
 		}
 	}
 	return e, nil
 }
 
-func (s *pgCubeEntryStore) Load(ctx context.Context, tenant string) ([]blockpack.CubeRegistryEntry, error) {
+// Load returns every cube entry for tenant.
+func (s *PgEntryStore) Load(ctx context.Context, tenant string) ([]RegistryEntry, error) {
 	rows, err := s.pool.Query(ctx, cubeSelectAllSQL, tenant)
 	if err != nil {
 		return nil, fmt.Errorf("pg cube entrystore: load: %w", err)
 	}
 	defer rows.Close()
 
-	var out []blockpack.CubeRegistryEntry
+	var out []RegistryEntry
 	for rows.Next() {
 		e, scanErr := scanCubeEntry(rows)
 		if scanErr != nil {
@@ -87,21 +107,21 @@ func (s *pgCubeEntryStore) Load(ctx context.Context, tenant string) ([]blockpack
 // idempotency-check-then-insert sequence needs an explicit advisory lock
 // instead to prevent two concurrent registrations of the same new CubeID from
 // both passing the "not present" check before either INSERT commits.
-func (s *pgCubeEntryStore) AddEntry(ctx context.Context, tenant string, entry blockpack.CubeRegistryEntry) error {
+func (s *PgEntryStore) AddEntry(ctx context.Context, tenant string, entry RegistryEntry) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("pg cube entrystore: begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, tenant); err != nil {
-		return fmt.Errorf("pg cube entrystore: advisory lock: %w", err)
+	if _, lockErr := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, tenant); lockErr != nil {
+		return fmt.Errorf("pg cube entrystore: advisory lock: %w", lockErr)
 	}
 
 	var alreadyPresent bool
 	row := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM cube_entries WHERE tenant = $1 AND cube_id = $2)`, tenant, entry.CubeID)
-	if err := row.Scan(&alreadyPresent); err != nil {
-		return fmt.Errorf("pg cube entrystore: exists check: %w", err)
+	if scanErr := row.Scan(&alreadyPresent); scanErr != nil {
+		return fmt.Errorf("pg cube entrystore: exists check: %w", scanErr)
 	}
 	if alreadyPresent {
 		return nil // idempotent, mirrors blobEntryStore.addEntry
@@ -124,7 +144,8 @@ func (s *pgCubeEntryStore) AddEntry(ctx context.Context, tenant string, entry bl
 		return fmt.Errorf("pg cube entrystore: encode watermarks: %w", err)
 	}
 
-	_, err = tx.Exec(ctx, `
+	_, err = tx.Exec(
+		ctx, `
 		INSERT INTO cube_entries (cube_id, tenant, dimensions, filters, agg_attrs, resolution, created_at, watermarks)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
 		entry.CubeID, entry.Tenant, dimensions, filters, aggAttrs, entry.Resolution, entry.CreatedAt, watermarks,
@@ -140,7 +161,7 @@ func (s *pgCubeEntryStore) AddEntry(ctx context.Context, tenant string, entry bl
 
 // RemoveEntry deletes the entry with cubeID for tenant, a no-op if already
 // absent -- mirrors blobEntryStore.removeEntry's exact contract.
-func (s *pgCubeEntryStore) RemoveEntry(ctx context.Context, tenant, cubeID string) error {
+func (s *PgEntryStore) RemoveEntry(ctx context.Context, tenant, cubeID string) error {
 	_, err := s.pool.Exec(ctx, `DELETE FROM cube_entries WHERE tenant = $1 AND cube_id = $2`, tenant, cubeID)
 	if err != nil {
 		return fmt.Errorf("pg cube entrystore: remove: %w", err)
@@ -153,7 +174,7 @@ func (s *pgCubeEntryStore) RemoveEntry(ctx context.Context, tenant, cubeID strin
 // blobEntryStore.updateWatermarksEntry's exact contract. Errors if cubeID is
 // not found. SELECT ... FOR UPDATE provides the same read-modify-write
 // atomicity viusage's UpsertEntry relies on.
-func (s *pgCubeEntryStore) UpdateWatermarksEntry(ctx context.Context, tenant, cubeID string, level, minMinute, maxMinute uint32) error {
+func (s *PgEntryStore) UpdateWatermarksEntry(ctx context.Context, tenant, cubeID string, level, minMinute, maxMinute uint32) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("pg cube entrystore: begin: %w", err)
@@ -162,17 +183,17 @@ func (s *pgCubeEntryStore) UpdateWatermarksEntry(ctx context.Context, tenant, cu
 
 	var watermarksRaw []byte
 	row := tx.QueryRow(ctx, `SELECT watermarks FROM cube_entries WHERE tenant = $1 AND cube_id = $2 FOR UPDATE`, tenant, cubeID)
-	if err := row.Scan(&watermarksRaw); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+	if scanErr := row.Scan(&watermarksRaw); scanErr != nil {
+		if errors.Is(scanErr, pgx.ErrNoRows) {
 			return fmt.Errorf("pg cube entrystore: update watermarks: cube %q not found", cubeID)
 		}
-		return fmt.Errorf("pg cube entrystore: load for update: %w", err)
+		return fmt.Errorf("pg cube entrystore: load for update: %w", scanErr)
 	}
 
-	watermarks := map[uint32]blockpack.CubeResolutionWatermark{}
+	watermarks := map[uint32]ResolutionWatermark{}
 	if len(watermarksRaw) > 0 {
-		if err := json.Unmarshal(watermarksRaw, &watermarks); err != nil {
-			return fmt.Errorf("pg cube entrystore: decoding watermarks: %w", err)
+		if decodeErr := json.Unmarshal(watermarksRaw, &watermarks); decodeErr != nil {
+			return fmt.Errorf("pg cube entrystore: decoding watermarks: %w", decodeErr)
 		}
 		// json.Marshal(nil map) produces the JSON literal "null" (not "{}"), and
 		// unmarshaling "null" into a map resets it to nil, overwriting the
@@ -180,11 +201,11 @@ func (s *pgCubeEntryStore) UpdateWatermarksEntry(ctx context.Context, tenant, cu
 		// never panics on a nil map (confirmed via a real Postgres run: AddEntry's
 		// nil-Watermarks-on-creation path round-trips through exactly this null case).
 		if watermarks == nil {
-			watermarks = map[uint32]blockpack.CubeResolutionWatermark{}
+			watermarks = map[uint32]ResolutionWatermark{}
 		}
 	}
 
-	newWm := blockpack.CubeResolutionWatermark{MinMinute: minMinute, MaxMinute: maxMinute}
+	newWm := ResolutionWatermark{MinMinute: minMinute, MaxMinute: maxMinute}
 	if existing, ok := watermarks[level]; ok {
 		if existing.MinMinute < newWm.MinMinute {
 			newWm.MinMinute = existing.MinMinute
@@ -208,4 +229,4 @@ func (s *pgCubeEntryStore) UpdateWatermarksEntry(ctx context.Context, tenant, cu
 	return nil
 }
 
-var _ blockpack.CubeEntryStore = (*pgCubeEntryStore)(nil)
+var _ EntryStore = (*PgEntryStore)(nil)

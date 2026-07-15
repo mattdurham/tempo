@@ -4,6 +4,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/grafana/tempo/modules/postgres"
 	"github.com/grafana/tempo/tempodb/encoding/common"
 	"github.com/grafana/tempo/tempodb/encoding/vparquet5"
 	"github.com/grafana/tempo/tempodb/wal"
@@ -107,6 +108,75 @@ func TestValidateConfig(t *testing.T) {
 					BloomShardSizeBytes: 1,
 					Version:             vparquet5.VersionString,
 				},
+			},
+		},
+		// issue #504: CubeTenants non-empty with no Postgres configured hard-fails at startup
+		// (the cube registry is Postgres-only, no blob/index.json fallback).
+		{
+			cfg: &Config{
+				WAL: &wal.Config{},
+				Block: &common.BlockConfig{
+					BloomFP:             0.01,
+					BloomShardSizeBytes: 1,
+					Version:             vparquet5.VersionString,
+					Blockpack: common.BlockpackConfig{
+						CubeTenants: []string{"tenant-a"},
+					},
+				},
+				Postgres: nil,
+			},
+			err: errors.New("blockpack.cube_tenants is non-empty but postgres is not configured: the cube registry requires postgres (issue #504)"),
+		},
+		// empty CubeTenants passes regardless of whether Postgres is configured.
+		{
+			cfg: &Config{
+				WAL: &wal.Config{},
+				Block: &common.BlockConfig{
+					BloomFP:             0.01,
+					BloomShardSizeBytes: 1,
+					Version:             vparquet5.VersionString,
+				},
+				Postgres: nil,
+			},
+			expectedConfig: &Config{
+				WAL: &wal.Config{
+					Version: vparquet5.VersionString,
+				},
+				Block: &common.BlockConfig{
+					BloomFP:             0.01,
+					BloomShardSizeBytes: 1,
+					Version:             vparquet5.VersionString,
+				},
+				Postgres: nil,
+			},
+		},
+		// non-empty CubeTenants passes when Postgres is configured.
+		{
+			cfg: &Config{
+				WAL: &wal.Config{},
+				Block: &common.BlockConfig{
+					BloomFP:             0.01,
+					BloomShardSizeBytes: 1,
+					Version:             vparquet5.VersionString,
+					Blockpack: common.BlockpackConfig{
+						CubeTenants: []string{"tenant-a"},
+					},
+				},
+				Postgres: &postgres.Config{},
+			},
+			expectedConfig: &Config{
+				WAL: &wal.Config{
+					Version: vparquet5.VersionString,
+				},
+				Block: &common.BlockConfig{
+					BloomFP:             0.01,
+					BloomShardSizeBytes: 1,
+					Version:             vparquet5.VersionString,
+					Blockpack: common.BlockpackConfig{
+						CubeTenants: []string{"tenant-a"},
+					},
+				},
+				Postgres: &postgres.Config{},
 			},
 		},
 	}

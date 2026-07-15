@@ -457,6 +457,13 @@ func (w *BackendWorker) processCubeBackfillJobPostgres(ctx context.Context, job 
 	if w.s3Cfg == nil {
 		return fmt.Errorf("cube backfill: S3 not configured on worker")
 	}
+	// w.pgPool backs the cube registry (issue #504: Postgres is now the only supported cube
+	// registry backend, no blob/index.json fallback) -- distinct from w.jobStore's own nil
+	// check above (jobStore is the durable job QUEUE; pgPool here is the cube registry itself,
+	// both opt-in on the SAME cfg.Postgres != nil condition, see w.pgPool's field doc comment).
+	if w.pgPool == nil {
+		return fmt.Errorf("cube backfill: postgres not configured on worker")
+	}
 
 	level.Info(log.Logger).Log("msg", "processing cube backfill job (postgres)",
 		"job_id", job.ID, "tenant", job.Tenant, "cube_id", detail.CubeID)
@@ -466,13 +473,13 @@ func (w *BackendWorker) processCubeBackfillJobPostgres(ctx context.Context, job 
 	// RunCubeBackfill with a placeholder entry lacking AggAttrs would fail
 	// cube.Backfiller's per-minute validation on every single minute of the
 	// backfill window, burning the job's entire ctx budget for nothing.
-	entry, err := vblockpack.LoadCubeEntry(ctx, w.s3Cfg, job.Tenant, detail.CubeID)
+	entry, err := vblockpack.LoadCubeEntry(ctx, w.pgPool, job.Tenant, detail.CubeID)
 	if err != nil {
 		return fmt.Errorf("cube backfill: no registry entry found for cube %s: %w", detail.CubeID, err)
 	}
 
 	// Run backfill synchronously (the worker goroutine is already async).
-	if err := vblockpack.RunCubeBackfill(ctx, entry, w.s3Cfg); err != nil {
+	if err := vblockpack.RunCubeBackfill(ctx, entry, w.s3Cfg, w.pgPool); err != nil {
 		return fmt.Errorf("cube backfill failed: %w", err)
 	}
 

@@ -426,6 +426,11 @@ func TestTryQueryFromCube_ExcludesFileOnAggAttrsMismatch(t *testing.T) {
 // rollupCubeInputs was, because tryQueryFromCube's S3/minio file-listing wiring is otherwise
 // untestable in isolation (no minio test double exists in this codebase for listObjects/
 // getObject, only for the registry store seam).
+// Deliberately kept on blockpack.NewCubeRegistry's blob backend (issue #504's test-migration
+// review, 2026-07-15): this drives router.Route/cubeCoveredWindow directly against a
+// standalone Registry round trip, never through cubeQueryPath's loadEntries/maybeCreateCube
+// (which are Postgres-only in production now) -- a real Postgres testcontainer would add
+// test weight for zero additional coverage of this function's actual logic under test.
 func TestCubeCoveredWindow_RealRouterResult(t *testing.T) {
 	ctx := context.Background()
 	tenant := "cube-covered-window-tenant"

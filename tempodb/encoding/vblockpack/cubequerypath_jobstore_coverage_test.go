@@ -4,8 +4,13 @@ package vblockpack
 // "already exists" (Created=false) branch must also insert a durable retry job when the
 // existing cube has never completed a single backfill pass (no CubeRollupL0 watermark
 // yet) -- closing the coverage gap identified in §5.3 once cube_backfill's poll is gone.
-// Uses seedCubeEntry/fakeCubeRegistryObjectStore (cube_backfill_watermark_test.go, same
-// package) to register a pre-existing entry so TryCreate's "already exists" branch fires.
+//
+// 2026-07-15 migration (issue #504): cube's registry is Postgres-only now (no
+// blob/index.json fallback), and maybeCreateCube's own registry construction moved to
+// blockpack.NewPgCubeRegistry(cqp.pgPool, tenant) -- these tests seed the pre-existing
+// entry into a real ephemeral Postgres instance (newTestPostgresPool, shared with
+// pg_entrystore_test.go) and set cqp.pgPool, in place of the old
+// seedCubeEntry/fakeCubeRegistryObjectStore blob fixtures.
 
 import (
 	"context"
@@ -46,17 +51,16 @@ func TestMaybeCreateCube_AlreadyExists_NoL0Watermark_InsertsRetryJob(t *testing.
 	pool := newTestPostgresPool(t)
 	require.NoError(t, migrate.Apply(context.Background(), pool))
 
-	store := &fakeCubeRegistryObjectStore{}
 	tenant := "tenant-cube-nowatermark"
 	dims := []string{"resource.service.name"}
 	entry := existingCubeEntry(tenant, dims, nil) // no watermarks at all -> no L0 entry
-	seedCubeEntry(t, store, entry)
+	require.NoError(t, blockpack.NewPgCubeRegistry(pool, tenant).Add(context.Background(), entry))
 
 	cqp := &cubeQueryPath{
-		store:      store,
 		tenants:    make(map[string]*tenantCubeState),
 		createSeen: make(map[string]time.Time),
 		jobStore:   jobstore.New(pool),
+		pgPool:     pool,
 	}
 
 	now := time.Now()
@@ -78,20 +82,19 @@ func TestMaybeCreateCube_AlreadyExists_HasL0Watermark_NoInsert(t *testing.T) {
 	pool := newTestPostgresPool(t)
 	require.NoError(t, migrate.Apply(context.Background(), pool))
 
-	store := &fakeCubeRegistryObjectStore{}
 	tenant := "tenant-cube-haswatermark"
 	dims := []string{"resource.service.name"}
 	watermarks := map[uint32]blockpack.CubeResolutionWatermark{
 		blockpack.CubeRollupL0: {MinMinute: 100, MaxMinute: 200},
 	}
 	entry := existingCubeEntry(tenant, dims, watermarks)
-	seedCubeEntry(t, store, entry)
+	require.NoError(t, blockpack.NewPgCubeRegistry(pool, tenant).Add(context.Background(), entry))
 
 	cqp := &cubeQueryPath{
-		store:      store,
 		tenants:    make(map[string]*tenantCubeState),
 		createSeen: make(map[string]time.Time),
 		jobStore:   jobstore.New(pool),
+		pgPool:     pool,
 	}
 
 	now := time.Now()
@@ -114,11 +117,10 @@ func TestMaybeCreateCube_AlreadyExists_NoL0Watermark_ExistingPendingJobIsNotDupl
 	pool := newTestPostgresPool(t)
 	require.NoError(t, migrate.Apply(context.Background(), pool))
 
-	store := &fakeCubeRegistryObjectStore{}
 	tenant := "tenant-cube-dup"
 	dims := []string{"resource.service.name"}
 	entry := existingCubeEntry(tenant, dims, nil)
-	seedCubeEntry(t, store, entry)
+	require.NoError(t, blockpack.NewPgCubeRegistry(pool, tenant).Add(context.Background(), entry))
 
 	js := jobstore.New(pool)
 	require.NoError(t, js.InsertCubeBackfill(context.Background(), tenant, jobstore.CubeBackfillDetail{
@@ -126,10 +128,10 @@ func TestMaybeCreateCube_AlreadyExists_NoL0Watermark_ExistingPendingJobIsNotDupl
 	}))
 
 	cqp := &cubeQueryPath{
-		store:      store,
 		tenants:    make(map[string]*tenantCubeState),
 		createSeen: make(map[string]time.Time),
 		jobStore:   js,
+		pgPool:     pool,
 	}
 
 	now := time.Now()

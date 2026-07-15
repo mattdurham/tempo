@@ -2,9 +2,15 @@ package vblockpack
 
 // cubequerypath_warming_test.go — F-10 (issue #481 part 3, R1's self-healing story):
 // real-write-path/real-conversion-path tests for tryQueryFromCube's ErrCubeWarming
-// distinction and QueryRange's error-path wiring. Uses cubeQueryPath's store injection seam
-// (cubequerypath.go's objectStore()) to exercise tryQueryFromCube's cube-not-found branch
-// through the REAL production method, without a live S3/minio server.
+// distinction and QueryRange's error-path wiring. Exercises tryQueryFromCube's
+// cube-not-found branch through the REAL production method, without a live S3/minio server.
+//
+// 2026-07-15 migration (issue #504): cube's registry is Postgres-only now (no
+// blob/index.json fallback) -- newEmptyTestCubeQueryPath used to back cqp with a fake
+// always-"not found" blockpack.CubeObjectStore (emptyCubeObjectStore, via
+// cubequerypath.go's now-removed objectStore() DI seam) to simulate a genuinely empty
+// registry. A freshly-created ephemeral Postgres pool (newTestPostgresPool) with no
+// cube_entries rows achieves the exact same "not found" semantics now.
 
 import (
 	"context"
@@ -22,19 +28,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// emptyCubeObjectStore is a minimal blockpack.CubeObjectStore reporting "not found" for every
-// path — a genuinely empty cube registry, mirroring minioObjectStore.Get's own NoSuchKey
-// convention (nil data, empty etag, nil error).
-type emptyCubeObjectStore struct{}
-
-func (emptyCubeObjectStore) Get(context.Context, string) ([]byte, string, error) {
-	return nil, "", nil
-}
-
-func (emptyCubeObjectStore) ConditionalPut(context.Context, string, []byte, string) error {
-	return nil
-}
-
 // withCubeQueryPath installs cqp as the process-level cube query path for the duration of the
 // test, restoring the previous value (nil in production tests, since ConfigureCubeQueryPath is
 // never called in this test binary) on cleanup.
@@ -51,15 +44,16 @@ func withCubeQueryPath(t *testing.T, cqp *cubeQueryPath) {
 	})
 }
 
-// newEmptyTestCubeQueryPath returns a *cubeQueryPath backed by emptyCubeObjectStore — every
-// query with group-by dims and a cube-representable filter reaches tryQueryFromCube's
-// "!result.Found" branch (a genuinely empty registry), firing maybeCreateCube and returning
-// ErrCubeWarming.
-func newEmptyTestCubeQueryPath() *cubeQueryPath {
+// newEmptyTestCubeQueryPath returns a *cubeQueryPath backed by a genuinely empty (freshly
+// migrated, no cube_entries rows) real Postgres pool — every query with group-by dims and a
+// cube-representable filter reaches tryQueryFromCube's "!result.Found" branch (a genuinely
+// empty registry), firing maybeCreateCube and returning ErrCubeWarming.
+func newEmptyTestCubeQueryPath(t *testing.T) *cubeQueryPath {
+	t.Helper()
 	return &cubeQueryPath{
-		store:      emptyCubeObjectStore{},
 		tenants:    make(map[string]*tenantCubeState),
 		createSeen: make(map[string]time.Time),
+		pgPool:     newTestPostgresPool(t),
 	}
 }
 
@@ -68,7 +62,7 @@ func newEmptyTestCubeQueryPath() *cubeQueryPath {
 // does — so the background goroutine tryQueryFromCube fires (`go cqp.maybeCreateCube(...)`)
 // hits its own cooldown check and returns IMMEDIATELY, before ever reaching fetchVCNTSection/
 // TryCreate/launchBackfill. Those deeper steps need a real S3/minio client (cqp.client, which
-// this test's cqp intentionally leaves nil via the store-injection seam) and are exercised by
+// this test's cqp intentionally leaves nil) and are exercised by
 // cube_scheduler_test.go/cubemanager_test.go elsewhere — NOT this file's concern. Without this,
 // the fire-and-forget goroutine outlives the test function and can panic on a nil *minio.Client
 // asynchronously, crashing an unrelated LATER test in the same process (verified: this is
@@ -108,7 +102,7 @@ func TestTryQueryFromCube_NoGroupByDims_DistinctFromCubeWarming(t *testing.T) {
 // above pins actually fires for the warming case, not just that it doesn't misfire for the
 // non-applicable case.
 func TestTryQueryFromCube_EmptyRegistry_ReturnsCubeWarming(t *testing.T) {
-	cqp := newEmptyTestCubeQueryPath()
+	cqp := newEmptyTestCubeQueryPath(t)
 	const query = `{ resource.service.name = "svc-alpha" } | count_over_time() by (resource.service.name)`
 	preventBackgroundCreateAttempt(cqp, "test-tenant", query)
 
@@ -134,7 +128,7 @@ func TestTryQueryFromCube_EmptyRegistry_ReturnsCubeWarming(t *testing.T) {
 // QueryRange must surface distinguishably from the permanent "shape not answerable" reason,
 // since a repeat query after backfill should succeed.
 func TestQueryRange_CubeNotYetBackfilled_ProductionDefault_ReturnsWarmingTypedError_TriggersCreate(t *testing.T) {
-	cqp := newEmptyTestCubeQueryPath()
+	cqp := newEmptyTestCubeQueryPath(t)
 	const query = `{ resource.service.name = "svc-alpha" } | count_over_time() by (resource.service.name)`
 	preventBackgroundCreateAttempt(cqp, "test-tenant", query)
 	withCubeQueryPath(t, cqp)

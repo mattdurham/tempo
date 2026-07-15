@@ -835,10 +835,10 @@ Back-refs: `internal/modules/valueindexconsumer/service.go:recordManifestEntry,M
 `internal/modules/colhashmanifest` (the shared registry implementation; see its own
 SPECS.md/NOTES.md), `internal/modules/valuecountscompactor/NOTES.md` NOTE-VC-019 (VCNT's
 symmetric hook, and why it lives at compaction time instead of an L0 write blockpack does not
-own), `internal/modules/valueindex/NOTES.md` NOTE-VI-107 (the cross-reference entry in the
+own), `internal/modules/valueindex/NOTES.md` NOTE-VI-117 (the cross-reference entry in the
 module this feature is conceptually "for," even though its call site lives here).
 
-## NOTE-VI-108 — `recordManifestEntry` caches confirmed-recorded `(tenant, colHash)` pairs, skipping the manifest `Get` on every repeat flush (task #216 HIGH follow-up)
+## NOTE-VI-118 — `recordManifestEntry` caches confirmed-recorded `(tenant, colHash)` pairs, skipping the manifest `Get` on every repeat flush (task #216 HIGH follow-up)
 
 Date: 2026-07-13
 

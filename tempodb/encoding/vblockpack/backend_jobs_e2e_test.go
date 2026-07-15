@@ -161,6 +161,11 @@ func TestE2E_MaybeCreateCube_RealTrigger_InsertsPendingJob(t *testing.T) {
 		tenants:    make(map[string]*tenantCubeState),
 		createSeen: make(map[string]time.Time),
 		jobStore:   jobstore.New(pool),
+		// pgPool backs maybeCreateCube's cube registry (issue #504: Postgres-only now, no
+		// blob/index.json fallback) -- without this, maybeCreateCube's nil-pgPool guard
+		// would skip cube creation entirely, and this test's whole point (a real durable
+		// pending job actually getting inserted) would never fire.
+		pgPool: pool,
 	}
 	withCubeQueryPath(t, cqp)
 

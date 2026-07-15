@@ -129,7 +129,7 @@ func (it *BucketFileIterator) skipEmptyBlocks() {
 // failure is a genuine corrupt v2 file and is returned as an error: silently skipping it
 // would permanently drop its postings from a compacted output, silently under-counting the
 // index — the same silent-partial-result bug class the trace-by-id review caught
-// (NOTE-VI-046). Mirrors NewDiskBucketFileIterator's discipline.
+// (NOTE-VI-115). Mirrors NewDiskBucketFileIterator's discipline.
 func DecodeFilteredBucketFile(ctx context.Context, data []byte, checker RefChecker) (*BucketFile, CompactStats, error) {
 	f, err := DecodeBucketFile(data)
 	if err != nil {

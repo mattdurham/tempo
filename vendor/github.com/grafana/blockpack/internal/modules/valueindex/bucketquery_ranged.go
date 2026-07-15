@@ -32,7 +32,7 @@ import (
 // errors.Is(err, ErrNotBucketFile) from DecodeBucketFooter) is treated as "not a bucket file"
 // and returns (nil, nil) — the per-file analog of QueryBucketFiles' ErrNotBucketFile-skip, not
 // an error. Any other decode failure is a genuine error on a real v2 file and is returned, so
-// the caller falls back to a full scan rather than silently under-count (NOTE-VI-046).
+// the caller falls back to a full scan rather than silently under-count (NOTE-VI-115).
 func QueryBucketFileRanged(
 	ctx context.Context, src RangedSource, pred Predicate, timeRange *[2]uint64,
 ) ([]LookupResult, error) {
@@ -183,7 +183,7 @@ func QueryBucketFileRangedNewestFirst(
 func readAndDecodeBlockRanged(src RangedSource, d *BlockDirEntry) (*BucketBlock, error) {
 	// d.CompOff/CompLen were already bounds-checked against the string-table offset by
 	// readBucketFileTail (bucketfile_metadata.go) when dir was decoded — this function never
-	// sees an unvalidated entry (NOTE-VI-046).
+	// sees an unvalidated entry (NOTE-VI-115).
 	raw := make([]byte, d.CompLen)
 	if _, err := src.ReadAt(raw, int64(d.CompOff)); err != nil { //nolint:gosec // bounds-checked by readBucketFileTail
 		return nil, fmt.Errorf("read compressed bytes: %w", err)

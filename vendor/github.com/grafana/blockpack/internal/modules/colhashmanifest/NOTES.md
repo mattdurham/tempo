@@ -168,3 +168,55 @@ test.go`) and `TestMergeLevel_HangingManifestStoreDoesNotBlockMerge`
 
 Back-refs: `internal/modules/colhashmanifest/manifest.go:manifestOpTimeout,Load,RecordColumn`.
 See SPECS.md SPEC-COLMANIFEST-5.
+
+## NOTE-COLMANIFEST-3 — Native Postgres Store: generic key/blob table chosen over a normalized per-Entry table (issue #506)
+
+Date: 2026-07-15
+
+**Decision:** `pg_store.go` adds `PgStore{pool}` / `NewPgStore(pool)`, a fresh (not ported) native
+Postgres-backed implementation of `Store` (SPEC-COLMANIFEST-2), backed by a generic key/blob table
+(`column_manifest_blobs`: `key TEXT PRIMARY KEY, data BYTEA, updated_at BIGINT`) — deliberately NOT
+a normalized table with one row per `Entry`. `Get` = `SELECT data WHERE key=$1`; `Put` = `INSERT
+... ON CONFLICT(key) DO UPDATE`. No transaction, no advisory lock, no `SELECT ... FOR UPDATE`.
+
+**Why key/blob, not normalized (spec-oracle-506's Open Decision D1 review, approved before
+implementation):**
+1. `Store`'s own contract (SPEC-COLMANIFEST-2) is ALREADY blob-shaped — `Get(ctx,key)([]byte,error)`/
+   `Put(ctx,key,data)error` operating on one opaque key (`ManifestPath(tenant)`,
+   SPEC-COLMANIFEST-1) holding one whole JSON-encoded manifest, not one row per `Entry`. A
+   key/blob table maps 1:1 onto `Store`'s own two methods with ZERO additional logic in
+   `pg_store.go` — `RecordColumn`/`Load`'s entire business logic (the idempotent-per-colHash
+   create/no-op/upgrade-to-`SourceBoth` state machine, SPEC-COLMANIFEST-4) keeps running
+   byte-for-byte identically regardless of backend, since `manifest.go` only ever calls
+   `Store.Get`/`Store.Put`.
+2. A normalized table would have forced `pg_store.go` to reimplement SPEC-COLMANIFEST-4's decision
+   table as SQL, AND reimplement the JSON blob's encode/decode round-trip (splitting one
+   `Put(wholeBlob)` into N per-entry row upserts, reassembling N rows into one blob on `Get`) —
+   real, avoidable duplication of already-tested Go logic, and a genuine behavioral-drift risk
+   between backends (no SPECS.md anywhere in this codebase permits backend-dependent behavioral
+   divergence).
+3. No query-by-subfield need exists to justify normalization's usual benefit — this manifest is
+   never consulted by any correctness-relevant read/write/query path (SPEC-COLMANIFEST-1), only
+   ever loaded whole per tenant.
+4. `PgStore.Get` on a missing key returns a real, non-nil, wrapped error (never `(nil, nil)`) —
+   matching `Store`'s own doc-comment expectation of a genuine error signal for a miss, even
+   though `Load` (SPEC-COLMANIFEST-3) treats ANY `Get` error identically as "empty manifest" one
+   layer up, so this is behaviorally equivalent to the blob backend either way from `Load`'s
+   perspective.
+
+**No row-locking/ETag ceremony, by design:** matches NOTE-COLMANIFEST-1's own rationale exactly —
+this manifest is advisory-only, never consulted by any correctness-relevant path, and already
+tolerates lost updates under true concurrency on the blob backend. Giving the Postgres backend
+row-lock/ETag rigor cube/viusage's own `EntryStore` implementations need would over-engineer a
+LOW-priority, best-effort feature against its own already-reasoned simplicity choice.
+
+**Verified end-to-end** by `TestRecordColumn_BlobAndPgBackends_IdenticalBehavior`
+(`pg_blob_differential_test.go`) and `TestRecordColumn_PgStore_HangingQueryRespectsCtxTimeout`
+(`pg_hanging_query_test.go`, the required manifestOpTimeout-under-real-contention regression test
+spec-oracle-506's review called for) — see SPEC-COLMANIFEST-6.
+
+**Back-refs:** `internal/modules/colhashmanifest/pg_store.go:PgStore,NewPgStore,Get,Put,
+ApplySchema`, `internal/modules/colhashmanifest/schema.sql`,
+`column_manifest.go:NewPgColumnManifestStore,ApplyColumnManifestSchema` (root, first-ever
+colhashmanifest root re-export). Tests: `pg_store_test.go`, `pg_blob_differential_test.go`,
+`pg_hanging_query_test.go`. See SPEC-COLMANIFEST-6. Issue #506.

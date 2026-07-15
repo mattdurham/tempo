@@ -28,6 +28,8 @@ import (
 	"context"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/grafana/blockpack/internal/modules/valueindex"
 	"github.com/grafana/blockpack/internal/modules/viusage"
 )
@@ -91,10 +93,11 @@ func NewRegistry(store ObjectStore, tenant string) *Registry {
 
 // EntryStore is the row-oriented storage interface an alternative Registry backend
 // implements (2026-07-11 Postgres support) — in place of ObjectStore's whole-blob
-// conditional-PUT shape, this is one row per (tenant, colHash, colType). tempo's
-// pgx-backed implementation lives entirely in tempo (this package never imports a SQL
-// driver) — mirrors ObjectStore's own "interface owned here, concrete backend owned by
-// the caller" split exactly.
+// conditional-PUT shape, this is one row per (tenant, colHash, colType). blockpack
+// now ships its own native pgx-backed implementation (NewPgViUsageEntryStore, issue
+// #506) as well as accepting an externally-supplied one (e.g. tempo's own pre-#506
+// pgx-backed store) — mirrors ObjectStore's own "interface owned here, concrete
+// backend owned by either side" split.
 type EntryStore = viusage.EntryStore
 
 // NewRegistryFromEntryStore constructs a Registry over an externally-supplied
@@ -103,6 +106,28 @@ type EntryStore = viusage.EntryStore
 // are byte-identical regardless of which constructor built it.
 func NewRegistryFromEntryStore(store EntryStore, tenant string) *Registry {
 	return viusage.NewRegistryFromEntryStore(store, tenant)
+}
+
+var _ EntryStore = (*viusage.PgEntryStore)(nil)
+
+// NewPgViUsageEntryStore constructs a native Postgres-backed EntryStore over
+// pool (issue #506).
+func NewPgViUsageEntryStore(pool *pgxpool.Pool) EntryStore {
+	return viusage.NewPgEntryStore(pool)
+}
+
+// NewPgViUsageRegistry is a one-call convenience constructor for the common
+// case of wanting a Postgres-backed Registry without caring about the
+// EntryStore seam directly.
+func NewPgViUsageRegistry(pool *pgxpool.Pool, tenant string) *Registry {
+	return viusage.NewPgRegistry(pool, tenant)
+}
+
+// ApplyViUsageSchema applies viusage's Postgres schema (viusage_entries)
+// against pool. Never called automatically by any constructor — the
+// embedding application calls it once at its own startup.
+func ApplyViUsageSchema(ctx context.Context, pool *pgxpool.Pool) error {
+	return viusage.ApplySchema(ctx, pool)
 }
 
 // RecordUseAndMaybeTrigger appends one usage timestamp for (tenant, colName, colType)

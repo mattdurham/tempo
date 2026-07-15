@@ -117,7 +117,7 @@ type Service struct {
 	columns      map[string]struct{}
 
 	// manifestSeen caches (tenant, colHash) pairs already confirmed recorded in the colHash
-	// manifest this process's lifetime, keyed by tenant+"\x00"+colHash (NOTE-VI-108, task #216
+	// manifest this process's lifetime, keyed by tenant+"\x00"+colHash (NOTE-VI-118, task #216
 	// HIGH follow-up). recordManifestEntry checks this BEFORE ever calling into
 	// colhashmanifest.RecordColumn, skipping the Get round-trip entirely once a colHash is
 	// known-recorded -- Service is single-goroutine (see the struct doc comment above), so no
@@ -561,7 +561,7 @@ func (s *Service) flushColumn(ctx context.Context, buf *columnBuffer) error {
 // call follows has already succeeded and must never be failed retroactively by this
 // side-channel.
 //
-// NOTE-VI-108 (task #216 HIGH follow-up): checks s.manifestSeen BEFORE ever calling into
+// NOTE-VI-118 (task #216 HIGH follow-up): checks s.manifestSeen BEFORE ever calling into
 // colhashmanifest.RecordColumn, which otherwise performs a full Get of the tenant's aggregate
 // manifest file on EVERY flush of a given column, forever -- flushColumn runs on VI's real L0
 // write path, every column flush, indefinitely. Once a (tenant, colHash) pair is confirmed

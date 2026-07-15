@@ -10,6 +10,8 @@ package cube
 import (
 	"context"
 	"errors"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // indexVersion is the current version of the index.json wire format.
@@ -61,6 +63,13 @@ type Registry struct {
 // blobEntryStore (today's S3/Local/GCS/Azure conditional-PUT path, behavior-preserving).
 func NewRegistry(store ObjectStore, tenant string) *Registry {
 	return &Registry{store: &blobEntryStore{store: store}, tenant: tenant}
+}
+
+// NewPgRegistry is a convenience constructor for the common case of wanting a
+// Postgres-backed Registry without caring about the EntryStore seam directly
+// -- equivalent to NewRegistryFromEntryStore(NewPgEntryStore(pool), tenant).
+func NewPgRegistry(pool *pgxpool.Pool, tenant string) *Registry {
+	return NewRegistryFromEntryStore(NewPgEntryStore(pool), tenant)
 }
 
 // Load fetches and decodes the current index. Returns an empty index when the file does

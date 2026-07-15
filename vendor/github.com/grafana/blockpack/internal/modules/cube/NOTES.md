@@ -916,3 +916,69 @@ TryCreate`; `cube_ingest.go:CubeTriggerConfig`; `cmd/deadcode/main.go`. Tests:
 `internal/modules/cube/registry_test.go:TestRegistry_NoLimitEnforced_UnboundedCubeCount`,
 `internal/modules/cube/trigger_test.go:TestTrigger_NoLimitEnforced_UnboundedCubeCount`. Issues
 #182, #497.
+
+## NOTE-CUBE-030: Native Postgres EntryStore implementation added (issue #506)
+
+Date: 2026-07-15
+
+**Decision:** `pg_entry_store.go` adds `PgEntryStore{pool}` / `NewPgEntryStore(pool)`, a native
+Postgres-backed implementation of `EntryStore` (SPEC-CUBE-014), ported verbatim from tempo's
+`tempodb/encoding/vblockpack/pg_entrystore_cube.go` (2026-07-11). blockpack now depends on
+`github.com/jackc/pgx/v5` directly for this file only; `EntryStore`'s own contract, `NewRegistry`,
+and the blob-backed path are unchanged and remain fully supported — this is purely additive.
+`NewPgRegistry(pool, tenant)` (`registry.go`) is a one-call convenience wrapper equivalent to
+`NewRegistryFromEntryStore(NewPgEntryStore(pool), tenant)`. `ApplySchema(ctx, pool)` (`//go:embed
+schema.sql`) applies `cube_entries`'s schema; never called automatically by any constructor,
+mirroring tempo's own `migrate.Apply` precedent — the embedding application calls it once at its
+own startup.
+
+**Rationale:** see spec-oracle-506's own review (`.bob/state/spec-oracle-506-review.md`) for the
+full analysis of why this mirrors, rather than shares code with, viusage's/colhashmanifest's own
+native Postgres implementations — cube's `entryStore` interface has 4 narrow methods (not
+viusage's 1 generic `upsertEntry`), a distinction this port preserves exactly (`AddEntry`/
+`RemoveEntry`/`UpdateWatermarksEntry` as 3 separate methods, matching NOTE-CUBE-025's own R1
+ruling).
+
+**Load-bearing details preserved verbatim from the port, not reimplemented or "cleaned up":**
+- Advisory-lock-before-exists-check ordering in `AddEntry` (`pg_advisory_xact_lock(hashtext(tenant))`
+  acquired FIRST, before the idempotency check) — the first cube for a tenant has no row to
+  `SELECT ... FOR UPDATE`, so this ordering is the only thing preventing two concurrent
+  first-registrations of the same new CubeID from both passing the "not present" check before
+  either INSERT commits.
+- The JSONB-null-map watermarks re-init guard in `UpdateWatermarksEntry` (`json.Marshal(nil map)`
+  → `"null"` → unmarshal resets to nil) — carried over with its original explanatory comment
+  citing "a real Postgres run" as the evidence for the bug class.
+
+**Mutation-tested per this project's standing rigor bar:** the advisory lock was temporarily
+removed from `AddEntry` for `TestPgEntryStore_AddEntry_ConcurrentFirstCubeRegistration_
+NoDuplicateOrRace` — plain removal alone did not reliably reproduce a failure against a fast
+local Postgres round-trip, so a temporary 50ms sleep was added between the exists-check and the
+INSERT to widen the race window (mirroring tempo's own documented precedent for the analogous
+viusage test). With both changes in place, the test correctly failed with a real duplicate-key
+violation (SQLSTATE 23505); both were reverted and the full package suite (including `-race`)
+confirmed green again.
+
+**Back-refs:** `internal/modules/cube/pg_entry_store.go:PgEntryStore,NewPgEntryStore,ApplySchema`,
+`internal/modules/cube/registry.go:NewPgRegistry`, `internal/modules/cube/schema.sql`,
+`cube_ingest.go:NewPgCubeEntryStore,NewPgCubeRegistry,ApplyCubeSchema`. Tests:
+`pg_entry_store_test.go`, `pg_blob_differential_test.go`. See SPEC-CUBE-031. Issue #506.
+
+### Addendum (2026-07-15): schema-drift risk between `schema.sql` and tempo's `registries.sql`
+
+`schema.sql` was ported verbatim from tempo's own
+`tempodb/encoding/vblockpack/schema/registries.sql` (`cube_entries` section) and is, as of this
+writing, byte-identical to it (confirmed by direct diff during the #506 holistic review). This is
+kept in sync **by convention only — there is no automated check, CI diff, or shared source file
+between the two repos.** If tempo's copy of `registries.sql` is ever modified (e.g. a new column
+or index added to `cube_entries`), blockpack's `schema.sql` must be updated to match by hand, and
+vice versa; nothing today would catch a silent divergence, and whichever `ApplySchema`/
+`migrate.Apply` call happens to run first against a fresh database "wins" the initial table shape.
+This is not a live bug — both `CREATE TABLE IF NOT EXISTS`/`CREATE INDEX IF NOT EXISTS` statements
+are idempotent, so calling both against the same database today is a safe no-op — but it is a real,
+currently-undocumented gap for the future. Whoever eventually migrates tempo's 4 cube-related call
+sites (`cube_scheduler.go`, `cube_backfill.go` x2, `cubequerypath.go`) onto blockpack's
+`NewPgCubeEntryStore`/`ApplyCubeSchema` (the stated next step after #506) should, at that point,
+retire tempo's own copy of the `cube_entries` section of `registries.sql` and treat blockpack's
+`schema.sql` as the sole source of truth — this closes the gap permanently. Until that happens,
+treat any change to either file as requiring a manual check of the other. See go-presubmit.md /
+review.md Issue 2 (#506 holistic review) for the finding that prompted this addendum.

@@ -138,3 +138,28 @@ real write path" documentation, which was previously only true against a fast-er
 see NOTES.md NOTE-COLMANIFEST-2 for the full CRITICAL-finding writeup.
 
 Back-ref: `internal/modules/colhashmanifest/manifest.go:manifestOpTimeout,Load,RecordColumn`.
+
+## SPEC-COLMANIFEST-6: Native Postgres Store must be behaviorally identical to the blob-backed implementation, and must still respect manifestOpTimeout under real query contention (issue #506)
+
+*Added: 2026-07-15*
+
+**Invariant:** A native Postgres `Store` implementation (`colhashmanifest.PgStore`) MUST be
+behaviorally identical to the blob-backed implementation for `Load`/`RecordColumn` — backend
+choice never changes their observable contract (SPEC-COLMANIFEST-3/4). Verified by
+`TestRecordColumn_BlobAndPgBackends_IdenticalBehavior` (`pg_blob_differential_test.go`), with
+explicit attention to `FirstSeenAtSec` never being mutated by the upgrade-to-`SourceBoth` step, on
+either backend.
+
+A Postgres `Store` implementation MUST still respect the caller-derived `manifestOpTimeout`
+deadline (SPEC-COLMANIFEST-5) even under REAL query contention (a blocked-on-a-row-lock query),
+not just a fast-erroring failure — verified by `TestRecordColumn_PgStore_HangingQueryRespectsCtxTimeout`
+(`pg_hanging_query_test.go`), which holds a real, uncommitted transaction locking `RecordColumn`'s
+target key and confirms `RecordColumn`'s `Put` call surfaces a real, non-nil, propagated error
+within a bounded time (never swallowed — SPEC-COLMANIFEST-4 point 5 — unlike the blob-backed
+hanging test's `Get`-swallow path, TEST-COLMANIFEST-15) — mirroring
+`TestRecordColumn_HangingStoreDoesNotBlockForever`'s existing discipline for the blob-backed case.
+
+**Back-ref:** `internal/modules/colhashmanifest/pg_store.go`,
+`internal/modules/colhashmanifest/pg_blob_differential_test.go:TestRecordColumn_BlobAndPgBackends_
+IdenticalBehavior`, `internal/modules/colhashmanifest/pg_hanging_query_test.go:
+TestRecordColumn_PgStore_HangingQueryRespectsCtxTimeout`. See NOTE-COLMANIFEST-3. Issue #506.

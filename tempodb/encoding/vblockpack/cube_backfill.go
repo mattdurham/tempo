@@ -20,6 +20,7 @@ import (
 	blockpack "github.com/grafana/blockpack"
 	util_log "github.com/grafana/tempo/pkg/util/log"
 	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
+	"github.com/jackc/pgx/v5/pgxpool"
 	minio "github.com/minio/minio-go/v7"
 )
 
@@ -96,12 +97,10 @@ func (cqp *cubeQueryPath) fetchVCNTSection(
 	dims []string,
 	minTS, maxTS uint64,
 ) ([]byte, []blockpack.VCNTChunkDirEntry) {
-	// F-10 (issue #481 part 3): a nil client (the test-only cqp.store injection seam,
-	// cubequerypath.go's objectStore(), covers the REGISTRY store only — this is a SEPARATE
-	// value-index store construction with no equivalent seam) is exactly the "absent
-	// capability" case this function's own doc comment already treats as safe/expected —
-	// same posture as "absent coverage": return an empty section rather than dereferencing a
-	// nil *minio.Client inside newBackfillVIStore's ListObjects call.
+	// F-10 (issue #481 part 3): a nil client is exactly the "absent capability" case this
+	// function's own doc comment already treats as safe/expected — same posture as "absent
+	// coverage": return an empty section rather than dereferencing a nil *minio.Client
+	// inside newBackfillVIStore's ListObjects call.
 	if cqp.client == nil {
 		return nil, nil
 	}
@@ -234,7 +233,8 @@ numeric:
 }
 
 // runCubeBackfillCore is launchBackfill/RunCubeBackfill's dependency-injected
-// core: constructs the CubeRegistry from objStore and runs the CubeBackfiller,
+// core: constructs the CubeRegistry from pgPool (issue #504: Postgres is now the only
+// supported cube registry backend, no blob/index.json fallback) and runs the CubeBackfiller,
 // persisting progress via CubeRegistry.UpdateWatermarks on EVERY successful
 // progressFn callback, not just on Done (R9 -- go-presubmit.md/review.md's
 // #496-planning-time finding: launchBackfill/RunCubeBackfill's progressFn
@@ -282,11 +282,11 @@ func runCubeBackfillCore(
 	ctx context.Context,
 	entry blockpack.CubeRegistryEntry,
 	src blockpack.CubeValueIndexSource,
-	objStore blockpack.CubeObjectStore,
+	pgPool *pgxpool.Pool,
 	cfg blockpack.CubeBackfillConfig,
 	currentMinute uint32,
 ) error {
-	registry := blockpack.NewCubeRegistry(objStore, entry.Tenant)
+	registry := blockpack.NewPgCubeRegistry(pgPool, entry.Tenant)
 	bf := blockpack.NewCubeBackfiller(entry, src, cfg)
 	var consecutiveFailures int
 	return bf.Run(ctx, currentMinute, func(prog blockpack.CubeBackfillProgress) error {
@@ -351,7 +351,6 @@ func launchBackfill(entry blockpack.CubeRegistryEntry) {
 		indexPrefix: defaultValueIndexPref,
 	}
 	store := &s3ObjectPutter{client: cqp.client, bucket: cqp.bucket}
-	objStore := &minioObjectStore{client: cqp.client, bucket: cqp.bucket}
 	cfg := blockpack.CubeBackfillConfig{
 		Store:   store,
 		Workers: 4,
@@ -369,7 +368,7 @@ func launchBackfill(entry blockpack.CubeRegistryEntry) {
 			"tenant", entry.Tenant,
 			"cube_id", entry.CubeID,
 		)
-		if err := runCubeBackfillCore(context.Background(), entry, src, objStore, cfg, 0); err != nil {
+		if err := runCubeBackfillCore(context.Background(), entry, src, cqp.pgPool, cfg, 0); err != nil {
 			metricCubeBackfillFailed.Inc()
 			level.Warn(util_log.Logger).Log(
 				"msg", "vblockpack: cube backfill error",
@@ -383,11 +382,15 @@ func launchBackfill(entry blockpack.CubeRegistryEntry) {
 
 // RunCubeBackfill runs the cube backfill synchronously in the calling goroutine.
 // Unlike launchBackfill, this blocks until the backfill is complete or ctx is done.
-// Used by the backend-worker job executor. Returns a real error on any genuine failure
-// (S3 client construction, watermark persistence, or a BackfillEngine.Run error,
-// including context cancellation/deadline) so the caller (processCubeBackfillJobPostgres)
-// can report the job as failed rather than unconditionally as succeeded.
-func RunCubeBackfill(ctx context.Context, entry blockpack.CubeRegistryEntry, s3cfg *s3backend.Config) error {
+// Used by the backend-worker job executor. pgPool backs the cube registry (issue #504:
+// Postgres is now the only supported cube registry backend, no blob/index.json fallback) --
+// s3cfg remains required for the value-index read side (viBackfillSource) and the cube file
+// write side (s3ObjectPutter), which are unrelated to the registry backend. Returns a real
+// error on any genuine failure (S3 client construction, watermark persistence, or a
+// BackfillEngine.Run error, including context cancellation/deadline) so the caller
+// (processCubeBackfillJobPostgres) can report the job as failed rather than unconditionally as
+// succeeded.
+func RunCubeBackfill(ctx context.Context, entry blockpack.CubeRegistryEntry, s3cfg *s3backend.Config, pgPool *pgxpool.Pool) error {
 	if s3cfg == nil {
 		return nil
 	}
@@ -401,7 +404,6 @@ func RunCubeBackfill(ctx context.Context, entry blockpack.CubeRegistryEntry, s3c
 		indexPrefix: defaultValueIndexPref,
 	}
 	store := &s3ObjectPutter{client: client, bucket: s3cfg.Bucket}
-	objStore := &minioObjectStore{client: client, bucket: s3cfg.Bucket}
 	cfg := blockpack.CubeBackfillConfig{
 		Store:   store,
 		Workers: 4,
@@ -410,7 +412,7 @@ func RunCubeBackfill(ctx context.Context, entry blockpack.CubeRegistryEntry, s3c
 		WindowMinutes: math.MaxUint32,
 	}
 	metricCubeBackfillStarted.Inc()
-	err = runCubeBackfillCore(ctx, entry, src, objStore, cfg, 0)
+	err = runCubeBackfillCore(ctx, entry, src, pgPool, cfg, 0)
 	if err != nil && !errors.Is(err, ctx.Err()) {
 		metricCubeBackfillFailed.Inc()
 		level.Warn(util_log.Logger).Log("msg", "vblockpack: cube backfill error",
@@ -419,26 +421,24 @@ func RunCubeBackfill(ctx context.Context, entry blockpack.CubeRegistryEntry, s3c
 	return err
 }
 
-// LoadCubeEntry loads the actual CubeRegistryEntry for cubeID from S3.
-// Returns a real error if s3cfg is nil, the S3 client cannot be constructed,
-// the registry cannot be loaded, or no entry with cubeID exists in it --
-// callers must treat any of these as a hard failure (2026-07-14 fix). A
-// prior version of this function silently returned a caller-supplied
-// placeholder CubeRegistryEntry on any of these failures, which let
-// processCubeBackfillJobPostgres proceed into RunCubeBackfill with a
-// definition guaranteed to fail cube.Backfiller's per-minute "definition
-// must include duration in AggAttrs" validation on literally every minute
-// of the (possibly math.MaxUint32-wide) backfill window.
-func LoadCubeEntry(ctx context.Context, s3cfg *s3backend.Config, tenant, cubeID string) (blockpack.CubeRegistryEntry, error) {
-	if s3cfg == nil {
-		return blockpack.CubeRegistryEntry{}, errors.New("cube registry: s3 not configured")
+// LoadCubeEntry loads the actual CubeRegistryEntry for cubeID from the cube registry.
+// Returns a real error if pgPool is nil, the registry cannot be loaded, or no entry
+// with cubeID exists in it -- callers must treat any of these as a hard failure
+// (2026-07-14 fix). A prior version of this function silently returned a
+// caller-supplied placeholder CubeRegistryEntry on any of these failures, which let
+// processCubeBackfillJobPostgres proceed into RunCubeBackfill with a definition
+// guaranteed to fail cube.Backfiller's per-minute "definition must include duration
+// in AggAttrs" validation on literally every minute of the (possibly
+// math.MaxUint32-wide) backfill window.
+//
+// Issue #504: this used to build a minio client from an s3cfg parameter to construct
+// a blob-backed CubeRegistry; Postgres is now the only supported cube registry
+// backend, so this function no longer needs (or accepts) an s3cfg at all.
+func LoadCubeEntry(ctx context.Context, pgPool *pgxpool.Pool, tenant, cubeID string) (blockpack.CubeRegistryEntry, error) {
+	if pgPool == nil {
+		return blockpack.CubeRegistryEntry{}, errors.New("cube registry: postgres not configured")
 	}
-	client, err := newMinioClientFromS3Config(s3cfg)
-	if err != nil {
-		return blockpack.CubeRegistryEntry{}, fmt.Errorf("cube registry: new minio client: %w", err)
-	}
-	os := &minioObjectStore{client: client, bucket: s3cfg.Bucket}
-	reg := blockpack.NewCubeRegistry(os, tenant)
+	reg := blockpack.NewPgCubeRegistry(pgPool, tenant)
 	entries, _, loadErr := reg.Load(ctx)
 	if loadErr != nil {
 		return blockpack.CubeRegistryEntry{}, fmt.Errorf("cube registry: load: %w", loadErr)

@@ -259,4 +259,17 @@ phase's ID-routing convention (FOOTGUN 5, `.bob/state/spec-knowledge-phase-e.md`
 | TEST-CUBE-104 | `TestLog2Bucketize_PathologicallyLargeValueExcludedNotOOB` | bucket_test.go | v=2^63 still ceilings correctly to bucket 63 (the largest valid boundary); v=2^63+1 and v=MaxUint64 both return the -1 sentinel instead of the pre-fix 1<<64-wraps-to-0 result. |
 | TEST-CUBE-105 | `TestAccumulator_Add_PathologicallyLargeDuration_ExcludedNotOOB` | accumulator_test.go | A span whose duration is the smallest float64 strictly greater than 2^63 flows through the real Add→addAggAttrs path without panicking; SampleCount/Sum still reflect the sample but every Buckets[] slot stays zero. Mutation-verified: reverting the bucket.go fix reproduces the exact pre-fix `index out of range [64] with length 64` panic at accumulator.go's Buckets write. |
 
-**Next free ID: TEST-CUBE-106.**
+
+## TEST-CUBE-106..112 — Native Postgres EntryStore (issue #506)
+
+| ID | Test | File | What it pins |
+|---|---|---|---|
+| TEST-CUBE-106 | `TestPgEntryStore_AddEntry_IdempotentAndUnboundedCubeCount` | pg_entry_store_test.go | AddEntry is idempotent on a repeated CubeID; a second, distinct CubeID for the same tenant succeeds unconditionally (no cardinality gate, issue #497) |
+| TEST-CUBE-107 | `TestPgEntryStore_RemoveEntry_IdempotentOnAbsent` | pg_entry_store_test.go | RemoveEntry on an absent cube is a no-op; removing a present cube deletes it |
+| TEST-CUBE-108 | `TestPgEntryStore_UpdateWatermarksEntry_MinOfMinsMaxOfMaxes` | pg_entry_store_test.go | UpdateWatermarksEntry expands (min-of-mins, max-of-maxes) an existing range rather than replacing it, across a narrowing then a widening call |
+| TEST-CUBE-109 | `TestPgEntryStore_UpdateWatermarksEntry_NotFoundErrors` | pg_entry_store_test.go | UpdateWatermarksEntry against an unregistered CubeID returns an error |
+| TEST-CUBE-110 | `TestPgEntryStore_Load_ReturnsAllRowsForTenant_NotOtherTenants` | pg_entry_store_test.go | Load returns exactly one tenant's rows, never leaking another tenant's entries |
+| TEST-CUBE-111 | `TestPgEntryStore_AddEntry_ConcurrentFirstCubeRegistration_NoDuplicateOrRace` | pg_entry_store_test.go | 20 goroutines racing AddEntry for the SAME brand-new CubeID on a zero-cube tenant produce exactly one persisted row — the specific race `pg_advisory_xact_lock` exists to prevent, since the first cube for a tenant has no row to `SELECT ... FOR UPDATE`. Mutation-verified (see NOTE-CUBE-030): lock removal alone did not reliably fail; a temporary artificial delay was added to make the race deterministic, confirmed to fail with a real duplicate-key violation, then reverted. |
+| TEST-CUBE-112 | `TestCubeRegistry_BlobAndPgBackends_IdenticalBehavior` | pg_blob_differential_test.go | Runs the identical Add/Remove/UpdateWatermarks/duplicate-Add operation sequence against both a blob-backed and a Postgres-backed Registry; asserts the resulting Load() sets are field-equal — proves SPEC-CUBE-031's behavioral-identity invariant end-to-end, not just structurally |
+
+**Next free ID: TEST-CUBE-113.**

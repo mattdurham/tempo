@@ -42,20 +42,10 @@ CREATE TABLE IF NOT EXISTS viusage_query_log (
 CREATE INDEX IF NOT EXISTS idx_viusage_query_log_lookup
     ON viusage_query_log (tenant, col_hash, col_type, queried_at DESC);
 
--- cube: one row per active cube. dimensions/filters/agg_attrs/watermarks are
--- variable-shape/nested (Filters especially — ColumnFilter has its own sub-
--- structure) and bounded in practice (MaxCubesPerTenant=1000, small watermark
--- maps keyed by resolution level) — stored as JSONB rather than fully normalized
--- into child tables, a deliberate simplicity choice for this data's actual shape
--- and access pattern (loaded whole per cube, never queried by sub-field).
-CREATE TABLE IF NOT EXISTS cube_entries (
-    cube_id      TEXT    NOT NULL PRIMARY KEY,
-    tenant       TEXT    NOT NULL,
-    dimensions   JSONB   NOT NULL DEFAULT '[]',
-    filters      JSONB   NOT NULL DEFAULT '[]',
-    agg_attrs    JSONB   NOT NULL DEFAULT '[]',
-    resolution   INT     NOT NULL DEFAULT 1,
-    created_at   BIGINT  NOT NULL DEFAULT 0,
-    watermarks   JSONB   NOT NULL DEFAULT '{}'
-);
-CREATE INDEX IF NOT EXISTS idx_cube_entries_tenant ON cube_entries (tenant);
+-- cube: NO LONGER DEFINED HERE (issue #504, 2026-07-15). Tempo's own local
+-- pgCubeEntryStore/cube_entries table (this section used to define it) was deleted --
+-- cube's Postgres-backed registry is now blockpack's own native implementation
+-- (blockpack.NewPgCubeRegistry / cube.PgEntryStore, issue #506), which owns its own
+-- schema (applied via blockpack.ApplyCubeSchema, see blockpack's internal/modules/cube/
+-- pg_entry_store.go / schema.sql) entirely independently of this file. viusage's tables
+-- above are unaffected -- #504's scope is cube-only.

@@ -477,7 +477,7 @@ whether to fetch the rest of the metadata at all (`QueryBucketFileRanged`'s file
 prune, SPEC-VI-10) does not pay for a redundant footer read — only `ReadBucketFileMetadata`'s
 own combined call re-derives the footer, and does so exactly once.
 
-**Bounds validation (binding, NOTE-VI-046):** `readBucketFileTail` validates every untrusted
+**Bounds validation (binding, NOTE-VI-115):** `readBucketFileTail` validates every untrusted
 offset/length it decodes using the same overflow-safe, per-term-before-sum pattern
 `DecodeBucketFile` already established (`bucketfile.go:DecodeBucketFile`) — never a naive
 `off+len > bound` sum-first check, which a corrupt huge `off` paired with a small `len` can wrap
@@ -573,7 +573,7 @@ and decode surviving blocks:
    file"** and returns `(nil, nil)`, not an error — the per-file analog of `QueryBucketFiles`'
    own `ErrNotBucketFile`-skip (`bucketquery.go:121`). Any other footer decode failure is a
    genuine error on a real v2 file and is returned (caller falls back to a full scan, per
-   NOTE-VI-046's silent-under-count concern).
+   NOTE-VI-115's silent-under-count concern).
 2. **File-level time prune:** if the footer's own time range does not overlap
    `[minTS, maxTS]`, return `(nil, nil)` — costs exactly one `ReadAt` (the footer) and nothing
    more. **No internal flooring is applied to `minTS`/`maxTS` here** — this check
@@ -593,7 +593,7 @@ and decode surviving blocks:
    TEST-VI-19.
 5. Block-body `ReadAt` — one per surviving block only, via `readAndDecodeBlockRanged`. The
    entry's `CompOff`/`CompLen` were already bounds-checked against `StringTableOff` by step 3's
-   `readBucketFileTail` call (SPEC-VI-8's binding bounds-validation clause, NOTE-VI-046) — this
+   `readBucketFileTail` call (SPEC-VI-8's binding bounds-validation clause, NOTE-VI-115) — this
    step never sees an unvalidated entry.
 6. **Group/predicate matching** delegated to `matchGroupsInBlock` — the exact same function
    `QueryBucketFiles` calls for its own per-block matching (extracted from `QueryBucketFiles`'

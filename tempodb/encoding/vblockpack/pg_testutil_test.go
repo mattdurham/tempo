@@ -1,8 +1,9 @@
 package vblockpack
 
 // pg_testutil_test.go — shared ephemeral-Postgres test infrastructure for this
-// package's pg_entrystore_test.go and vi_backfill_catalog_test.go (2026-07-11).
-// First testcontainers-go precedent in either the blockpack or tempo repos.
+// package's pg_entrystore_test.go and vi_backfill_catalog_test.go (2026-07-11), and
+// (2026-07-15, issue #504) every cube test that now needs a real Postgres-backed
+// cube registry.
 //
 // newTestPostgresPool starts a real, throwaway PostgreSQL container per test run
 // (spun up and torn down via t.Cleanup, never a persistent or shared instance --
@@ -10,7 +11,12 @@ package vblockpack
 // exception carved out by the standing infrastructure checkpoint, not a
 // violation of it) and applies schema/registries.sql + schema/file_catalog.sql
 // verbatim -- this is the test that proves those schema files are actually
-// valid, executable SQL, not just reviewed prose.
+// valid, executable SQL, not just reviewed prose. It also applies blockpack's OWN
+// cube schema (blockpack.ApplyCubeSchema) -- cube's Postgres-backed registry moved
+// to blockpack's native implementation (issue #506), which owns the cube_entries
+// table definition now; schema/registries.sql's own cube_entries section was
+// removed (issue #504) once tempo's local pgCubeEntryStore was deleted, so this is
+// the only remaining source of that table for tests in this package.
 
 import (
 	"context"
@@ -18,6 +24,7 @@ import (
 	"strings"
 	"testing"
 
+	blockpack "github.com/grafana/blockpack"
 	"github.com/jackc/pgx/v5/pgxpool"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
@@ -74,6 +81,9 @@ func newTestPostgresPool(t *testing.T) *pgxpool.Pool {
 
 	applySchema(ctx, t, pool, "schema/registries.sql")
 	applySchema(ctx, t, pool, "schema/file_catalog.sql")
+	if err := blockpack.ApplyCubeSchema(ctx, pool); err != nil {
+		t.Fatalf("applying blockpack cube schema: %v", err)
+	}
 
 	return pool
 }
@@ -106,11 +116,16 @@ func applySchema(ctx context.Context, t *testing.T, pool *pgxpool.Pool, path str
 func TestNewTestPostgresPool_SmokeTest(t *testing.T) {
 	pool := newTestPostgresPool(t)
 
+	// cube_entries is now created by blockpack.ApplyCubeSchema (issue #504/#506), not by
+	// this package's own schema/registries.sql -- tempo's local pgCubeEntryStore/cube_entries
+	// definition was deleted once cube moved to blockpack's own native Postgres-backed
+	// registry (blockpack.NewPgCubeRegistry, which owns this table's schema entirely now).
+	// newTestPostgresPool applies both, so it's still expected to exist here.
 	var tableCount int
 	err := pool.QueryRow(context.Background(), `
 		SELECT count(*) FROM information_schema.tables
 		WHERE table_schema = 'public'
-		AND table_name IN ('viusage_entries', 'viusage_query_log', 'cube_entries', 'file_catalog')
+		AND table_name IN ('viusage_entries', 'viusage_query_log', 'file_catalog', 'cube_entries')
 	`).Scan(&tableCount)
 	if err != nil {
 		t.Fatalf("querying information_schema: %v", err)

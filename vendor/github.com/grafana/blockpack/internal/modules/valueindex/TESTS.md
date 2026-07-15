@@ -523,13 +523,13 @@ no-internal-flooring, caller-trusts contract `QueryBucketFiles` already has per 
 boundary, not excluded by `minTS=995`) — and compares `QueryBucketFileRanged` against
 `QueryBucketFiles` at the same window-edge `minTS` values as TEST-VI-18.
 
-## TEST-VI-20: `readBucketFileTail` rejects overflowing footer offsets (NOTE-VI-046, ranged path parity)
+## TEST-VI-20: `readBucketFileTail` rejects overflowing footer offsets (NOTE-VI-115, ranged path parity)
 *Added: 2026-07-07*
 
 **Scenario:** the shared metadata helper (`readBucketFileTail`, SPEC-VI-8) must reject a corrupt
 footer whose `StringTableOff`/`BlockIndexOff` are individually validated against the file size
 *before* being summed with their paired length — the overflow-safe pattern `DecodeBucketFile`
-already established (`bucketfile.go:DecodeBucketFile`, NOTE-VI-046). A naive `off+len > size`
+already established (`bucketfile.go:DecodeBucketFile`, NOTE-VI-115). A naive `off+len > size`
 check is insufficient: a huge `off` paired with a small `len` can wrap `uint64` and slip back
 below `size`, passing a sum-first check while `off` itself is nonsensical.
 
@@ -542,7 +542,7 @@ math.MaxUint64-5, StringTableLen = 10` against a 100-byte `countingRangedSource`
 before any `ReadAt` is issued, so a corrupt footer cannot even trigger a wasted string-table/
 block-index fetch, let alone a negative-offset `ReadAt` or an oversized allocation.
 
-## TEST-VI-21: block-directory `CompOff`/`CompLen` bounds check rejects corrupt entries on both the ranged and disk read paths (NOTE-VI-046)
+## TEST-VI-21: block-directory `CompOff`/`CompLen` bounds check rejects corrupt entries on both the ranged and disk read paths (NOTE-VI-115)
 *Added: 2026-07-07*
 
 **Scenario:** `readBucketFileTail` validates every decoded `BlockDirEntry`'s `CompOff`/`CompLen`

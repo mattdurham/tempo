@@ -140,7 +140,7 @@ func (it *diskBucketFileIterator) decodeBlockAt(ctx context.Context, i int) (*Bu
 	d := it.dir[i]
 	// d.CompOff/CompLen were already bounds-checked against the string-table offset by
 	// readBucketFileTail (bucketfile_metadata.go, via readBucketFileMetadata) when it.dir was
-	// decoded — this function never sees an unvalidated entry (NOTE-VI-046).
+	// decoded — this function never sees an unvalidated entry (NOTE-VI-115).
 	raw := make([]byte, d.CompLen)
 	if _, err := it.f.ReadAt(raw, int64(d.CompOff)); err != nil { //nolint:gosec // bounds-checked by readBucketFileTail
 		return nil, fmt.Errorf("block %d: read compressed bytes: %w", i, err)

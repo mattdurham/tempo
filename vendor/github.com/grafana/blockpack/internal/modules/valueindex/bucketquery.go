@@ -132,7 +132,7 @@ func QueryBucketFiles(pred Predicate, timeRange *[2]uint64, files ...[]byte) ([]
 			// overrun). Silently skipping it would drop this file's postings from a
 			// result the querier treats as authoritative coverage (NOTE-VI-033),
 			// silently under-counting — the exact silent-partial-result bug the
-			// trace-by-id review caught (NOTE-VI-046). Surface the error so the
+			// trace-by-id review caught (NOTE-VI-115). Surface the error so the
 			// caller falls back to a full scan rather than return a wrong result.
 			return nil, fmt.Errorf("valueindex: query bucket file: %w", err)
 		}

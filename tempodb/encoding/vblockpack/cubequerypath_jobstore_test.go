@@ -31,10 +31,14 @@ func TestMaybeCreateCube_Created_InsertsPendingJob(t *testing.T) {
 	require.NoError(t, migrate.Apply(context.Background(), pool))
 
 	cqp := &cubeQueryPath{
-		store:      emptyCubeObjectStore{},
 		tenants:    make(map[string]*tenantCubeState),
 		createSeen: make(map[string]time.Time),
 		jobStore:   jobstore.New(pool),
+		// pgPool backs maybeCreateCube's cube registry (issue #504: Postgres-only now, no
+		// blob/index.json fallback) -- a genuinely empty (freshly migrated, no cube_entries
+		// rows) real Postgres instance is this test's "no cube exists yet" fixture, in place
+		// of the old emptyCubeObjectStore blob fake.
+		pgPool: pool,
 	}
 
 	tenant := "tenant-cube-a"
@@ -67,9 +71,10 @@ func TestMaybeCreateCube_Created_InsertsPendingJob(t *testing.T) {
 // safe no-op here since this cqp is never installed as the process singleton).
 func TestMaybeCreateCube_Created_NilPgPool_SkipsInsertNoError(t *testing.T) {
 	cqp := &cubeQueryPath{
-		store:      emptyCubeObjectStore{},
 		tenants:    make(map[string]*tenantCubeState),
 		createSeen: make(map[string]time.Time),
+		// pgPool deliberately left nil -- this is the "no Postgres configured" regression
+		// guard itself (see test name/doc comment).
 	}
 
 	tenant := "tenant-cube-b"

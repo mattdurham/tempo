@@ -762,3 +762,27 @@ locals — see the #218 plan's §A3).
 **Back-ref:** `internal/modules/cube/reader.go:Reader.BytesRead,OpenReader,OpenReaderFromBytes`.
 Tempo-side consumer: `tempodb/encoding/vblockpack/cubequerypath.go` (captures the value at the
 point the cube reader is opened, sets `SearchMetrics.CubeBytesRead`). Issue #218.
+
+## SPEC-CUBE-031: Native Postgres EntryStore must be behaviorally identical to the blob-backed implementation (issue #506)
+
+*Added: 2026-07-15*
+
+**Invariant:** A native Postgres `EntryStore` implementation (`cube.PgEntryStore`) MUST be
+behaviorally identical to the blob-backed implementation (`blobEntryStore`) for every `Registry`
+public method (`Load`/`Add`/`Remove`/`UpdateWatermarks`) — backend choice never changes
+`Registry`'s observable contract, per SPEC-CUBE-014's own `[UPDATED]` design intent.
+`PgEntryStore.AddEntry` is idempotent on an already-present `CubeID` (mirrors
+`blobEntryStore.addEntry`'s contract, SPEC-CUBE-014); no per-tenant cube-count limit is enforced
+(issue #497, NOTE-CUBE-029 — unbounded on both backends). `PgEntryStore.UpdateWatermarksEntry`
+expands an existing watermark range (min-of-mins, max-of-maxes) exactly as
+`blobEntryStore.updateWatermarksEntry` does, and errors if the CubeID is not found.
+
+Verified end-to-end by `TestCubeRegistry_BlobAndPgBackends_IdenticalBehavior`
+(`pg_blob_differential_test.go`) — runs the IDENTICAL operation sequence (3 Adds, 1 Remove, 2
+UpdateWatermarks calls narrowing-then-widening, 1 duplicate Add) against both a blob-backed and a
+Postgres-backed `Registry`, then asserts their resulting `Load()` sets are field-equal (CubeID,
+Tenant, Dimensions, AggAttrs, Resolution, Watermarks) after sorting both by CubeID.
+
+**Back-ref:** `internal/modules/cube/pg_entry_store.go`,
+`internal/modules/cube/pg_blob_differential_test.go:TestCubeRegistry_BlobAndPgBackends_
+IdenticalBehavior`. See NOTE-CUBE-030. Issue #506.

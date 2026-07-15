@@ -10,52 +10,44 @@ package vblockpack
 // makes this testable against fakes without a live S3/minio server --
 // cube_backfill.go previously had NO test coverage at all, exactly the R9
 // gap this closes.
+//
+// 2026-07-15 migration (issue #504): cube's registry is Postgres-only now (no
+// blob/index.json fallback) -- runCubeBackfillCore's registry-persist side takes a
+// *pgxpool.Pool directly (blockpack.NewPgCubeRegistry internally), not an injectable
+// blockpack.CubeObjectStore fake. This file's tests now seed/assert against a real
+// ephemeral Postgres instance (newTestPostgresPool, shared with pg_entrystore_test.go)
+// instead of the old in-memory fakeCubeRegistryObjectStore. Two consequences:
+//
+//  1. Postgres has no ConditionalPut/etag-conflict concept, so
+//     TestRunCubeBackfillCore_PersistFailureAbortsRun's "always-conflict" fake store is
+//     gone -- the natural Postgres-equivalent persist failure is "cube not found"
+//     (never added to the registry), the same failure mode
+//     cube_backfill_s3config_test.go's TestE2E_RunCubeBackfill_ReturnsErrorOnRegistryFailure
+//     already exercises end-to-end.
+//  2. There is no per-call counter available on the real Postgres client the way the fake
+//     store's putCalls field provided, so "persistence happens on EVERY progress callback,
+//     not just at Done" can no longer be proven by counting calls.
+//     TestRunCubeBackfillCore_PersistsProgressBeforeAbort proves the same contract more
+//     directly instead: a successful minute followed by enough consecutive failures to trip
+//     the circuit breaker (aborting the run with an error, before Done) must still have
+//     durably persisted the earlier success's watermark. If persistence only happened once
+//     at the very end (the pre-fix bug this whole file guards against), an aborted run would
+//     persist nothing at all, exactly like
+//     TestRunCubeBackfillCore_ConsecutiveStructuralFailuresAbortEarly's own "no minute ever
+//     succeeded" case below -- the one earlier success surviving the abort is the proof.
 
 import (
 	"context"
 	"errors"
-	"sync"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	blockpack "github.com/grafana/blockpack"
 )
-
-// fakeCubeRegistryObjectStore is an in-memory blockpack.CubeObjectStore for
-// tests, mirroring fakeViObjectStore's (vi_backfill_test.go) exact shape and
-// putCalls counter so the two backfill engines' watermark-persistence
-// regression tests read the same way.
-type fakeCubeRegistryObjectStore struct {
-	mu       sync.Mutex
-	data     []byte
-	etag     string
-	putCalls int
-}
-
-func (s *fakeCubeRegistryObjectStore) Get(_ context.Context, _ string) ([]byte, string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.data == nil {
-		return nil, "", blockpack.CubeErrNotFound
-	}
-	cp := append([]byte(nil), s.data...)
-	return cp, s.etag, nil
-}
-
-func (s *fakeCubeRegistryObjectStore) ConditionalPut(_ context.Context, _ string, data []byte, etag string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.etag != etag {
-		return blockpack.CubeErrConflict
-	}
-	s.data = append([]byte(nil), data...)
-	s.etag = etag + "x"
-	s.putCalls++
-	return nil
-}
 
 // fakeEmptyCubeValueIndexSource returns no data for every LookupColumn call.
 // processMinute (internal/modules/cube/backfill.go) treats a dim1 miss as
@@ -71,25 +63,21 @@ func (fakeEmptyCubeValueIndexSource) LookupColumn(
 	return nil, nil
 }
 
-// seedCubeEntry registers entry directly via CubeRegistry.Add so
-// runCubeBackfillCore's UpdateWatermarks calls succeed (it errors on a
-// not-found cube, mirroring viusage.Registry.UpdateWatermark's identical
-// not-found contract).
-func seedCubeEntry(t *testing.T, store blockpack.CubeObjectStore, entry blockpack.CubeRegistryEntry) {
+// seedCubeEntryPg registers entry directly via blockpack.NewPgCubeRegistry(pool, ...).Add
+// so runCubeBackfillCore's UpdateWatermarks calls succeed (it errors on a not-found cube,
+// mirroring viusage.Registry.UpdateWatermark's identical not-found contract).
+func seedCubeEntryPg(t *testing.T, pool *pgxpool.Pool, entry blockpack.CubeRegistryEntry) {
 	t.Helper()
-	registry := blockpack.NewCubeRegistry(store, entry.Tenant)
+	registry := blockpack.NewPgCubeRegistry(pool, entry.Tenant)
 	require.NoError(t, registry.Add(context.Background(), entry))
 }
 
 // TestRunCubeBackfillCore_CallsUpdateWatermarksOnEachProgress is THE critical
-// R9 regression test mirroring
-// TestRunViBackfillCore_CallsUpdateWatermarkOnEachProgress's exact assertion
-// style: assert CubeRegistry.UpdateWatermarks (via the fake store's
-// ConditionalPut) is actually called once per successfully-processed minute,
-// not just once at the end -- and that the final persisted registry state
-// reflects the full backfilled window, not just whatever a later,
-// unrelated compaction pass happened to write.
+// R9 regression test: the run's final persisted registry state must reflect the
+// full backfilled window, not just whatever a later, unrelated compaction pass
+// happened to write.
 func TestRunCubeBackfillCore_CallsUpdateWatermarksOnEachProgress(t *testing.T) {
+	pool := newTestPostgresPool(t)
 	entry := blockpack.CubeRegistryEntry{
 		CubeID:     "abc123",
 		Tenant:     "tenant-a",
@@ -97,9 +85,7 @@ func TestRunCubeBackfillCore_CallsUpdateWatermarksOnEachProgress(t *testing.T) {
 		AggAttrs:   []string{blockpack.CubeDurationColumn},
 		Resolution: 1,
 	}
-	store := &fakeCubeRegistryObjectStore{}
-	seedCubeEntry(t, store, entry)
-	preSeedPutCalls := store.putCalls
+	seedCubeEntryPg(t, pool, entry)
 
 	cfg := blockpack.CubeBackfillConfig{
 		Store:         &fakeCubeObjectPutter{},
@@ -109,19 +95,13 @@ func TestRunCubeBackfillCore_CallsUpdateWatermarksOnEachProgress(t *testing.T) {
 
 	completedBefore := testutil.ToFloat64(metricCubeBackfillCompleted)
 
-	err := runCubeBackfillCore(context.Background(), entry, fakeEmptyCubeValueIndexSource{}, store, cfg, 0)
+	err := runCubeBackfillCore(context.Background(), entry, fakeEmptyCubeValueIndexSource{}, pool, cfg, 0)
 	require.NoError(t, err)
-
-	// One UpdateWatermarks (ConditionalPut) call per backfilled minute (3), on
-	// top of the seed Add -- i.e. strictly more than one, proving persistence
-	// happens on EVERY progress callback, not just the last.
-	assert.Equal(t, preSeedPutCalls+3, store.putCalls,
-		"expected 1 ConditionalPut per backfilled minute (3), proving per-callback persistence")
 
 	assert.Equal(t, completedBefore+1, testutil.ToFloat64(metricCubeBackfillCompleted),
 		"reaching prog.Watermark.Done must increment metricCubeBackfillCompleted exactly once")
 
-	registry := blockpack.NewCubeRegistry(store, entry.Tenant)
+	registry := blockpack.NewPgCubeRegistry(pool, entry.Tenant)
 	entries, _, loadErr := registry.Load(context.Background())
 	require.NoError(t, loadErr)
 	require.Len(t, entries, 1)
@@ -131,42 +111,83 @@ func TestRunCubeBackfillCore_CallsUpdateWatermarksOnEachProgress(t *testing.T) {
 		"the persisted watermark range must cover all 3 backfilled minutes, not just the last one")
 }
 
-// TestRunCubeBackfillCore_PersistFailureAbortsRun verifies a watermark-persist
-// failure aborts the run rather than silently continuing to backfill more
-// minutes the registry cannot yet account for -- mirrors
-// TestRunViBackfillCore_PersistFailureAbortsRun's identical contract.
-func TestRunCubeBackfillCore_PersistFailureAbortsRun(t *testing.T) {
+// TestRunCubeBackfillCore_PersistsProgressBeforeAbort is the per-callback-persistence proof
+// for the Postgres-only world (see file doc comment): one successful minute, immediately
+// followed by cubeBackfillMaxConsecutiveFailures (5) consecutive failures that trip the
+// circuit breaker and abort the run with an error -- the earlier success's watermark must
+// still be durably visible afterward. If persistence only happened once at Done (the R9 bug
+// this file exists to catch), an aborted run would persist nothing, exactly like
+// TestRunCubeBackfillCore_ConsecutiveStructuralFailuresAbortEarly's all-failing case below.
+func TestRunCubeBackfillCore_PersistsProgressBeforeAbort(t *testing.T) {
+	pool := newTestPostgresPool(t)
 	entry := blockpack.CubeRegistryEntry{
-		CubeID:     "abc123",
+		CubeID:     "one-success-then-abort-cube",
 		Tenant:     "tenant-a",
 		Dimensions: []string{"service.name"},
 		AggAttrs:   []string{blockpack.CubeDurationColumn},
 		Resolution: 1,
 	}
-	store := &fakeCubeRegistryObjectStore{}
-	seedCubeEntry(t, store, entry)
+	seedCubeEntryPg(t, pool, entry)
 
-	failing := &alwaysConflictCubeStore{inner: store}
+	const (
+		currentMinute = 1000
+		windowMinutes = 10 // would process minutes [990, 999] if never aborted; processed newest-first
+	)
+	// Minute 999 (the first one processed, newest-first) succeeds; the next 5 consecutive
+	// (994-998) fail, tripping the breaker before minutes 990-993 are ever reached.
+	src := &failingMinuteCubeValueIndexSource{
+		failMinutes: map[uint32]bool{994: true, 995: true, 996: true, 997: true, 998: true},
+		failErr:     errors.New("definition must include duration in AggAttrs"),
+	}
+
+	cfg := blockpack.CubeBackfillConfig{
+		Store:         &fakeCubeObjectPutter{},
+		Workers:       1,
+		WindowMinutes: windowMinutes,
+	}
+
+	err := runCubeBackfillCore(context.Background(), entry, src, pool, cfg, currentMinute)
+	require.Error(t, err, "5 consecutive failures must abort the run")
+	assert.Contains(t, err.Error(), "aborted after 5 consecutive per-minute failures")
+
+	registry := blockpack.NewPgCubeRegistry(pool, entry.Tenant)
+	entries, _, loadErr := registry.Load(context.Background())
+	require.NoError(t, loadErr)
+	require.Len(t, entries, 1)
+	wm, ok := entries[0].Watermarks[blockpack.CubeRollupL0]
+	require.True(t, ok,
+		"minute 999's success before the abort must have been durably persisted, proving persistence happens per-callback, not only at Done")
+	assert.Equal(t, uint32(999), wm.MinMinute)
+	assert.Equal(t, uint32(999), wm.MaxMinute)
+}
+
+// TestRunCubeBackfillCore_PersistFailureAbortsRun verifies a watermark-persist
+// failure aborts the run rather than silently continuing to backfill more
+// minutes the registry cannot yet account for -- mirrors
+// TestRunViBackfillCore_PersistFailureAbortsRun's identical contract. The
+// Postgres-equivalent persist failure (issue #504) is "cube not found": entry is
+// deliberately never added to the registry, so the very first UpdateWatermarksEntry
+// call fails exactly the way a crashed/inconsistent trigger would produce (mirrors
+// cube_backfill_s3config_test.go's TestE2E_RunCubeBackfill_ReturnsErrorOnRegistryFailure).
+func TestRunCubeBackfillCore_PersistFailureAbortsRun(t *testing.T) {
+	pool := newTestPostgresPool(t)
+	entry := blockpack.CubeRegistryEntry{
+		CubeID:     "never-added-cube",
+		Tenant:     "tenant-a",
+		Dimensions: []string{"service.name"},
+		AggAttrs:   []string{blockpack.CubeDurationColumn},
+		Resolution: 1,
+	}
+	// Deliberately NOT seeded into the registry.
 
 	cfg := blockpack.CubeBackfillConfig{
 		Store:         &fakeCubeObjectPutter{},
 		Workers:       1,
 		WindowMinutes: 3,
 	}
-	err := runCubeBackfillCore(context.Background(), entry, fakeEmptyCubeValueIndexSource{}, failing, cfg, 0)
+	err := runCubeBackfillCore(context.Background(), entry, fakeEmptyCubeValueIndexSource{}, pool, cfg, 0)
 	require.Error(t, err)
-}
-
-type alwaysConflictCubeStore struct {
-	inner *fakeCubeRegistryObjectStore
-}
-
-func (s *alwaysConflictCubeStore) Get(ctx context.Context, path string) ([]byte, string, error) {
-	return s.inner.Get(ctx, path)
-}
-
-func (s *alwaysConflictCubeStore) ConditionalPut(context.Context, string, []byte, string) error {
-	return blockpack.CubeErrConflict
+	assert.Contains(t, err.Error(), "not found")
 }
 
 // failingMinuteCubeValueIndexSource is a deterministic LookupColumn fake, keyed by minute
@@ -199,6 +220,7 @@ func (s *failingMinuteCubeValueIndexSource) LookupColumn(
 // no error), with the watermark covering the full window -- exactly the "a few isolated bad
 // minutes scattered through an otherwise-healthy run should NOT trip the breaker" contract.
 func TestRunCubeBackfillCore_ScatteredTransientFailuresTolerated(t *testing.T) {
+	pool := newTestPostgresPool(t)
 	entry := blockpack.CubeRegistryEntry{
 		CubeID:     "scattered-cube",
 		Tenant:     "tenant-a",
@@ -206,9 +228,7 @@ func TestRunCubeBackfillCore_ScatteredTransientFailuresTolerated(t *testing.T) {
 		AggAttrs:   []string{blockpack.CubeDurationColumn},
 		Resolution: 1,
 	}
-	store := &fakeCubeRegistryObjectStore{}
-	seedCubeEntry(t, store, entry)
-	preSeedPutCalls := store.putCalls
+	seedCubeEntryPg(t, pool, entry)
 
 	const (
 		currentMinute = 1000
@@ -227,13 +247,10 @@ func TestRunCubeBackfillCore_ScatteredTransientFailuresTolerated(t *testing.T) {
 		WindowMinutes: windowMinutes,
 	}
 
-	err := runCubeBackfillCore(context.Background(), entry, src, store, cfg, currentMinute)
+	err := runCubeBackfillCore(context.Background(), entry, src, pool, cfg, currentMinute)
 	require.NoError(t, err, "isolated, scattered per-minute failures must not abort the run")
 
-	// One ConditionalPut per successfully-processed minute (20 total - 3 failures = 17).
-	assert.Equal(t, preSeedPutCalls+17, store.putCalls)
-
-	registry := blockpack.NewCubeRegistry(store, entry.Tenant)
+	registry := blockpack.NewPgCubeRegistry(pool, entry.Tenant)
 	entries, _, loadErr := registry.Load(context.Background())
 	require.NoError(t, loadErr)
 	require.Len(t, entries, 1)
@@ -250,6 +267,7 @@ func TestRunCubeBackfillCore_ScatteredTransientFailuresTolerated(t *testing.T) {
 // count, WITHOUT ever persisting a watermark, rather than continuing to burn the rest of the
 // window on work that can never succeed.
 func TestRunCubeBackfillCore_ConsecutiveStructuralFailuresAbortEarly(t *testing.T) {
+	pool := newTestPostgresPool(t)
 	entry := blockpack.CubeRegistryEntry{
 		CubeID:     "consecutive-fail-cube",
 		Tenant:     "tenant-a",
@@ -257,8 +275,7 @@ func TestRunCubeBackfillCore_ConsecutiveStructuralFailuresAbortEarly(t *testing.
 		AggAttrs:   []string{blockpack.CubeDurationColumn},
 		Resolution: 1,
 	}
-	store := &fakeCubeRegistryObjectStore{}
-	seedCubeEntry(t, store, entry)
+	seedCubeEntryPg(t, pool, entry)
 
 	const (
 		currentMinute = 1000
@@ -277,11 +294,11 @@ func TestRunCubeBackfillCore_ConsecutiveStructuralFailuresAbortEarly(t *testing.
 		WindowMinutes: windowMinutes,
 	}
 
-	err := runCubeBackfillCore(context.Background(), entry, src, store, cfg, currentMinute)
+	err := runCubeBackfillCore(context.Background(), entry, src, pool, cfg, currentMinute)
 	require.Error(t, err, "an uninterrupted run of consecutive structural failures must abort the run")
 	assert.Contains(t, err.Error(), "aborted after 5 consecutive per-minute failures")
 
-	registry := blockpack.NewCubeRegistry(store, entry.Tenant)
+	registry := blockpack.NewPgCubeRegistry(pool, entry.Tenant)
 	entries, _, loadErr := registry.Load(context.Background())
 	require.NoError(t, loadErr)
 	require.Len(t, entries, 1)

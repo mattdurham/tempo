@@ -29,6 +29,7 @@ import (
 
 	"github.com/grafana/tempo/modules/cache/memcached"
 	"github.com/grafana/tempo/modules/cache/redis"
+	"github.com/grafana/tempo/modules/postgres"
 	"github.com/grafana/tempo/pkg/cache"
 	"github.com/grafana/tempo/pkg/model"
 	"github.com/grafana/tempo/pkg/model/trace"
@@ -1162,6 +1163,11 @@ func TestNew_CacheProviderConfigured_RegistriesGetUnwrappedRawBackend(t *testing
 			ChunkSizeBytes:  1_000_000,
 			ReadBufferCount: 8, ReadBufferSizeBytes: 4 * 1024 * 1024,
 		},
+		// issue #504: validateConfig now hard-fails if CubeTenants is non-empty without
+		// Postgres configured. This test's pgxpool is never dialed (NewPool/ParseConfig
+		// don't connect eagerly), so an empty DSN is fine -- this test is about
+		// cache-provider unwrapping, not Postgres connectivity.
+		Postgres: &postgres.Config{},
 	}
 
 	// A real, non-nil cache.Provider with zero roles configured -- mirrors a real deployment's

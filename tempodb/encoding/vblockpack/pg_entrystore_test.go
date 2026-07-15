@@ -117,120 +117,13 @@ func TestPgViUsageEntryStore_Load_ReturnsAllRowsForTenant_NotOtherTenants(t *tes
 	}
 }
 
-func TestPgCubeEntryStore_AddEntry_IdempotentAndUnboundedCubeCount(t *testing.T) {
-	pool := newTestPostgresPool(t)
-	store := newPgCubeEntryStore(pool)
-	ctx := context.Background()
-
-	entry := blockpack.CubeRegistryEntry{
-		CubeID: "cube1", Tenant: "tenant-a", Dimensions: []string{"resource.service.name"},
-		AggAttrs: []string{"duration"}, Resolution: 1, CreatedAt: 100,
-	}
-	if err := store.AddEntry(ctx, "tenant-a", entry); err != nil {
-		t.Fatalf("AddEntry (first): %v", err)
-	}
-	// Idempotent: adding the same CubeID again must be a no-op, not an error.
-	if err := store.AddEntry(ctx, "tenant-a", entry); err != nil {
-		t.Fatalf("AddEntry (idempotent repeat): %v", err)
-	}
-
-	entries, err := store.Load(ctx, "tenant-a")
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if len(entries) != 1 {
-		t.Fatalf("expected exactly 1 entry after idempotent repeat, got %d", len(entries))
-	}
-
-	// No cardinality gate (blockpack #497): a second, genuinely new CubeID for the
-	// same tenant must succeed unconditionally.
-	second := entry
-	second.CubeID = "cube2"
-	if err := store.AddEntry(ctx, "tenant-a", second); err != nil {
-		t.Fatalf("AddEntry (second distinct cube, no limit): %v", err)
-	}
-	entries, err = store.Load(ctx, "tenant-a")
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if len(entries) != 2 {
-		t.Fatalf("expected 2 entries after adding a second distinct cube, got %d", len(entries))
-	}
-}
-
-func TestPgCubeEntryStore_RemoveEntry_IdempotentOnAbsent(t *testing.T) {
-	pool := newTestPostgresPool(t)
-	store := newPgCubeEntryStore(pool)
-	ctx := context.Background()
-
-	if err := store.RemoveEntry(ctx, "tenant-a", "never-existed"); err != nil {
-		t.Fatalf("RemoveEntry on absent cube should be a no-op, got: %v", err)
-	}
-
-	entry := blockpack.CubeRegistryEntry{CubeID: "cube1", Tenant: "tenant-a", Dimensions: []string{"x"}, AggAttrs: []string{"duration"}, Resolution: 1}
-	if err := store.AddEntry(ctx, "tenant-a", entry); err != nil {
-		t.Fatalf("AddEntry: %v", err)
-	}
-	if err := store.RemoveEntry(ctx, "tenant-a", "cube1"); err != nil {
-		t.Fatalf("RemoveEntry: %v", err)
-	}
-	entries, err := store.Load(ctx, "tenant-a")
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("expected 0 entries after remove, got %d", len(entries))
-	}
-}
-
-func TestPgCubeEntryStore_UpdateWatermarksEntry_MinOfMinsMaxOfMaxes(t *testing.T) {
-	pool := newTestPostgresPool(t)
-	store := newPgCubeEntryStore(pool)
-	ctx := context.Background()
-
-	entry := blockpack.CubeRegistryEntry{CubeID: "cube1", Tenant: "tenant-a", Dimensions: []string{"x"}, AggAttrs: []string{"duration"}, Resolution: 1}
-	if err := store.AddEntry(ctx, "tenant-a", entry); err != nil {
-		t.Fatalf("AddEntry: %v", err)
-	}
-
-	if err := store.UpdateWatermarksEntry(ctx, "tenant-a", "cube1", 1, 100, 200); err != nil {
-		t.Fatalf("UpdateWatermarksEntry (first): %v", err)
-	}
-	// A narrower window must NOT shrink the existing coverage (min-of-mins, max-of-maxes).
-	if err := store.UpdateWatermarksEntry(ctx, "tenant-a", "cube1", 1, 150, 180); err != nil {
-		t.Fatalf("UpdateWatermarksEntry (narrower): %v", err)
-	}
-	// A wider window on the other side must extend coverage.
-	if err := store.UpdateWatermarksEntry(ctx, "tenant-a", "cube1", 1, 50, 250); err != nil {
-		t.Fatalf("UpdateWatermarksEntry (wider): %v", err)
-	}
-
-	entries, err := store.Load(ctx, "tenant-a")
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if len(entries) != 1 {
-		t.Fatalf("expected 1 entry, got %d", len(entries))
-	}
-	wm, ok := entries[0].Watermarks[1]
-	if !ok {
-		t.Fatalf("expected watermark at level 1, got %+v", entries[0].Watermarks)
-	}
-	if wm.MinMinute != 50 || wm.MaxMinute != 250 {
-		t.Fatalf("expected min-of-mins/max-of-maxes [50,250], got [%d,%d]", wm.MinMinute, wm.MaxMinute)
-	}
-}
-
-func TestPgCubeEntryStore_UpdateWatermarksEntry_NotFoundErrors(t *testing.T) {
-	pool := newTestPostgresPool(t)
-	store := newPgCubeEntryStore(pool)
-	ctx := context.Background()
-
-	err := store.UpdateWatermarksEntry(ctx, "tenant-a", "never-existed", 1, 100, 200)
-	if err == nil {
-		t.Fatal("expected an error updating watermarks for a nonexistent cube, got nil")
-	}
-}
+// NOTE (issue #504): this file used to also cover tempo's own local pgCubeEntryStore
+// (pg_entrystore_cube.go, deleted 2026-07-15) with TestPgCubeEntryStore_* tests. Cube's
+// Postgres-backed CubeEntryStore is now blockpack's own native implementation
+// (blockpack.NewPgCubeEntryStore / cube.PgEntryStore, issue #506), which ships its own
+// equivalent test coverage in blockpack's internal/modules/cube/pg_entry_store_test.go --
+// no tempo-side duplicate needed. viusage's pg_entrystore.go (below) is unaffected and
+// remains tempo's own implementation; #504's scope is cube-only.
 
 // TestPgViUsageEntryStore_UpsertEntry_ConcurrentTriggersConvergeOnOneWinner is
 // the required regression guard (plan.md Part 5.3): N goroutines racing

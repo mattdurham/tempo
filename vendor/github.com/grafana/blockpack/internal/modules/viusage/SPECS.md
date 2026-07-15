@@ -28,7 +28,7 @@ file is the authoritative renumbering: `registry.go` keeps `002`; `backfill.go`'
 be corrected to `004` and `config.go`'s to `005` in a follow-up code comment fix (flagged to
 coder-1, not yet landed as of this writing — track until confirmed).
 
-Next free ID: **SPEC-VIUSAGE-10**.
+Next free ID: **SPEC-VIUSAGE-11**.
 
 ---
 
@@ -501,3 +501,28 @@ Back-refs: `internal/modules/viusage/entry.go:BackfillState.LastCatalogRowID`;
 `internal/modules/viusage/registry.go:Registry.UpdateCatalogCursor`. Tests:
 `TESTS.md`'s 2026-07-11 update (`TestRegistry_UpdateCatalogCursor_MonotonicOnly`,
 `TestRegistry_UpdateCatalogCursor_NotFoundReturnsError`, `registry_test.go`).
+
+## SPEC-VIUSAGE-10: Native Postgres EntryStore must be behaviorally identical to the blob-backed implementation, including the monotonic catalog cursor (issue #506)
+*Added: 2026-07-15*
+
+**Invariant:** A native Postgres `EntryStore` implementation (`viusage.PgEntryStore`) MUST be
+behaviorally identical to the blob-backed implementation (`blobEntryStore`) for every `Registry`
+public method (`Load`/`RenewLease`/`UpdateWatermark`/`UpdateCatalogCursor`/
+`RecordUseAndMaybeTrigger`) — backend choice never changes `Registry`'s observable contract, per
+SPEC-VIUSAGE-4's own `[UPDATED]` design intent. `PgEntryStore.UpsertEntry`'s `mutate` closure is
+invoked exactly once per call against the row's currently-locked state, matching SPEC-VIUSAGE-4's
+existing "mutate invoked once PER RETRY ATTEMPT" contract for the blob backend's retry loop.
+SPEC-VIUSAGE-9's monotonic `LastCatalogRowID` no-regression guarantee (a `rowID`
+less-than-or-equal-to the current value is a silent no-op) MUST hold identically on the Postgres
+backend.
+
+Verified end-to-end by `TestViUsageRegistry_BlobAndPgBackends_IdenticalBehavior`
+(`pg_blob_differential_test.go`) — runs the IDENTICAL operation sequence (seed, RenewLease,
+UpdateWatermark partial-then-done, UpdateCatalogCursor advancing-then-regressing) against both a
+blob-backed and a Postgres-backed `Registry`, then asserts the resulting entries are field-equal,
+with explicit attention to both backends converging on `LastCatalogRowID == 50` (the regressing
+`rowID=10` call correctly ignored on both).
+
+**Back-ref:** `internal/modules/viusage/pg_entry_store.go`,
+`internal/modules/viusage/pg_blob_differential_test.go:TestViUsageRegistry_BlobAndPgBackends_
+IdenticalBehavior`. See NOTE-VIUSAGE-14. Issue #506.

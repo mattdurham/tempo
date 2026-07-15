@@ -10,6 +10,8 @@ package blockpack
 import (
 	"context"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/grafana/blockpack/internal/modules/cube"
 )
 
@@ -116,10 +118,11 @@ func NewCubeRegistry(store CubeObjectStore, tenant string) *CubeRegistry {
 
 // CubeEntryStore is the row-oriented storage interface an alternative CubeRegistry
 // backend implements (2026-07-11 Postgres support) — in place of CubeObjectStore's
-// whole-blob conditional-PUT shape, this is one row per (tenant, cube_id). tempo's
-// pgx-backed implementation lives entirely in tempo (this package never imports a SQL
-// driver) — mirrors CubeObjectStore's own "interface owned here, concrete backend owned
-// by the caller" split exactly.
+// whole-blob conditional-PUT shape, this is one row per (tenant, cube_id). blockpack
+// now ships its own native pgx-backed implementation (NewPgCubeEntryStore, issue #506)
+// as well as accepting an externally-supplied one (e.g. tempo's own pre-#506 pgx-backed
+// store) — mirrors CubeObjectStore's own "interface owned here, concrete backend owned
+// by either side" split.
 type CubeEntryStore = cube.EntryStore
 
 // NewCubeRegistryFromEntryStore constructs a CubeRegistry over an externally-supplied
@@ -128,6 +131,32 @@ type CubeEntryStore = cube.EntryStore
 // are byte-identical regardless of which constructor built it.
 func NewCubeRegistryFromEntryStore(store CubeEntryStore, tenant string) *CubeRegistry {
 	return cube.NewRegistryFromEntryStore(store, tenant)
+}
+
+var _ CubeEntryStore = (*cube.PgEntryStore)(nil)
+
+// NewPgCubeEntryStore constructs a native Postgres-backed CubeEntryStore over
+// pool (issue #506). Signature-compatible drop-in substitute for tempo's own
+// newPgCubeEntryStore(pgPool) at all 4 existing call sites
+// (cube_scheduler.go, cube_backfill.go x2, cubequerypath.go), each of which
+// passes the result directly into NewCubeRegistryFromEntryStore(<call>, tenant)
+// and nothing else.
+func NewPgCubeEntryStore(pool *pgxpool.Pool) CubeEntryStore {
+	return cube.NewPgEntryStore(pool)
+}
+
+// NewPgCubeRegistry is a one-call convenience constructor for the common case
+// of wanting a Postgres-backed CubeRegistry without caring about the
+// CubeEntryStore seam directly.
+func NewPgCubeRegistry(pool *pgxpool.Pool, tenant string) *CubeRegistry {
+	return cube.NewPgRegistry(pool, tenant)
+}
+
+// ApplyCubeSchema applies cube's Postgres schema (cube_entries + its tenant
+// index) against pool. Never called automatically by any constructor — the
+// embedding application calls it once at its own startup.
+func ApplyCubeSchema(ctx context.Context, pool *pgxpool.Pool) error {
+	return cube.ApplySchema(ctx, pool)
 }
 
 // CubeReader reads cells from an in-memory cube file.

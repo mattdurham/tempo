@@ -43,13 +43,6 @@ import (
 type cubeQueryPath struct {
 	client *minio.Client
 	bucket string
-	// store, when non-nil, is used in place of a minioObjectStore{client, bucket} wrapper —
-	// a test-only dependency-injection seam (F-10, issue #481 part 3) so tryQueryFromCube's
-	// cube-not-found/warming branch is testable through the REAL production entry point
-	// without a live S3/minio server. ConfigureCubeQueryPath (production) never sets this;
-	// ordinary production behavior is completely unchanged (objectStore() falls back to
-	// wrapping client/bucket exactly as before this field existed).
-	store blockpack.CubeObjectStore
 	// per-tenant registry cache (refreshed every 5m)
 	mu      sync.RWMutex
 	tenants map[string]*tenantCubeState
@@ -61,16 +54,13 @@ type cubeQueryPath struct {
 	// Created branch is purely additive: it does NOT replace launchBackfill,
 	// both run.
 	jobStore *jobstore.Store
-}
-
-// objectStore returns cqp.store if injected (tests), otherwise the real minio-backed store —
-// the SINGLE construction point both loadEntries and maybeCreateCube use, so the two call
-// sites can never drift on which store a cqp instance actually talks to.
-func (cqp *cubeQueryPath) objectStore() blockpack.CubeObjectStore {
-	if cqp.store != nil {
-		return cqp.store
-	}
-	return &minioObjectStore{client: cqp.client, bucket: cqp.bucket}
+	// pgPool backs the cube registry (issue #504: Postgres is now the only supported cube
+	// registry backend, no blob/index.json fallback) -- used by loadEntries/maybeCreateCube
+	// below and by cube_backfill.go's launchBackfill (which reads it off the shared
+	// *cubeQueryPath singleton via getCubeQueryPath()). nil in any deployment without
+	// cfg.Postgres configured -- both loadEntries and maybeCreateCube nil-guard this and
+	// decline/skip gracefully rather than dereference a nil pool (see their own doc comments).
+	pgPool *pgxpool.Pool
 }
 
 type tenantCubeState struct {
@@ -109,6 +99,7 @@ func ConfigureCubeQueryPath(enabled bool, s3cfg *s3backend.Config, pgPool *pgxpo
 			tenants:    make(map[string]*tenantCubeState),
 			createSeen: make(map[string]time.Time),
 			jobStore:   jobStore,
+			pgPool:     pgPool,
 		}
 		processCubeQueryPathMu.Unlock()
 		level.Info(util_log.Logger).Log("msg", "vblockpack: cube query path configured")
@@ -123,6 +114,19 @@ func getCubeQueryPath() *cubeQueryPath {
 
 // loadEntries returns cached (or freshly-loaded) cube entries for a tenant.
 func (cqp *cubeQueryPath) loadEntries(ctx context.Context, tenant string) ([]blockpack.CubeRegistryEntry, error) {
+	// cqp.pgPool is nil in any deployment with ValueIndexEnabled+S3 but no cfg.Postgres --
+	// unlike CubeManager (gated by CubeTenants, and hard-failed at config-validation time if
+	// CubeTenants is non-empty without Postgres, tempodb/config.go's validateConfig), the cube
+	// QUERY path's opportunistic creation-trigger runs unconditionally and has no such gate.
+	// Issue #504 removed the blob/index.json registry fallback entirely, so there is no
+	// backend left to serve this call without Postgres -- decline gracefully (the caller,
+	// tryQueryFromCube, already treats any loadEntries error as "cube path not applicable,
+	// fall back to VI/scan", exactly the pre-existing decline contract) rather than let
+	// blockpack.NewPgCubeRegistry's underlying nil pool panic on first use.
+	if cqp.pgPool == nil {
+		return nil, errors.New("vblockpack: cube registry requires postgres, none configured")
+	}
+
 	cqp.mu.Lock()
 	st, ok := cqp.tenants[tenant]
 	if ok && time.Since(st.lastRefresh) < 5*time.Minute {
@@ -132,10 +136,17 @@ func (cqp *cubeQueryPath) loadEntries(ctx context.Context, tenant string) ([]blo
 	}
 	cqp.mu.Unlock()
 
-	os := cqp.objectStore()
-	reg := blockpack.NewCubeRegistry(os, tenant)
+	reg := blockpack.NewPgCubeRegistry(cqp.pgPool, tenant)
 	entries, _, err := reg.Load(ctx)
 	if err != nil {
+		// A real Postgres failure here (pool exhaustion, connectivity blip, etc.) is
+		// otherwise indistinguishable to the caller (tryQueryFromCube) from a benign
+		// "this query shape isn't cube-answerable" decline -- both silently fall back to
+		// the VI/scan path. Log it at Warn (mirroring cubemanager.go's loadDefs failure
+		// logging) so an operator investigating a latency regression during a cube-configured
+		// tenant's Postgres outage has a signal to look at, without changing the fallback
+		// behavior itself.
+		level.Warn(util_log.Logger).Log("msg", "vblockpack: cube query path: registry load failed, falling back to VI/scan", "tenant", tenant, "err", err)
 		return nil, err
 	}
 
@@ -370,6 +381,18 @@ func (cqp *cubeQueryPath) maybeCreateCube(
 	neededAttrOK bool,
 	minTS, maxTS uint64,
 ) {
+	// cqp.pgPool is nil in any deployment with ValueIndexEnabled+S3 but no cfg.Postgres (see
+	// loadEntries' identical nil-guard doc comment above for why this path has no such
+	// hard-fail gate at config-validation time, unlike CubeManager/CubeTenants). Issue #504
+	// removed the blob/index.json registry fallback this used to fall back to
+	// (blockpack.NewCubeRegistry(cqp.objectStore(), tenant)) -- skip cube creation entirely
+	// rather than let blockpack.NewPgCubeRegistry's underlying nil pool panic on first use.
+	// Mirrors this same function's existing cqp.jobStore == nil optional-skip below.
+	if cqp.pgPool == nil {
+		level.Debug(util_log.Logger).Log("msg", "vblockpack: cube: postgres not configured, skipping cube creation", "tenant", tenant)
+		return
+	}
+
 	key := tenant + "|" + strings.Join(dims, ",") + "|" + filterDedupKey(filters)
 
 	cqp.mu.Lock()
@@ -380,8 +403,7 @@ func (cqp *cubeQueryPath) maybeCreateCube(
 	cqp.createSeen[key] = time.Now()
 	cqp.mu.Unlock()
 
-	os := cqp.objectStore()
-	reg := blockpack.NewCubeRegistry(os, tenant)
+	reg := blockpack.NewPgCubeRegistry(cqp.pgPool, tenant)
 	trigger := blockpack.NewCubeCreationTrigger(reg, blockpack.CubeTriggerConfig{})
 	// Fetch real VCNT data for the proposed dimensions over the query window so the
 	// cardinality gate runs against actual per-dimension distinct-value counts

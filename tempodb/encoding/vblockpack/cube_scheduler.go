@@ -28,6 +28,7 @@ import (
 	"github.com/go-kit/log/level"
 	blockpack "github.com/grafana/blockpack"
 	util_log "github.com/grafana/tempo/pkg/util/log"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/minio/minio-go/v7"
 	"golang.org/x/sync/errgroup"
 )
@@ -76,6 +77,11 @@ type CubeScheduler struct {
 	bucket  string
 	tenants []string
 	cfg     CubeSchedulerConfig
+	// pgPool backs the cube registry (issue #504: Postgres is now the only supported cube
+	// registry backend, no blob/index.json fallback). Required whenever the scheduler actually
+	// runs -- tempodb/config.go's validateConfig hard-fails at startup if CubeTenants is
+	// non-empty with cfg.Postgres == nil, so this is never nil in a valid production config.
+	pgPool *pgxpool.Pool
 	// nowFunc returns the current wall-clock minute; overridable in tests for deterministic
 	// boundary-completeness assertions.
 	nowFunc func() uint32
@@ -85,8 +91,13 @@ type CubeScheduler struct {
 	processTenantFn func(ctx context.Context, tenant string, nowMinute uint32)
 }
 
-// ConfigureCubeScheduler creates a CubeScheduler for the given tenants.
-func ConfigureCubeScheduler(client *minio.Client, bucket string, tenants []string, cfg CubeSchedulerConfig) *CubeScheduler {
+// ConfigureCubeScheduler creates a CubeScheduler for the given tenants. pgPool is the required
+// Postgres connection pool backing the cube registry (issue #504: Postgres is now the only
+// supported cube registry backend). pgPool must be non-nil whenever the scheduler is actually
+// wired up (see the CubeScheduler.pgPool field doc comment) -- blockpack.NewPgCubeRegistry's
+// underlying entry store dereferences the pool directly with no nil-guard, so a nil pgPool here
+// would panic on the scheduler's first tick rather than degrade gracefully.
+func ConfigureCubeScheduler(client *minio.Client, bucket string, tenants []string, cfg CubeSchedulerConfig, pgPool *pgxpool.Pool) *CubeScheduler {
 	cfg.setDefaults()
 	level.Info(util_log.Logger).Log("msg", "vblockpack: cube scheduler configured",
 		"tenants", strings.Join(tenants, ","), "tick_interval", cfg.TickInterval)
@@ -95,6 +106,7 @@ func ConfigureCubeScheduler(client *minio.Client, bucket string, tenants []strin
 		bucket:  bucket,
 		tenants: tenants,
 		cfg:     cfg,
+		pgPool:  pgPool,
 		nowFunc: wallMinute,
 	}
 	cs.processTenantFn = cs.processTenant
@@ -140,8 +152,7 @@ func (s *CubeScheduler) runOnce(ctx context.Context) {
 }
 
 func (s *CubeScheduler) processTenant(ctx context.Context, tenant string, nowMinute uint32) {
-	objStore := &minioObjectStore{client: s.client, bucket: s.bucket}
-	reg := blockpack.NewCubeRegistry(objStore, tenant)
+	reg := blockpack.NewPgCubeRegistry(s.pgPool, tenant)
 	entries, _, err := reg.Load(ctx)
 	if err != nil {
 		level.Warn(util_log.Logger).Log("msg", "vblockpack: cube scheduler load registry failed",

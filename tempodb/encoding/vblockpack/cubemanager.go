@@ -13,6 +13,7 @@ package vblockpack
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -189,14 +190,20 @@ func CubeObjectStoreRawWriterTypeForTest() string {
 	}
 }
 
-// loadDefs reads the cube index.json and rebuilds defs + accs.
+// loadDefs reads the cube registry (Postgres-backed, issue #504: no blob/index.json
+// fallback) and rebuilds defs + accs. cm.pgPool is nil-guarded here rather than assumed
+// non-nil: tempodb/config.go's validateConfig hard-fails at startup if CubeTenants is
+// non-empty with cfg.Postgres == nil, so ConfigureCubeManager's own production call site
+// (tempodb.go, gated on CubeTenants) never actually reaches this with a nil pgPool -- but
+// ConfigureCubeManager itself has no such gate (it's called once per already-validated
+// tenant), and defensively degrading here (return an error, which the caller already logs
+// as "will retry" rather than crashing the process) is strictly safer than trusting every
+// current and future caller to respect that invariant.
 func (cm *cubeManager) loadDefs(ctx context.Context) error {
-	var reg *blockpack.CubeRegistry
-	if cm.pgPool != nil {
-		reg = blockpack.NewCubeRegistryFromEntryStore(newPgCubeEntryStore(cm.pgPool), cm.tenant)
-	} else {
-		reg = blockpack.NewCubeRegistry(cm.objStore, cm.tenant)
+	if cm.pgPool == nil {
+		return errors.New("vblockpack: cube manager: postgres not configured")
 	}
+	reg := blockpack.NewPgCubeRegistry(cm.pgPool, cm.tenant)
 	// CubeColumnFilterToFilter is the single source of truth (shared with blockpack's own
 	// backfill.go) for converting a RegistryEntry's baked-in filter into a runtime predicate
 	// (#491 Phase E fix pass, review.md Issue 2). Previously nil here, so def.Filters was always

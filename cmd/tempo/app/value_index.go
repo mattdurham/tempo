@@ -18,9 +18,11 @@ import (
 
 	"github.com/go-kit/log/level"
 	"github.com/grafana/dskit/services"
+	"github.com/grafana/tempo/modules/postgres"
 	"github.com/grafana/tempo/pkg/util/log"
 	s3cfg "github.com/grafana/tempo/tempodb/backend/s3"
 	common "github.com/grafana/tempo/tempodb/encoding/common"
+	"github.com/jackc/pgx/v5/pgxpool"
 	minio "github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/prometheus/client_golang/prometheus"
@@ -47,10 +49,25 @@ func newMinioFromS3Cfg(cfg *s3cfg.Config) (*minio.Client, error) {
 	})
 }
 
+// manifestStore is the structural shape colhashmanifest.Store requires, and which
+// vicconsumer.Config.ManifestStore / vcntcompactor.Config.ManifestStore each locally
+// redeclare (issue #216/#507): a ctx-scoped whole-object Get/Put. Declared here, rather
+// than importing colhashmanifest directly (an internal blockpack package tempo cannot
+// import), so toVICConsumerCfg/toVCNTCompactorCfg can accept and assign it structurally --
+// any value satisfying this method set (blockpack.NewPgColumnManifestStore's return value,
+// or the plain *tempoVCCStore object-store adapter already defined below) is directly
+// assignable to either Config's ManifestStore field with no further wrapping.
+type manifestStore interface {
+	Get(ctx context.Context, key string) ([]byte, error)
+	Put(ctx context.Context, key string, data []byte) error
+}
+
 // toVICConsumerCfg converts the Tempo config struct to the blockpack consumer config.
-func toVICConsumerCfg(cfg common.ValueIndexConsumerConfig) vicconsumer.Config {
+// manifestStore is nil when no manifest recording is configured (see initValueIndexConsumer).
+func toVICConsumerCfg(cfg common.ValueIndexConsumerConfig, ms manifestStore) vicconsumer.Config {
 	return vicconsumer.Config{
 		Enabled:            cfg.Enabled,
+		ManifestStore:      ms,
 		RedisAddr:          cfg.RedisAddr,
 		StreamName:         cfg.StreamName,
 		ConsumerGroup:      cfg.ConsumerGroup,
@@ -103,9 +120,11 @@ func toVICCompactorCfg(cfg common.ValueIndexCompactorConfig) viccompactor.Config
 }
 
 // toVCNTCompactorCfg converts the Tempo config struct to the blockpack VCNT compactor config.
-func toVCNTCompactorCfg(cfg common.ValueCountCompactorConfig) vcntcompactor.Config {
+// manifestStore is nil when no manifest recording is configured (see initValueIndexCompactor).
+func toVCNTCompactorCfg(cfg common.ValueCountCompactorConfig, ms manifestStore) vcntcompactor.Config {
 	out := vcntcompactor.Config{
 		Enabled:               cfg.Enabled,
+		ManifestStore:         ms,
 		Tenants:               cfg.Tenants,
 		CompactInterval:       cfg.CompactInterval,
 		CompactThresholdFiles: cfg.CompactThresholdFiles,
@@ -137,10 +156,45 @@ func toVCNTCompactorCfg(cfg common.ValueCountCompactorConfig) vcntcompactor.Conf
 // ── value-index consumer ──────────────────────────────────────────────────────
 
 func (t *App) initValueIndexConsumer() (services.Service, error) {
-	vicCfg := toVICConsumerCfg(t.cfg.StorageConfig.Trace.Block.Blockpack.ValueIndexConsumer)
-	if !vicCfg.Enabled {
+	bp := t.cfg.StorageConfig.Trace.Block.Blockpack
+	if !bp.ValueIndexConsumer.Enabled {
 		return services.NewIdleService(nil, nil), nil
 	}
+
+	s3Client, err := newMinioFromS3Cfg(t.cfg.StorageConfig.Trace.S3)
+	if err != nil {
+		return nil, fmt.Errorf("value-index-consumer: create S3 client: %w", err)
+	}
+	bucket := t.cfg.StorageConfig.Trace.S3.Bucket
+
+	// Column-manifest recording (colhashmanifest, task #216) was shipped in blockpack but
+	// never wired to a production ManifestStore before this (issue #507) -- flushColumn
+	// correctly no-ops on a nil ManifestStore, so recording was silently disabled for every
+	// tenant. Prefer the Postgres-backed store (blockpack#506) when cfg.Postgres is
+	// configured, mirroring the same opt-in pattern initValueIndexCompactor already uses for
+	// cube's registry below. When Postgres isn't configured, fall back to the plain S3-backed
+	// *tempoVCCStore adapter (defined below): its Get/Put methods already match
+	// colhashmanifest.Store's exact shape (ctx-scoped whole-object read/write), so no new
+	// blockpack API and no new tempo adapter type is needed for the blob path -- blockpack's
+	// colhashmanifest package has no exported blob-backed constructor of its own yet (it never
+	// had a production caller before this wiring).
+	var pgPool *pgxpool.Pool
+	var manStore manifestStore
+	if pgCfg := t.cfg.StorageConfig.Trace.Postgres; pgCfg != nil {
+		pgPool, err = postgres.NewPool(context.Background(), pgCfg)
+		if err != nil {
+			return nil, fmt.Errorf("value-index-consumer: create postgres pool for column manifest: %w", err)
+		}
+		if err := blockpack.ApplyColumnManifestSchema(context.Background(), pgPool); err != nil {
+			pgPool.Close()
+			return nil, fmt.Errorf("value-index-consumer: apply column manifest schema: %w", err)
+		}
+		manStore = blockpack.NewPgColumnManifestStore(pgPool)
+	} else {
+		manStore = &tempoVCCStore{client: s3Client, bucket: bucket}
+	}
+
+	vicCfg := toVICConsumerCfg(bp.ValueIndexConsumer, manStore)
 	// Expose consumer pipeline metrics on the default registry.
 	vicCfg.Registerer = prometheus.DefaultRegisterer
 	// Inject a structured logger so the consumer logs job/flush boundaries
@@ -148,33 +202,39 @@ func (t *App) initValueIndexConsumer() (services.Service, error) {
 	// box after startup.
 	vicCfg.Logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	s3Client, err := newMinioFromS3Cfg(t.cfg.StorageConfig.Trace.S3)
-	if err != nil {
-		return nil, fmt.Errorf("value-index-consumer: create S3 client: %w", err)
-	}
-
 	var consumer vicconsumer.Consumer
 	var consumerCloser func()
 	rc, cerr := vicconsumer.NewRedisConsumer(vicCfg)
 	if cerr != nil {
+		if pgPool != nil {
+			pgPool.Close()
+		}
 		return nil, fmt.Errorf("value-index-consumer: create redis consumer: %w", cerr)
 	}
 	consumer = rc
 	consumerCloser = func() { _ = rc.Close() }
 
-	bucket := t.cfg.StorageConfig.Trace.S3.Bucket
 	extractor := &tempoVICExtractor{client: s3Client, bucket: bucket, viUsage: t.cfg.StorageConfig.Trace.Block.Blockpack.ViUsage}
 	store := &tempoVICPutter{client: s3Client, bucket: bucket}
 
 	svc, err := vicconsumer.NewService(vicCfg, consumer, extractor, store)
 	if err != nil {
 		consumerCloser()
+		if pgPool != nil {
+			pgPool.Close()
+		}
 		return nil, fmt.Errorf("value-index-consumer: create service: %w", err)
 	}
 
 	return services.NewIdleService(
 		func(ctx context.Context) error { return svc.Run(ctx) },
-		func(_ error) error { consumerCloser(); return nil },
+		func(_ error) error {
+			consumerCloser()
+			if pgPool != nil {
+				pgPool.Close()
+			}
+			return nil
+		},
 	), nil
 }
 
@@ -183,9 +243,8 @@ func (t *App) initValueIndexConsumer() (services.Service, error) {
 func (t *App) initValueIndexCompactor() (services.Service, error) {
 	bp := t.cfg.StorageConfig.Trace.Block.Blockpack
 	vccCfg := toVICCompactorCfg(bp.ValueIndexCompactor)
-	vcntCfg := toVCNTCompactorCfg(bp.ValueCountCompactor)
 
-	if !vccCfg.Enabled && !bp.CubeCompactorEnabled && !vcntCfg.Enabled {
+	if !vccCfg.Enabled && !bp.CubeCompactorEnabled && !bp.ValueCountCompactor.Enabled {
 		return services.NewIdleService(nil, nil), nil
 	}
 
@@ -198,6 +257,42 @@ func (t *App) initValueIndexCompactor() (services.Service, error) {
 	store := &tempoVCCStore{client: s3Client, bucket: bucket}
 	exister := &tempoVCCExister{client: s3Client, bucket: bucket}
 	vcntStore := &tempoVCNTStore{store: store}
+
+	// pgPool backs the cube scheduler's registry (issue #504: Postgres is now the only
+	// supported cube registry backend, no blob/index.json fallback) and, when configured, the
+	// Postgres-backed column-manifest store (issue #507, below). Constructed whenever
+	// cfg.Postgres is configured, not just when the cube scheduler will run -- tempodb/
+	// config.go's validateConfig hard-fails at startup if CubeTenants is non-empty with
+	// cfg.Postgres == nil, so cfg.Postgres is guaranteed non-nil whenever the cube branch below
+	// is reached; widening the condition to cfg.Postgres != nil also lets the VCNT compactor's
+	// manifest recording use the Postgres-backed store even when cube itself is disabled. This
+	// is a SEPARATE pgxpool.Pool from the one tempodb.New's readerWriter owns internally (that
+	// field is unexported, and this module has no reference to the concrete *readerWriter, only
+	// the Reader/Writer/Compactor interfaces) -- mirrors modules/backendworker's own identical
+	// cfg.Postgres != nil -> postgres.NewPool pattern for the same reason.
+	var pgPool *pgxpool.Pool
+	if pgCfg := t.cfg.StorageConfig.Trace.Postgres; pgCfg != nil {
+		pgPool, err = postgres.NewPool(context.Background(), pgCfg)
+		if err != nil {
+			return nil, fmt.Errorf("value-index-compactor: create postgres pool: %w", err)
+		}
+		if err := blockpack.ApplyColumnManifestSchema(context.Background(), pgPool); err != nil {
+			pgPool.Close()
+			return nil, fmt.Errorf("value-index-compactor: apply column manifest schema: %w", err)
+		}
+	}
+
+	// Column-manifest recording (colhashmanifest, task #216) -- see initValueIndexConsumer's
+	// identical comment for the Postgres-vs-blob decision (issue #507). The VI compactor
+	// (viccompactor.Config) has no ManifestStore field; only the VCNT compactor
+	// (vcntcompactor.Config) records manifest entries.
+	var manStore manifestStore
+	if pgPool != nil {
+		manStore = blockpack.NewPgColumnManifestStore(pgPool)
+	} else {
+		manStore = store
+	}
+	vcntCfg := toVCNTCompactorCfg(bp.ValueCountCompactor, manStore)
 
 	return services.NewIdleService(
 		func(ctx context.Context) error {
@@ -222,6 +317,7 @@ func (t *App) initValueIndexCompactor() (services.Service, error) {
 				cubeScheduler := vblockpack.ConfigureCubeScheduler(
 					s3Client, bucket, bp.CubeTenants,
 					vblockpack.CubeSchedulerConfig{TickInterval: bp.CubeCompactorInterval},
+					pgPool,
 				)
 				go cubeScheduler.Run(ctx)
 			}
@@ -245,7 +341,12 @@ func (t *App) initValueIndexCompactor() (services.Service, error) {
 			<-ctx.Done()
 			return nil
 		},
-		nil,
+		func(_ error) error {
+			if pgPool != nil {
+				pgPool.Close()
+			}
+			return nil
+		},
 	), nil
 }
 

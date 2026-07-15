@@ -610,7 +610,7 @@ Back-refs: `internal/modules/valueindexcompactor/service.go:buildWorkList,compac
 compactColumn`, `internal/modules/valueindexcompactor/traceindex_dispatch.go:
 isTraceIndexColDir`. See `viusage/SPECS.md` SPEC-VIUSAGE-5, `valueindex/SPECS.md` SPEC-VI-11.
 
-## NOTE-VI-102 — NOTE-VI-096's `unique_values` exclusion guard removed: structurally obsolete, not just unnecessary (2026-07-10)
+## NOTE-VI-116 — NOTE-VI-096's `unique_values` exclusion guard removed: structurally obsolete, not just unnecessary (2026-07-10)
 
 VCNT's on-disk key layout moved from `<tenant>/indexes/unique_values/<colHash>/...` to
 `<tenant>/value_counts/<colHash>/...` (`valuecountscompactor/NOTES.md` NOTE-VC-019):

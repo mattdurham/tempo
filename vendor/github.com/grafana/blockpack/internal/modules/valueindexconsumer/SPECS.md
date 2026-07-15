@@ -281,4 +281,4 @@ latency/I/O optimization with no correctness dependency, since the manifest itse
 by any query/write path (`colhashmanifest/SPECS.md` SPEC-COLMANIFEST-1).
 
 Back-ref: `internal/modules/valueindexconsumer/service.go:Service.manifestSeen,recordManifestEntry`
-(NOTE-VI-108).
+(NOTE-VI-118).

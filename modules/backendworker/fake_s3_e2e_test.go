@@ -42,21 +42,22 @@ type fakeS3Object struct {
 
 // fakeS3Server is a bucket-scoped, in-memory S3-compatible object store served over a
 // real httptest.Server. blockPuts, when set (SetBlockPuts), rejects every subsequent PUT
-// with a real error while leaving GET/LIST unaffected -- used to force a genuine,
+// with a real error while leaving GET/LIST unaffected.
+//
+// SetBlockPuts is currently unused (issue #504, 2026-07-15): it used to force a genuine,
 // immediate watermark-persist failure (blobEntryStore.updateWatermarksEntry's
-// ConditionalPut) against an otherwise-healthy, already-populated registry, without
-// resorting to a "cube not found"/unreachable-backend scenario. Before the 2026-07-14
-// compounding-bug fix, either of those instead made processCubeBackfillJobPostgres's
-// placeholder CubeRegistryEntry -- which omitted AggAttrs -- reach cube.Backfiller, where
-// every single minute failed cube's own "definition must include duration in AggAttrs"
-// per-minute validation forever without ever aborting the run; that gap is now closed
-// (processCubeBackfillJobPostgres fails fast on a missing registry entry instead of
-// falling back to a placeholder, and runCubeBackfillCore's consecutive-failure circuit
-// breaker bounds any remaining structural-failure case too -- see
-// TestE2E_CubeBackfill_NoRegistryEntry_FailsFastNotBurningCtx and
-// TestRunCubeBackfillCore_ConsecutiveStructuralFailuresAbortEarly). This server's
-// SetBlockPuts remains the right tool for exercising a genuine watermark-persist failure
-// against a well-formed entry specifically, independent of that now-fixed gap.
+// ConditionalPut) against an otherwise-healthy, already-populated registry -- but cube's
+// registry is Postgres-only now (no blob/index.json fallback), so watermark persistence no
+// longer goes through S3 at all, and blocking S3 PUTs no longer has any effect on it.
+// TestE2E_CubeBackfill_FailureThenReclaimSucceeds (backend_jobs_e2e_test.go) now injects its
+// "LoadCubeEntry succeeds, the run itself later genuinely fails" scenario via a
+// structurally-invalid (missing AggAttrs) seeded entry instead, tripping
+// runCubeBackfillCore's consecutive-failure circuit breaker -- see also
+// TestE2E_CubeBackfill_NoRegistryEntry_FailsFastNotBurningCtx (the "never registered at
+// all" fast-fail case) and TestRunCubeBackfillCore_ConsecutiveStructuralFailuresAbortEarly
+// (the unit-level equivalent). Left in place (not deleted) as real, working
+// infrastructure -- it may still be useful for a future S3-side (not registry-side)
+// failure-injection test.
 type fakeS3Server struct {
 	mu        sync.Mutex
 	bucket    string

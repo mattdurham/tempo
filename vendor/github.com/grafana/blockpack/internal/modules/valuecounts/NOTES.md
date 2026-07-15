@@ -672,7 +672,7 @@ decode path), and nothing in `valuecounts` changed to support it.
 Back-refs: `internal/modules/colhashmanifest` (the shared registry — see its own SPECS.md/
 NOTES.md for the full contract), `internal/modules/valuecountscompactor/NOTES.md` NOTE-VC-019
 (the actual VCNT-side call site and hook rationale), `internal/modules/valueindex/NOTES.md`
-NOTE-VI-107 (VI's symmetric cross-reference entry), `filename.go:ColHash`.
+NOTE-VI-117 (VI's symmetric cross-reference entry), `filename.go:ColHash`.
 
 ---
 

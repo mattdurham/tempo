@@ -1113,7 +1113,7 @@ Back-refs: `internal/modules/valueindex/traceindex.go:MergeTraceGroups`,
 `internal/modules/valueindexcompactor/traceindex_dispatch.go:mergeTraceLevel`,
 `:isTraceIndexColDir`. See `SPECS.md` SPEC-VI-6.
 
-## NOTE-VI-046 — corrupt v2 file must ERROR, not silently skip (issue #469 audit, step 1)
+## NOTE-VI-115 — corrupt v2 file must ERROR, not silently skip (issue #469 audit, step 1)
 
 Date: 2026-07-05
 
@@ -1596,7 +1596,7 @@ per-block loop (time-range check, then predicate/group matching) is extracted in
 `QueryBucketFileRanged` (SPEC-VI-10). This is a correctness-by-construction choice, not just
 code reuse: a hand-duplicated second copy of the matching logic in the ranged path would be one
 more place a future predicate-type addition or edge-case fix could be applied to only one of the
-two paths, silently reintroducing exactly the kind of read-path divergence issue #476/NOTE-VI-046
+two paths, silently reintroducing exactly the kind of read-path divergence issue #476/NOTE-VI-115
 warned about for trace-by-id lookups. With the shared helper, the two paths are structurally
 incapable of disagreeing on which groups a given block yields — the only remaining difference is
 which blocks' bodies get read at all (SPEC-VI-9's directory-level value prune, new in the ranged
@@ -1796,7 +1796,7 @@ ExtractValueIndexEntriesForColumns` (root package), `valueindex_l0write.go:Write
 (root package). See `SPECS.md` SPEC-VI-11, `valueindexconsumer/NOTES.md`'s R10 acknowledgment
 entry (the full "why different in kind" argument), and `viusage/NOTES.md` NOTE-VIUSAGE-6/7.
 
-## NOTE-VI-107 — colHash -> column-name audit manifest lives in `internal/modules/colhashmanifest`, not here (task #216, cross-reference entry)
+## NOTE-VI-117 — colHash -> column-name audit manifest lives in `internal/modules/colhashmanifest`, not here (task #216, cross-reference entry)
 
 Date: 2026-07-13
 

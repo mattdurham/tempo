@@ -1354,6 +1354,13 @@ func TestCellValueForFunction(t *testing.T) {
 // this proves the TEMPO-side integration (real Registry round trip, real QueryRouter.Route, real
 // cube files via the real Accumulator write path, real CubeRollup + buildCubeQueryResponse), which
 // internal/modules/cube/router_test.go's own TestRoute_SupersetTieBreak_* unit tests do not cover.
+//
+// Deliberately kept on blockpack.NewCubeRegistry's blob backend (issue #504's test-migration
+// review, 2026-07-15), here and at TestCubeMetricsParity_ResolutionCompletenessDecline below:
+// both drive router.Route/buildCubeQueryResponse/CubeRollup directly against a standalone
+// Registry round trip, never through cubeQueryPath's Postgres-backed loadEntries/
+// maybeCreateCube -- a real Postgres testcontainer would add test weight for zero additional
+// coverage of the router/rollup/response-mapping logic under test in this file.
 func TestCubeMetricsParity_RouterSupersetTieBreak(t *testing.T) {
 	ctx := context.Background()
 	tenant := "parity-superset-tenant"

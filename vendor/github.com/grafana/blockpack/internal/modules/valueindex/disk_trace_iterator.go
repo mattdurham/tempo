@@ -151,7 +151,7 @@ func readTraceFileMetadata(f *os.File) ([]traceBlockDirEntry, *StringTable, erro
 		return nil, nil, fmt.Errorf("decode footer: %w", ferr)
 	}
 
-	// Overflow-safe bounds validation, mirroring readBucketFileTail's NOTE-VI-046 guard: check
+	// Overflow-safe bounds validation, mirroring readBucketFileTail's NOTE-VI-115 guard: check
 	// each term against sz individually before summing, so a corrupt footer with huge
 	// offsets/lengths cannot wrap uint64 and slip past the check.
 	sz := uint64(size) //nolint:gosec // size is a validated non-negative length

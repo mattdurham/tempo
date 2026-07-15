@@ -151,9 +151,12 @@ func TestQueryRange_CubePartialCoverage_DefersToVIScan_FallsBackWhenVIDeclines(t
 	require.Greater(t, maxMinute, minMinute, "test window must span at least 2 minutes")
 	coveredMax := minMinute + (maxMinute-minMinute)/2
 
-	// Real cube registry entry (via the store-injection seam, cubequerypath.go's objectStore())
-	// with PARTIAL watermark coverage: only [minMinute, coveredMax] of the requested
-	// [minMinute, maxMinute] window is covered.
+	// Real cube registry entry with PARTIAL watermark coverage: only [minMinute, coveredMax]
+	// of the requested [minMinute, maxMinute] window is covered. Issue #504: the cube
+	// registry is Postgres-only now (no blob/index.json fallback) -- loadEntries (which
+	// tryQueryFromCube calls below) reads through cqp.pgPool, so this must be seeded into a
+	// real (ephemeral testcontainers) Postgres instance, not the old fake blob objStore via
+	// cubequerypath.go's (now-removed) objectStore() DI seam.
 	idHex := blockpack.CubeComputeID(tenant, []string{"resource.service.name"}, nil, []string{blockpack.CubeDurationColumn})
 	entry := blockpack.CubeRegistryEntry{
 		CubeID:     idHex,
@@ -164,22 +167,22 @@ func TestQueryRange_CubePartialCoverage_DefersToVIScan_FallsBackWhenVIDeclines(t
 		Resolution: 1,
 		CreatedAt:  1000,
 	}
-	objStore := &fakeSchedObjectStore{}
-	reg := blockpack.NewCubeRegistry(objStore, tenant)
+	pgPool := newTestPostgresPool(t)
+	reg := blockpack.NewPgCubeRegistry(pgPool, tenant)
 	require.NoError(t, reg.Add(context.Background(), entry))
 
 	// Real cube L0 file with a cell inside the covered sub-range, served through a real
 	// *minio.Client hitting a local fake S3 endpoint (cqp.client/cqp.listObjects/cqp.getObject
-	// bypass the store-injection seam entirely -- see cubequerypath.go).
+	// are unrelated to the registry -- see cubequerypath.go).
 	cubeFileData := buildRealPartialCubeFile(t, minMinute)
 	fakeClient := newFakeCubeS3Client(t, cubeFileData)
 
 	cqp := &cubeQueryPath{
-		store:      objStore,
 		client:     fakeClient,
 		bucket:     "test-bucket",
 		tenants:    make(map[string]*tenantCubeState),
 		createSeen: make(map[string]time.Time),
+		pgPool:     pgPool,
 	}
 	withCubeQueryPath(t, cqp)
 

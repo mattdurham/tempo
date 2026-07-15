@@ -226,8 +226,12 @@ func TestE2E_QueryRange_CubeAnswered_ReportsCubeBytesRead_OtherFieldsZero(t *tes
 		Resolution: 1,
 		CreatedAt:  1000,
 	}
-	objStore := &fakeSchedObjectStore{}
-	reg := blockpack.NewCubeRegistry(objStore, tenant)
+	// Issue #504: the cube registry is Postgres-only now (no blob/index.json fallback) --
+	// loadEntries (which tryQueryFromCube calls below) reads through cqp.pgPool, so the
+	// fixture entry must be seeded into a real (ephemeral testcontainers) Postgres instance,
+	// not the old fake blob objStore.
+	pgPool := newTestPostgresPool(t)
+	reg := blockpack.NewPgCubeRegistry(pgPool, tenant)
 	require.NoError(t, reg.Add(context.Background(), entry))
 
 	// Real cube L0 file, served through a real *minio.Client hitting a local fake S3 endpoint
@@ -237,11 +241,11 @@ func TestE2E_QueryRange_CubeAnswered_ReportsCubeBytesRead_OtherFieldsZero(t *tes
 	fakeClient := newFakeCubeS3Client(t, cubeFileData)
 
 	cqp := &cubeQueryPath{
-		store:      objStore,
 		client:     fakeClient,
 		bucket:     "test-bucket",
 		tenants:    make(map[string]*tenantCubeState),
 		createSeen: make(map[string]time.Time),
+		pgPool:     pgPool,
 	}
 	withCubeQueryPath(t, cqp)
 
