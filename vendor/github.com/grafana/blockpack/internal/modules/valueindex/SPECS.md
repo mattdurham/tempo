@@ -14,7 +14,7 @@ across the whole value-index pipeline's NOTES.md files by established convention
 assigned in ascending order and never reused or renumbered; superseded entries are marked
 `[SUPERSEDED by SPEC-VI-N]` rather than deleted.
 
-Next free ID: **SPEC-VI-16**.
+Next free ID: **SPEC-VI-18**.
 
 ---
 
@@ -139,7 +139,30 @@ one block (`ValueIndexBucketGroupsPerBlock`) and a file may overshoot the cap by
 block's serialized size (the cap is approximate, matching the flat-VINX path). `maxOutputBytes
 <= 0` preserves the original single-file behavior.
 
-Back-ref: `internal/modules/valueindex/stream_compaction.go:StreamCompactBucketFiles`.
+**Addendum (2026-07-14, issue #501): peak memory bound revised, precisely.**
+`StreamCompactBucketFiles`' peak memory is bounded by (a) the K input files' currently-decoded
+state (one block each, unchanged), (b) one in-progress output block, and (c) a transient per-key
+merge-union buffer. Every OUTPUT `BucketGroup`, once written (`assembleBucketWithCap`, writer.go)
+or merged (`mergeGroupsAtKey`), is capped at `shared.ValueIndexBucketGroupMaxSpanRefs` span-ref
+entries — this bounds decode-side cost (`decodeBucketBlock`) unconditionally, and prevents a hot
+key's group from growing without bound across compaction generations (issue #501's core bug:
+pre-fix, nothing ever split a group once formed). **It does NOT, by itself, bound the transient
+union-building buffer inside `collectContributionsAtKey`/`mergeGroupsAtKey` to a fixed
+constant** — that buffer's real size is K × (each contributing iterator's own real total fan-in
+for the key), and the coalescing behavior (`collectContributionsAtKey`, SPEC-VI-3 amended below)
+deliberately does not cap an iterator's own total, since doing so would prevent sibling groups
+from ever re-consolidating. Real-world risk is mitigated by three complementary factors, not a
+single unconditional bound: (1) this cap preventing unbounded-forever single-group growth, (2)
+`valueindexcompactor`'s `CompactMaxInputFiles`/`CompactBatchBytes` bounding K, and (3) retention
+filtering keeping a key's real live fan-in from growing without bound over time in practice. This
+supersedes a less precise "K × `ValueIndexBucketGroupMaxSpanRefs`" characterization of the
+merge-buffer bound that existed only in this issue's own planning draft, never previously
+committed here. See `NOTES.md` NOTE-VI-111 for the full residual-risk writeup and the real-data
+evidence (tenant 11638 histogram) that informed the final cap constant.
+
+Back-ref: `internal/modules/valueindex/stream_compaction.go:StreamCompactBucketFiles,
+mergeGroupsAtKey, collectContributionsAtKey`. See `NOTES.md` NOTE-VI-111, NOTE-VI-112 (why the
+regression test for this proves an output-shape postcondition rather than a peak-heap bound).
 
 ---
 
@@ -172,6 +195,36 @@ does not silently violate it.
 Back-refs: `internal/modules/valueindex/stream_compaction.go:StreamCompactBucketFiles`,
 `internal/modules/valueindex/writer.go:assembleBucket`,
 `internal/modules/valueindex/bucketmerge.go:MergeBucketFiles`.
+
+**Amended (2026-07-14, issue #501): the precondition above no longer holds unconditionally.**
+`(TimeSec, CanonicalValue)` keys are no longer guaranteed unique within a single input file. As
+of issue #501, `assembleBucketWithCap` (writer.go) and `mergeGroupsAtKey`/
+`splitBucketGroupBySpanCap` (stream_compaction.go, bucketfile.go — contract in SPEC-VI-16)
+deliberately emit multiple sibling `BucketGroup`s sharing one key when that key's accumulated
+span-ref count would exceed `shared.ValueIndexBucketGroupMaxSpanRefs`. Every sibling's `Refs` may
+reference the same underlying data block (`SourceID`+`Ref`) as another sibling, but their `Spans`
+subsets are always disjoint by construction — no span is ever duplicated or dropped across
+siblings (proven by `TestSplitBucketGroupBySpanCap`'s union-equality assertions and
+`TestSplitSiblingGroups_QueryEquivalentToUnsplitGroup`'s end-to-end query-equivalence check,
+`TESTS.md` TEST-VI-26/TEST-VI-27). `collectContributionsAtKey`'s combined pop-advance-repush loop
+(no longer the old two-phase collect-then-advance split this entry's original "Consequence"
+paragraph above described) merges consecutive same-key groups from ONE iterator within a single
+merge pass, so sibling groups re-consolidate (down to the cap, never below it) across successive
+compaction generations rather than proliferating indefinitely — see `TESTS.md` TEST-VI-28. The
+query path (`matchGroupsInBlock`/`matchGroupsInBlockReverse`) already tolerates multiple same-key
+groups with zero changes (plain union of matches, no dedup risk since disjoint by construction).
+The original "Consequence"/"Status" paragraphs above describing this as unreachable/latent are
+superseded for the specific violation shape this amendment covers (deliberate, capped,
+re-consolidating sibling emission) — they remain accurate for any OTHER, non-#501 way a future
+producer might violate per-file key uniqueness (e.g. a hand-corrupted file, or a new producer
+that emits same-key groups without going through `splitBucketGroupBySpanCap`), which the
+heap-merge still does not defend against or detect.
+
+Back-refs (amendment): `internal/modules/valueindex/writer.go:assembleBucketWithCap`,
+`internal/modules/valueindex/stream_compaction.go:mergeGroupsAtKey, collectContributionsAtKey`,
+`internal/modules/valueindex/bucketfile.go:splitBucketGroupBySpanCap`. See SPEC-VI-16 (the
+cap/split mechanism's own contract) and `NOTES.md` NOTE-VI-111 (design rationale, real-data
+evidence, residual-risk writeup).
 
 ---
 
@@ -911,6 +964,19 @@ while-loop condition then pops again in the same call. Contributions are ordered
 via `traceIterEntry.priority` (each iterator's original slice index), making the collected order
 exactly match `MergeTraceGroups`' own input-order iteration without a separate sort step.
 
+**Addendum (2026-07-14, issue #501): this contrast is now historical, not live.** The
+distinguishing claim above ("not `stream_compaction.go`'s two-phase split") described
+`stream_compaction.go`'s `collectContributionsAtKey`/`advanceContributors` as they existed at
+SPEC-VI-15's original writing (2026-07-14). Issue #501 (later the same day) changed
+`collectContributionsAtKey` to the SAME combined pop-advance-repush shape described in this
+entry, for an analogous reason — `splitBucketGroupBySpanCap` (SPEC-VI-16) can now emit multiple
+same-key sibling `BucketGroup`s within one file, so BucketGroup's own per-file key uniqueness
+assumption no longer holds unconditionally either (SPEC-VI-3, amended). `advanceContributors`
+was deleted outright as part of that change — it is no longer live code, and this entry's
+original paragraph should be read as "distinct from `stream_compaction.go`'s PRE-#501 two-phase
+split," not as describing `stream_compaction.go`'s current behavior. See `NOTES.md` NOTE-VI-111
+for the #501-side design rationale.
+
 **Output tail assembly reuses `traceindex.go`'s existing helpers unmodified** —
 `encodeTraceBlock`, `traceBlockTimeRange`, `EncodeStringTable`, `appendTraceBlockIndex` — rather
 than duplicating or refactoring them; only the footer-byte-layout (`writeTraceFileTail`) is
@@ -923,3 +989,94 @@ Back-refs: `internal/modules/valueindex/stream_trace_compaction.go:StreamCompact
 traceIteratorHeap, collectTraceContributionsAtKey, mergeTraceGroupsAtKey, traceStreamWriter,
 writeTraceFileTail`. Tests: `stream_trace_compaction_test.go` (TEST-VI-24),
 `stream_trace_compaction_scaling_test.go` (TEST-VI-25).
+
+---
+
+## SPEC-VI-16: `bucketGroupSpanCount`/`splitBucketGroupBySpanCap` — per-`BucketGroup` span-ref cap and sibling-splitting mechanism (issue #501)
+*Added: 2026-07-14*
+
+**Contract:** `bucketGroupSpanCount(g *BucketGroup) int` returns the total number of `(ref,
+traceID)` span entries in `g` — the cheap size proxy this cap uses (`sum of len(r.Spans) across
+g.Refs`), never a byte-size estimate. `splitBucketGroupBySpanCap(g BucketGroup, maxSpans int)
+[]BucketGroup` splits `g` into one or more sibling `BucketGroup`s, each with
+`bucketGroupSpanCount <= maxSpans`, every sibling sharing `g`'s exact `TimeSec`/`CanonicalValue`.
+`maxSpans <= 0` is a no-op (mirrors `SplitIntoBlocks`' own `groupsPerBlock <= 0` convention):
+returns `[]BucketGroup{g}` unchanged, no copy performed.
+
+**Packing strategy (binding, not an implementation detail free to change without re-verifying
+`TestSplitBucketGroupBySpanCap`):** greedy first-fit by `Refs` order — whole refs are appended to
+the current sibling until the next ref would exceed `maxSpans`, then the sibling is cut. A single
+`BucketBlockRef` whose own `Spans` slice already exceeds `maxSpans` is itself split across
+siblings (same `SourceID`/`Ref`, disjoint `Spans` subsets) — this is the specific shape that
+caused issue #501's OOM (one hot value referencing one data block via many distinct traces, not
+many distinct refs). Neither `Refs` order nor any `Spans` slice's internal order is ever
+reshuffled, so a caller relying on `sortBucketBlock`'s pre-existing ordering guarantee sees no
+extra work.
+
+**No-loss/no-duplication guarantee (binding):** the union of every returned sibling's `Spans`,
+keyed by `(SourceID, Ref, TraceID, SpanIndexes)`, is exactly equal to the input `g`'s own spans —
+zero spans dropped, zero duplicated, regardless of which packing branch (whole-ref vs.
+split-single-ref) produced a given sibling. Pinned by `TESTS.md` TEST-VI-26.
+
+**Enforcement points (both, binding — both apply the SAME cap constant,
+`shared.ValueIndexBucketGroupMaxSpanRefs`, for a given group's siblings to correctly
+re-consolidate across write→merge→merge generations):**
+1. **Write time** (`writer.go:assembleBucketWithCap`, called by the production
+   `FlushBucket`/`flushBucketWithCap` path): a `groupBuild`'s `spanCount` is checked before every
+   genuinely new `(ref, traceID)` pair is added (never on an additional `SpanIndexes` append to an
+   already-existing `SpanRef`, which does not grow `spanCount`); once `spanCount >=
+   maxSpansPerGroup`, the current group is sealed into `sealedGroups` and a fresh `groupBuild` is
+   started for the same key, with its own fresh `spanIdx`/`refIdx` maps (`spanKeyLocal2` is scoped
+   per-`groupBuild` instance, not per-file, specifically so a sealed sibling's slot indices can
+   never collide with the new sibling's).
+2. **Merge time** (`stream_compaction.go:mergeGroupsAtKey`): the existing union-building loop
+   (unbounded per this function's own signature, but now itself bounded by the write-time
+   enforcement point above applied recursively across generations — SPEC-VI-2's Addendum) is
+   unchanged; only the tail changed — instead of returning one `BucketGroup`, it calls
+   `splitBucketGroupBySpanCap(out, maxSpansPerGroup)` and returns the result directly, so
+   `mergeGroupsAtKey`'s own return type is `[]BucketGroup`, not `BucketGroup`.
+
+**Caller-visible consequence (see SPEC-VI-3's amendment):** `StreamCompactBucketFiles`'s main
+loop now runs its add+rotate step (`addMergedGroupAndMaybeRotate`) once per sibling a merged key
+produces, not once per key — extracted specifically to keep this branching out of the main loop's
+own cyclomatic complexity.
+
+Back-refs: `internal/modules/valueindex/bucketfile.go:bucketGroupSpanCount,
+splitBucketGroupBySpanCap`, `internal/modules/valueindex/writer.go:assembleBucketWithCap,
+flushBucketWithCap`, `internal/modules/valueindex/stream_compaction.go:mergeGroupsAtKey,
+addMergedGroupAndMaybeRotate`, `internal/modules/blockio/shared/constants.go:
+ValueIndexBucketGroupMaxSpanRefs`. See SPEC-VI-2 (Addendum), SPEC-VI-3 (Amended), `NOTES.md`
+NOTE-VI-111, `TESTS.md` TEST-VI-26/TEST-VI-27.
+
+---
+
+## SPEC-VI-17: `ValueIndexBucketBlockMaxBytes` — byte-size-aware early block cutting in `streamOutputWriter` (Approach B, issue #501)
+*Added: 2026-07-14*
+
+**Contract:** `streamOutputWriter.add` (`stream_compaction.go`) cuts the current output block
+once EITHER `len(w.pending) >= w.groupsPerBlock` OR `w.pendingBytes >= w.maxBlockBytes` is true —
+whichever threshold is reached first. `maxBlockBytes` is threaded through `newStreamOutputWriter`
+and defaults to `shared.ValueIndexBucketBlockMaxBytes` (16 MiB) at both of
+`StreamCompactBucketFiles`'s production call sites (`newBucketOutputFile`). `pendingBytes` is a
+running, cheap, **directionally-correct, not exact** estimate
+(`estimateBucketGroupBytes`: `len(CanonicalValue) + len(Refs)*32 + bucketGroupSpanCount(g)*24`),
+reset to `0` alongside `w.pending`'s reallocation (`w.pending = make([]BucketGroup, 0,
+w.groupsPerBlock)`, inside `streamOutputWriter.flush`) whenever a block is flushed — never a full
+per-`add`-call re-encode.
+
+**Relationship to SPEC-VI-16's per-group cap (binding — this mechanism is now secondary
+hardening, not the primary defense against one group dominating a block):** since SPEC-VI-16
+caps any individual group's own span-ref count, a single pathologically large group can no longer
+by itself dominate a block's decoded bytes the way it could pre-#501. `ValueIndexBucketBlockMaxBytes`
+protects against the OTHER shape — many individually-capped-but-still-moderately-sized groups
+landing in one block and collectively exceeding a healthy per-block byte budget — its original
+role from the #501 brainstorm, now narrower in scope than originally conceived because SPEC-VI-16
+already closed the "one huge group" case.
+
+**Not blocked on the evidence-gathering step that sized `ValueIndexBucketGroupMaxSpanRefs`** — 16
+MiB is a reasonable round-number default for this secondary hardening measure, independent of the
+per-tenant span-count histogram that determined the primary cap's value (`NOTES.md` NOTE-VI-111).
+
+Back-refs: `internal/modules/valueindex/stream_compaction.go:streamOutputWriter,
+newStreamOutputWriter, estimateBucketGroupBytes`, `internal/modules/blockio/shared/constants.go:
+ValueIndexBucketBlockMaxBytes`. See `TESTS.md` TEST-VI-29.

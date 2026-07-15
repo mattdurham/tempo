@@ -10,7 +10,7 @@ Entries in this file use the module-local, sequential prefix `TEST-VI-N` (file-s
 SPEC-ROOT-009 — distinct from the `NOTE-VI-N` numbering in `NOTES.md`). IDs are assigned in
 ascending order and never reused or renumbered.
 
-Next free ID: **TEST-VI-26**.
+Next free ID: **TEST-VI-31**.
 
 ---
 
@@ -661,3 +661,167 @@ trace-format equivalent of `writer.go`'s `FlushBucket(ctx, groupsPerBlock)` a
 patching `shared.ValueIndexTraceGroupsPerBlock` itself.
 
 Back-refs: `internal/modules/valueindex/stream_trace_compaction_scaling_test.go`.
+
+---
+
+## TEST-VI-26: `bucketGroupSpanCount`/`splitBucketGroupBySpanCap` — pure-function unit coverage (issue #501)
+*Added: 2026-07-14*
+
+**Scenario:** `bucketGroupSpanCount` sums `(ref, traceID)` span entries correctly across zero,
+one, and multiple `Refs`. `splitBucketGroupBySpanCap` (SPEC-VI-16) packs greedily by `Refs`
+order, splits a single ref whose own `Spans` exceed the cap across multiple siblings, treats
+`maxSpans <= 0` as a no-op, and never drops or duplicates a span across its returned siblings.
+
+**Setup:**
+- `TestBucketGroupSpanCount` — table test over `BucketGroup{}` (0 refs), one ref with 4 spans,
+  and three refs with 3/5/2 spans, asserting the exact sum in each case.
+- `TestSplitBucketGroupBySpanCap` — four subtests: "already under cap" (3 spans, cap 10 → single
+  sibling, unchanged, `require.Equal` not just length, so an accidental copy that drops data is
+  caught); "split across ref boundaries" (3 refs × 5 spans = 15, cap 6 → 3 siblings sized 5/5/5,
+  every sibling sharing `g`'s `TimeSec`/`CanonicalValue`); "single ref alone exceeds cap" (1 ref ×
+  20 spans, cap 6 → 4 siblings sized 6/6/6/2, each carrying the SAME `SourceID`/`Ref` with
+  disjoint `Spans`, no `TraceID` repeated across siblings); "cap <= 0 is a no-op" (cap 0 and cap
+  -1 both return `[]BucketGroup{g}` unchanged).
+
+**Assertions:** exact span-count sums; exact sibling count and per-sibling size for both split
+shapes; every sibling shares the input's `TimeSec`/`CanonicalValue`; the union of every returned
+sibling's spans (keyed by `(SourceID, Ref, TraceID, SpanIndexes)`, via the `collectSpanKeys`
+helper) equals the input's own spans exactly — zero dropped, zero duplicated; no cap-disabled
+case mutates or copies its input.
+
+**Spec invariants tested:** SPEC-VI-16.
+
+Back-ref: `internal/modules/valueindex/bucketfile_test.go:TestBucketGroupSpanCount,
+TestSplitBucketGroupBySpanCap, collectSpanKeys`.
+
+---
+
+## TEST-VI-27: Sibling-group-splitting is enforced identically at write time, merge time, and end-to-end, and is query-equivalent to the unsplit shape (issue #501)
+*Added: 2026-07-14*
+
+**Scenario:** SPEC-VI-3's amendment and SPEC-VI-16's write/merge enforcement points are each
+exercised at their own layer, plus one end-to-end proof tying both layers together, plus a
+query-equivalence guardrail proving the split is invisible to a real query.
+
+**Setup:**
+- `TestFlushBucket_HotKeySplitsIntoSiblingGroups` (`writer_bucket_hotkey_test.go`, in-package so
+  it can call the unexported `flushBucketWithCap`/`assembleBucketWithCap` test seam directly) —
+  feeds 25 distinct-`TraceID` entries at one hot `(value="hot", timeSec=1000)` key against a
+  small cap of 10 (not a clean multiple of 25, exercising the ragged tail sibling), plus one
+  unrelated cold key at the same `TimeSec`.
+- `TestMergeGroupsAtKey_SplitsOverflowIntoSiblings` (`stream_compaction_test.go`) — 3 contributing
+  input groups (5 spans each from 3 distinct sources) sharing one hot key, cap 6, calling
+  `mergeGroupsAtKey` directly; cross-checked against the same fixture run with `cap<=0` (today's
+  single-output-group behavior) for span-set equivalence.
+- `TestStreamCompactBucketFiles_HotKeySplitsIntoSiblingGroups` (`stream_compaction_test.go`) — 4
+  input `BucketFile`s (5 spans each, 20 total) sharing one hot key, run through
+  `streamCompactBucketFilesWithCap` twice: once at a small cap (6) and once at `cap=0` (today's
+  old behavior), decoded, and compared.
+- `TestSplitSiblingGroups_QueryEquivalentToUnsplitGroup` (`stream_compaction_test.go`) — the SAME
+  500-trace fixture flushed via `flushBucketWithCap` twice (cap disabled → one large group; cap
+  37, not a clean divisor of 500 → multiple ragged siblings), then queried both ways via the real
+  `QueryBucketFiles` entry point.
+
+**Assertions:** every layer independently confirms: (a) the hot key splits into `> 1` sibling
+groups once over cap, each individually `<= cap`, every sibling sharing the key's
+`TimeSec`/`CanonicalValue`; (b) `cap <= 0` reproduces exactly one group (today's pre-#501 shape),
+used as the equivalence oracle; (c) the union of the capped run's sibling spans (via
+`collectSpanKeys`) exactly equals the uncapped run's single group's spans — zero loss, zero
+duplication, at every layer (write, merge, and end-to-end); (d) a cold/unrelated key well under
+the cap is completely unaffected; (e) `QueryBucketFiles` returns byte-identical match sets
+(`TraceID`s, span indexes, block refs) against the split and unsplit shapes of the identical
+underlying data — proving the split is query-invisible, not merely internally consistent.
+
+**Spec invariants tested:** SPEC-VI-3 (amended), SPEC-VI-16.
+
+Back-refs: `internal/modules/valueindex/writer_bucket_hotkey_test.go:
+TestFlushBucket_HotKeySplitsIntoSiblingGroups`, `internal/modules/valueindex/
+stream_compaction_test.go:TestMergeGroupsAtKey_SplitsOverflowIntoSiblings,
+TestStreamCompactBucketFiles_HotKeySplitsIntoSiblingGroups,
+TestSplitSiblingGroups_QueryEquivalentToUnsplitGroup`.
+
+---
+
+## TEST-VI-28: `collectContributionsAtKey` coalesces consecutive same-key sibling groups from one iterator into a single collect pass (issue #501)
+*Added: 2026-07-14*
+
+**Scenario:** SPEC-VI-3's amended precondition allows a single input file/iterator to hold TWO
+consecutive groups sharing one `(TimeSec, CanonicalValue)` key (produced by
+`splitBucketGroupBySpanCap` on a prior write/merge generation). `collectContributionsAtKey`'s
+combined pop-advance-repush loop (replacing the pre-#501 two-phase collect-then-advance split)
+must coalesce BOTH into one collect pass, not defer the second to a later, separate outer-loop
+pass — the deferred case would surface as a spurious extra output group for the same key instead
+of being re-consolidated.
+
+**Setup:** `TestCollectContributionsAtKey_CoalescesConsecutiveSameKeyGroupsFromOneIterator`
+(`stream_compaction_test.go`) builds a single `GroupIterator` (via `multiBlockFileWith`/
+`NewBucketFileIterator`) whose blocks contain two consecutive groups sharing `(TimeSec=1000,
+CanonicalValue="hot")`, each with one ref/span, and calls `collectContributionsAtKey` directly.
+
+**Assertions:** the returned `groups` slice has length 2 — both same-key sibling groups from the
+ONE iterator are collected in a single call, not split across two separate outer-loop passes.
+
+**Spec invariants tested:** SPEC-VI-3 (amended), SPEC-VI-16.
+
+Back-ref: `internal/modules/valueindex/stream_compaction_test.go:
+TestCollectContributionsAtKey_CoalescesConsecutiveSameKeyGroupsFromOneIterator`.
+
+---
+
+## TEST-VI-29: `streamOutputWriter` cuts a block early once the estimated byte budget is exceeded, ahead of `groupsPerBlock` (Approach B, issue #501)
+*Added: 2026-07-14*
+
+**Scenario:** `streamOutputWriter.add` (SPEC-VI-17) must cut the current block once
+`pendingBytes >= maxBlockBytes`, even while `len(pending) < groupsPerBlock` — proving the byte
+cap is a genuine, independently-triggering second cut condition, not dead code shadowed by the
+count-based cap.
+
+**Setup:** `TestStreamOutputWriter_CutsBlockEarlyOnByteSizeCap` (`stream_compaction_test.go`)
+constructs a `streamOutputWriter` with `groupsPerBlock=100` (deliberately large, so only the
+byte cap can trigger a cut in this test) and `maxBlockBytes=100`, adds one small group (asserts
+no cut yet), then a second (asserts a cut now fires and exactly one block was written to `dir`).
+
+**Assertions:** the first `add` call reports `cut == false`; the second reports `cut == true`
+once accumulated `pendingBytes` crosses the 100-byte threshold; `len(w.dir) == 1` confirms
+exactly one block was cut, not zero or two.
+
+**Spec invariants tested:** SPEC-VI-17.
+
+Back-ref: `internal/modules/valueindex/stream_compaction_test.go:
+TestStreamOutputWriter_CutsBlockEarlyOnByteSizeCap`.
+
+---
+
+## TEST-VI-30: `StreamCompactBucketFiles`' output-group-size cap holds across unbounded real growth over many compaction generations (issue #501)
+*Added: 2026-07-14*
+
+**Scenario:** proves the structural postcondition NOTE-VI-112 documents in place of the
+originally-planned (and mutation-test-rejected) peak-heap-sampling design: no decoded
+`BucketGroup` sharing a hot key ever exceeds `shared.ValueIndexBucketGroupMaxSpanRefs` span-ref
+entries, no matter how large that key's real cumulative history grows across arbitrarily many
+compaction generations of genuine continued ingest — proven end-to-end through the real
+`streamCompactBucketFilesWithCap` pipeline, not merely `splitBucketGroupBySpanCap`'s own
+isolated-function unit test (TEST-VI-26).
+
+**Setup:** `TestStreamCompactBucketFiles_OutputGroupSizeStaysCappedAcrossUnboundedRealGrowth`
+(`stream_compaction_hotkey_scaling_test.go`) seeds 5 files (1,000 genuinely distinct traces each,
+all sharing one hot `(value="hot", timeSec=1000)` key) via `makeHotKeyDeltaFile` (using
+`flushBucketWithCap` with `spanCap=2000`), compacts them via `compactBucketFiles`
+(`streamCompactBucketFilesWithCap` over real disk-backed `NewDiskBucketFileIterator`s), then runs
+19 further generations, each merging the current compacted output with ONE fresh delta file
+contributing 1,000 more genuinely new distinct traces (25,000 total by the final generation, well
+past the 2,000-entry cap). `assertHotKeyGroupsWithinCap` decodes the output after every
+generation.
+
+**Assertions:** at every one of the 20 generations, every hot-key `BucketGroup`'s
+`bucketGroupSpanCount` is `<= spanCap`, at least one hot-key group exists (guards against the
+hot key vacuously disappearing), and the cumulative span total across all of that generation's
+hot-key groups exactly equals the sum of every generation's contributions so far — proving no
+span is ever lost or duplicated across 20 real compaction generations of unbounded growth.
+
+**Spec invariants tested:** SPEC-VI-2 (Addendum), SPEC-VI-16.
+
+Back-ref: `internal/modules/valueindex/stream_compaction_hotkey_scaling_test.go:
+TestStreamCompactBucketFiles_OutputGroupSizeStaysCappedAcrossUnboundedRealGrowth,
+makeHotKeyDeltaFile, compactBucketFiles, assertHotKeyGroupsWithinCap`. See `NOTES.md`
+NOTE-VI-112.

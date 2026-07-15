@@ -221,7 +221,16 @@ func (w *writerImpl) Flush(_ context.Context, level uint8) ([]byte, error) {
 // FlushBucket builds a v2 BucketGroup file from the buffered entries (NOTE-VI-045, #429).
 // It reuses the same sort/dedup/spill-merge machinery as Flush but feeds the sorted stream
 // into a BucketFile builder instead of the flat VINX encoder.
-func (w *writerImpl) FlushBucket(_ context.Context, groupsPerBlock int) ([]byte, error) {
+func (w *writerImpl) FlushBucket(ctx context.Context, groupsPerBlock int) ([]byte, error) {
+	return w.flushBucketWithCap(ctx, groupsPerBlock, shared.ValueIndexBucketGroupMaxSpanRefs)
+}
+
+// flushBucketWithCap is FlushBucket's implementation, parameterized by the per-group
+// span-ref cap (assembleBucketWithCap, issue #501) so in-package tests can exercise the
+// write-path hot-key-splitting behavior with a small cap without needing
+// shared.ValueIndexBucketGroupMaxSpanRefs-sized input. FlushBucket (the production entry
+// point) always calls this with the real default.
+func (w *writerImpl) flushBucketWithCap(_ context.Context, groupsPerBlock, maxSpansPerGroup int) ([]byte, error) {
 	if groupsPerBlock <= 0 {
 		groupsPerBlock = shared.ValueIndexBucketGroupsPerBlock
 	}
@@ -234,7 +243,7 @@ func (w *writerImpl) FlushBucket(_ context.Context, groupsPerBlock int) ([]byte,
 		sortRawSlice(w.colType, w.entries)
 		w.entries = deduplicateEntries(w.entries)
 		entries := w.entries
-		data, err = w.assembleBucket(groupsPerBlock, func(yield func(rawEntry) error) error {
+		data, err = w.assembleBucketWithCap(groupsPerBlock, maxSpansPerGroup, func(yield func(rawEntry) error) error {
 			for i := range entries {
 				if e := yield(entries[i]); e != nil {
 					return e
@@ -246,7 +255,7 @@ func (w *writerImpl) FlushBucket(_ context.Context, groupsPerBlock int) ([]byte,
 		// External sort-merge path.
 		defer w.discardRuns()
 		tail := w.entries
-		data, err = w.assembleBucket(groupsPerBlock, func(yield func(rawEntry) error) error {
+		data, err = w.assembleBucketWithCap(groupsPerBlock, maxSpansPerGroup, func(yield func(rawEntry) error) error {
 			return mergeRuns(w.colType, w.runs, tail, yield)
 		})
 	}
@@ -257,12 +266,21 @@ func (w *writerImpl) FlushBucket(_ context.Context, groupsPerBlock int) ([]byte,
 	return data, nil
 }
 
-// assembleBucket consumes a sorted, deduplicated rawEntry stream and materializes a
+// assembleBucketWithCap consumes a sorted, deduplicated rawEntry stream and materializes a
 // single-block BucketFile, then splits it into blocks of at most groupsPerBlock groups.
 // The stream arrives sorted by (canonicalValue, timeSec, traceID); groups are keyed by
 // (timeSec, canonicalValue) so we accumulate into a map and let SplitIntoBlocks re-sort.
-func (w *writerImpl) assembleBucket(
-	groupsPerBlock int,
+//
+// maxSpansPerGroup caps each open groupBuild's span-ref count (SPEC-VI-16, issue #501): once a
+// key's count reaches the cap, the open groupBuild is sealed into sealedGroups and replaced
+// with a fresh one for the same key. spanIdx/refIdx are scoped per-groupBuild instance (not
+// function-level) so a fresh sibling's slot indices never collide with an already-sealed
+// sibling's — a ref that existed in a sealed sibling starts fresh in the new one, which is
+// fine per SPEC-VI-3 (amended): siblings' Refs may repeat the same SourceID/Ref, but their
+// Spans subsets are always disjoint by construction. maxSpansPerGroup <= 0 disables the cap
+// (mirrors groupsPerBlock's own <= 0 convention).
+func (w *writerImpl) assembleBucketWithCap(
+	groupsPerBlock, maxSpansPerGroup int,
 	source func(yield func(rawEntry) error) error,
 ) ([]byte, error) {
 	table := NewStringTable()
@@ -271,11 +289,36 @@ func (w *writerImpl) assembleBucket(
 	// ref key within a group ((sourceID, page)) → BucketBlockRef index.
 	// span key within a ref (traceID) → SpanRef index.
 	type groupBuild struct {
-		refIdx map[refKey]int
-		group  *BucketGroup
+		refIdx    map[refKey]int
+		spanIdx   map[spanKeyLocal2]int
+		group     *BucketGroup
+		spanCount int
 	}
+	newGroupBuild := func(timeSec uint64, canonicalValue []byte) *groupBuild {
+		return &groupBuild{
+			group: &BucketGroup{
+				TimeSec:        timeSec,
+				CanonicalValue: append([]byte(nil), canonicalValue...),
+			},
+			refIdx:  make(map[refKey]int),
+			spanIdx: make(map[spanKeyLocal2]int),
+		}
+	}
+	ensureRef := func(gb *groupBuild, sid uint16, blockRef BlockRef, rk refKey) int {
+		ri, ok := gb.refIdx[rk]
+		if !ok {
+			ri = len(gb.group.Refs)
+			gb.group.Refs = append(gb.group.Refs, BucketBlockRef{
+				SourceID: sid,
+				Ref:      blockRef,
+			})
+			gb.refIdx[rk] = ri
+		}
+		return ri
+	}
+
 	groups := make(map[string]*groupBuild)
-	spanIdx := make(map[spanKeyLocal]int) // (groupKey,refKey,traceID) → span slot
+	var sealedGroups []BucketGroup
 
 	var overflow error
 	err := source(func(re rawEntry) error {
@@ -287,32 +330,31 @@ func (w *writerImpl) assembleBucket(
 		gk := formatGroupKey(re.timeSec, re.canonicalValue)
 		gb := groups[gk]
 		if gb == nil {
-			gb = &groupBuild{
-				group: &BucketGroup{
-					TimeSec:        re.timeSec,
-					CanonicalValue: append([]byte(nil), re.canonicalValue...),
-				},
-				refIdx: make(map[refKey]int),
-			}
+			gb = newGroupBuild(re.timeSec, re.canonicalValue)
 			groups[gk] = gb
 		}
 		rk := refKey{sourceID: sid, page: re.blockRef.PageNum, lenPages: re.blockRef.LenPages}
-		ri, ok := gb.refIdx[rk]
-		if !ok {
-			ri = len(gb.group.Refs)
-			gb.group.Refs = append(gb.group.Refs, BucketBlockRef{
-				SourceID: sid,
-				Ref:      re.blockRef,
-			})
-			gb.refIdx[rk] = ri
-		}
-		spk := spanKeyLocal{group: gk, ref: rk, traceID: re.traceID}
-		si, ok := spanIdx[spk]
-		if !ok {
+		spk := spanKeyLocal2{ref: rk, traceID: re.traceID}
+
+		si, spanExists := gb.spanIdx[spk]
+		var ri int
+		if spanExists {
+			ri = gb.refIdx[rk]
+		} else {
+			// Genuinely new (ref, traceID) pair: this is the only point at which a
+			// group's span count grows, so it's the only point that needs the cap check.
+			if maxSpansPerGroup > 0 && gb.spanCount >= maxSpansPerGroup {
+				sealedGroups = append(sealedGroups, *gb.group)
+				gb = newGroupBuild(re.timeSec, re.canonicalValue)
+				groups[gk] = gb
+			}
+			ri = ensureRef(gb, sid, re.blockRef, rk)
 			si = len(gb.group.Refs[ri].Spans)
 			gb.group.Refs[ri].Spans = append(gb.group.Refs[ri].Spans, SpanRef{TraceID: re.traceID})
-			spanIdx[spk] = si
+			gb.spanIdx[spk] = si
+			gb.spanCount++
 		}
+
 		// rowIdx is meaningful only for v4 entries; v2 entries carry rowIdx==0, which is
 		// a valid row index, so we always record it. Duplicate (traceID,rowIdx) pairs are
 		// collapsed by ComputeBlockMeta/sortBucketBlock's sortUint16 (they stay distinct
@@ -335,7 +377,8 @@ func (w *writerImpl) assembleBucket(
 		return nil, nil
 	}
 
-	block := BucketBlock{Groups: make([]BucketGroup, 0, len(groups))}
+	block := BucketBlock{Groups: make([]BucketGroup, 0, len(sealedGroups)+len(groups))}
+	block.Groups = append(block.Groups, sealedGroups...)
 	for _, gb := range groups {
 		block.Groups = append(block.Groups, *gb.group)
 	}
@@ -363,9 +406,11 @@ type refKey struct {
 	lenPages uint16
 }
 
-// spanKeyLocal keys a SpanRef within the whole file build: its group, its ref, and its trace id.
-type spanKeyLocal struct {
-	group   string
+// spanKeyLocal2 keys a SpanRef within a single groupBuild instance: its ref and its trace id.
+// Scoped per-groupBuild (not per-file, unlike its predecessor spanKeyLocal) so that sealing a
+// group and starting a fresh sibling for the same key (issue #501) can never collide with the
+// sealed sibling's slot indices — a fresh groupBuild always gets a fresh, empty spanIdx map.
+type spanKeyLocal2 struct {
 	ref     refKey
 	traceID [16]byte
 }

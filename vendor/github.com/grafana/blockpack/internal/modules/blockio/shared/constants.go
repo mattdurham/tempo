@@ -449,6 +449,35 @@ const (
 	// while still allowing coarse skips across a large file.
 	ValueIndexBucketGroupsPerBlock = 4_096
 
+	// ValueIndexBucketGroupMaxSpanRefs is the maximum number of (ref, traceID) span entries a
+	// single BucketGroup may accumulate before write time (assembleBucketWithCap, writer.go) or
+	// merge time (mergeGroupsAtKey, stream_compaction.go) splits the overflow into a sibling
+	// BucketGroup sharing the same (TimeSec, CanonicalValue) key (SPEC-VI-16, issue #501). A hot
+	// key's output group size is otherwise unbounded and grows monotonically across compaction
+	// generations (NOTE-VI-111/#501 pprof evidence: 3.44GB decodeBucketBlock / 3.01GB
+	// mergeGroupsAtKey on tenant 11638's "string" column). Bounding by span-ref count (not byte
+	// size) mirrors ValueIndexBucketGroupsPerBlock's own count-based cap and avoids re-deriving
+	// a byte-size estimator for BucketBlockRef/SpanRef.
+	//
+	// Value confirmed 2026-07-14 against a real per-group Refs/Spans-count histogram sampled
+	// from tenant 11638's largest "string" column L3 file (268MB, live S3 read via
+	// internal/modules/valueindex/cmd/bgstats): 1,432,547 groups, 13,780,102 total spans,
+	// median=1 span/group, p99=33, max=56,490 (only 59 groups in the 32768-65536 bucket; only
+	// 414 groups exceed 8,192 total). 20,000 sits comfortably above the observed p99 and
+	// meaningfully splits the small heavy tail while staying below this sample's own max.
+	ValueIndexBucketGroupMaxSpanRefs = 20_000
+
+	// ValueIndexBucketBlockMaxBytes is a byte-size cap on a single output block of a v2
+	// BucketGroup value-index file, evaluated alongside ValueIndexBucketGroupsPerBlock's
+	// count-based cap (SPEC-VI-17, issue #501, Approach B secondary hardening): a block is cut
+	// once EITHER cap is reached. Protects against many moderately-sized groups landing in one
+	// block and dominating its decoded bytes — less load-bearing than the per-group span-ref
+	// cap (ValueIndexBucketGroupMaxSpanRefs), which already bounds any single group's own size,
+	// but still useful since ValueIndexBucketGroupsPerBlock alone bounds group COUNT, not
+	// bytes. 16 MiB is a reasonable round-number default, not evidence-derived like the
+	// span-ref cap.
+	ValueIndexBucketBlockMaxBytes = 16 << 20
+
 	// ValueIndexWriterSpillEntries is the number of buffered posting-list entries at
 	// which the value-index writer sorts its in-memory run and spills it to a temp
 	// file (NOTE-VI-026, issue #413). At ~72 bytes/rawEntry this caps peak in-memory

@@ -218,9 +218,20 @@ func popStaleIterator(h *bucketIteratorHeap) error {
 	return it.Err()
 }
 
-// mergeGroupsAtKey merges N same-key BucketGroups (one per contributing iterator, each
-// resolved against its own file's StringTable) into one output BucketGroup, unioning
-// BlockRefs by (sourcePath, page) and SpanRefs by TraceID (NOTE-VI-045 dedup semantics —
+// mergeGroupsAtKey merges N same-key BucketGroups into one OR MORE output BucketGroups sharing
+// the key, capping each output group's total span-ref count at maxSpansPerGroup (SPEC-VI-16,
+// issue #501).
+//
+// Peak memory during the union-building phase is bounded by K * (each contributing iterator's
+// own real total fan-in for this key), NOT a fixed K * maxSpansPerGroup constant. The write-path
+// cap (assembleBucketWithCap, writer.go, SPEC-VI-16) bounds any single INPUT group's own size,
+// but collectContributionsAtKey's coalescing (SPEC-VI-3, amended) deliberately does not cap how
+// many same-key sibling groups one iterator can contribute, since doing so would prevent
+// siblings from ever re-consolidating. See SPEC-VI-2's Addendum and NOTES.md NOTE-VI-111 for the
+// accepted residual-risk framing this implies. maxSpansPerGroup <= 0 is a no-op (single output
+// group, today's behavior) for callers/tests that don't care about the cap.
+//
+// Unions BlockRefs by (sourcePath, page) and SpanRefs by TraceID (NOTE-VI-045 dedup semantics —
 // same rule as MergeBucketFiles, verified by the equivalence tests, not by shared code,
 // since the two accumulators operate at different scopes: whole-file vs single-key).
 func mergeGroupsAtKey(
@@ -229,7 +240,8 @@ func mergeGroupsAtKey(
 	groups []*BucketGroup,
 	tables []*StringTable,
 	outTable *StringTable,
-) (BucketGroup, error) {
+	maxSpansPerGroup int,
+) ([]BucketGroup, error) {
 	type spanAcc struct {
 		idx     map[uint16]struct{}
 		traceID [16]byte
@@ -288,7 +300,7 @@ func mergeGroupsAtKey(
 		}
 		id, ok := outTable.Intern(ra.sourcePath)
 		if !ok {
-			return BucketGroup{}, fmt.Errorf("valueindex: mergeGroupsAtKey: %w", ErrStringTableOverflow)
+			return nil, fmt.Errorf("valueindex: mergeGroupsAtKey: %w", ErrStringTableOverflow)
 		}
 		br := BucketBlockRef{SourceID: id, Ref: ra.ref, Spans: make([]SpanRef, 0, len(ra.spans))}
 		for _, sa := range ra.spans {
@@ -314,42 +326,66 @@ func mergeGroupsAtKey(
 			return compareTraceID(spans[i].TraceID, spans[j].TraceID) < 0
 		})
 	}
-	return out, nil
+	return splitBucketGroupBySpanCap(out, maxSpansPerGroup), nil
 }
 
 // streamOutputWriter accumulates BucketGroups into fixed-size blocks and writes each block
 // directly to a bufio.Writer as it is cut (plan.md Decision 3), tracking the block directory
 // and file-level min/max time needed for the eventual footer. Extracted out of
 // StreamCompactBucketFiles to keep that function's cyclomatic complexity under the repo's
-// gocyclo gate.
+// gocyclo gate. maxBlockBytes/pendingBytes implement the SPEC-VI-17 byte-size block cap.
 type streamOutputWriter struct {
 	bw             *bufio.Writer
 	dir            []BlockDirEntry
 	pending        []BucketGroup
 	groupsPerBlock int
+	maxBlockBytes  uint64
+	pendingBytes   uint64
 	bodyEnd        uint64
 	fileMin        uint64
 	fileMax        uint64
 	haveFileTime   bool
 }
 
-func newStreamOutputWriter(bw *bufio.Writer, groupsPerBlock int, headerLen uint64) *streamOutputWriter {
+func newStreamOutputWriter(
+	bw *bufio.Writer,
+	groupsPerBlock int,
+	headerLen, maxBlockBytes uint64,
+) *streamOutputWriter {
 	return &streamOutputWriter{
 		bw:             bw,
 		dir:            make([]BlockDirEntry, 0, 8),
 		pending:        make([]BucketGroup, 0, groupsPerBlock),
 		groupsPerBlock: groupsPerBlock,
+		maxBlockBytes:  maxBlockBytes,
 		bodyEnd:        headerLen,
 	}
 }
 
-// add appends g to the pending block, flushing automatically once groupsPerBlock is
-// reached. It reports whether a block was just cut (flushed) by this call, so the caller
-// can safely evaluate an output-file-size split boundary only at a block boundary — never
-// mid-block, since a block's groups reference the current file's string table (NOTE-VI-077).
+// estimateBucketGroupBytes is a cheap, directionally-correct (not exact) estimate of g's
+// encoded size, used only by the SPEC-VI-17 block-byte-size cap (Approach B, issue #501) —
+// never a full re-encode per add() call. perRefBytes/perSpanBytes are rough fixed-size
+// approximations of BucketBlockRef's/SpanRef's on-wire shape (bucketfile.go's block layout
+// comment).
+func estimateBucketGroupBytes(g *BucketGroup) uint64 {
+	const perRefBytes = 32
+	const perSpanBytes = 24
+	// G115: len()/count values here are bounded by in-memory slice sizes, never negative.
+	size := uint64(len(g.CanonicalValue))
+	size += uint64(len(g.Refs)) * perRefBytes
+	size += uint64(bucketGroupSpanCount(g)) * perSpanBytes //nolint:gosec // G115: see above
+	return size
+}
+
+// add appends g to the pending block, flushing automatically once EITHER groupsPerBlock or
+// maxBlockBytes (SPEC-VI-17, Approach B, issue #501) is reached. It reports whether a block
+// was just cut (flushed) by this call, so the caller can safely evaluate an output-file-size
+// split boundary only at a block boundary — never mid-block, since a block's groups reference
+// the current file's string table (NOTE-VI-077).
 func (w *streamOutputWriter) add(g BucketGroup) (blockCut bool, err error) {
 	w.pending = append(w.pending, g)
-	if len(w.pending) >= w.groupsPerBlock {
+	w.pendingBytes += estimateBucketGroupBytes(&g)
+	if len(w.pending) >= w.groupsPerBlock || (w.maxBlockBytes > 0 && w.pendingBytes >= w.maxBlockBytes) {
 		if err := w.flush(); err != nil {
 			return false, err
 		}
@@ -390,6 +426,7 @@ func (w *streamOutputWriter) flush() error {
 	}
 	w.haveFileTime = true
 	w.pending = make([]BucketGroup, 0, w.groupsPerBlock)
+	w.pendingBytes = 0
 	return nil
 }
 
@@ -430,18 +467,25 @@ func populateMergeHeap(iterators []GroupIterator) (*bucketIteratorHeap, error) {
 	return h, nil
 }
 
-// collectContributionsAtKey pops every iterator whose Peek() reports the same (keyTS,
-// keyValue) key currently parked at the heap root into the caller-owned groups/tables/iters
-// buffers (reset via [:0] here, reused across outer-loop iterations to avoid a fresh
-// allocation per merged key).
+// collectContributionsAtKey pops every group currently sharing (keyTS, keyValue) into the
+// caller-owned groups/tables/iters buffers (reset via [:0] here, reused across outer-loop
+// iterations to avoid a fresh allocation per merged key) — including MULTIPLE groups from the
+// SAME iterator, via a combined pop-advance-repush loop mirroring
+// collectTraceContributionsAtKey's (stream_trace_compaction.go): after popping an iterator
+// whose Peek() matches the key, it is immediately advanced; if it is still positioned at the
+// same key it is pushed straight back onto the heap and popped again by this same loop, rather
+// than deferred to a later outer-loop pass (NOTE-VI-111 design rationale; regression-guarded by
+// TEST-VI-28).
 //
-// SPEC-VI-3: this coalescing loop only merges groups simultaneously parked at the heap root
-// during this one outer-loop pass. It relies on (TimeSec, CanonicalValue) keys being unique
-// within each input file (not just globally ordered per SPEC-VI-1) — a second same-key group
-// later in the same file would surface as a spurious extra output group instead of being
-// merged here. This is guaranteed today by every producer's pre-dedup construction and is not
-// defended against here.
+// SPEC-VI-3 (amended, issue #501): (TimeSec, CanonicalValue) keys are no longer guaranteed
+// unique within a single input file — assembleBucketWithCap/mergeGroupsAtKey/
+// splitBucketGroupBySpanCap deliberately emit multiple sibling BucketGroups sharing one key
+// when that key's span-ref count would exceed shared.ValueIndexBucketGroupMaxSpanRefs. This
+// combined loop (not the old two-phase collect-then-advance split) is what re-consolidates
+// those siblings down to the cap across successive compaction generations instead of letting
+// them proliferate.
 func collectContributionsAtKey(
+	ctx context.Context,
 	h *bucketIteratorHeap,
 	keyTS uint64,
 	keyValue []byte,
@@ -470,35 +514,32 @@ func collectContributionsAtKey(
 		groups = append(groups, g)
 		tables = append(tables, it.StringTable())
 		iters = append(iters, it)
-	}
-	return groups, tables, iters, nil
-}
 
-// advanceContributors advances every iterator that contributed to the just-merged key,
-// re-pushing it onto the heap if it still has more groups, and aborting on the first error.
-func advanceContributors(ctx context.Context, h *bucketIteratorHeap, contribIters []GroupIterator) error {
-	for _, it := range contribIters {
 		it.Advance(ctx)
-		if err := it.Err(); err != nil {
-			return err
+		if aerr := it.Err(); aerr != nil {
+			return nil, nil, nil, aerr
 		}
 		if _, ok := it.Peek(); ok {
 			heap.Push(h, it)
 		}
 	}
-	return nil
+	return groups, tables, iters, nil
 }
 
 // StreamCompactBucketFiles performs a heap-based k-way merge across N already-decoded,
 // already-filtered GroupIterators, emitting merged BucketGroups in sorted order and
 // cutting them into output blocks of at most groupsPerBlock groups (SPEC-VI-2). It never
-// materializes the full merged group set: peak memory is bounded by the K input files
-// (already decoded by the caller) plus one in-progress output block plus a transient
-// per-key merge buffer sized to however many of the K files currently share one key —
-// replacing MergeBucketFiles+SplitIntoBlocks' map-of-maps for this call path. groupsPerBlock
-// <= 0 defaults to shared.ValueIndexBucketGroupsPerBlock. output is called at most once,
-// with the path to the fully assembled output file, or not at all if there is nothing to
-// emit.
+// materializes the full merged group set: peak memory is bounded by (a) the K input files
+// (already decoded by the caller), (b) one in-progress output block, and (c) a transient
+// per-key merge-union buffer -- NOT bounded to a fixed K * shared.ValueIndexBucketGroupMaxSpanRefs
+// constant. Every OUTPUT BucketGroup is capped at shared.ValueIndexBucketGroupMaxSpanRefs
+// (mergeGroupsAtKey, SPEC-VI-16), bounding decode-side cost and preventing unbounded-forever
+// single-group growth, but the transient buffer's real size is K * (each contributing iterator's
+// own real total fan-in for the key) -- mitigated by CompactMaxInputFiles/CompactBatchBytes
+// bounding K and by retention filtering, not by a single unconditional bound (SPEC-VI-2, amended;
+// NOTES.md NOTE-VI-111) — replacing MergeBucketFiles+SplitIntoBlocks' map-of-maps for this call
+// path. groupsPerBlock <= 0 defaults to shared.ValueIndexBucketGroupsPerBlock. output is called
+// at most once per emitted file, or not at all if there is nothing to emit.
 //
 // The merged output is staged through a local temp file (plan.md Decision 3): a
 // bufio.Writer over a fresh os.CreateTemp file, written block-by-block as each output block
@@ -510,6 +551,25 @@ func StreamCompactBucketFiles(
 	iterators []GroupIterator,
 	groupsPerBlock int,
 	maxOutputBytes int64,
+	output func(path string) error,
+) error {
+	return streamCompactBucketFilesWithCap(
+		ctx, iterators, groupsPerBlock, maxOutputBytes, shared.ValueIndexBucketGroupMaxSpanRefs, output,
+	)
+}
+
+// streamCompactBucketFilesWithCap is StreamCompactBucketFiles' implementation, parameterized
+// by the per-key span-ref cap (SPEC-VI-16, mergeGroupsAtKey, issue #501) so in-package tests
+// can exercise hot-key sibling-splitting end-to-end with a small cap without needing
+// shared.ValueIndexBucketGroupMaxSpanRefs-sized input. StreamCompactBucketFiles (the
+// production entry point) always calls this with the real default; the cap is not
+// caller-configurable at this call site (no <= 0 escape hatch), unlike groupsPerBlock.
+func streamCompactBucketFilesWithCap(
+	ctx context.Context,
+	iterators []GroupIterator,
+	groupsPerBlock int,
+	maxOutputBytes int64,
+	maxSpansPerGroup int,
 	output func(path string) error,
 ) error {
 	if err := ctx.Err(); err != nil {
@@ -530,7 +590,9 @@ func StreamCompactBucketFiles(
 	}
 	// Only the current (in-progress) output file needs cleanup on error: a file that has
 	// been finalized+handed to `output` is the caller's responsibility per the callback
-	// contract, and finalizeBucketOutputFile clears of.file after a successful handoff.
+	// contract, and finalizeBucketOutputFile clears of.file after a successful handoff. This
+	// closure captures `of` by reference, so it always cleans up whichever output file is
+	// current at defer-execution time even after addMergedGroupAndMaybeRotate replaces it.
 	defer func() { of.cleanup() }()
 
 	contribGroups := make([]*BucketGroup, 0, len(iterators))
@@ -557,51 +619,28 @@ func StreamCompactBucketFiles(
 		keyTS := keyGroup.TimeSec
 		keyValue := keyGroup.CanonicalValue
 
+		// collectContributionsAtKey advances every contributor inline (issue #501) — there is
+		// no separate advance-contributors step here, unlike the pre-#501 two-phase split.
 		var cerr error
 		contribGroups, contribTables, contribIters, cerr = collectContributionsAtKey(
-			h, keyTS, keyValue, contribGroups, contribTables, contribIters,
+			ctx, h, keyTS, keyValue, contribGroups, contribTables, contribIters,
 		)
 		if cerr != nil {
 			return cerr
 		}
 
-		merged, err := mergeGroupsAtKey(keyTS, keyValue, contribGroups, contribTables, of.table)
+		mergedSiblings, err := mergeGroupsAtKey(
+			keyTS, keyValue, contribGroups, contribTables, of.table, maxSpansPerGroup,
+		)
 		if err != nil {
 			return fmt.Errorf("valueindex: StreamCompactBucketFiles: %w", err)
 		}
-		blockCut, addErr := of.out.add(merged)
-		if addErr != nil {
-			return addErr
-		}
-
-		// Advance the contributing iterators back onto the heap BEFORE evaluating the split
-		// boundary: collectContributionsAtKey popped every contributor out of the heap, so
-		// h.Len() would be 0 here for a single-input merge even when that input still has more
-		// groups. Advancing first restores the heap to reflect the true remaining work, so the
-		// "more input remaining" guard below is accurate.
-		if advErr := advanceContributors(ctx, h, contribIters); advErr != nil {
-			return advErr
-		}
-
-		// NOTE-VI-077 (#482): honor maxOutputBytes by rotating to a fresh output file at a
-		// block boundary once the projected finalized file size has grown past the cap.
-		// projectedFileSize (not just bodyEnd) accounts for the tail — string table + block
-		// index + footer — which for a many-block file dominates the compressed body, so a
-		// bodyEnd-only check would never trigger. Rotation is only ever evaluated right after
-		// a block was cut (blockCut) so the split lands on a block boundary — never mid-block,
-		// since a block's groups reference the current file's string table (a mid-block split
-		// would strand references to interned SourceRefs the new file's table does not carry).
-		// The h.Len() > 0 guard (evaluated after advanceContributors above) guarantees
-		// rotation never produces a trailing empty file.
-		//nolint:gosec // G115: maxOutputBytes > 0 is guarded here, so the uint64 conversion is safe.
-		if blockCut && maxOutputBytes > 0 && h.Len() > 0 &&
-			projectedFileSize(of.out, of.table) >= uint64(maxOutputBytes) {
-			if finErr := finalizeBucketOutputFile(of, output); finErr != nil {
-				return finErr
-			}
-			var newErr error
-			if of, newErr = newBucketOutputFile(groupsPerBlock); newErr != nil {
-				return newErr
+		// One key can now produce more than one sibling group (issue #501): the add+rotate
+		// step runs once per sibling, unlike contributor advancement above, which already ran
+		// exactly once for this key.
+		for _, mg := range mergedSiblings {
+			if err := addMergedGroupAndMaybeRotate(&of, mg, maxOutputBytes, groupsPerBlock, h, output); err != nil {
+				return err
 			}
 		}
 	}
@@ -618,6 +657,55 @@ func StreamCompactBucketFiles(
 	}
 
 	return finalizeBucketOutputFile(of, output)
+}
+
+// addMergedGroupAndMaybeRotate adds one merged sibling group to the current output file and,
+// at a block boundary, rotates to a fresh output file once the projected finalized size has
+// grown past maxOutputBytes (NOTE-VI-077, #482). Extracted out of
+// streamCompactBucketFilesWithCap's main loop because mergeGroupsAtKey can now return more
+// than one sibling per key (issue #501) — this must run once PER SIBLING, both to keep
+// streamCompactBucketFilesWithCap's cyclomatic complexity from growing and because rotation
+// must still only ever land on a block boundary regardless of how many siblings share a key.
+// ofp is threaded by pointer-to-pointer so a rotation can replace the caller's
+// *bucketOutputFile in place.
+func addMergedGroupAndMaybeRotate(
+	ofp **bucketOutputFile,
+	mg BucketGroup,
+	maxOutputBytes int64,
+	groupsPerBlock int,
+	h *bucketIteratorHeap,
+	output func(path string) error,
+) error {
+	of := *ofp
+	blockCut, addErr := of.out.add(mg)
+	if addErr != nil {
+		return addErr
+	}
+
+	// NOTE-VI-077 (#482): honor maxOutputBytes by rotating to a fresh output file at a
+	// block boundary once the projected finalized file size has grown past the cap.
+	// projectedFileSize (not just bodyEnd) accounts for the tail — string table + block
+	// index + footer — which for a many-block file dominates the compressed body, so a
+	// bodyEnd-only check would never trigger. Rotation is only ever evaluated right after
+	// a block was cut (blockCut) so the split lands on a block boundary — never mid-block,
+	// since a block's groups reference the current file's string table (a mid-block split
+	// would strand references to interned SourceRefs the new file's table does not carry).
+	// h.Len() > 0 reflects the heap's true remaining-work state: collectContributionsAtKey
+	// advances contributors inline (issue #501) before this function is ever called, so no
+	// separate "advance before checking h.Len()" step is needed here.
+	//nolint:gosec // G115: maxOutputBytes > 0 is guarded here, so the uint64 conversion is safe.
+	if blockCut && maxOutputBytes > 0 && h.Len() > 0 &&
+		projectedFileSize(of.out, of.table) >= uint64(maxOutputBytes) {
+		if finErr := finalizeBucketOutputFile(of, output); finErr != nil {
+			return finErr
+		}
+		newOf, newErr := newBucketOutputFile(groupsPerBlock)
+		if newErr != nil {
+			return newErr
+		}
+		*ofp = newOf
+	}
+	return nil
 }
 
 // bucketOutputFile bundles the per-output-file state StreamCompactBucketFiles cuts blocks
@@ -651,7 +739,7 @@ func newBucketOutputFile(groupsPerBlock int) (*bucketOutputFile, error) {
 		file:  f,
 		bw:    bw,
 		table: NewStringTable(),
-		out:   newStreamOutputWriter(bw, groupsPerBlock, uint64(len(header))),
+		out:   newStreamOutputWriter(bw, groupsPerBlock, uint64(len(header)), shared.ValueIndexBucketBlockMaxBytes),
 	}, nil
 }
 

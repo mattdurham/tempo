@@ -471,7 +471,10 @@ func (s *Service) compactColumn(ctx context.Context, tenant, colDir string, objs
 // as they are fetched; each input's decoded representation is bounded to one block at a time
 // via a disk-backed lazy iterator (valueindex.NewDiskBucketFileIterator) — peak decoded memory
 // is bounded by the number of concurrently-open iterators times one block, not by the number
-// or total size of input files.
+// or total size of input files. This is the DECODE-side memory bound (already true before
+// issue #501, unaffected by it) — distinct from the transient per-key MERGE-buffer bound
+// inside valueindex.StreamCompactBucketFiles itself (SPEC-VI-2, amended by #501; see that
+// function's doc comment), which this comment does not cover.
 func (s *Service) mergeLevel(ctx context.Context, colDir string, files []levelFile) error {
 	mergeStart := s.now()
 

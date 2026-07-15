@@ -9,16 +9,20 @@ package valueindex
 // per-file TraceGroupIterators, bounding peak memory to the K already-decoded input files' one
 // current block each, plus one in-progress output block.
 //
-// Merge-key shape difference from stream_compaction.go (SPEC-VI-14/NOTE-VI-109): BucketGroup's
-// merge key (TimeSec, CanonicalValue) is also each input file's own per-group uniqueness key
-// (SPEC-VI-3), so stream_compaction.go's collectContributionsAtKey/advanceContributors can be
-// two separate phases — pop every iterator currently AT the key, then advance all of them once.
-// TraceGroup's merge key is TraceID alone; TimeSec is deliberately excluded (MergeTraceGroups
-// collapses every group sharing a TraceID, regardless of TimeSec, into one output group), so a
-// single input file can hold MULTIPLE consecutive groups for the same TraceID (differing only
-// in TimeSec). collectTraceContributionsAtKey below is therefore a single combined
-// pop-advance-repush loop, not a two-phase split: after advancing a just-popped iterator, if it
-// is still positioned at the same TraceID it is pushed straight back onto the heap and will be
+// Merge-key shape vs. stream_compaction.go (SPEC-VI-14/NOTE-VI-109): BucketGroup's merge key
+// (TimeSec, CanonicalValue) was originally also each input file's own per-group uniqueness key
+// (SPEC-VI-3), which once let stream_compaction.go's collectContributionsAtKey use a simpler
+// two-phase split (pop every iterator currently AT the key, then advance all of them once).
+// SPEC-VI-3 was amended by issue #501: a single input file can now hold multiple consecutive
+// sibling groups sharing one key (splitBucketGroupBySpanCap's overflow siblings), so
+// collectContributionsAtKey now uses the same combined pop-advance-repush loop as
+// collectTraceContributionsAtKey below — the two modules converge on this shape. TraceGroup's
+// merge key is TraceID alone; TimeSec is deliberately excluded (MergeTraceGroups collapses
+// every group sharing a TraceID, regardless of TimeSec, into one output group), so a single
+// input file can hold MULTIPLE consecutive groups for the same TraceID (differing only in
+// TimeSec) for a structurally different reason. collectTraceContributionsAtKey below is a
+// single combined pop-advance-repush loop: after advancing a just-popped iterator, if it is
+// still positioned at the same TraceID it is pushed straight back onto the heap and will be
 // popped again by the same loop iteration, rather than deferred to a later outer-loop pass.
 
 import (

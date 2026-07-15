@@ -1505,6 +1505,16 @@ decisions:
   (`h.Len() > 0`, which prevents ever finalizing a rotation that would leave a trailing empty
   file) is therefore evaluated only *after* `advanceContributors` restores the heap.
 
+  **Addendum (2026-07-14, issue #501): `advanceContributors` no longer exists.** The bullet
+  above described the mechanism as it existed before issue #501's coalescing change.
+  `collectContributionsAtKey` now advances every contributor inline, itself, via a combined
+  pop-advance-repush loop (SPEC-VI-3, amended; `NOTES.md` NOTE-VI-111) — there is no longer a
+  separate `advanceContributors` call anywhere in this file. The "more input remaining" guard
+  this bullet describes lives on in spirit inside `addMergedGroupAndMaybeRotate` (which checks
+  `h.Len() > 0` once per sibling a merged key produces), but by the time that function runs,
+  contributors have already been advanced by `collectContributionsAtKey` itself, earlier in the
+  same outer-loop iteration — not by a separate step evaluated "after" anything.
+
 - **Per-file state is bundled.** Each output file gets its own `bucketOutputFile` (temp file +
   buffered writer + fresh `StringTable` + `streamOutputWriter`); rotation replaces the live
   one with a new instance. `finalizeBucketOutputFile` clears the handed-off file handle so the
@@ -1906,3 +1916,210 @@ Back-refs: `internal/modules/valueindex/disk_trace_iterator.go`,
 `internal/modules/valueindexcompactor/traceindex_dispatch.go:mergeTraceLevel` (NOTE-VI-110, the
 caller-side wiring). See SPEC-VI-14/SPEC-VI-15 (`SPECS.md`) and TEST-VI-23/24/25 (`TESTS.md`).
 Issue #500.
+
+## NOTE-VI-111 — Per-`BucketGroup` span-ref cap + sibling-splitting: real-data evidence, chosen constant, coalescing design, and accepted residual risk (issue #501)
+
+Date: 2026-07-14
+
+### The problem
+
+`valueindex.mergeGroupsAtKey`/`decodeBucketBlock` OOM'd `value-index-compactor` pods on a hot
+low-cardinality column (tenant 11638's `string` column: 3.44 GB decode / 3.01 GB merge,
+pprof-confirmed, per issue #501's own filing) because nothing, at any layer, ever split a
+`BucketGroup` once formed — a single hot value's `Refs`/`Spans` grew monotonically across every
+compaction generation with no ceiling.
+
+### The fix (SPEC-VI-16, SPEC-VI-3 amended)
+
+Every `BucketGroup`, once written (`writer.go:assembleBucketWithCap`) or merged
+(`stream_compaction.go:mergeGroupsAtKey`), is now capped at
+`shared.ValueIndexBucketGroupMaxSpanRefs` span-ref entries; overflow is split into sibling groups
+sharing the same key (`bucketfile.go:splitBucketGroupBySpanCap`) rather than allowed to keep
+growing. `collectContributionsAtKey`'s coalescing (below) re-consolidates siblings down to the
+cap — never below it — across successive compaction generations, so the sibling count stays
+stable rather than proliferating.
+
+### Real-data evidence informing the cap constant
+
+Team lead downloaded and analyzed a real 268 MB L3 `BucketGroup` file for tenant 11638's `string`
+column via live, read-only S3 access on 2026-07-14 (`internal/modules/valueindex/cmd/bgstats`,
+the throwaway decode-only histogram tool built for this task). Sample: **1,432,547 groups /
+13,780,102 spans** total. Per-group span-count distribution: **median = 1, p99 = 33, max =
+56,490**. This confirms the hot-key hypothesis the plan required before finalizing Approach C:
+the overwhelming majority of groups are small (median 1 span), but a heavy tail exists (p99 is
+already 33x the median, and the single largest observed group is 56,490x the median) — exactly
+the shape that lets one or a handful of pathological keys dominate decode/merge memory while
+being invisible in any average-case metric.
+
+**Chosen constant: `ValueIndexBucketGroupMaxSpanRefs = 20_000`** (replacing the plan's original
+`50_000` placeholder, which predated this real-data sample). 20,000 sits comfortably above the
+observed p99 (33) — so the overwhelming majority of real groups are never split at all — while
+sitting below the observed max (56,490), so the specific pathological shape that caused #501's
+OOM is guaranteed to be split and bounded. coder-2 independently re-measured and confirmed this
+same histogram shape before the constant was finalized.
+
+### `collectContributionsAtKey` coalescing: why a combined phase, not the old two-phase split
+
+SPEC-VI-3's original precondition ((TimeSec, CanonicalValue) unique per file) meant the old
+`collectContributionsAtKey`/`advanceContributors` two-phase split (collect everything currently
+at the heap root, THEN separately advance every contributor once) was correct: a key could never
+recur later in the same file, so nothing was ever left behind to miss. That assumption no longer
+holds once `splitBucketGroupBySpanCap` can emit a same-key sibling that a `GroupIterator` will
+later `Peek()` again. `collectContributionsAtKey` was rewritten to pop-advance-repush inline
+(mirroring `stream_trace_compaction.go`'s `collectTraceContributionsAtKey`, issue #500's own
+precedent in this exact file family): after popping an iterator whose `Peek()` matches the
+current key, it is immediately `Advance`d; if still positioned at the same key, it is pushed
+straight back onto the heap and popped again by the SAME loop iteration, rather than deferred to
+a later outer-loop pass. This required threading `ctx context.Context` into
+`collectContributionsAtKey` for the first time (`Advance` needs it) and, once every contributor
+is advanced inline, made the separate per-key `advanceContributors` call in
+`StreamCompactBucketFiles`'s main loop redundant — it was deleted outright, not left as a
+no-op, since leaving it in place would double-advance iterators.
+
+### Accepted residual risk: the merge-time transient union buffer is NOT bounded by a fixed constant
+
+**What this fix DOES guarantee, unconditionally:** (1) every OUTPUT `BucketGroup`'s own size is
+capped at `ValueIndexBucketGroupMaxSpanRefs`, bounding decode-side cost
+(`decodeBucketBlock`) for any single group regardless of how hot its key is or how many
+compaction generations it has survived; (2) a hot key's group can no longer grow without bound
+forever — issue #501's actual bug, since pre-fix nothing ever split a group once formed.
+
+**What this fix does NOT guarantee:** a fixed-constant bound on the transient per-key
+union-building buffer inside `collectContributionsAtKey`/`mergeGroupsAtKey` itself. That buffer's
+real size is K × (each contributing iterator's own real total fan-in for the key) — and the
+coalescing behavior above deliberately does NOT cap an iterator's own total fan-in for a key,
+since doing so would prevent sibling groups from ever re-consolidating (the whole point of
+coalescing). SPEC-VI-2's amended peak-memory-bound text states this precisely; this note records
+WHY it is accepted rather than further mitigated in this task:
+
+Real-world risk is mitigated by three complementary factors, not a single unconditional bound:
+1. This cap preventing unbounded-forever single-group growth (above) — the union buffer's inputs
+   are themselves capped once written/merged, so the buffer cannot inherit an already-unbounded
+   group from a prior generation the way it could pre-fix.
+2. `valueindexcompactor`'s existing `CompactMaxInputFiles`/`CompactBatchBytes` config (SPEC-VI-2/
+   SPEC-VI-3, `valueindexcompactor/SPECS.md`) already bounds K (the number of concurrently
+   merging input files) independently of this task.
+3. Retention filtering (`RefChecker`/`cachingRefChecker`) keeps a key's real live fan-in from
+   growing without bound over time in practice — a key's true cardinality is bounded by how much
+   live, non-retention-expired data actually references it, not by an unbounded historical
+   accumulation.
+
+This is accepted as a known, explicitly documented gap rather than closed in this task — properly
+closing it (e.g. capping an iterator's own per-key contribution at collect time, at the cost of
+preventing sibling re-consolidation) is a larger design tradeoff than this task's scope, and there
+is no evidence the union-buffer shape itself (as opposed to the pre-fix unbounded-single-group
+shape this task DOES fix) has caused an OOM in production. Revisit if `CompactMaxInputFiles`
+is ever raised substantially without a corresponding revisit of this buffer's real-world sizing,
+or if production telemetry ever shows a single merge's per-key union buffer approaching the same
+order of magnitude the pre-fix unbounded group did.
+
+### Mutation testing (task #24, confirmed 2026-07-14)
+
+All five mandatory reintroduce-confirm-revert cycles (`feedback_mutation_test_review.md`
+convention) were run and confirmed red-then-green:
+
+1. **Size-cap logic** (`bucketfile.go:splitBucketGroupBySpanCap`): hardcoded `maxSpans = 0` as
+   the function's first line, forcing its no-op path. `TestSplitBucketGroupBySpanCap` failed (2
+   of 4 subtests: "split across ref boundaries" expected 3 groups, got 1; "single ref alone
+   exceeds cap" expected 4 groups, got 1) and
+   `TestStreamCompactBucketFiles_OutputGroupSizeStaysCappedAcrossUnboundedRealGrowth` (TEST-VI-30)
+   failed at generation 0 ("5000 is not less than or equal to 2000"). Reverted, both green again.
+2. **Write-path sealing** (`writer.go:assembleBucketWithCap`): changed the reseal check to
+   `if false && maxSpansPerGroup > 0 && gb.spanCount >= maxSpansPerGroup`, disabling it
+   unconditionally. `TestFlushBucket_HotKeySplitsIntoSiblingGroups` failed ("1 is not greater
+   than 1" — the hot key never split). Reverted, green again.
+3. **Merge-path splitting** (`stream_compaction.go:mergeGroupsAtKey`): changed the tail to
+   `return []BucketGroup{out}, nil`, skipping the split call. `TestMergeGroupsAtKey_
+   SplitsOverflowIntoSiblings` failed ("1 is not greater than 1" — 15 unioned spans under cap 6
+   never split). Reverted, green again.
+4. **Coalescing logic** (`stream_compaction.go:collectContributionsAtKey`): wrapped the inline
+   `Advance`+re-push block in `if false { ... }`, reverting to the old two-phase
+   collect-then-advance shape. `TestCollectContributionsAtKey_
+   CoalescesConsecutiveSameKeyGroupsFromOneIterator` failed ("should have 2 item(s), but has 1" —
+   the second same-key sibling from one iterator was left for a later pass instead of coalescing
+   in the same one). Reverted, green again.
+5. **Approach B block-byte-cap** (`stream_compaction.go:streamOutputWriter.add`): dropped the
+   `w.maxBlockBytes > 0 && w.pendingBytes >= w.maxBlockBytes` disjunct from the cut condition,
+   leaving only the count-based check. `TestStreamOutputWriter_CutsBlockEarlyOnByteSizeCap`
+   failed (the byte cap never tripped). Reverted, green again.
+
+**Honest note on two designs that mutation-testing correctly rejected before TEST-VI-30's final
+shape was chosen (mirrors NOTE-VI-109's own precedent of reporting a mutation that wasn't
+caught, rather than omitting it):**
+1. A single-pass "vary instantaneous fan-in (2,000 vs 200,000), expect peak `HeapAlloc` not to
+   scale linearly" design. No mutation was even needed here — the FIXED code itself already
+   showed ~80x memory growth for a 100x fan-in increase (essentially linear), so the assertion
+   was never true to begin with (see the "Accepted residual risk" section above:
+   `collectContributionsAtKey`'s coalescing is an inherent O(real live fan-in for the key) cost
+   within one merge pass, which no per-group output cap can eliminate).
+2. A K=1 "feed generation N-1's output back in as generation N's sole input, repeat with no new
+   data" recompaction-loop design. This one DID require mutation-testing to expose the gap:
+   disabling both the write-path reseal check AND the merge-path split call (a literal pre-fix
+   simulation) produced FLAT, non-growing peak-heap numbers across all 6 generations — identical
+   to the fixed code's own flat numbers. **The mutation was NOT caught** — recompacting a single
+   already-consolidated file with zero new data is a no-op regardless of any cap, since there is
+   nothing new to union either way.
+Both designs were discarded outright (no trace left in the final test file) once mutation-testing
+exposed them as vacuous or never-true. Team lead directed the pivot to the current design (a
+genuinely-growing real total across 20 compaction generations, checking a structural
+output-shape postcondition rather than a peak-heap curve) — which IS caught by mutation testing,
+per cycle 1 above (the same `splitBucketGroupBySpanCap` mutation that fails `TestSplitBucketGroupBySpanCap`
+also fails TEST-VI-30). See `NOTE-VI-112` for the full test-design rationale.
+
+Back-refs: `internal/modules/valueindex/bucketfile.go:bucketGroupSpanCount,
+splitBucketGroupBySpanCap`, `internal/modules/valueindex/writer.go:assembleBucketWithCap`,
+`internal/modules/valueindex/stream_compaction.go:mergeGroupsAtKey, collectContributionsAtKey`,
+`internal/modules/blockio/shared/constants.go:ValueIndexBucketGroupMaxSpanRefs`,
+`internal/modules/valueindex/cmd/bgstats/main.go` (the histogram tool). See `SPECS.md` SPEC-VI-2
+(Addendum), SPEC-VI-3 (Amended), SPEC-VI-16. Issue #501.
+
+## NOTE-VI-112 — Why the #501 hot-key regression test proves an output-shape postcondition, not a peak-heap-sampling bound (two rejected test designs)
+
+Date: 2026-07-14
+
+### The problem this note records
+
+The original plan for #501's hot-key memory-boundedness test (mirroring TEST-VI-25's
+`TestStreamCompactTraceGroups_MemoryBoundedRegardlessOfInputCount` peak-heap-sampling design)
+called for a test proving "peak transient merge-buffer memory does not scale linearly with a hot
+key's fan-in." Two designs matching that plan were built and both were REJECTED under this
+project's mandatory mutation-test rigor bar (`feedback_mutation_test_review.md`): a single-pass
+fan-in sweep, then a K=1 feed-back-in recompaction loop. Neither design could distinguish
+fixed code from pre-fix code — reintroducing the pre-#501 bug (removing the split) did not make
+either test fail.
+
+### Why: the claim itself is not actually true
+
+`collectContributionsAtKey`'s coalescing (SPEC-VI-3, amended; `NOTE-VI-111`) deliberately
+re-unions every sibling sharing a key in one merge pass — this is an unavoidable O(real live
+fan-in) cost for correct dedup, not a bug or an oversight. A no-new-data recompaction loop (the
+second rejected design) also never exercises this cost either way, since re-merging the same
+already-capped output produces no new growth to bound. **"Peak transient merge-buffer memory
+bounded regardless of fan-in" is simply not a true claim about this fix** — it is the identical
+fact SPEC-VI-2's own amendment (2026-07-14) documents as an honestly-accepted residual risk,
+not a gap this test could have been designed to hide. Team lead redirected the test design
+(2026-07-14) once both peak-heap-sampling attempts failed mutation testing, rather than accepting
+a test that merely looked plausible.
+
+### What the fix DOES provably guarantee, and how this test proves it
+
+Narrower, but structural and directly checkable: no single decoded `BucketGroup` ever exceeds
+`shared.ValueIndexBucketGroupMaxSpanRefs` span-ref entries, no matter how large a hot key's REAL
+cumulative history grows across arbitrarily many compaction generations of genuine continued
+ingest. This is exactly the mechanism that fixes the original #501 pprof finding (one 3.44 GB
+`decodeBucketBlock`/one oversized group) — a postcondition on OUTPUT SHAPE, not a peak-heap
+claim — and it is checkable directly by decoding the output and asserting
+`bucketGroupSpanCount(&g) <= cap` for every group sharing the hot key, at every generation,
+including the latest ones where the cumulative real total is largest.
+`TestStreamCompactBucketFiles_OutputGroupSizeStaysCappedAcrossUnboundedRealGrowth`
+(`stream_compaction_hotkey_scaling_test.go`, TEST-VI-30) drives 20 real compaction generations,
+each contributing 1,000 genuinely new distinct traces to one hot key (5,000 seed + 19,000 more,
+25,000 total, well past the test's own 2,000-entry cap), asserting the cap holds at every
+generation AND that the cumulative span total exactly matches every generation's contributions
+summed (no loss, no duplication) — proving the postcondition holds under real, unbounded growth,
+not merely in `splitBucketGroupBySpanCap`'s own isolated-function unit test (TEST-VI-26).
+
+Back-refs: `internal/modules/valueindex/stream_compaction_hotkey_scaling_test.go:
+TestStreamCompactBucketFiles_OutputGroupSizeStaysCappedAcrossUnboundedRealGrowth,
+makeHotKeyDeltaFile, compactBucketFiles, assertHotKeyGroupsWithinCap`. See `SPECS.md` SPEC-VI-2
+(Addendum) and SPEC-VI-16, `NOTES.md` NOTE-VI-111, `TESTS.md` TEST-VI-30. Issue #501.

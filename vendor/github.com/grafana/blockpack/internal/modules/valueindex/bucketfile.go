@@ -228,6 +228,81 @@ func sortUint16(s []uint16) {
 	sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
 }
 
+// bucketGroupSpanCount returns the total number of (ref, traceID) span entries in g — the
+// cheap size proxy used by the #501 per-key cap (SPEC-VI-16, assembleBucketWithCap,
+// mergeGroupsAtKey) to decide when a group must be split into siblings.
+func bucketGroupSpanCount(g *BucketGroup) int {
+	n := 0
+	for i := range g.Refs {
+		n += len(g.Refs[i].Spans)
+	}
+	return n
+}
+
+// splitBucketGroupBySpanCap splits g into one or more sibling BucketGroups, each with total
+// span-ref count <= maxSpans, preserving g's TimeSec/CanonicalValue on every sibling (SPEC-VI-16;
+// SPEC-VI-3, amended: multiple same-key groups are now a defined, tolerated shape within one
+// file/merge output, issue #501). A single BucketBlockRef whose own Spans slice already exceeds
+// maxSpans is itself split across siblings (same SourceID/Ref, disjoint Spans subsets) — this is
+// the case that actually caused #501's OOM (one hot value referencing one data block via many
+// distinct traces). maxSpans <= 0 is a no-op (mirrors SplitIntoBlocks' groupsPerBlock <= 0
+// convention): returns []BucketGroup{g} unchanged, no copy.
+//
+// Packing strategy: greedy first-fit by Refs order — walk g.Refs in order, appending whole refs
+// to the current sibling until the next ref would exceed maxSpans, then cut; if a single ref
+// alone exceeds maxSpans, split that ref's Spans slice across as many siblings as needed before
+// continuing. This never reorders Refs/Spans (preserves the existing sortBucketBlock-imposed
+// order within each sibling), so downstream sort calls remain no-ops for already-sorted input.
+func splitBucketGroupBySpanCap(g BucketGroup, maxSpans int) []BucketGroup {
+	if maxSpans <= 0 || bucketGroupSpanCount(&g) <= maxSpans {
+		return []BucketGroup{g}
+	}
+
+	var out []BucketGroup
+	cur := BucketGroup{TimeSec: g.TimeSec, CanonicalValue: g.CanonicalValue}
+	curCount := 0
+	flush := func() {
+		if len(cur.Refs) > 0 {
+			out = append(out, cur)
+		}
+		cur = BucketGroup{TimeSec: g.TimeSec, CanonicalValue: g.CanonicalValue}
+		curCount = 0
+	}
+
+	for _, ref := range g.Refs {
+		refCount := len(ref.Spans)
+		switch {
+		case refCount > maxSpans:
+			// This ref alone exceeds the cap: flush whatever's pending, then split its
+			// own Spans slice across as many fresh siblings as needed.
+			flush()
+			remaining := ref.Spans
+			for len(remaining) > 0 {
+				take := min(maxSpans, len(remaining))
+				out = append(out, BucketGroup{
+					TimeSec:        g.TimeSec,
+					CanonicalValue: g.CanonicalValue,
+					Refs: []BucketBlockRef{{
+						SourceID: ref.SourceID,
+						Ref:      ref.Ref,
+						Spans:    remaining[:take],
+					}},
+				})
+				remaining = remaining[take:]
+			}
+		case curCount+refCount > maxSpans:
+			flush()
+			cur.Refs = append(cur.Refs, ref)
+			curCount = refCount
+		default:
+			cur.Refs = append(cur.Refs, ref)
+			curCount += refCount
+		}
+	}
+	flush()
+	return out
+}
+
 // EncodeBucketFile serializes f into the v2 wire format. Blocks are encoded in order;
 // each block is sorted and its metadata recomputed before encoding so the caller need not
 // pre-sort. The file-level MinTimeSec/MaxTimeSec are derived from the blocks.
