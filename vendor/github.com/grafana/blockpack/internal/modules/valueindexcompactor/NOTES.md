@@ -678,3 +678,53 @@ to hunt down every `os.CreateTemp`/`os.TempDir()` call independently.
 Back-refs: `internal/modules/valueindexcompactor/traceindex_dispatch.go:mergeTraceLevel`. See
 `valueindex/NOTES.md` NOTE-VI-109 and this package's own SPEC-VI-8 (`SPECS.md`), TEST-VI-20
 (`TESTS.md`). Issue #500.
+
+## NOTE-VI-114 — `mergeLevel`'s `tmpDir` unification bundled into #503 rather than deferred
+
+**ID caveat, read first (same as `valueindex/NOTES.md` NOTE-VI-113's own caveat):**
+`NOTE-VI-*` is a single GLOBAL counter shared across
+`valueindex`/`valueindexcompactor`/`valueindexconsumer`/`vibuilder`'s `NOTES.md` files. This
+entry's author (coder-1) queried spec-oracle for a live re-confirmation before writing both this
+entry and `valueindex/NOTES.md`'s own NOTE-VI-113, did not receive a response in time, and
+proceeded after independently re-verifying by direct file inspection (2026-07-15) that
+`valueindex`=113 (just written, this same session), `valueindexcompactor`=110 (pre-existing),
+`valueindexconsumer`=108, `vibuilder`=108 — so 114 is next-free by direct observation of every
+candidate file. **Whoever reviews or merges this must re-confirm 114 is still correct against
+the live team-wide counter before treating it as final.**
+
+Date: 2026-07-15
+
+### Why this convention was unified as part of #503, not deferred again
+
+`mergeLevel` (`service.go`) historically called `os.TempDir()` independently at two separate
+call sites: once for `writeLocalTempInput` (input staging) and, implicitly, once for
+`valueindex.StreamCompactBucketFiles`'s own hardcoded `os.CreateTemp("", ...)` (which
+`os.CreateTemp` resolves to `os.TempDir()` — behaviorally identical, but a second independent
+site nonetheless). `mergeTraceLevel` (`traceindex_dispatch.go`, issue #500, NOTE-VI-110)
+already used the better convention — one local `tmpDir` variable threaded into every call —
+specifically to avoid needing to "hunt down every `os.CreateTemp`/`os.TempDir()` call
+independently" (that file's own stated rationale) when a real config-driven mount path is
+eventually wired in.
+
+Issue #503 was already changing `StreamCompactBucketFiles`'s signature (adding `tmpDir string`
+to support per-key merge-buffer spill chunks, `valueindex/SPECS.md` SPEC-VI-18) and therefore
+already touching this exact call site in `mergeLevel`. Adopting the one-local-variable
+convention here, bundled into the same already-required signature-threading change, closes the
+one remaining inconsistency between `mergeLevel` and `mergeTraceLevel` at near-zero incremental
+cost — deferring it again to a separate cleanup task would have meant touching this same call
+site twice for two closely-related reasons, for no real benefit.
+
+### What changed, concretely
+
+A single `tmpDir := os.TempDir()` local, declared immediately after `mergeLevel`'s existing
+`sort.Slice(files, ...)` line, replaces the two independent `os.TempDir()` references — one at
+the `writeLocalTempInput` call, one implicit inside `StreamCompactBucketFiles`'s own
+(now-parameterized) temp-file creation. Behavior is unchanged today (`os.TempDir()` resolves to
+the identical value either way); this is a real-var-vs-repeated-literal refactor, not a
+functional change, verified by `mergeLevel`'s own existing integration test suite passing
+unmodified except for the signature-threading itself.
+
+Back-ref: `internal/modules/valueindexcompactor/service.go:mergeLevel`. See this package's own
+SPEC-VI-9 (`SPECS.md`), `valueindex/SPECS.md` SPEC-VI-18, `valueindex/NOTES.md` NOTE-VI-113
+(the corresponding valueindex-side entry, written in the same #503 implementation pass). Issue
+#503.

@@ -9,7 +9,7 @@ Entries in this file use the module-local, sequential prefix `BENCH-VI-N` (file-
 SPEC-ROOT-009 — distinct from the `NOTE-VI-N` numbering in `NOTES.md`). IDs are assigned in
 ascending order and never reused or renumbered.
 
-Next free ID: **BENCH-VI-2**.
+Next free ID: **BENCH-VI-3**.
 
 ---
 
@@ -72,5 +72,53 @@ target since there is no old path left to compare against.
 `B/op` regresses past the `_streaming` baseline above (284,190 allocs/op, 16.97 MB/op) — the
 old-path comparison columns are historical context only, not a live threshold. The `ns/op`
 threshold (> ~39.3 ms) from the original entry still applies unchanged.
+
+---
+
+## BENCH-VI-2: BenchmarkMergeGroupsAtKey_SmallKey_NeverSpills (issue #503)
+
+**Function / file:** `BenchmarkMergeGroupsAtKey_SmallKey_NeverSpills` —
+`internal/modules/valueindex/stream_compaction_bench_test.go`.
+
+**Purpose:** Common-case allocation regression guard for #503's uniform flat-accumulation
+rewrite of `mergeGroupsAtKey` (SPEC-VI-18's Design decision, plan.md): real S3 evidence (issue
+#503 brainstorm, tenant 11638's `string` column) found the TYPICAL key's combined cross-file
+span-ref fan-in has a median of ~9 spans — small enough that the per-key disk-spill threshold
+(`ValueIndexMergeBufferSpillBytes`, 4 MiB) is never crossed. This fixture reproduces that shape
+(200 keys per call, K=3 contributing groups each, 3 spans/group — 9 total per key across all
+contributors) so the rewrite's allocation profile on exactly this never-spills path can be
+checked against the pre-rewrite map-based implementation's own baseline.
+
+**Baseline (captured 2026-07-15, BEFORE Phase 5's rewrite touched `mergeGroupsAtKey` —
+specifically so this comparison has a real captured before/after pair, not a reconstructed one;
+`go test -bench BenchmarkMergeGroupsAtKey_SmallKey_NeverSpills -benchmem -count=5
+./internal/modules/valueindex/`, `benchstat` both sides):**
+
+| Metric | before (map-based) | after (flat-accumulation) | delta |
+|---|---|---|---|
+| `sec/op` | 948.5µs | 1150.5µs | ~ (p=0.548, not significant) |
+| `B/op` | 733.0Ki | 978.7Ki | +33.52% (p=0.008, significant) |
+| `allocs/op` | 16.60k | 13.40k | −19.27% (p=0.008, significant) |
+
+**Honest finding, not silently absorbed:** `B/op` increased significantly (fewer, larger flat-
+record allocations replacing the old map-of-maps' many small per-entry allocations), while
+`allocs/op` improved and `ns/op` showed no significant change. Per plan.md's own stated fallback
+trigger ("if `allocs/op` or `ns/op` regresses meaningfully"), NEITHER of those two metrics
+regressed, so the hybrid-cutover fallback (keeping the old map-based code as a below-threshold
+fast path) is not warranted. The `B/op` increase is real and should not be hidden, but in
+absolute terms it is small (~1.3 KB/key extra on a ~9-span key, versus the multi-MB-to-GB
+pathological case this issue exists to fix) — accepted as a reasonable tradeoff, not a
+regression requiring redesign.
+
+**Regression threshold:** Flag if `allocs/op` or `ns/op` regresses meaningfully past the "after"
+baseline above (13.40k allocs/op, no significant ns/op change from 1150.5µs) — per the accepted
+tradeoff above, a FURTHER `B/op` increase beyond 978.7Ki/op is also worth flagging for review,
+though it is not itself an automatic fail threshold given the already-accepted increase.
+
+**Spec invariants tested:** SPEC-VI-18 (per-key disk-spill mechanism, common-case no-op path).
+
+Back-ref: `internal/modules/valueindex/stream_compaction_bench_test.go:
+BenchmarkMergeGroupsAtKey_SmallKey_NeverSpills, buildMergeGroupsAtKeyContributionForBench`. See
+`SPECS.md` SPEC-VI-18. Issue #503.
 
 Back-ref (updated): `internal/modules/valueindex/stream_compaction_bench_test.go:BenchmarkStreamCompactBucketFiles`.

@@ -10,7 +10,7 @@ Entries in this file use the module-local, sequential prefix `TEST-VI-N` (file-s
 SPEC-ROOT-009 — distinct from the `NOTE-VI-N` numbering in `NOTES.md`). IDs are assigned in
 ascending order and never reused or renumbered.
 
-Next free ID: **TEST-VI-31**.
+Next free ID: **TEST-VI-46**.
 
 ---
 
@@ -825,3 +825,402 @@ Back-ref: `internal/modules/valueindex/stream_compaction_hotkey_scaling_test.go:
 TestStreamCompactBucketFiles_OutputGroupSizeStaysCappedAcrossUnboundedRealGrowth,
 makeHotKeyDeltaFile, compactBucketFiles, assertHotKeyGroupsWithinCap`. See `NOTES.md`
 NOTE-VI-112.
+
+---
+
+## TEST-VI-31: `keySpillRecord` wire-format round trip preserves every field, including `spanIndexes` edge cases (issue #503)
+*Added: 2026-07-15*
+
+**Scenario:** `writeKeySpillRecord`/`readKeySpillRecord` (`keymerge_spill.go`) must preserve
+every field of a `keySpillRecord` exactly, including edge cases around `spanIndexes` (empty,
+single-element, and duplicate entries — duplicates must round-trip verbatim since dedup happens
+at union time, not decode time), and `io.EOF` must propagate cleanly at end of stream.
+
+**Setup:** `TestKeySpillRecordRoundTrip` (`keymerge_spill_test.go`) writes three records
+(nil/empty, single, and duplicate `spanIndexes`) to an in-memory buffer, reads them back via a
+`bufio.Reader` loop until `io.EOF`.
+
+**Assertions:** every field of every record is field-for-field equal to the input; the read loop
+terminates via a clean `io.EOF`, not a decode error.
+
+**Spec invariants tested:** SPEC-VI-18.
+
+Back-ref: `internal/modules/valueindex/keymerge_spill_test.go:TestKeySpillRecordRoundTrip`.
+
+---
+
+## TEST-VI-32: `writeKeySpillChunk` sorts before spilling and lands the file inside the caller-supplied `tmpDir` (issue #503)
+*Added: 2026-07-15*
+
+**Scenario:** `writeKeySpillChunk` must sort an unsorted batch of records by
+`compareKeySpillRecord` order before spilling, and must create the file inside the
+caller-supplied `tmpDir` — never a silent fallback to `os.TempDir()` (SPEC-VI-18).
+
+**Setup:** `TestKeySpillChunk_WriteSortedReadBack` (`keymerge_spill_test.go`) builds an unsorted
+batch of `keySpillRecord`s with mixed `sourceID`/`PageNum`/`TraceID` order, spills them via
+`writeKeySpillChunk(tmpDir, ...)`, and reads them back sequentially via a plain `bufio.Reader`.
+
+**Assertions:** the file's directory (`filepath.Dir`) equals `tmpDir` exactly; the read-back
+order matches a reference `sort.Slice` of the same input via `compareKeySpillRecord`.
+
+**Spec invariants tested:** SPEC-VI-18.
+
+Back-ref: `internal/modules/valueindex/keymerge_spill_test.go:TestKeySpillChunk_WriteSortedReadBack`.
+
+---
+
+## TEST-VI-33: `keySpillChunkReader` unifies a disk-backed chunk and an in-memory tail behind one `advance()`/`cur`/`valid` shape (issue #503)
+*Added: 2026-07-15*
+
+**Scenario:** `keySpillChunkReader` (mirroring `runspill.go`'s `runReader`) must walk records in
+order from EITHER a real disk chunk OR a sorted in-memory tail, reporting `valid=false` cleanly
+at the end of either source.
+
+**Setup:** `TestKeySpillChunkReader_AdvanceOverDiskAndTail` (`keymerge_spill_test.go`) exercises
+one reader over a real disk chunk (via `writeKeySpillChunk`) and a separate reader over a sorted
+in-memory tail slice.
+
+**Assertions:** `advance()` walks both sources' records in order via `cur`; `valid` becomes
+`false` cleanly once each source is exhausted, with no error.
+
+**Spec invariants tested:** SPEC-VI-18.
+
+Back-ref: `internal/modules/valueindex/keymerge_spill_test.go:TestKeySpillChunkReader_AdvanceOverDiskAndTail`.
+
+---
+
+## TEST-VI-34: `estimateKeySpillRecordBytes` scales monotonically with `spanIndexes` length and matches a pinned formula (issue #503)
+*Added: 2026-07-15*
+
+**Scenario:** `estimateKeySpillRecordBytes` — the cheap proxy `accumulateAndSpillKeyRecords`
+uses to track the running spill-trigger total — must grow monotonically as `spanIndexes` grows
+and must match a hand-computed expected value for known inputs, so an accidental later change to
+the formula is caught.
+
+**Setup:** `TestEstimateKeySpillRecordBytes_ScalesWithSpanIndexes` (`keymerge_spill_test.go`)
+checks the fixed-overhead case (empty `spanIndexes`), a one-index case, and a five-index case
+against the formula `keySpillRecordFixedSize + 2*len(spanIndexes)`.
+
+**Assertions:** each case matches the pinned formula exactly; the estimate strictly increases as
+`spanIndexes` grows.
+
+**Spec invariants tested:** SPEC-VI-18.
+
+Back-ref: `internal/modules/valueindex/keymerge_spill_test.go:TestEstimateKeySpillRecordBytes_ScalesWithSpanIndexes`.
+
+---
+
+## TEST-VI-35: `streamingSplitPacker` (fed one ref at a time) produces output identical to `splitBucketGroupBySpanCap` (called once) — mandatory differential equivalence (issue #503)
+*Added: 2026-07-15*
+
+**Scenario:** the streaming incremental packer (SPEC-VI-18) — the piece that makes #503's
+memory-bound claim provable by letting sibling packing run ref-by-ref instead of after a full
+materialization — must be behaviorally IDENTICAL to the existing, already-tested
+`splitBucketGroupBySpanCap` (SPEC-VI-16, TEST-VI-26) for the same input in the same order. This
+is a hard precondition of spec-oracle's conditional sign-off on scoping this design into #503
+(plan.md Task 0.2), not optional polish.
+
+**Setup:** `TestStreamingSplitPacker_MatchesSplitBucketGroupBySpanCap`
+(`keymerge_spill_test.go`) is table-driven, reusing/extending `TestSplitBucketGroupBySpanCap`'s
+own fixtures (`bucketfile_test.go`) plus a new "many siblings from one oversized ref" case and an
+explicit empty-refs case (Edge Case 1). For each case, refs are fed one at a time into
+`streamingSplitPacker.addRef` (concatenated with a final `finish()` call) and compared against
+`splitBucketGroupBySpanCap` called once on the same refs in the same order.
+
+**Assertions:** the concatenated incremental result is `require.Equal` to the one-shot result,
+for every table case including the zero-ref no-op case.
+
+**Mutation check (documented in the test's own doc comment):** changing the ported `addRef`
+logic's `curCount+refCount > maxSpans` to `>=` did NOT initially fail with the original table
+(none of those fixtures ever land the running sum exactly on the boundary) — an explicit
+"exact boundary sum must not flush early" case was added specifically to force that boundary;
+with it present, the mutation DOES fail, confirming the `>` vs `>=` distinction is genuinely
+covered, not just apparently covered.
+
+**Spec invariants tested:** SPEC-VI-16, SPEC-VI-18.
+
+Back-ref: `internal/modules/valueindex/keymerge_spill_test.go:TestStreamingSplitPacker_MatchesSplitBucketGroupBySpanCap`.
+
+---
+
+## TEST-VI-36: One `BucketBlockRef`'s distinct-TraceID count never exceeds `shared.MaxSpans` — pinning a real but derived cross-package coupling (issue #503)
+*Added: 2026-07-15, revised 2026-07-15 (review follow-up)*
+
+**Scenario:** #503's memory-bound design (SPEC-VI-18) leans on "one `BucketBlockRef`'s own
+`len(ref.Spans)` can never exceed `shared.MaxSpans`" as if it were an enforced
+`valueindex`-package invariant — it is only true INDIRECTLY (a ref addresses one physical source
+block, and `MaxSpans` caps that block's own row count at the base `blockio` format level, a
+different package: `blockio/shared/constants.go:573`). Per spec-oracle's Phase 0 follow-up, this
+is an input-precondition pin, not a new defensive runtime guard (a corrupt/malicious input
+violating this remains out of scope, a decode-time concern for `DecodeBucketFile`/
+`decodeBucketBlock`).
+
+**Review follow-up (caught pre-ship):** the first version of this test
+(`TestBucketBlockRefSpanCount_NeverExceedsSharedMaxSpans`) built its fixture via
+`makeRefWithSpans(0, ref, shared.MaxSpans, 0)`, whose helper unconditionally does
+`make([]SpanRef, n)` for whatever `n` is passed — meaning `len(ref.Spans) == shared.MaxSpans`
+was true BY CONSTRUCTION for any `n`, never exercising the REAL enforcement point
+(`blockio/reader/block_parser.go:164`, a different package). The test was retained (kept as a
+boundary-value sanity pin, not deleted) but a SECOND, real cross-package test was added to
+actually exercise the enforcement this coupling depends on.
+
+**Setup:** `TestBucketBlockRefSpanCount_NeverExceedsSharedMaxSpans` (`bucketfile_test.go`)
+builds a synthetic ref at exactly `shared.MaxSpans` rows via `makeRefWithSpans`, pinning the
+boundary case unambiguously (retained as-is, now explicitly framed as a sanity pin, not proof of
+enforcement). `TestBucketBlockRef_CannotAddressABlockWithSpanCountAboveMaxSpans`
+(`bucketfile_test.go`, the real regression test) builds a minimal V14 block header via
+`buildMinimalV14BlockHeaderForTest` with `spanCount = shared.MaxSpans+1` and decodes it through
+the ACTUAL exported `reader.ParseColMetas` entry point (`blockio/reader`), then repeats at
+exactly `shared.MaxSpans` (the boundary).
+
+**Assertions:** `len(ref.Spans) <= shared.MaxSpans` (first test, sanity pin only).
+`reader.ParseColMetas` returns an error mentioning `"span_count"` for `MaxSpans+1`, and NO error
+for exactly `MaxSpans` (second test — this is what makes the bound TIGHT, not merely
+directional, and is the real basis for SPEC-VI-18's citation).
+
+**Spec invariants tested:** SPEC-VI-18 (cites `TestBucketBlockRef_
+CannotAddressABlockWithSpanCountAboveMaxSpans` as the real basis and `shared.MaxSpans`'s origin
+by name, does not re-derive the number).
+
+Back-ref: `internal/modules/valueindex/bucketfile_test.go:
+TestBucketBlockRefSpanCount_NeverExceedsSharedMaxSpans,
+TestBucketBlockRef_CannotAddressABlockWithSpanCountAboveMaxSpans,
+buildMinimalV14BlockHeaderForTest`.
+
+---
+
+## TEST-VI-37: `reduceKeySpillRecords` unions `SpanIndexes` across a spill boundary — the FULL union, not just the first chunk (issue #503)
+*Added: 2026-07-15*
+
+**Scenario:** one of the two brainstorm-flagged correctness-critical tests: dedup by
+union-of-`SpanIndexes` must survive a spill boundary, not degrade to first-wins — the exact
+divergence from `runspill.go`'s deliberately-different `sameEntry`/`mergeRuns` "same-entry
+collapse" dedup rule.
+
+**Setup:** `TestReduceKeySpillRecords_UnionsSpanIndexesAcrossChunks`
+(`stream_compaction_spill_test.go`) constructs records for the SAME `(sourceID, ref, traceID)`
+triple split across THREE sources — chunk A (`{1,2}`), chunk B (`{3}`), and the in-memory tail
+(`{2,4}`, deliberately overlapping AND disjoint) — and calls `reduceKeySpillRecords` directly.
+
+**Assertions:** the single resulting `SpanRef`'s `SpanIndexes` is the FULL union `{1,2,3,4}`, not
+chunk A's subset `{1,2}`.
+
+**Mutation check (documented in `TestReduceKeySpillRecords_ExactDuplicateAcrossChunksDoesNotDoubleCount`'s
+own doc comment, TEST-VI-38):** changing the union step to take the LAST-seen record's
+`spanIndexes` instead of unioning DOES make this test fail, confirming the union step (as
+opposed to an overwrite) is load-bearing.
+
+**Spec invariants tested:** SPEC-VI-18.
+
+Back-ref: `internal/modules/valueindex/stream_compaction_spill_test.go:TestReduceKeySpillRecords_UnionsSpanIndexesAcrossChunks`.
+
+---
+
+## TEST-VI-38: `reduceKeySpillRecords`'s union is idempotent for an exact duplicate contribution across chunks (issue #503)
+*Added: 2026-07-15*
+
+**Scenario:** a legitimate scenario — TWO input `BucketGroup`s both already carry the identical
+`(sourceID, ref, traceID, spanIndexes)` entry verbatim (e.g. re-consolidating siblings from a
+prior #501 split) — must union IDEMPOTENTLY (`{1,2}` ∪ `{1,2}` = `{1,2}`), not produce a
+duplicated `SpanRef` entry for the same TraceID.
+
+**Setup:** `TestReduceKeySpillRecords_ExactDuplicateAcrossChunksDoesNotDoubleCount`
+(`stream_compaction_spill_test.go`) writes the identical record verbatim to two separate spill
+chunks and calls `reduceKeySpillRecords`.
+
+**Assertions:** exactly one ref, one `SpanRef` for the TraceID, `SpanIndexes == {1,2}` (not
+duplicated).
+
+**Spec invariants tested:** SPEC-VI-18.
+
+Back-ref: `internal/modules/valueindex/stream_compaction_spill_test.go:TestReduceKeySpillRecords_ExactDuplicateAcrossChunksDoesNotDoubleCount`.
+
+---
+
+## TEST-VI-39: Every spill chunk created during a successful `mergeGroupsAtKey` call is removed once processing completes (issue #503)
+*Added: 2026-07-15*
+
+**Scenario:** every spill chunk created for a key must be removed once that key's processing
+completes successfully — no `vi-keymerge-*.tmp` files left behind.
+
+**Setup:** `TestMergeGroupsAtKey_SpillChunksCleanedUpOnSuccess`
+(`stream_compaction_spill_test.go`) forces a low `spillThresholdBytes` (via
+`mergeGroupsAtKeyWithSpillThreshold`) against a multi-ref fixture guaranteed to spill at least
+once, then globs `tmpDir` for `vi-keymerge-*.tmp`.
+
+**Assertions:** the call succeeds and returns non-empty output; the glob finds ZERO matching
+files afterward.
+
+**Mutation check (performed manually, then reverted):** disabling the cleanup `defer`'s actual
+`c.remove()` call (no-op instead) DOES make this test fail with real leftover files, confirming
+the cleanup step is load-bearing, not vacuous (nothing to clean up).
+
+**Spec invariants tested:** SPEC-VI-18.
+
+Back-ref: `internal/modules/valueindex/stream_compaction_spill_test.go:TestMergeGroupsAtKey_SpillChunksCleanedUpOnSuccess`.
+
+---
+
+## TEST-VI-40: Spill chunks already written before an error (including `ctx` cancellation mid-key-spill) are still removed (issue #503, Edge Case 4)
+*Added: 2026-07-15*
+
+**Scenario:** doubles as the Edge Case 4 (`ctx` cancellation mid-key-spill) regression test —
+the outer `StreamCompactBucketFiles` loop already checks `ctx.Err()` per key iteration, but a
+key whose own accumulation spans many spill chunks had no cancellation check WITHIN
+`mergeGroupsAtKey` before this issue. A cancellation arriving AFTER some real spilling has
+already happened must still clean up every chunk written so far, not just cleanly propagate the
+error.
+
+**Setup:** `TestMergeGroupsAtKey_SpillChunksCleanedUpOnError`
+(`stream_compaction_spill_test.go`) uses a `cancelAfterNContext` test double (`Err()` returns
+`nil` for the first `n` calls, then `context.Canceled` forever after) with `n=1` against a
+3-ref, low-spill-threshold fixture — the first ref-boundary `ctx.Err()` check passes (letting ref
+0 accumulate and spill for real), the second reports canceled, aborting before ref 1.
+
+**Assertions:** the returned error wraps `context.Canceled`; the glob for `vi-keymerge-*.tmp`
+in `tmpDir` finds ZERO matches — every chunk already written for ref 0 is still removed.
+
+**Mutation check (performed manually, then reverted):** disabling the cleanup `defer` (as
+above) DOES make this test fail with real leftover files from ref 0's spill.
+
+**Spec invariants tested:** SPEC-VI-18.
+
+Back-ref: `internal/modules/valueindex/stream_compaction_spill_test.go:TestMergeGroupsAtKey_SpillChunksCleanedUpOnError`.
+
+---
+
+## TEST-VI-41: Spilled and non-spilled `mergeGroupsAtKey` accumulation produce byte-identical output — mandatory differential equivalence (issue #503)
+*Added: 2026-07-15*
+
+**Scenario:** the second brainstorm-flagged correctness-critical test: the spilled
+(`spillThresholdBytes=1`, forces a spill on nearly every record) and non-spilled
+(`spillThresholdBytes=math.MaxUint64`, never spills) paths through
+`mergeGroupsAtKeyWithSpillThreshold` must produce IDENTICAL output for identical input. Per
+plan.md, this test must pass immediately if Phases 2-6 are correct — a failure here is a real
+implementation bug, not a test-design flaw.
+
+**Setup:** `TestMergeGroupsAtKey_SpillPathEquivalence` (`stream_compaction_spill_test.go`) builds
+a realistic 3-group fixture for one hot key with REAL cross-group ref AND TraceID overlap
+(`buildOverlappingHotKeyContributions`: 3 shared refs, 3 shared TraceIDs with disjoint
+`SpanIndexes` subsets requiring a real union, not mere concatenation) and runs both threshold
+extremes.
+
+**Assertions:** the two results are `require.Equal`; a sanity check confirms TraceID 1's
+cross-group union is complete (`{0,1,2}`), proving the fixture's overlap is genuinely exercised,
+not vacuously equal.
+
+**Spec invariants tested:** SPEC-VI-18.
+
+Back-ref: `internal/modules/valueindex/stream_compaction_spill_test.go:TestMergeGroupsAtKey_SpillPathEquivalence`.
+
+---
+
+## TEST-VI-42: Union-dedup across a forced spill boundary does not degrade to first-wins (issue #503)
+*Added: 2026-07-15*
+
+**Scenario:** deliberately forces the SAME `(sourceID, ref, TraceID)` triple's `SpanIndexes`
+contributions to land in TWO DIFFERENT spill chunks (group A spills into its own chunk before
+group B is ever processed), proving the union survives even when the two contributions never
+share an in-memory buffer together — the exact bug a naive port of `runspill.go`'s
+`sameEntry`/`mergeRuns` collapse-dedup would introduce.
+
+**Setup:** `TestMergeGroupsAtKey_UnionDedupNotFirstWinsAcrossSpillBoundary`
+(`stream_compaction_spill_test.go`) feeds group A (`SpanIndexes={1,2}`) then group B
+(`SpanIndexes={3}`) for the same triple, with `spillThresholdBytes=1` forcing each into its own
+chunk.
+
+**Assertions:** the low-threshold (spilling) result's `SpanIndexes` is the full union `{1,2,3}`;
+the low-threshold and high-threshold (`math.MaxUint64`, never-spills) results are identical.
+
+**Spec invariants tested:** SPEC-VI-18.
+
+Back-ref: `internal/modules/valueindex/stream_compaction_spill_test.go:TestMergeGroupsAtKey_UnionDedupNotFirstWinsAcrossSpillBoundary`.
+
+---
+
+## TEST-VI-43: TEST-VI-30's output-shape postcondition holds end-to-end when the merge buffer is ACTUALLY spilling (issue #503)
+*Added: 2026-07-15*
+
+**Scenario:** re-runs TEST-VI-30's identical 20-generation hot-key-growth scenario, but threads
+a forced-low merge-buffer spill threshold through the FULL `streamCompactBucketFilesWithCap`
+call path end-to-end (via the new `streamCompactBucketFilesWithCapAndSpillThreshold` test entry
+point), proving the #501 output-shape postcondition (every hot-key sibling group's span count
+stays within `spanCap`) still holds when the merge buffer is genuinely spilling during a real
+multi-generation compaction run, not just in an isolated `mergeGroupsAtKey` unit test.
+
+**Setup:**
+`TestStreamCompactBucketFiles_OutputGroupSizeStaysCappedAcrossUnboundedRealGrowth_WithSpillForced`
+(`stream_compaction_spill_test.go`) mirrors TEST-VI-30's exact seed/generation shape via
+`compactBucketFilesWithSpillThreshold` (real disk-backed iterators, `spillThresholdBytes=1`).
+
+**Assertions:** identical to TEST-VI-30 — every generation's hot-key groups stay within
+`spanCap`, and the cumulative span total across generations reflects every generation's
+contributions exactly, even while spilling for real.
+
+**Spec invariants tested:** SPEC-VI-2 (Addendum), SPEC-VI-16, SPEC-VI-18.
+
+Back-ref: `internal/modules/valueindex/stream_compaction_spill_test.go:TestStreamCompactBucketFiles_OutputGroupSizeStaysCappedAcrossUnboundedRealGrowth_WithSpillForced`.
+
+---
+
+## TEST-VI-44: No in-memory structure in the disk-spill merge path exceeds its documented structural bound — mutation-tested, not peak-heap-sampled (issue #503)
+*Added: 2026-07-15*
+
+**Scenario:** per #501's own precedent (NOTE-VI-112): peak-heap-sampling designs are
+structurally unable to distinguish fixed from broken code and were rejected twice already. This
+test instruments STRUCTURE directly at the three points SPEC-VI-18's memory-bound formula names:
+(a) the in-memory accumulation buffer's length right after each record is appended, before the
+spill check runs; (b) `reduceKeySpillRecords`' per-TraceID union map size; (c)
+`streamingSplitPacker`'s in-progress group's running span count.
+
+**Setup:** `TestMergeGroupsAtKey_NoInMemoryStructureExceedsStructuralBound`
+(`stream_compaction_spill_test.go`) wires three zero-cost-in-production hook variables
+(`testHookAccumBufLen`, `testHookReduceUnionSize`, `testHookPackerCurSpans`) to max-tracking
+counters, then runs a 500,000-record high-fan-in fixture (500 refs x 200 TraceIDs x 5-way
+contributing-group fan-in, every fan-in group touching the SAME `(ref, TraceID)` pairs) through
+the REAL `mergeGroupsAtKey` production entry point.
+
+**Assertions:** (a) max observed buffer length `<=`
+`ValueIndexMergeBufferSpillBytes`/per-record-estimate + 1 (computed the same way the production
+code does); (b) max observed union-map size `<= shared.MaxSpans`; (c) max observed
+in-progress-group span count `<= shared.ValueIndexBucketGroupMaxSpanRefs`.
+
+**Mutation check (mandatory, performed manually then reverted — full outcome documented in the
+test's own doc comment):**
+1. Disabling the spill-threshold check (never spills) DOES make bound (a) fail. **Load-bearing,
+   confirmed.**
+2. Making `reduceKeySpillRecords` accumulate ALL refs' unions in one shared, never-reset map
+   does NOT make bound (b) fail, at ANY fixture scale — a genuine structural fact, not a
+   fixture-tuning failure: `SpanIndexes` is `uint16`, capping any such map at 65,536 entries,
+   far below `shared.MaxSpans` (1,000,000). **NOT load-bearing against this mutation class** —
+   that correctness property is independently covered by TEST-VI-37's own mutation check.
+3. Changing `streamingSplitPacker` to never flush early (buffer the whole key before emitting)
+   DOES make bound (c) fail. **Load-bearing, confirmed.**
+
+**Spec invariants tested:** SPEC-VI-2 (Addendum), SPEC-VI-18.
+
+Back-ref: `internal/modules/valueindex/stream_compaction_spill_test.go:TestMergeGroupsAtKey_NoInMemoryStructureExceedsStructuralBound`,
+`internal/modules/valueindex/stream_compaction.go:testHookAccumBufLen`,
+`internal/modules/valueindex/keymerge_spill.go:testHookReduceUnionSize, testHookPackerCurSpans`.
+
+---
+
+## TEST-VI-45: `sweepOrphanedMergeTempFilesIn` also removes orphaned `vi-keymerge-*.tmp` files (issue #503)
+*Added: 2026-07-15*
+
+**Scenario:** the new per-key spill-chunk naming convention (`vi-keymerge-*.tmp`, SPEC-VI-18)
+needs sweep coverage as a backstop against a crash mid-key-spill, alongside the existing
+`vi-merge-*.tmp` coverage (NOTE-VI-XXX) — `sweepOrphanedMergeTempFilesIn`'s glob did not
+previously match this prefix.
+
+**Setup:** `TestSweepOrphanedMergeTempFiles_RemovesKeyMergePrefixToo` (`temp_cleanup_test.go`)
+adds a backdated `vi-keymerge-abc123.tmp` fixture file alongside the existing
+`vi-merge-in-*`/`vi-merge-out-*`/`vi-run-*`/unrelated fixtures already covered by
+`TestSweepOrphanedMergeTempFiles_RemovesOnlyMatchingPrefix`.
+
+**Assertions:** the new fixture IS removed (removed count increases accordingly) while
+`vi-run-*.tmp` (a DIFFERENT package's own convention, `runspill.go`) still survives untouched.
+
+**Spec invariants tested:** SPEC-VI-18.
+
+Back-ref: `internal/modules/valueindex/temp_cleanup_test.go:TestSweepOrphanedMergeTempFiles_RemovesKeyMergePrefixToo`.

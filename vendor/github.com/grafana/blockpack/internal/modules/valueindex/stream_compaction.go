@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"sort"
 
 	"github.com/golang/snappy"
 
@@ -222,38 +221,113 @@ func popStaleIterator(h *bucketIteratorHeap) error {
 // the key, capping each output group's total span-ref count at maxSpansPerGroup (SPEC-VI-16,
 // issue #501).
 //
-// Peak memory during the union-building phase is bounded by K * (each contributing iterator's
-// own real total fan-in for this key), NOT a fixed K * maxSpansPerGroup constant. The write-path
-// cap (assembleBucketWithCap, writer.go, SPEC-VI-16) bounds any single INPUT group's own size,
-// but collectContributionsAtKey's coalescing (SPEC-VI-3, amended) deliberately does not cap how
-// many same-key sibling groups one iterator can contribute, since doing so would prevent
-// siblings from ever re-consolidating. See SPEC-VI-2's Addendum and NOTES.md NOTE-VI-111 for the
-// accepted residual-risk framing this implies. maxSpansPerGroup <= 0 is a no-op (single output
+// SPEC-VI-18 (issue #503) replaced the original map-of-maps union-building implementation
+// (which held the WHOLE key's cross-file union in memory before ever cutting a sibling
+// group) with a disk-spill design: contributing (ref, span) pairs accumulate into a flat
+// in-memory buffer (accumulateAndSpillKeyRecords) that spills to a sorted temp chunk
+// (keymerge_spill.go, mirroring runspill.go's external sort-merge shape) once its estimated
+// size crosses shared.ValueIndexMergeBufferSpillBytes, then a streaming k-way merge
+// (reduceKeySpillRecords) reduces the spilled chunks plus the in-memory tail back into
+// output groups, feeding completed refs into a streamingSplitPacker incrementally rather
+// than materializing the full merged result first. Net peak memory is bounded by O(one
+// spill-chunk's worth of records) + O(maxSpansPerGroup, one sibling group being packed) —
+// mutation-confirmed load-bearing, independent of K (contributing file/iterator count) and
+// independent of the key's cumulative real total fan-in — plus a third, honestly-scoped
+// term (one ref's own distinct-TraceID union bounded by shared.MaxSpans, a real but derived
+// cross-package fact, not mutation-provable at this bound; see SPEC-VI-18), closing the
+// residual risk NOTES.md NOTE-VI-111/112 (issue #501) left open. See SPEC-VI-2's Addendum
+// and SPEC-VI-18 for the full citation. maxSpansPerGroup <= 0 is a no-op (single output
 // group, today's behavior) for callers/tests that don't care about the cap.
 //
 // Unions BlockRefs by (sourcePath, page) and SpanRefs by TraceID (NOTE-VI-045 dedup semantics —
 // same rule as MergeBucketFiles, verified by the equivalence tests, not by shared code,
 // since the two accumulators operate at different scopes: whole-file vs single-key).
 func mergeGroupsAtKey(
+	ctx context.Context,
 	timeSec uint64,
 	value []byte,
 	groups []*BucketGroup,
 	tables []*StringTable,
 	outTable *StringTable,
 	maxSpansPerGroup int,
+	tmpDir string,
 ) ([]BucketGroup, error) {
-	type spanAcc struct {
-		idx     map[uint16]struct{}
-		traceID [16]byte
-	}
-	type refAcc struct {
-		spans      map[[16]byte]*spanAcc
-		sourcePath string
-		ref        BlockRef
-	}
+	return mergeGroupsAtKeyWithSpillThreshold(
+		ctx, timeSec, value, groups, tables, outTable, maxSpansPerGroup, tmpDir,
+		shared.ValueIndexMergeBufferSpillBytes,
+	)
+}
 
-	refs := make(map[string]*refAcc, len(groups))
-	refOrder := make([]string, 0, len(groups))
+// mergeGroupsAtKeyWithSpillThreshold is mergeGroupsAtKey's implementation, parameterized by the
+// spill-trigger byte threshold (issue #503) so in-package tests can force spilling with a tiny
+// threshold without needing megabyte-scale fixtures — mirrors streamCompactBucketFilesWithCap's
+// own production/test-parameterized-entry-point split (issue #501). mergeGroupsAtKey (the
+// production entry point) always calls this with the real shared.ValueIndexMergeBufferSpillBytes
+// constant; there is one implementation, not two copies.
+func mergeGroupsAtKeyWithSpillThreshold(
+	ctx context.Context,
+	timeSec uint64,
+	value []byte,
+	groups []*BucketGroup,
+	tables []*StringTable,
+	outTable *StringTable,
+	maxSpansPerGroup int,
+	tmpDir string,
+	spillThresholdBytes uint64,
+) ([]BucketGroup, error) {
+	chunks, tail, err := accumulateAndSpillKeyRecords(ctx, groups, tables, outTable, tmpDir, spillThresholdBytes)
+	// Every spill chunk created for this key must be removed once its processing completes,
+	// success or not (plan.md Phase 6) — registered immediately after the call so a partial
+	// failure partway through accumulation (e.g. ErrStringTableOverflow or ctx cancellation on
+	// a later ref, after earlier refs already spilled) still cleans up whatever was already
+	// written to disk. accumulateAndSpillKeyRecords always returns every chunk it created so
+	// far on EVERY exit path, error or not, so this defer never misses one.
+	defer func() {
+		for _, c := range chunks {
+			c.remove()
+		}
+	}()
+	if err != nil {
+		return nil, err
+	}
+	return reduceKeySpillRecords(ctx, chunks, tail, timeSec, value, maxSpansPerGroup)
+}
+
+// testHookAccumBufLen is a zero-cost-in-production instrumentation hook (nil by default),
+// wired to a counter ONLY by TestMergeGroupsAtKey_NoInMemoryStructureExceedsStructuralBound
+// (Phase 8, #503) to observe the in-memory accumulation buffer's length immediately after
+// each record is appended, before the spill-threshold check evaluates — a structural
+// observation point, not heap sampling (rejected twice already for this exact class of
+// claim, NOTE-VI-112).
+var testHookAccumBufLen func(n int)
+
+// accumulateAndSpillKeyRecords walks groups/tables in the same nested order mergeGroupsAtKey has
+// always used, interning each contributing ref's sourcePath into outTable EAGERLY, in
+// first-arrival order (this is what makes spilled and non-spilled accumulation produce the
+// identical total order — see plan.md's Design decision section), and appends one
+// keySpillRecord per (ref, span) pair to a running in-memory buffer. The spill check runs after
+// EVERY record (not just after each ref) so a single pathological ref with millions of spans
+// still spills incrementally rather than defeating the memory bound. Once the buffer's
+// estimated byte size crosses spillThresholdBytes, it is spilled to a new sorted disk chunk
+// (writeKeySpillChunk, mirroring runspill.go's writeRun) and reset. ctx.Err() is checked once
+// per ref boundary (Edge Case 4, plan.md) so a long-running hot-key spill can still be
+// canceled promptly. Returns every spill chunk created SO FAR on every exit path — including
+// error paths — so the caller's cleanup defer never leaks a chunk that was already written to
+// disk before a later ref failed.
+func accumulateAndSpillKeyRecords(
+	ctx context.Context,
+	groups []*BucketGroup,
+	tables []*StringTable,
+	outTable *StringTable,
+	tmpDir string,
+	spillThresholdBytes uint64,
+) ([]*keySpillChunk, []keySpillRecord, error) {
+	var (
+		chunks   []*keySpillChunk
+		buf      []keySpillRecord
+		bufBytes uint64
+	)
+
 	for gi, g := range groups {
 		if g == nil || gi >= len(tables) || tables[gi] == nil {
 			// Defensive: groups/tables must be parallel slices supplied by the caller;
@@ -263,70 +337,36 @@ func mergeGroupsAtKey(
 		}
 		table := tables[gi]
 		for ri := range g.Refs {
+			if err := ctx.Err(); err != nil {
+				return chunks, nil, err
+			}
 			r := &g.Refs[ri]
 			path := table.Lookup(r.SourceID)
-			rk := formatRefKey(path, r.Ref)
-			ra := refs[rk]
-			if ra == nil {
-				ra = &refAcc{sourcePath: path, ref: r.Ref, spans: make(map[[16]byte]*spanAcc, len(r.Spans))}
-				refs[rk] = ra
-				refOrder = append(refOrder, rk)
+			id, ok := outTable.Intern(path)
+			if !ok {
+				return chunks, nil, fmt.Errorf("valueindex: mergeGroupsAtKey: %w", ErrStringTableOverflow)
 			}
 			for si := range r.Spans {
 				s := &r.Spans[si]
-				sa := ra.spans[s.TraceID]
-				if sa == nil {
-					sa = &spanAcc{traceID: s.TraceID, idx: make(map[uint16]struct{}, len(s.SpanIndexes))}
-					ra.spans[s.TraceID] = sa
+				rec := keySpillRecord{sourceID: id, ref: r.Ref, traceID: s.TraceID, spanIndexes: s.SpanIndexes}
+				buf = append(buf, rec)
+				if testHookAccumBufLen != nil {
+					testHookAccumBufLen(len(buf))
 				}
-				for _, idx := range s.SpanIndexes {
-					sa.idx[idx] = struct{}{}
+				bufBytes += uint64(estimateKeySpillRecordBytes(&rec)) //nolint:gosec // bounded by real record sizes
+				if bufBytes >= spillThresholdBytes {
+					chunk, werr := writeKeySpillChunk(tmpDir, buf)
+					if werr != nil {
+						return chunks, nil, fmt.Errorf("valueindex: mergeGroupsAtKey: %w", werr)
+					}
+					chunks = append(chunks, chunk)
+					buf = nil
+					bufBytes = 0
 				}
 			}
 		}
 	}
-
-	out := BucketGroup{
-		TimeSec:        timeSec,
-		CanonicalValue: value,
-		Refs:           make([]BucketBlockRef, 0, len(refOrder)),
-	}
-	for _, rk := range refOrder {
-		ra := refs[rk]
-		if ra == nil {
-			// Defensive: refOrder only ever holds keys inserted alongside a non-nil
-			// value in the loop above (SPEC-ROOT-001 — guard rather than deref nil).
-			continue
-		}
-		id, ok := outTable.Intern(ra.sourcePath)
-		if !ok {
-			return nil, fmt.Errorf("valueindex: mergeGroupsAtKey: %w", ErrStringTableOverflow)
-		}
-		br := BucketBlockRef{SourceID: id, Ref: ra.ref, Spans: make([]SpanRef, 0, len(ra.spans))}
-		for _, sa := range ra.spans {
-			idxs := make([]uint16, 0, len(sa.idx))
-			for idx := range sa.idx {
-				idxs = append(idxs, idx)
-			}
-			sortUint16(idxs)
-			br.Spans = append(br.Spans, SpanRef{TraceID: sa.traceID, SpanIndexes: idxs})
-		}
-		out.Refs = append(out.Refs, br)
-	}
-
-	sort.Slice(out.Refs, func(i, j int) bool {
-		if out.Refs[i].SourceID != out.Refs[j].SourceID {
-			return out.Refs[i].SourceID < out.Refs[j].SourceID
-		}
-		return out.Refs[i].Ref.PageNum < out.Refs[j].Ref.PageNum
-	})
-	for ri := range out.Refs {
-		spans := out.Refs[ri].Spans
-		sort.Slice(spans, func(i, j int) bool {
-			return compareTraceID(spans[i].TraceID, spans[j].TraceID) < 0
-		})
-	}
-	return splitBucketGroupBySpanCap(out, maxSpansPerGroup), nil
+	return chunks, buf, nil
 }
 
 // streamOutputWriter accumulates BucketGroups into fixed-size blocks and writes each block
@@ -551,10 +591,11 @@ func StreamCompactBucketFiles(
 	iterators []GroupIterator,
 	groupsPerBlock int,
 	maxOutputBytes int64,
+	tmpDir string,
 	output func(path string) error,
 ) error {
 	return streamCompactBucketFilesWithCap(
-		ctx, iterators, groupsPerBlock, maxOutputBytes, shared.ValueIndexBucketGroupMaxSpanRefs, output,
+		ctx, iterators, groupsPerBlock, maxOutputBytes, shared.ValueIndexBucketGroupMaxSpanRefs, tmpDir, output,
 	)
 }
 
@@ -570,6 +611,32 @@ func streamCompactBucketFilesWithCap(
 	groupsPerBlock int,
 	maxOutputBytes int64,
 	maxSpansPerGroup int,
+	tmpDir string,
+	output func(path string) error,
+) error {
+	return streamCompactBucketFilesWithCapAndSpillThreshold(
+		ctx, iterators, groupsPerBlock, maxOutputBytes, maxSpansPerGroup, tmpDir,
+		shared.ValueIndexMergeBufferSpillBytes, output,
+	)
+}
+
+// streamCompactBucketFilesWithCapAndSpillThreshold is streamCompactBucketFilesWithCap's
+// implementation, further parameterized by the per-key merge-buffer spill-trigger byte
+// threshold (issue #503) so in-package tests can force spilling end-to-end through the FULL
+// StreamCompactBucketFiles call path — mirrors mergeGroupsAtKey's own
+// production/mergeGroupsAtKeyWithSpillThreshold test-parameterized-entry-point split.
+// streamCompactBucketFilesWithCap (called by the production entry point,
+// StreamCompactBucketFiles) always calls this with the real
+// shared.ValueIndexMergeBufferSpillBytes constant; there is one implementation, not two
+// copies.
+func streamCompactBucketFilesWithCapAndSpillThreshold(
+	ctx context.Context,
+	iterators []GroupIterator,
+	groupsPerBlock int,
+	maxOutputBytes int64,
+	maxSpansPerGroup int,
+	tmpDir string,
+	spillThresholdBytes uint64,
 	output func(path string) error,
 ) error {
 	if err := ctx.Err(); err != nil {
@@ -584,7 +651,7 @@ func streamCompactBucketFilesWithCap(
 		return err
 	}
 
-	of, err := newBucketOutputFile(groupsPerBlock)
+	of, err := newBucketOutputFile(groupsPerBlock, tmpDir)
 	if err != nil {
 		return err
 	}
@@ -629,8 +696,8 @@ func streamCompactBucketFilesWithCap(
 			return cerr
 		}
 
-		mergedSiblings, err := mergeGroupsAtKey(
-			keyTS, keyValue, contribGroups, contribTables, of.table, maxSpansPerGroup,
+		mergedSiblings, err := mergeGroupsAtKeyWithSpillThreshold(
+			ctx, keyTS, keyValue, contribGroups, contribTables, of.table, maxSpansPerGroup, tmpDir, spillThresholdBytes,
 		)
 		if err != nil {
 			return fmt.Errorf("valueindex: StreamCompactBucketFiles: %w", err)
@@ -639,7 +706,7 @@ func streamCompactBucketFilesWithCap(
 		// step runs once per sibling, unlike contributor advancement above, which already ran
 		// exactly once for this key.
 		for _, mg := range mergedSiblings {
-			if err := addMergedGroupAndMaybeRotate(&of, mg, maxOutputBytes, groupsPerBlock, h, output); err != nil {
+			if err := addMergedGroupAndMaybeRotate(&of, mg, maxOutputBytes, groupsPerBlock, tmpDir, h, output); err != nil {
 				return err
 			}
 		}
@@ -673,6 +740,7 @@ func addMergedGroupAndMaybeRotate(
 	mg BucketGroup,
 	maxOutputBytes int64,
 	groupsPerBlock int,
+	tmpDir string,
 	h *bucketIteratorHeap,
 	output func(path string) error,
 ) error {
@@ -699,7 +767,7 @@ func addMergedGroupAndMaybeRotate(
 		if finErr := finalizeBucketOutputFile(of, output); finErr != nil {
 			return finErr
 		}
-		newOf, newErr := newBucketOutputFile(groupsPerBlock)
+		newOf, newErr := newBucketOutputFile(groupsPerBlock, tmpDir)
 		if newErr != nil {
 			return newErr
 		}
@@ -720,10 +788,12 @@ type bucketOutputFile struct {
 	out   *streamOutputWriter
 }
 
-// newBucketOutputFile creates a fresh temp output file, writes its header, and returns the
-// bundled per-file writer state.
-func newBucketOutputFile(groupsPerBlock int) (*bucketOutputFile, error) {
-	f, err := os.CreateTemp("", "vi-merge-out-*.tmp")
+// newBucketOutputFile creates a fresh temp output file inside tmpDir (issue #503 —
+// previously hardcoded os.CreateTemp("", ...), which os.CreateTemp already resolves to
+// os.TempDir(), so passing os.TempDir() explicitly here is behavior-preserving for every
+// existing caller), writes its header, and returns the bundled per-file writer state.
+func newBucketOutputFile(groupsPerBlock int, tmpDir string) (*bucketOutputFile, error) {
+	f, err := os.CreateTemp(tmpDir, "vi-merge-out-*.tmp")
 	if err != nil {
 		return nil, fmt.Errorf("valueindex: StreamCompactBucketFiles: create temp output: %w", err)
 	}

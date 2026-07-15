@@ -2123,3 +2123,103 @@ Back-refs: `internal/modules/valueindex/stream_compaction_hotkey_scaling_test.go
 TestStreamCompactBucketFiles_OutputGroupSizeStaysCappedAcrossUnboundedRealGrowth,
 makeHotKeyDeltaFile, compactBucketFiles, assertHotKeyGroupsWithinCap`. See `SPECS.md` SPEC-VI-2
 (Addendum) and SPEC-VI-16, `NOTES.md` NOTE-VI-111, `TESTS.md` TEST-VI-30. Issue #501.
+
+## NOTE-VI-113 — Streaming incremental-packer design over the brainstorm's literal "materialize final slice" wording, and the mutation-testing outcome that determines what SPEC-VI-2 can honestly claim (issue #503)
+
+**ID caveat, read first:** `NOTE-VI-*` is a single GLOBAL counter shared across
+`valueindex`/`valueindexcompactor`/`valueindexconsumer`/`vibuilder`'s `NOTES.md` files
+(plan.md Preamble, spec-oracle's Phase 0 response, 2026-07-14, which confirmed 113 as
+next-free at that time). This entry's author queried spec-oracle again immediately before
+writing (per the plan's own explicit instruction) but did not receive a live response in time
+and proceeded with 113 after independently re-verifying, by direct inspection, that no file in
+this worktree (`valueindex`=112, `valueindexcompactor`=110, `valueindexconsumer`=108,
+`vibuilder`=108, all checked 2026-07-15) has claimed 113 or higher. **Whoever reviews or merges
+this must re-confirm 113 is still correct against the live team-wide counter before treating
+this number as final** — if another concurrent worktree claimed 113 first, this entry (and any
+back-references to it) needs renumbering.
+
+Date: 2026-07-15
+
+### The problem this note records
+
+Issue #501 (NOTE-VI-111) capped every OUTPUT `BucketGroup`'s size but explicitly left the
+TRANSIENT per-key merge-union buffer inside `collectContributionsAtKey`/`mergeGroupsAtKey`
+unbounded — real size K × (each contributing iterator's own real total fan-in for the key) —
+as an accepted residual risk (SPEC-VI-2's 2026-07-14 Addendum). Issue #503's own mandate was to
+close this gap for real, not defer it a second time.
+
+### Why the implementation goes beyond brainstorm.md's literal wording
+
+`brainstorm.md`'s Implementation Strategy said: do a k-way merge across spill chunks, then
+"hand the fully reduced `[]BucketBlockRef` to the EXISTING `splitBucketGroupBySpanCap`
+unchanged." Read literally, this does NOT actually close NOTE-VI-111's gap — it only replaces a
+live map-of-maps accumulator (held for the whole key) with a one-shot flat materialization at
+the end (same asymptotic size, lower constant). A sufficiently pathological hot key (the
+S3-observed 1.5M-span single-ref case) would still exhaust memory at the final-materialize step,
+just at a higher ceiling.
+
+**The key insight that makes a stronger claim provable:** within ONE key, a single
+`BucketBlockRef` can carry at most `shared.MaxSpans` (1,000,000) distinct TraceIDs, because
+that's the row cap of the data block it addresses — an existing hard constant
+(`blockio/shared/constants.go:573`), not a new one, though it is a *derived cross-package*
+consequence (the base `blockio` format's own row-count limit), not something `valueindex`
+itself previously stated or tested (spec-oracle's Phase 0 follow-up flagged this explicitly —
+see TEST-VI-36's revision history for why the FIRST version of the test pinning this coupling
+was itself a vacuous tautology, caught by review, and fixed with a real cross-package
+decode-time test). If spill records are sorted by `(sourceID, ref.PageNum, TraceID)` — the same
+total order `mergeGroupsAtKey` already produced — a k-way merge naturally groups all records
+for one ref together and, within a ref, all records for one TraceID together, in a strictly
+non-decreasing stream. That means the per-TraceID union, the per-ref assembly, and the
+sibling-group packing can all complete incrementally, ref-by-ref, rather than after a full
+materialization — a `streamingSplitPacker` (SPEC-VI-18) that is a byte-for-byte behavioral port
+of `splitBucketGroupBySpanCap`'s own greedy-first-fit logic, proven equivalent by a mandatory
+differential test (TEST-VI-35) before being trusted anywhere in the real merge path.
+
+**spec-oracle sign-off (obtained via coordinator relay, 2026-07-14, plan.md Preamble):**
+explicitly endorsed scoping this streaming-incremental-packer design into #503 itself rather
+than deferring it again, conditional on (a) the differential equivalence test (TEST-VI-35)
+actually passing, and (b) a new regression test pinning the `shared.MaxSpans` coupling
+(TEST-VI-36) being added. Both conditions were treated as mandatory, not optional polish, and
+both were satisfied before this design was used in the production merge path.
+
+### The mutation-testing outcome (Phase 8, 2026-07-15) — what SPEC-VI-2 can honestly claim
+
+Per NOTE-VI-112's own precedent (peak-heap-sampling designs rejected twice already), the
+memory-bound claim was pinned structurally (three instrumented points: accumulation buffer
+length, per-TraceID union map size, packer's in-progress group span count) and then subjected to
+the mandatory "try to break it" mutation-testing step:
+
+1. Disabling the spill-threshold check (never spills) — **DOES** make the accumulation-buffer
+   bound fail. Load-bearing.
+2. Making `reduceKeySpillRecords` accumulate ALL refs' unions in one shared, never-reset map
+   instead of one fresh map per TraceID — does **NOT** make the union-map bound fail, at ANY
+   fixture scale, for a genuine structural reason discovered during this task: `SpanIndexes`
+   values are `uint16`, so ANY map keyed by them is information-theoretically capped at 65,536
+   entries — already far below `shared.MaxSpans` (1,000,000) — so no amount of fixture scaling
+   could push a `SpanIndexes`-keyed map past that ceiling to violate this bound. This class of
+   bug is a CORRECTNESS defect (wrong unions), independently caught by
+   `TestReduceKeySpillRecords_UnionsSpanIndexesAcrossChunks`'s own mutation check (TEST-VI-37),
+   not a memory-bound violation this specific structural test can be expected to catch.
+3. Changing `streamingSplitPacker` to never flush early (buffer the whole key before emitting)
+   — **DOES** make the packer's in-progress-group-span-count bound fail. Load-bearing.
+
+**Honest net claim (mirrors NOTE-VI-112's own honesty, per this project's mutation-test rigor
+bar — a bound that isn't proven load-bearing must be stated as such, not silently kept or
+silently dropped):** peak per-key merge-buffer memory is now proven bounded by O(one
+spill-chunk's records) + O(`maxSpansPerGroup`, one sibling group being packed) — independent of
+K and of the key's cumulative real fan-in, closing NOTE-VI-111's gap for those two terms. The
+third term (one ref's own union bounded by `shared.MaxSpans`) is retained as a true, real,
+cited structural fact — not fiction — but is honestly NOT this specific mutation-tested
+regression guard's own proof; that correctness property lives in Phase 4's tests instead. This
+is a materially stronger, and now largely provable, claim than the "K × fan-in, unbounded"
+characterization NOTE-VI-111 left as an accepted residual risk — SPEC-VI-2's Addendum (this
+session) and SPEC-VI-18 (new) are updated accordingly.
+
+Back-refs: `internal/modules/valueindex/keymerge_spill.go` (`streamingSplitPacker`,
+`reduceKeySpillRecords`, `accumulateAndSpillKeyRecords` via `stream_compaction.go`),
+`internal/modules/valueindex/stream_compaction.go:mergeGroupsAtKey,
+mergeGroupsAtKeyWithSpillThreshold`, `internal/modules/valueindex/stream_compaction_spill_test.go:
+TestMergeGroupsAtKey_NoInMemoryStructureExceedsStructuralBound`. See `SPECS.md` SPEC-VI-2
+(Addendum, 2026-07-15), SPEC-VI-18, SPEC-VI-16. See `NOTES.md` NOTE-VI-111, NOTE-VI-112 (the
+#501 residual risk this note closes, in part). `TESTS.md` TEST-VI-31 through TEST-VI-45. Issue
+#503.

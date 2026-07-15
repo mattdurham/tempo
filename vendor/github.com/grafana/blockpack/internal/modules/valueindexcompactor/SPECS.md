@@ -15,7 +15,7 @@ from `internal/modules/valueindex/SPECS.md`'s own independent `SPEC-VI-N` sequen
 module's SPECS.md numbers from 1). IDs are assigned in ascending order and never reused or
 renumbered; superseded entries are marked `[SUPERSEDED by SPEC-VI-N]` rather than deleted.
 
-Next free ID: **SPEC-VI-9**.
+Next free ID: **SPEC-VI-10**.
 
 ---
 
@@ -350,3 +350,37 @@ wires up) and `valueindex/NOTES.md` NOTE-VI-109 (the full design-decision writeu
 deliberate corrupt-file-handling divergence from `mergeLevel`) and this package's own
 NOTE-VI-110 (the caller-side wiring change, mutation-test record, and deploy-side ephemeral disk
 change).
+
+---
+
+## SPEC-VI-9: `mergeLevel`'s `tmpDir` — one local variable is the source of truth for every local-disk staging path within one merge call (issue #503)
+*Added: 2026-07-15*
+
+**Contract:** `mergeLevel` (`service.go`) declares a single local `tmpDir := os.TempDir()`
+immediately after sorting its input files, and threads that SAME variable into EVERY local-disk
+staging call within the function — both input-side (`writeLocalTempInput(tmpDir, data)`, one
+call per fetched input file) and output-side (`valueindex.StreamCompactBucketFiles(ctx,
+iterators, 0, s.cfg.MaxOutputBytes, tmpDir, ...)`, which itself uses `tmpDir` for BOTH its
+output file AND, as of issue #503, its per-key merge-buffer spill chunks,
+`valueindex/SPECS.md` SPEC-VI-18). No call site within `mergeLevel` independently hardcodes
+`os.TempDir()` a second time.
+
+**Rationale for unifying now rather than deferring:** issue #503 was already touching
+`StreamCompactBucketFiles`'s own temp-file creation logic (threading `tmpDir` through for
+merge-buffer spill support) — adopting `traceindex_dispatch.go`'s existing (better) one-local-
+variable convention at the SAME call site, rather than leaving `mergeLevel`'s own historical
+two-independent-`os.TempDir()`-calls shape in place, was a small, in-scope improvement bundled
+into an already-required signature change, not separate scope creep. `mergeLevel` is the
+production-side value-index compaction entry point; `mergeTraceLevel`
+(`traceindex_dispatch.go`, SPEC-VI-8) already used this convention, so this closes the one
+remaining inconsistency between the two sibling functions.
+
+**Forward-looking note (unchanged by this task):** `tmpDir` is `os.TempDir()` today — the same
+underlying value both call sites always used — but is kept as one local variable specifically
+so it is trivially swappable for a config-driven PVC mount path once deploy-side disk
+provisioning for `value-index-compactor` exists (tracked separately; an `emptyDir` is unsafe
+here given this StatefulSet's replicas can be co-scheduled on the same nodes, per this
+project's own `no-emptyDir` convention).
+
+Back-ref: `internal/modules/valueindexcompactor/service.go:mergeLevel`. See
+`valueindex/SPECS.md` SPEC-VI-18, `NOTES.md` (this file, new entry). Issue #503.

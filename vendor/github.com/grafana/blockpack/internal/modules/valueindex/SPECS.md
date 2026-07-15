@@ -14,7 +14,7 @@ across the whole value-index pipeline's NOTES.md files by established convention
 assigned in ascending order and never reused or renumbered; superseded entries are marked
 `[SUPERSEDED by SPEC-VI-N]` rather than deleted.
 
-Next free ID: **SPEC-VI-18**.
+Next free ID: **SPEC-VI-19**.
 
 ---
 
@@ -163,6 +163,46 @@ evidence (tenant 11638 histogram) that informed the final cap constant.
 Back-ref: `internal/modules/valueindex/stream_compaction.go:StreamCompactBucketFiles,
 mergeGroupsAtKey, collectContributionsAtKey`. See `NOTES.md` NOTE-VI-111, NOTE-VI-112 (why the
 regression test for this proves an output-shape postcondition rather than a peak-heap bound).
+
+**Addendum (2026-07-15, issue #503): the "K × fan-in, unbounded" transient union-buffer risk
+above is now CLOSED, not merely mitigated — with one honestly-scoped exception.**
+`mergeGroupsAtKey`'s union-building internals (`keymerge_spill.go`) were rewritten from a
+map-of-maps held for the whole key to a disk-spill design (SPEC-VI-18): contributing
+`(ref, span)` pairs accumulate into a flat in-memory buffer that spills to a sorted temp chunk
+once its estimated size crosses `shared.ValueIndexMergeBufferSpillBytes` (mirroring
+`runspill.go`'s external sort-merge shape, NOTE-VI-026), and a streaming k-way merge
+(`reduceKeySpillRecords`) reduces the spilled chunks plus the in-memory tail back into output
+groups, feeding completed refs into a `streamingSplitPacker` (SPEC-VI-16's greedy-first-fit
+packing, ported to an incremental shape) as soon as each ref is finished, rather than
+materializing the full merged result first.
+
+**Revised peak memory bound, mutation-tested (NOTES.md NOTE-VI-113, TESTS.md new entries):**
+bounded by (a) O(one spill-chunk's worth of records, itself bounded by
+`shared.ValueIndexMergeBufferSpillBytes`/estimated-record-size) — **mutation-confirmed
+load-bearing** — plus (c) O(`maxSpansPerGroup`, one sibling group being incrementally packed) —
+**mutation-confirmed load-bearing** — **independent of K (contributing file/iterator count) and
+independent of the key's cumulative real total fan-in.** This closes the "K × fan-in" gap this
+Addendum's 2026-07-14 text left open.
+
+**Honest exception, NOT closed by this task:** the design's memory-bound argument also leans on
+a third term — (b) one ref's own per-TraceID union is bounded by `shared.MaxSpans` (a real but
+*derived, cross-package* consequence of `blockio/shared`'s row-count limit at
+`blockio/shared/constants.go:573`, not a `valueindex`-native invariant; pinned by
+`TestBucketBlockRef_CannotAddressABlockWithSpanCountAboveMaxSpans` — the real cross-package
+decode-time enforcement test, TESTS.md TEST-VI-36). Mutation testing found this
+specific term is **not provably load-bearing** against a "shared, never-reset union map" class of
+bug: `SpanIndexes` values are `uint16`, so any map keyed by them is information-theoretically
+capped at 65,536 entries regardless of fixture scale — far below `shared.MaxSpans` (1,000,000) —
+so no amount of fixture scaling could make that mutation violate this specific bound. That class
+of bug is a correctness defect (wrong unions), not a memory-bound violation, and is independently
+guarded by `TestReduceKeySpillRecords_UnionsSpanIndexesAcrossChunks`'s own mutation check
+(TESTS.md). Term (b) is retained here as a true structural fact (real, worth stating), not as
+this task's own proven regression guard.
+
+Back-ref: `internal/modules/valueindex/keymerge_spill.go` (`keySpillRecord`,
+`accumulateAndSpillKeyRecords`, `reduceKeySpillRecords`, `streamingSplitPacker`),
+`internal/modules/valueindex/stream_compaction.go:mergeGroupsAtKey,
+mergeGroupsAtKeyWithSpillThreshold`. See SPEC-VI-18, NOTES.md NOTE-VI-113. Issue #503.
 
 ---
 
@@ -1080,3 +1120,82 @@ per-tenant span-count histogram that determined the primary cap's value (`NOTES.
 Back-refs: `internal/modules/valueindex/stream_compaction.go:streamOutputWriter,
 newStreamOutputWriter, estimateBucketGroupBytes`, `internal/modules/blockio/shared/constants.go:
 ValueIndexBucketBlockMaxBytes`. See `TESTS.md` TEST-VI-29.
+
+---
+
+## SPEC-VI-18: Per-key merge-buffer disk-spill mechanism — transient, invisible to output shape (issue #503)
+*Added: 2026-07-15*
+
+**Contract:** `mergeGroupsAtKey`'s transient per-key union-building buffer (SPEC-VI-2's Addendum,
+2026-07-15) is bounded by spilling to disk once its estimated size crosses
+`shared.ValueIndexMergeBufferSpillBytes` (4 MiB, real-data-confirmed against two S3 samples —
+see `blockio/shared/constants.go`'s own comment on the constant). Spilling is **purely a
+transient memory-management technique, invisible to output-group semantics** — it changes HOW
+the per-key union is built, never WHAT gets split/emitted. `splitBucketGroupBySpanCap`'s
+SPEC-VI-16 re-consolidation guarantee is preserved by construction, not by argument: the
+streaming incremental packer (`streamingSplitPacker`) is a proven-equivalent, byte-for-byte
+behavioral port of `splitBucketGroupBySpanCap`'s own greedy-first-fit logic
+(`TestStreamingSplitPacker_MatchesSplitBucketGroupBySpanCap`, TESTS.md), so a spilled key and a
+never-spilled key with identical contributions produce byte-identical output
+(`TestMergeGroupsAtKey_SpillPathEquivalence`, TESTS.md).
+
+**Spill record format** (`keySpillRecord`, `keymerge_spill.go`): a flat, ephemeral,
+process-internal wire record — `sourceID[2] + BlockRef[5] + traceID[16] + idx_count[2] +
+idx[2]*idx_count` — one record per contributed `(ref, span)` pair, sorted by `(sourceID,
+ref.PageNum, TraceID)` (the same total order `mergeGroupsAtKey`'s own final sort has always
+produced). Spill files are created via `writeKeySpillChunk` (`os.CreateTemp(tmpDir,
+"vi-keymerge-*.tmp")`, mirroring `runspill.go`'s `writeRun`) and fully consumed within the SAME
+`mergeGroupsAtKey` call that created them — this format therefore has NO versioning/compat
+concerns, unlike `runspill.go`'s `rawEntry` format (contrast `spillV2Flag`/`spillV4Flag`).
+`tmpDir` must be the caller-supplied PVC-backed scratch directory, never a silent fallback to
+`os.TempDir()` — a nonexistent/unwritable `tmpDir` returns a clear error and aborts the whole
+key (Edge Case 3, plan.md), rather than defeating the reason `tmpDir` threading exists.
+
+**Dedup rule across a spill boundary (correctness-critical, deliberately DIFFERENT from
+`runspill.go`'s own rule):** `reduceKeySpillRecords`'s streaming k-way merge UNIONS
+`SpanIndexes` for a duplicate `(sourceID, ref, TraceID)` triple across chunks/tail — a
+`map[uint16]struct{}` scoped to ONLY the current TraceID being built, freed the instant the
+TraceID changes — never collapses to a single ("first-wins") entry the way `runspill.go`'s
+`sameEntry`/`mergeRuns` dedup does. `TestReduceKeySpillRecords_UnionsSpanIndexesAcrossChunks` and
+`TestMergeGroupsAtKey_UnionDedupNotFirstWinsAcrossSpillBoundary` (TESTS.md) pin this rule with a
+mutation check confirming a naive first-wins port would be caught.
+
+**Memory-bound formula (mutation-tested, NOTE-VI-113):** peak per-key merge-buffer memory is
+bounded by O(one spill-chunk's records, itself bounded by
+`ValueIndexMergeBufferSpillBytes`/estimated-record-size — **mutation-confirmed load-bearing**)
+plus O(`maxSpansPerGroup`, one sibling group being incrementally packed — **mutation-confirmed
+load-bearing**) — independent of K and of the key's cumulative real fan-in. A third term, one
+ref's own per-TraceID union bounded by `shared.MaxSpans` (`blockio/shared/constants.go:573` —
+**cited by name, a derived cross-package consequence of the base blockio format's row-count
+limit, NOT re-derived or independently enforced by `valueindex`** —
+`TestBucketBlockRef_CannotAddressABlockWithSpanCountAboveMaxSpans` pins the CURRENT real-world
+coupling via the actual decode-time enforcement, TESTS.md TEST-VI-36),
+is a true structural fact but is honestly **not** mutation-confirmed load-bearing against a
+"shared, never-reset union map" bug class — `SpanIndexes` being `uint16` caps any such map at
+65,536 entries regardless of fixture scale, far below `shared.MaxSpans` — so that class of bug
+manifests as a correctness defect (covered by the dedup-rule tests above), not a provable memory
+violation via this term. See SPEC-VI-2's Addendum for the full honest framing.
+
+**Cleanup (every exit path, including error/cancellation):** every spill chunk created for a key
+is removed via a `defer` registered immediately after `accumulateAndSpillKeyRecords` returns —
+success or error — so a partial failure partway through accumulation (string-table overflow, a
+disk write error, or `ctx` cancellation) never leaves an orphaned `vi-keymerge-*.tmp` file.
+`ctx.Err()` is checked once per ref boundary inside the accumulation loop, so a genuinely huge
+hot-key spill can still be cancelled promptly rather than running to completion after
+cancellation was requested. `sweepOrphanedMergeTempFilesIn` (`temp_cleanup.go`) additionally
+globs `vi-keymerge-*.tmp` as a backstop against a crash mid-key-spill.
+
+**Non-goal:** `stream_trace_compaction.go`/`collectTraceContributionsAtKey`/
+`mergeTraceGroupsAtKey` are explicitly NOT touched by this spec or its implementation — per
+SPEC-VI-14's "mirror, don't share" precedent, TraceGroup's own transient-buffer risk (if any) is
+deferred to a separate follow-up issue pending its own real-data evidence.
+
+Back-refs: `internal/modules/valueindex/keymerge_spill.go` (`keySpillRecord`,
+`writeKeySpillRecord`, `readKeySpillRecord`, `keySpillChunk`, `writeKeySpillChunk`,
+`keySpillChunkReader`, `estimateKeySpillRecordBytes`, `streamingSplitPacker`,
+`reduceKeySpillRecords`), `internal/modules/valueindex/stream_compaction.go:mergeGroupsAtKey,
+mergeGroupsAtKeyWithSpillThreshold, accumulateAndSpillKeyRecords`,
+`internal/modules/valueindex/temp_cleanup.go:sweepOrphanedMergeTempFilesIn`,
+`internal/modules/blockio/shared/constants.go:ValueIndexMergeBufferSpillBytes, MaxSpans`. See
+SPEC-VI-2 (Addendum), SPEC-VI-16, SPEC-VI-14, `NOTES.md` NOTE-VI-113, `TESTS.md` (new entries,
+Phases 2-8). Issue #503.

@@ -486,6 +486,33 @@ const (
 	// than this stay entirely in memory and take the unchanged fast path.
 	ValueIndexWriterSpillEntries = 500_000
 
+	// ValueIndexMergeBufferSpillBytes is the estimated-byte threshold at which
+	// mergeGroupsAtKey's transient per-key merge buffer spills its accumulated-so-far
+	// contributions to disk and resets (see NOTES.md, issue #503 — NOTE-VI-* ID intentionally
+	// not hardcoded here since it's a global sequence shared across concurrently-worked-on
+	// worktrees; see the NOTES.md entry itself for the bound ID), mirroring
+	// ValueIndexWriterSpillEntries' external-sort-merge shape on the write path. Estimated via
+	// the same cheap proxy estimateBucketGroupBytes uses (32B/ref + 24B/span).
+	//
+	// Value confirmed 2026-07-14 against two real S3 samples from tenant 11638, "string"
+	// column, both L2 files (internal/modules/valueindex/cmd/fanin503tmp, deleted after use):
+	// (1) an actual compact_threshold_files=4-shaped batch from column-hash
+	// c121a7cee525dd68944d2d3488c41a5c (four L2 files sharing the same 1783934400 window
+	// start, 384MB-1.19GB each) — 249 distinct keys, 49 (19.7%) shared across >=2 of the 4
+	// files (real K-way amplification, not just single-file pathological groups): combined
+	// cross-file span-ref fan-in median=561,638, p99=3,111,433; the 49 multi-file keys' own
+	// estimated bytes median=14.6MB, max=91.5MB. (2) a broader, non-overlapping 3-file sample
+	// from a second column-hash directory (29f30d55352e4f7588f7988666891ca7) confirming the
+	// earlier brainstorm's bimodal shape holds more generally: 662 keys, all single-file in
+	// this sample, median=920 bytes, p99=10.5MB, max=28.7MB.
+	//
+	// 4 MiB sits comfortably above both samples' typical case (sub-KB to low-KB median) while
+	// remaining well below the observed hot tail in both the single-file (up to ~35MB, #501's
+	// own evidence) and now-confirmed cross-file (up to ~91.5MB) pathological range — a
+	// genuinely hot key spills roughly 20+ times at this threshold, bounding peak per-spill-
+	// round memory tightly rather than accumulating to one large spill.
+	ValueIndexMergeBufferSpillBytes = 4 << 20
+
 	// ValueIndexCompactThresholdFiles is the file count above which compaction is triggered.
 	ValueIndexCompactThresholdFiles = 8
 	// ValueIndexCompactThresholdBytes is the total size above which compaction is triggered.

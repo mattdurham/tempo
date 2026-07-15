@@ -483,6 +483,18 @@ func (s *Service) mergeLevel(ctx context.Context, colDir string, files []levelFi
 
 	outputLevel := files[0].level + 1
 
+	// tmpDir is the single source of truth for where this merge stages local files (mirrors
+	// traceindex_dispatch.go's own convention), threaded into both the input-side
+	// writeLocalTempInput calls below AND the output-side StreamCompactBucketFiles call
+	// (which itself uses it for both merge-buffer spill chunks, issue #503, and output
+	// files) -- os.TempDir() today, but kept as one local variable (rather than each call
+	// site independently hardcoding os.TempDir()) so it is trivially swappable for a
+	// config-driven mount path once one exists (deploy-side disk provisioning for
+	// value-index-compactor, e.g. a PVC via volumeClaimTemplate, is being handled separately
+	// -- an emptyDir is unsafe here given this StatefulSet's replicas can be co-scheduled on
+	// the same nodes).
+	tmpDir := os.TempDir()
+
 	// NOTE-VI-077 (#482): MaxOutputBytes is threaded into StreamCompactBucketFiles below so
 	// the v2 BucketGroup path splits its output into multiple size-bounded files at block
 	// boundaries once the cap is exceeded, instead of emitting one unbounded file per input
@@ -513,7 +525,7 @@ func (s *Service) mergeLevel(ctx context.Context, colDir string, files []levelFi
 			s.metrics.incError(compactorOpGet)
 			return fmt.Errorf("valueindexcompactor: get %q: %w", f.key, err)
 		}
-		tmpPath, err := writeLocalTempInput(os.TempDir(), data)
+		tmpPath, err := writeLocalTempInput(tmpDir, data)
 		if err != nil {
 			return fmt.Errorf("valueindexcompactor: stage %q locally: %w", f.key, err)
 		}
@@ -532,7 +544,7 @@ func (s *Service) mergeLevel(ctx context.Context, colDir string, files []levelFi
 	}
 
 	var written int
-	err := valueindex.StreamCompactBucketFiles(ctx, iterators, 0, s.cfg.MaxOutputBytes, func(outPath string) error {
+	err := valueindex.StreamCompactBucketFiles(ctx, iterators, 0, s.cfg.MaxOutputBytes, tmpDir, func(outPath string) error {
 		//nolint:gosec // G304: outPath is StreamCompactBucketFiles' own local temp output file, not user input
 		data, err := os.ReadFile(outPath)
 		if err != nil {

@@ -4,8 +4,10 @@ package valueindex
 //
 // temp_cleanup.go — startup sweep for orphaned local merge temp files (plan.md Decision 4).
 // A process that crashes mid-merge can leave vi-merge-{in,out}-*.tmp files behind in the local
-// temp directory; this sweep removes them once, at service construction time. It never
-// touches runspill.go's vi-run-*.tmp files (a distinct, non-overlapping naming convention).
+// temp directory; this sweep removes them once, at service construction time. Since #503 it
+// also covers vi-keymerge-*.tmp (mergeGroupsAtKey's per-key spill chunks, keymerge_spill.go) —
+// a crash mid-key-spill must not leave those orphaned forever either. It never touches
+// runspill.go's vi-run-*.tmp files (a distinct, non-overlapping naming convention).
 
 import (
 	"fmt"
@@ -30,17 +32,25 @@ import (
 // still in active use or was orphaned so recently it will be caught by the next sweep.
 const staleMergeTempFileAge = 10 * time.Minute
 
-// sweepOrphanedMergeTempFilesIn removes every vi-merge-*.tmp file directly under dir that is
-// at least staleMergeTempFileAge old. Both the input-side (vi-merge-in-*, valueindexcompactor)
-// and output-side (vi-merge-out-*, this package) naming conventions share this prefix, so one
-// glob catches both. Best-effort: a missing or unreadable dir yields (0, nil), not an error —
-// a leftover orphaned file is a disk-hygiene concern, not a correctness blocker. Individual
-// stat/removal failures are collected (the first is returned) but every match is still
-// attempted.
+// orphanedMergeTempFileGlobs are the filename patterns the startup sweep treats as
+// orphanable: the pre-#503 vi-merge-{in,out}-*.tmp pair, plus #503's vi-keymerge-*.tmp
+// per-key spill-chunk prefix. filepath.Glob has no brace-expansion, so each pattern needs
+// its own Glob call; matches are unioned.
+var orphanedMergeTempFileGlobs = []string{"vi-merge-*.tmp", "vi-keymerge-*.tmp"}
+
+// sweepOrphanedMergeTempFilesIn removes every file directly under dir matching
+// orphanedMergeTempFileGlobs that is at least staleMergeTempFileAge old. Best-effort: a
+// missing or unreadable dir yields (0, nil), not an error — a leftover orphaned file is a
+// disk-hygiene concern, not a correctness blocker. Individual stat/removal failures are
+// collected (the first is returned) but every match is still attempted.
 func sweepOrphanedMergeTempFilesIn(dir string) (int, error) {
-	matches, err := filepath.Glob(filepath.Join(dir, "vi-merge-*.tmp"))
-	if err != nil {
-		return 0, fmt.Errorf("valueindex: sweepOrphanedMergeTempFilesIn: glob: %w", err)
+	var matches []string
+	for _, pat := range orphanedMergeTempFileGlobs {
+		m, err := filepath.Glob(filepath.Join(dir, pat))
+		if err != nil {
+			return 0, fmt.Errorf("valueindex: sweepOrphanedMergeTempFilesIn: glob %q: %w", pat, err)
+		}
+		matches = append(matches, m...)
 	}
 	var removed int
 	var firstErr error
