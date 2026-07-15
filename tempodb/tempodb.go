@@ -280,6 +280,17 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("creating postgres pool: %w", err)
 		}
+		// Cube's registry (blockpack.NewPgCubeRegistry, wired below via
+		// ConfigureCubeManager/ConfigureCubeQueryPath) has required Postgres since
+		// issue #504, but nothing in production ever called ApplyCubeSchema for it --
+		// cmd/tempo/app/value_index.go's colhashmanifest wiring (#507) applies its own
+		// schema at pool-construction time, and cube's registry needs the same
+		// treatment or every query/write against a fresh Postgres instance fails with
+		// "relation does not exist" instead of a clear startup error.
+		if err := blockpack.ApplyCubeSchema(context.Background(), pgPool); err != nil {
+			pgPool.Close()
+			return nil, nil, nil, fmt.Errorf("applying cube postgres schema: %w", err)
+		}
 	}
 
 	r := backend.NewReader(rawR)

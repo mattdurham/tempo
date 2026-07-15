@@ -49,6 +49,89 @@ docker buildx build \
 
 echo "==> Image pushed: ${IMAGE}"
 
+# Ensure Postgres exists before rolling components that depend on it -- issue #504 made
+# cube's registry Postgres-only (validateConfig hard-fails at tempo startup if
+# blockpack.cube_tenants is non-empty and storage.trace.postgres isn't configured). The
+# .k8s/configs/{block-builder,backend-worker}.yaml templates below point at this instance;
+# if it doesn't exist yet (e.g. a fresh namespace), a redeploy would otherwise crash-loop
+# on startup the same way tempo-dev-test-03 did on 2026-07-15. Idempotent: kubectl apply
+# no-ops if postgres-viusage already exists and is unchanged.
+echo "--- Ensuring postgres-viusage exists ---"
+cat <<'PGEOF' | kubectl apply -n "$NAMESPACE" -f -
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-viusage
+  labels:
+    app: postgres-viusage
+spec:
+  clusterIP: None
+  selector:
+    app: postgres-viusage
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres-viusage
+  labels:
+    app: postgres-viusage
+spec:
+  serviceName: postgres-viusage
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-viusage
+  template:
+    metadata:
+      labels:
+        app: postgres-viusage
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - name: POSTGRES_HOST_AUTH_METHOD
+              value: trust
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi
+PGEOF
+kubectl wait --for=condition=Ready pod/postgres-viusage-0 -n "$NAMESPACE" --timeout=120s
+
 # Push configs from .k8s/configs/ reference files
 CONFIGS_DIR="$(dirname "$0")/.k8s/configs"
 echo "--- Pushing configs from ${CONFIGS_DIR} ---"

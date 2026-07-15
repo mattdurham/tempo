@@ -1164,10 +1164,12 @@ func TestNew_CacheProviderConfigured_RegistriesGetUnwrappedRawBackend(t *testing
 			ReadBufferCount: 8, ReadBufferSizeBytes: 4 * 1024 * 1024,
 		},
 		// issue #504: validateConfig now hard-fails if CubeTenants is non-empty without
-		// Postgres configured. This test's pgxpool is never dialed (NewPool/ParseConfig
-		// don't connect eagerly), so an empty DSN is fine -- this test is about
-		// cache-provider unwrapping, not Postgres connectivity.
-		Postgres: &postgres.Config{},
+		// Postgres configured. New() also now applies blockpack's cube schema against
+		// this pool at construction time, so a real, connectable Postgres is required --
+		// an empty/unreachable DSN is no longer enough now that schema application
+		// forces an actual connection (this test is otherwise about cache-provider
+		// unwrapping, not Postgres connectivity).
+		Postgres: &postgres.Config{DSN: newTestPostgresPool(t)},
 	}
 
 	// A real, non-nil cache.Provider with zero roles configured -- mirrors a real deployment's
