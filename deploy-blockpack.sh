@@ -146,6 +146,20 @@ for component in block-builder backend-worker querier query-frontend live-store;
     fi
 done
 
+# value-index-compactor's configmap ("value-index-compactor-config", key tempo.yaml) doesn't fit
+# the tempo-${component} naming pattern above -- .k8s/configs/value-index-compactor.yaml is
+# already the StatefulSet's own manifest, not its tempo.yaml content, so its config lives in a
+# separately-named reference file instead. Wired with postgres: (2026-07-15) so its ManifestStore
+# (issue #507) uses blockpack.NewPgColumnManifestStore instead of falling back to blob.
+vic_compactor_cfg="${CONFIGS_DIR}/value-index-compactor-tempo.yaml"
+if [[ -f "$vic_compactor_cfg" ]]; then
+    kubectl patch configmap value-index-compactor-config -n "$NAMESPACE" --type=merge \
+        -p "{\"data\":{\"tempo.yaml\":$(jq -Rs . < "$vic_compactor_cfg")}}"
+    echo "    patched value-index-compactor-config"
+else
+    echo "    WARNING: no config file for value-index-compactor at ${vic_compactor_cfg}"
+fi
+
 # Roll components
 echo "--- Updating block-builder ---"
 kubectl set image statefulset/block-builder -n "$NAMESPACE" "block-builder=${IMAGE}"
