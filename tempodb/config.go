@@ -12,6 +12,7 @@ import (
 
 	"github.com/grafana/tempo/pkg/cache"
 	"github.com/grafana/tempo/pkg/util"
+	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/backend/azure"
 	backend_cache "github.com/grafana/tempo/tempodb/backend/cache"
 	"github.com/grafana/tempo/tempodb/backend/gcs"
@@ -200,6 +201,17 @@ func validateConfig(cfg *Config) error {
 	// silently no-op the first time they actually try to touch the registry.
 	if len(cfg.Block.Blockpack.CubeTenants) > 0 && cfg.Postgres == nil {
 		return errors.New("blockpack.cube_tenants is non-empty but postgres is not configured: the cube registry requires postgres (issue #504)")
+	}
+
+	// The check above does NOT cover this: ConfigureCubeQueryPath (tempodb.go) is called
+	// unconditionally whenever ValueIndexEnabled+S3, with no CubeTenants gate at all -- it's the
+	// querier-side opportunistic cube-creation path (tryQueryFromCube/maybeCreateCube), distinct
+	// from the ingest-side cube manager the CubeTenants check actually guards. A nil pgPool there
+	// doesn't panic or error -- it declines silently, every query, forever, with zero log signal
+	// (2026-07-15 incident: querier ran for weeks with cube creation permanently, invisibly
+	// dead because this exact gap was never caught). Fail fast instead.
+	if cfg.Block.Blockpack.ValueIndexEnabled && cfg.Backend == backend.S3 && cfg.Postgres == nil {
+		return errors.New("blockpack.value_index_enabled is true with an S3 backend but postgres is not configured: the cube query path silently never creates cubes without it")
 	}
 
 	return nil

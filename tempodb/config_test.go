@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/grafana/tempo/modules/postgres"
+	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding/common"
 	"github.com/grafana/tempo/tempodb/encoding/vparquet5"
 	"github.com/grafana/tempo/tempodb/wal"
@@ -177,6 +178,90 @@ func TestValidateConfig(t *testing.T) {
 					},
 				},
 				Postgres: &postgres.Config{},
+			},
+		},
+		// issue #504 follow-up (2026-07-15 incident): ValueIndexEnabled+S3 with no Postgres
+		// configured hard-fails too -- the cube QUERY path (ConfigureCubeQueryPath) is wired
+		// unconditionally on this exact condition, with NO CubeTenants gate, so leaving it
+		// unchecked let a real deployment (tempo-dev-test-03's querier) run for weeks with cube
+		// creation silently, permanently dead and zero log signal.
+		{
+			cfg: &Config{
+				WAL: &wal.Config{},
+				Block: &common.BlockConfig{
+					BloomFP:             0.01,
+					BloomShardSizeBytes: 1,
+					Version:             vparquet5.VersionString,
+					Blockpack: common.BlockpackConfig{
+						ValueIndexEnabled: true,
+					},
+				},
+				Backend:  backend.S3,
+				Postgres: nil,
+			},
+			err: errors.New("blockpack.value_index_enabled is true with an S3 backend but postgres is not configured: the cube query path silently never creates cubes without it"),
+		},
+		// same condition, Postgres configured: passes.
+		{
+			cfg: &Config{
+				WAL: &wal.Config{},
+				Block: &common.BlockConfig{
+					BloomFP:             0.01,
+					BloomShardSizeBytes: 1,
+					Version:             vparquet5.VersionString,
+					Blockpack: common.BlockpackConfig{
+						ValueIndexEnabled: true,
+					},
+				},
+				Backend:  backend.S3,
+				Postgres: &postgres.Config{},
+			},
+			expectedConfig: &Config{
+				WAL: &wal.Config{
+					Version: vparquet5.VersionString,
+				},
+				Block: &common.BlockConfig{
+					BloomFP:             0.01,
+					BloomShardSizeBytes: 1,
+					Version:             vparquet5.VersionString,
+					Blockpack: common.BlockpackConfig{
+						ValueIndexEnabled: true,
+					},
+				},
+				Backend:  backend.S3,
+				Postgres: &postgres.Config{},
+			},
+		},
+		// ValueIndexEnabled+non-S3 backend with no Postgres: passes -- ConfigureCubeQueryPath
+		// itself is S3-only (tempodb.go's own gate), so this combination never reaches it.
+		{
+			cfg: &Config{
+				WAL: &wal.Config{},
+				Block: &common.BlockConfig{
+					BloomFP:             0.01,
+					BloomShardSizeBytes: 1,
+					Version:             vparquet5.VersionString,
+					Blockpack: common.BlockpackConfig{
+						ValueIndexEnabled: true,
+					},
+				},
+				Backend:  backend.Local,
+				Postgres: nil,
+			},
+			expectedConfig: &Config{
+				WAL: &wal.Config{
+					Version: vparquet5.VersionString,
+				},
+				Block: &common.BlockConfig{
+					BloomFP:             0.01,
+					BloomShardSizeBytes: 1,
+					Version:             vparquet5.VersionString,
+					Blockpack: common.BlockpackConfig{
+						ValueIndexEnabled: true,
+					},
+				},
+				Backend:  backend.Local,
+				Postgres: nil,
 			},
 		},
 	}
