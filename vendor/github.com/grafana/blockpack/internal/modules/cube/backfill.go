@@ -200,13 +200,16 @@ func buildSpanVals(
 
 // processMinute builds one cube file for the given minute from value index data.
 func (b *Backfiller) processMinute(ctx context.Context, minute uint32) error {
-	// b.entry.Dimensions[0] is indexed unconditionally below. This is safe in practice because
-	// every real RegistryEntry is constructed via CreationTrigger.TryCreate (which only ever
-	// reaches here via cubequerypath.go's extractGroupByDims, itself guarded against an empty
-	// dims slice) — but Backfiller/NewBackfiller take a bare RegistryEntry with no validation of
-	// their own, so a hand-constructed or future non-cubequerypath caller with empty Dimensions
-	// would otherwise panic here instead of failing with a typed error (#491 Phase E fix pass,
-	// go-presubmit.md LOW finding).
+	// b.entry.Dimensions[0] is indexed unconditionally below. SPEC-CUBE-033: this is a PERMANENT
+	// limitation of the VI-based backfill mechanism, not merely a defensive guard against a
+	// malformed caller -- LookupColumn is fundamentally a per-attribute-value inverted-index
+	// lookup ("which spans have column X = value Y"), never an "enumerate every span" query. A
+	// zero-dimension (ungrouped) cube has no dimension column to anchor such a lookup on, so
+	// there is no way to reconstruct its historical per-minute counts from the value index at
+	// all -- a structural limitation, not something a different sentinel or extra plumbing
+	// would fix. A zero-dimension cube therefore only ever accumulates data going FORWARD from
+	// its creation moment (via forward ingest, which needs no VI lookup); this guard declines
+	// cleanly, once, rather than let Dimensions[0] panic on an out-of-bounds index.
 	if len(b.entry.Dimensions) == 0 {
 		return &DefinitionError{
 			Reason:     fmt.Sprintf("cube backfill: RegistryEntry %q has no Dimensions", b.entry.CubeID),
@@ -221,7 +224,12 @@ func (b *Backfiller) processMinute(ctx context.Context, minute uint32) error {
 	// directly from the registry entry — a real RegistryEntry is only ever created via
 	// CreationTrigger.TryCreate, which already enforces (via validateDefinition, E-4) that
 	// duration is present, so this is not re-derived defensively here.
-	dim2Col := "_"
+	// NOTE-CUBE-033 (Bug 2): must match CubeRegistryEntryToDefinition's forward-ingest sentinel
+	// exactly (AllDimSentinel, "__all__") -- a mismatched literal here previously ("_") meant a
+	// single-dimension cube's backfilled and forward-ingested files carried two DIFFERENT
+	// dim2 dictionary values, so CubeRollup treated them as two distinct series per dim1 value
+	// instead of merging them.
+	dim2Col := AllDimSentinel
 	if len(b.entry.Dimensions) > 1 {
 		dim2Col = b.entry.Dimensions[1]
 	}
@@ -265,8 +273,9 @@ func (b *Backfiller) processMinute(ctx context.Context, minute uint32) error {
 		return err
 	}
 
-	// If there is only one dimension, use a fixed sentinel for dim2.
-	dim2 := "_"
+	// If there is only one dimension, use a fixed sentinel for dim2 (must match dim2Col above,
+	// and CubeRegistryEntryToDefinition's forward-ingest sentinel -- see its own comment).
+	dim2 := AllDimSentinel
 	if len(b.entry.Dimensions) > 1 {
 		// With 2 dimensions, we need both. Build a (traceID+spanID) → dim1value map from
 		// dim1 entries, then scan dim2 entries to find matching spans and record (dim1,dim2) pairs.
@@ -298,7 +307,7 @@ func (b *Backfiller) processMinute(ctx context.Context, minute uint32) error {
 			}
 		}
 	} else {
-		// Single dimension: each dim1 entry increments the (dim1, "_") cell.
+		// Single dimension: each dim1 entry increments the (dim1, AllDimSentinel) cell.
 		for _, e := range dim1Entries {
 			key := viEntryKey(e.TraceID, e.SpanID)
 			d1val := e.SourceRef

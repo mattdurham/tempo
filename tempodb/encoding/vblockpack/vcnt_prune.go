@@ -15,16 +15,10 @@ import (
 // a query over [minSec, maxSec] (argument order matches blockpack.VCNTFileMeta.IsInTimeRange's
 // own (queryMinSec, queryMaxSec) order — do not swap).
 //
-// A v1-shaped or otherwise unparseable name (blockpack.VCNTParseFilenameV2 returns an error)
-// ALWAYS returns true: unknown range means always fetch, never drop. This is an unconditional,
-// hard-coded safety rule, not a tunable — it deliberately avoids repeating blockpack's own
-// valueindex/discovery.go mistake (NOTE-VI-030) of treating "I don't know this file's range"
-// as "skip it," which silently and permanently drops pre-v2-format files from ever being
-// considered.
-func VCNTFileOverlapsRange(name string, minSec, maxSec uint64) bool {
-	meta, err := blockpack.VCNTParseFilenameV2(name)
-	if err != nil {
-		return true
-	}
-	return meta.IsInTimeRange(minSec, maxSec)
-}
+// #508 Decision 3: this pure, store-independent predicate moved into blockpack root
+// (vcnt.go:VCNTFileOverlapsRange, used by cube_backfill_runner.go's buildVCNTSection) so the
+// moved cube backfill orchestration has no tempo-side dependency. Aliased here so
+// modules/frontend/vcnt_fetch.go's call site (vblockpack.VCNTFileOverlapsRange) needs zero
+// changes. See blockpack's own doc comment for the "unparseable name always returns true"
+// safety rule this predicate enforces.
+var VCNTFileOverlapsRange = blockpack.VCNTFileOverlapsRange

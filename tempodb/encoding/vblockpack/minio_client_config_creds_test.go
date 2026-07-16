@@ -34,6 +34,7 @@ import (
 	"testing"
 
 	blockpack "github.com/grafana/blockpack"
+	minio "github.com/minio/minio-go/v7"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -153,11 +154,22 @@ func TestConfigureCubeQueryPath_UsesConfigCredentialsNotEnv(t *testing.T) {
 	cqp := getCubeQueryPath()
 	require.NotNil(t, cqp, "ConfigureCubeQueryPath must install the process-level query path")
 
-	// listObjects issues a real bucket-listing GET through cqp.client -- rejected with 403 by the
-	// fake server for anything not signed with accessKey, so success here proves real
-	// authentication with s3cfg's own credentials (no AWS_* env vars set anywhere in this test).
-	_, err := cqp.listObjects(context.Background(), "")
-	require.NoError(t, err,
+	// #508: cqp.listObjects (a thin wrapper around cqp.client.ListObjects) moved into
+	// blockpack's own Lister/CubeFileStore adapters, no longer reachable from tempo test code.
+	// cqp.client itself is still a real field on cubeQueryPath (kept for exactly this kind of
+	// construction-site proof) -- listing through it directly, mirroring minioVIStore.List's own
+	// channel-drain pattern, proves the SAME thing the old cqp.listObjects proxy call did: a real
+	// bucket-listing GET through cqp.client, rejected with 403 by the fake server for anything
+	// not signed with accessKey, so success here proves real authentication with s3cfg's own
+	// credentials (no AWS_* env vars set anywhere in this test).
+	var listErr error
+	for obj := range cqp.client.ListObjects(context.Background(), cqp.bucket, minio.ListObjectsOptions{Recursive: true}) {
+		if obj.Err != nil {
+			listErr = obj.Err
+			break
+		}
+	}
+	require.NoError(t, listErr,
 		"cqp.client must have authenticated with s3cfg.AccessKey/SecretKey; falling back to "+
 			"credentials.NewEnvAWS() would sign anonymously and the fake server would reject the "+
 			"request with 403")

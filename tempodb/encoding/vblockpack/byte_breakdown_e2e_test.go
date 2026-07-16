@@ -240,12 +240,19 @@ func TestE2E_QueryRange_CubeAnswered_ReportsCubeBytesRead_OtherFieldsZero(t *tes
 	cubeFileData := buildRealPartialCubeFile(t, minMinute)
 	fakeClient := newFakeCubeS3Client(t, cubeFileData)
 
+	// #508: files/lister built directly from fakeClient, mirroring ConfigureCubeQueryPath's own
+	// adapter construction -- vi stays nil since this test only exercises the FOUND (cube
+	// answers immediately) path, never the creation trigger.
+	qp := blockpack.NewCubeQueryPath(
+		&cubeFileStore{client: fakeClient, bucket: "test-bucket"},
+		&minioVIStore{client: fakeClient, bucket: "test-bucket"},
+		nil, pgPool, blockpack.CubeQueryPathConfig{},
+	)
 	cqp := &cubeQueryPath{
-		client:     fakeClient,
-		bucket:     "test-bucket",
-		tenants:    make(map[string]*tenantCubeState),
-		createSeen: make(map[string]time.Time),
-		pgPool:     pgPool,
+		client: fakeClient,
+		bucket: "test-bucket",
+		pgPool: pgPool,
+		qp:     qp,
 	}
 	withCubeQueryPath(t, cqp)
 

@@ -3,15 +3,17 @@ package vblockpack
 // backend_jobs_e2e_test.go — #181 Phase 6.1/6.2 (trigger half): real end-to-end proof
 // that the REAL production trigger functions (realUsageRecorder.RecordUse, reached via
 // ConfigureViUsage's installed singleton -- the exact call vi_usage_hook_jobstore_test.go's
-// own Phase 2 tests use; cubeQueryPath.maybeCreateCube, reached via the SAME
-// withCubeQueryPath singleton-injection helper cubequerypath_warming_test.go already
-// established) insert a durable backend_jobs row when Postgres is configured, against a
-// REAL Postgres (testcontainers, mirroring every prior phase's convention) and a REAL
-// S3-compatible endpoint (fake_s3_e2e_test.go's hand-rolled server -- necessary because
-// RunCubeBackfill/LoadCubeEntry (cube_backfill.go) construct their own *minio.Client
-// directly from *s3backend.Config with no dependency-injection seam, so proving the
-// trigger's DOWNSTREAM in-process goroutine also runs for real requires a real S3-shaped
-// HTTP endpoint, not a hand-built fake ObjectStore).
+// own Phase 2 tests use; the cube creation trigger, reached via the REAL
+// ConfigureCubeQueryPath + tryQueryFromCube production entry points -- #508 moved the
+// trigger core itself into blockpack.CubeQueryPath, so cubequerypath.go's OnCreateAttempt
+// callback is now the only tempo-side code that inserts the durable job, and reaching it for
+// real requires the real ConfigureCubeQueryPath construction) insert a durable backend_jobs
+// row when Postgres is configured, against a REAL Postgres (testcontainers, mirroring every
+// prior phase's convention) and a REAL S3-compatible endpoint (fake_s3_e2e_test.go's
+// hand-rolled server -- necessary because blockpack.RunCubeBackfill/LoadCubeEntry construct
+// their own *minio.Client from *s3backend.Config with no dependency-injection seam, so
+// proving the trigger's DOWNSTREAM in-process goroutine also runs for real requires a real
+// S3-shaped HTTP endpoint, not a hand-built fake ObjectStore).
 //
 // The WORKER-claims-and-dispatches half of #181 Phase 6 (6.1/6.2 steps 2-3, 6.3, 6.4)
 // lives in modules/backendworker/backend_jobs_e2e_test.go, NOT here: BackendWorker.
@@ -29,18 +31,17 @@ package vblockpack
 
 import (
 	"context"
+	"errors"
+	"sync"
 	"testing"
 	"time"
 
 	blockpack "github.com/grafana/blockpack"
+	"github.com/grafana/tempo/pkg/tempopb"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	minio "github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
-
-	"github.com/grafana/tempo/tempodb/encoding/vblockpack/jobstore"
 	"github.com/grafana/tempo/tempodb/encoding/vblockpack/migrate"
 )
 
@@ -122,59 +123,58 @@ func TestE2E_ViRecordUse_RealTrigger_InsertsPendingJobAndBackfillCompletes(t *te
 }
 
 // TestE2E_MaybeCreateCube_RealTrigger_InsertsPendingJob is #181 Phase 6.2 step 1
-// (real-wiring half): a real maybeCreateCube call -- reached the SAME way
-// cubequerypath_jobstore_test.go's own Phase 2 tests reached it, but this time with a
-// REAL minio client (not nil) installed as the process singleton via withCubeQueryPath
-// (cubequerypath_warming_test.go's existing helper) so launchBackfill's own internal
-// getCubeQueryPath() lookup finds the SAME real client -- against a real Postgres and a
-// real S3-compatible endpoint, must durably insert a pending cube_backfill row.
+// (real-wiring half): a real query-triggered cube creation -- reached through the REAL
+// ConfigureCubeQueryPath + tryQueryFromCube production entry points (#508 moved the trigger
+// core itself into blockpack.CubeQueryPath; cubequerypath.go's OnCreateAttempt callback is now
+// the ONLY tempo-side code that calls jobStore.InsertCubeBackfill, so reaching it for real
+// requires going through the real ConfigureCubeQueryPath construction, not a hand-built
+// *cubeQueryPath with private fields this package's tests can no longer set directly) --
+// against a real Postgres and a real S3-compatible endpoint, must durably insert a pending
+// cube_backfill row.
 //
-// This test deliberately does NOT wait on launchBackfill's async goroutine
-// (runCubeBackfillCore against WindowMinutes=math.MaxUint32): RunCubeBackfill's own doc
-// comment and #181 Phase 4's backendworker_postgres_jobstore_test.go both independently
+// This test deliberately does NOT wait on the OnCreateAttempt closure's inner backfill
+// goroutine (blockpack.RunCubeBackfill against WindowMinutes=math.MaxUint32): RunCubeBackfill's
+// own doc comment and #181 Phase 4's backendworker_postgres_jobstore_test.go both independently
 // confirmed a from-scratch cube backfill with an unbounded window never returns in any
-// reasonable test time, real S3 or not -- launchBackfill also hardcodes
-// context.Background() for that goroutine (not a caller-supplied, cancelable ctx), so it
-// cannot be bounded from outside either. That goroutine keeps running in the background
-// for the remainder of this test binary's process life (self-limiting: it exits when the
-// process does), exactly mirroring real production behavior -- not suppressed here, since
-// suppressing it (e.g. by leaving cqp.client nil, Phase 2's own choice) would be LESS
-// realistic than this test's real-client wiring, not more. #181 Phase 6.2's own "real side
-// effect" proof for the WORKER's claim-and-execute half (a bounded, ctx-limited variant of
-// the same call) lives in modules/backendworker/backend_jobs_e2e_test.go instead, where a
-// context deadline can legitimately bound the equivalent call.
+// reasonable test time, real S3 or not -- that goroutine also hardcodes context.Background()
+// (not a caller-supplied, cancelable ctx), so it cannot be bounded from outside either. It keeps
+// running in the background for the remainder of this test binary's process life
+// (self-limiting: it exits when the process does), exactly mirroring real production behavior.
+// #181 Phase 6.2's own "real side effect" proof for the WORKER's claim-and-execute half (a
+// bounded, ctx-limited variant of the same call) lives in
+// modules/backendworker/backend_jobs_e2e_test.go instead, where a context deadline can
+// legitimately bound the equivalent call.
 func TestE2E_MaybeCreateCube_RealTrigger_InsertsPendingJob(t *testing.T) {
 	pool := newTestPostgresPool(t)
 	require.NoError(t, migrate.Apply(context.Background(), pool))
 
-	s3cfg := newFakeS3Config(t, "e2e-cube-bucket")
-	client, err := minio.New(s3cfg.Endpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(s3cfg.AccessKey, "test-secret-key", ""),
-		Secure: false,
-		Region: s3cfg.Region,
+	processCubeQueryPathMu.Lock()
+	prevCQP := processCubeQueryPath
+	processCubeQueryPath = nil
+	processCubeQueryPathMu.Unlock()
+	cubeQueryPathOnce = sync.Once{}
+	t.Cleanup(func() {
+		processCubeQueryPathMu.Lock()
+		processCubeQueryPath = prevCQP
+		processCubeQueryPathMu.Unlock()
 	})
-	require.NoError(t, err)
 
-	cqp := &cubeQueryPath{
-		client:     client,
-		bucket:     s3cfg.Bucket,
-		tenants:    make(map[string]*tenantCubeState),
-		createSeen: make(map[string]time.Time),
-		jobStore:   jobstore.New(pool),
-		// pgPool backs maybeCreateCube's cube registry (issue #504: Postgres-only now, no
-		// blob/index.json fallback) -- without this, maybeCreateCube's nil-pgPool guard
-		// would skip cube creation entirely, and this test's whole point (a real durable
-		// pending job actually getting inserted) would never fire.
-		pgPool: pool,
-	}
-	withCubeQueryPath(t, cqp)
+	s3cfg := newFakeS3Config(t, "e2e-cube-bucket")
+	ConfigureCubeQueryPath(true, s3cfg, pool)
+	cqp := getCubeQueryPath()
+	require.NotNil(t, cqp, "ConfigureCubeQueryPath must install the process-level query path")
 
 	tenant := "e2e-cube-tenant"
-	dims := []string{"resource.service.name"}
+	const query = `{} | count_over_time() by (resource.service.name)`
 	now := time.Now()
-	minTS, maxTS := uint64(now.Add(-time.Hour).Unix()), uint64(now.Unix())
-
-	cqp.maybeCreateCube(context.Background(), tenant, dims, nil, "", blockpack.CubeAggAttrTypeFloat64, false, minTS, maxTS)
+	req := &tempopb.QueryRangeRequest{
+		Query: query,
+		Start: uint64(now.Add(-time.Hour).UnixNano()),
+		End:   uint64(now.UnixNano()),
+		Step:  uint64(time.Minute.Nanoseconds()),
+	}
+	_, _, err := cqp.tryQueryFromCube(context.Background(), tenant, req)
+	require.True(t, errors.Is(err, ErrCubeWarming), "err = %v, want ErrCubeWarming (creation triggered on a genuinely empty registry)", err)
 
 	var (
 		jobType, gotTenant, status string

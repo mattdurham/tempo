@@ -272,4 +272,50 @@ phase's ID-routing convention (FOOTGUN 5, `.bob/state/spec-knowledge-phase-e.md`
 | TEST-CUBE-111 | `TestPgEntryStore_AddEntry_ConcurrentFirstCubeRegistration_NoDuplicateOrRace` | pg_entry_store_test.go | 20 goroutines racing AddEntry for the SAME brand-new CubeID on a zero-cube tenant produce exactly one persisted row — the specific race `pg_advisory_xact_lock` exists to prevent, since the first cube for a tenant has no row to `SELECT ... FOR UPDATE`. Mutation-verified (see NOTE-CUBE-030): lock removal alone did not reliably fail; a temporary artificial delay was added to make the race deterministic, confirmed to fail with a real duplicate-key violation, then reverted. |
 | TEST-CUBE-112 | `TestCubeRegistry_BlobAndPgBackends_IdenticalBehavior` | pg_blob_differential_test.go | Runs the identical Add/Remove/UpdateWatermarks/duplicate-Add operation sequence against both a blob-backed and a Postgres-backed Registry; asserts the resulting Load() sets are field-equal — proves SPEC-CUBE-031's behavioral-identity invariant end-to-end, not just structurally |
 
-**Next free ID: TEST-CUBE-113.**
+## TEST-CUBE-113..126 — Query-path orchestration moved to blockpack root, `CubeQueryPath`/`QueryRange` (issue #508)
+
+*ID-numbering caveat: confirmed via direct inspection of this file's own "next free ID" line
+rather than `blockpack_search_modules` or a spec-oracle agent scoped to this worktree — neither
+was reachable in this session.*
+
+| ID | Test | File | Scenario/Setup/Assertions |
+|----|------|------|---------------------------|
+| TEST-CUBE-113 | `TestCubeQueryPathRequestResult_Shape` | cube_query_path_test.go (root package) | Compile-checking shape test for `CubeQueryPathRequest`/`CubeQueryPathResult` — written first, confirmed to fail to compile before the types existed |
+| TEST-CUBE-114 | `TestNewCubeQueryPath_ReturnsNonNilValue` | cube_query_path_test.go (root package) | `NewCubeQueryPath` with fakes returns a non-nil value |
+| TEST-CUBE-115 | `TestCubeQueryPath_LoadEntries_CachesWithinTTL` | cube_query_path_internal_test.go (root package, white-box) | Two `loadEntries` calls within `RegistryCacheTTL` return the STALE (pre-mutation) result after a direct row mutation via `pool.Exec`; `invalidateCache` then forces a fresh load reflecting the mutation |
+| TEST-CUBE-116 | `TestCubeQueryPath_LoadEntries_NilPgPool` | cube_query_path_internal_test.go (root package, white-box) | `loadEntries` returns an error (not a panic) when `pgPool` is nil |
+| TEST-CUBE-117 | `TestCubeQueryPath_QueryRange_FoundReturnsCells` | cube_query_path_test.go (root package) | A real cube file (built via `NewCubeAccumulator`/`Add`/`Encode`) + matching `pgtest`-seeded registry entry: `QueryRange` returns `(result, true, nil)` with the expected `Resolution` and non-empty `Cells` |
+| TEST-CUBE-118 | `TestCubeQueryPath_QueryRange_FanOutUsesListerNotFileStoreList` | cube_query_path_test.go (root package) | `CubeFileStore.List` always returns empty; `QueryRange` still discovers and fetches files (one merged-time-range-shaped name, one accumulator-written unmerged-shaped name) via the `Lister`-supplied raw keys and `CubeFileStore.Get` alone — proves Decision 2's narrower-`Lister` file-coverage is not narrower than the pre-move raw-listing behavior |
+| TEST-CUBE-119 | `TestCubeQueryPath_QueryRange_FanOutOrderIndependent` | cube_query_path_test.go (root package) | 20 fake L0 files with injected per-`Get` jitter produce an identical total cell count regardless of simulated goroutine completion order — proves the ported fan-out's panic-recover/ordering guard survived the move intact |
+| TEST-CUBE-120 | `TestCubeQueryPath_QueryRange_TriggersCubeCreation` | cube_query_path_test.go (root package) | A cache-miss `QueryRange` call returns `(nil, false, CubeErrWarming)` immediately (non-blocking); polling confirms a new `CubeRegistryEntry` is registered and `OnCreateAttempt` fires exactly once with `created=true` |
+| TEST-CUBE-121 | `TestCubeQueryPath_MaybeCreateCube_Cooldown` | cube_query_path_test.go (root package) | Two `QueryRange` calls for the identical `(tenant,dims,filters)` key within `CreateCooldown` invoke `OnCreateAttempt` only once |
+| TEST-CUBE-122 | `TestCubeRegistryEntryToDefinition_ZeroDimension` | cube_zerodim_publicapi_test.go (root package) | A `Dimensions: nil` entry converts to `Dim1Column == Dim2Column == CubeAllDimSentinel`; a real `Accumulator.Add` through that `Definition` counts (`CellCount() == 1`) — see NOTE-CUBE-033 Bug 1 |
+| TEST-CUBE-123 | `TestCubeCreationTrigger_TryCreate_ZeroDimDoesNotPanicOrDecline` | cube_query_path_test.go (root package) | `TryCreate` with `dims` as both `nil` and `[]string{}` succeeds (`Created=true`, empty `Entry.Dimensions`) — no cardinality-gate panic or spurious decline for the zero-dim shape |
+| TEST-CUBE-124 | `TestCubeQueryRouter_Route_ZeroDimDoesNotPanicOrDecline` | cube_query_path_test.go (root package) | `Route` with `dims` as both `nil` and `[]string{}` finds a pre-registered zero-dim cube (`Found=true`) |
+| TEST-CUBE-125 | `TestCubeQueryPath_GroupedQuery_TriggersCreationAndBackfill` | cube_query_path_publicapi_test.go (root package) | Full real sequence: miss → `CubeErrWarming` + background creation → poll for registry entry + `OnCreateAttempt(created=true)` → `RunCubeBackfill` writes a real file from real VI data → second `QueryRange` call for the SAME request succeeds with non-empty `Cells`. Confirmed to fail with the trigger-goroutine spawn temporarily commented out (Step 8.2), and separately caught the real NOTE-CUBE-034 directory-padding bug on its first real run |
+| TEST-CUBE-126 | `TestCubeQueryPath_UngroupedQuery_TriggersZeroDimCreation` | cube_query_path_publicapi_test.go (root package) | Zero-dimension variant of TEST-CUBE-125: an ungrouped (`Dims: nil`) query triggers creation of a `Dimensions: []` cube; a real `Accumulator.Add` through `CubeRegistryEntryToDefinition`'s output counts; `RunCubeBackfill` on that same entry returns a real, non-nil error immediately (the documented permanent limitation, not a silent no-op) |
+
+## TEST-CUBE-127..138 — Backfill runner moved to blockpack root, `RunCubeBackfill`/`NewCubeVIBackfillSource`/`LoadCubeEntry` (issue #508)
+
+| ID | Test | File | Scenario/Setup/Assertions |
+|----|------|------|---------------------------|
+| TEST-CUBE-127 | `TestBuildVCNTSection_MergesInRangeAndSkipsOutOfRangeFiles` | cube_backfill_runner_internal_test.go (root package, white-box) | `buildVCNTSection` merges in-range `.vcnt` objects across dims and skips out-of-range ones via `VCNTFileOverlapsRange` |
+| TEST-CUBE-128 | `TestBuildVCNTSection_NoMatchingDimReturnsEmptySection` | cube_backfill_runner_internal_test.go (root package, white-box) | No VCNT coverage for the requested dims returns a nil/empty section (the cardinality gate's "no coverage, pass by default" contract) |
+| TEST-CUBE-129 | `TestNewCubeVIBackfillSource_LookupColumn_DecodesNumericTypesCorrectly` | cube_backfill_runner_test.go (root package) | Decision 1 regression: a real int64 value ≥10 and a real float64 value, written via the production `valueindex.Writer`, decode via `LookupColumn` to their genuine string forms, not a truncated digit or a bit-pattern misread |
+| TEST-CUBE-130 | `TestNewCubeVIBackfillSource_LookupColumn_MalformedNumericPayloadDoesNotPanic` | cube_backfill_runner_test.go (root package) | A short/malformed numeric-typed payload falls through to raw string passthrough rather than panicking |
+| TEST-CUBE-131 | `TestLoadCubeEntry_NilPgPoolReturnsError` | cube_backfill_runner_test.go (root package) | `LoadCubeEntry` with a nil pool returns an error, not a panic |
+| TEST-CUBE-132 | `TestLoadCubeEntry_RoundTrip` | cube_backfill_runner_test.go (root package) | A `pgtest`-seeded entry loads back correctly by `(tenant, cubeID)` |
+| TEST-CUBE-133 | `TestLoadCubeEntry_NotFoundReturnsError` | cube_backfill_runner_test.go (root package) | An unregistered `cubeID` returns an error, not a zero-value entry |
+| TEST-CUBE-134 | `TestRunCubeBackfill_NilPgPoolDeclinesWithoutPanic` | cube_backfill_runner_test.go (root package) | `RunCubeBackfill` with a nil pool declines with a real error immediately |
+| TEST-CUBE-135 | `TestRunCubeBackfill_WritesFileAndAdvancesWatermark` | cube_backfill_runner_test.go (root package) | A `pgtest`-seeded entry + fake VI data for one minute: `RunCubeBackfill` writes a real cube file and advances the registry's `CubeRollupL0` watermark |
+| TEST-CUBE-136 | `TestRunCubeBackfill_CtxCancelReturnsNonNilError` | cube_backfill_runner_test.go (root package) | A cancelled context makes `RunCubeBackfill` return a non-nil error, never a false "done" (`nil`) |
+| TEST-CUBE-137 | `TestRunCubeBackfill_CircuitBreakerAbortsAfterConsecutiveFailures` | cube_backfill_runner_test.go (root package) | 5+ consecutive forced per-minute failures trip `cubeBackfillMaxConsecutiveFailures` and abort the run with a non-nil error, rather than burning the whole window — underwrites `SPEC-CUBE-032`'s "`err == nil` iff the full window genuinely completed" contract |
+| TEST-CUBE-138 | `TestRunCubeBackfill_ZeroDimensionEntryDeclinesImmediately` | cube_backfill_runner_test.go (root package) | A `Dimensions: nil` entry declines immediately with a real error and burns zero retries — the zero-dim backfill limitation is enforced, not silently wrong |
+
+## TEST-CUBE-139 — Zero-dim/single-dim `AllDimSentinel` backfill regression (issue #508)
+
+| ID | Test | File | Scenario/Setup/Assertions |
+|----|------|------|---------------------------|
+| TEST-CUBE-139 | `TestBackfill_SingleDimDim2SentinelMatchesForwardIngest` | backfill_test.go | Builds one cube file via the forward-ingest-style `Definition{Dim2Column: AllDimSentinel}` path and one via the real `Backfiller`/`processMinute` path for the SAME single-dimension `RegistryEntry`; feeds both into `Rollup` and asserts exactly ONE merged series results. Confirmed to fail (2 unmerged series) against the pre-fix `"_"` literal before implementing the fix — see NOTE-CUBE-033 Bug 2 |
+
+**Next free ID: TEST-CUBE-140.**

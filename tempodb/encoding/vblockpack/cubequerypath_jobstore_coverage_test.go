@@ -1,23 +1,31 @@
 package vblockpack
 
-// cubequerypath_jobstore_coverage_test.go — #181 §6.3/§9 Phase 3: maybeCreateCube's
+// cubequerypath_jobstore_coverage_test.go — #181 §6.3/§9 Phase 3: the cube creation trigger's
 // "already exists" (Created=false) branch must also insert a durable retry job when the
-// existing cube has never completed a single backfill pass (no CubeRollupL0 watermark
-// yet) -- closing the coverage gap identified in §5.3 once cube_backfill's poll is gone.
+// existing cube has never completed a single backfill pass (no CubeRollupL0 watermark yet) --
+// closing the coverage gap identified in §5.3 once cube_backfill's poll is gone.
+//
+// #508 migration: this branch's logic (and its own jobStore.InsertCubeBackfill call) moved from
+// maybeCreateCube (this package) into blockpack.CubeQueryPath's internal trigger, surfaced back
+// to tempo only via cubequerypath.go's OnCreateAttempt callback (created=false, hasL0 bool).
+// These tests can no longer call a private maybeCreateCube method directly -- they now go
+// through the REAL ConfigureCubeQueryPath + tryQueryFromCube production entry points (mirrors
+// backend_jobs_e2e_test.go's own #508 migration), driving a query whose window does NOT overlap
+// the seeded entry's watermark (so Route declines and the trigger re-evaluation fires) for the
+// SAME registry entry identity TryCreate will recognize as "already exists".
 //
 // 2026-07-15 migration (issue #504): cube's registry is Postgres-only now (no
-// blob/index.json fallback), and maybeCreateCube's own registry construction moved to
-// blockpack.NewPgCubeRegistry(cqp.pgPool, tenant) -- these tests seed the pre-existing
-// entry into a real ephemeral Postgres instance (newTestPostgresPool, shared with
-// pg_entrystore_test.go) and set cqp.pgPool, in place of the old
-// seedCubeEntry/fakeCubeRegistryObjectStore blob fixtures.
+// blob/index.json fallback) -- these tests seed the pre-existing entry into a real ephemeral
+// Postgres instance (newTestPostgresPool, shared with pg_entrystore_test.go).
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
 	blockpack "github.com/grafana/blockpack"
+	"github.com/grafana/tempo/pkg/tempopb"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -26,7 +34,7 @@ import (
 )
 
 // existingCubeEntry builds a RegistryEntry that TryCreate will recognize as "already
-// exists" for (tenant, dims, nil filters) -- maybeCreateCube always calls TryCreate with
+// exists" for (tenant, dims, nil filters) -- the trigger always calls TryCreate with
 // only the mandatory duration aggAttr when neededAttrOK is false (buildAggAttrs), so the
 // seeded entry's AggAttrs/CubeID must match that exact shape for TryCreate's cubeID
 // comparison (trigger.go's `c.CubeID == cubeID` check) to find it.
@@ -56,28 +64,37 @@ func TestMaybeCreateCube_AlreadyExists_NoL0Watermark_InsertsRetryJob(t *testing.
 	entry := existingCubeEntry(tenant, dims, nil) // no watermarks at all -> no L0 entry
 	require.NoError(t, blockpack.NewPgCubeRegistry(pool, tenant).Add(context.Background(), entry))
 
-	cqp := &cubeQueryPath{
-		tenants:    make(map[string]*tenantCubeState),
-		createSeen: make(map[string]time.Time),
-		jobStore:   jobstore.New(pool),
-		pgPool:     pool,
-	}
+	resetCubeQueryPathSingleton(t)
+	ConfigureCubeQueryPath(true, newFakeS3Config(t, "e2e-nowatermark-bucket"), pool)
+	cqp := getCubeQueryPath()
+	require.NotNil(t, cqp)
 
 	now := time.Now()
-	minTS, maxTS := uint64(now.Add(-time.Hour).Unix()), uint64(now.Unix())
-	cqp.maybeCreateCube(context.Background(), tenant, dims, nil, "", blockpack.CubeAggAttrTypeFloat64, false, minTS, maxTS)
+	req := &tempopb.QueryRangeRequest{
+		Query: `{} | count_over_time() by (resource.service.name)`,
+		Start: uint64(now.Add(-time.Hour).UnixNano()),
+		End:   uint64(now.UnixNano()),
+		Step:  uint64(time.Minute.Nanoseconds()),
+	}
+	_, _, err := cqp.tryQueryFromCube(context.Background(), tenant, req)
+	require.Error(t, err)
 
 	var count int
-	row := pool.QueryRow(context.Background(),
-		`SELECT count(*) FROM backend_jobs WHERE job_type = 'cube_backfill' AND tenant = $1 AND status = 'pending'`, tenant)
-	require.NoError(t, row.Scan(&count))
-	assert.Equal(t, 1, count, "expected a durable retry job to be inserted for a never-backfilled existing cube")
+	require.Eventually(t, func() bool {
+		row := pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM backend_jobs WHERE job_type = 'cube_backfill' AND tenant = $1 AND status = 'pending'`, tenant)
+		return row.Scan(&count) == nil && count == 1
+	}, 5*time.Second, 10*time.Millisecond, "expected a durable retry job to be inserted for a never-backfilled existing cube")
+	assert.Equal(t, 1, count)
 }
 
 // TestMaybeCreateCube_AlreadyExists_HasL0Watermark_NoInsert is the negative case: a cube
 // that has already completed at least one backfill pass (has a CubeRollupL0 watermark) is
 // healthy -- re-inserting a job for it on every subsequent query would spam retries for a
-// cube that's fine, so no insert must happen.
+// cube that's fine, so no insert must happen. The query window (minutes 5000-5010) deliberately
+// does NOT overlap the seeded watermark (100-200), so Route still declines and the trigger
+// re-evaluation still fires -- genuinely exercising the hasL0=true branch, not merely skipping
+// evaluation because Route already found full coverage.
 func TestMaybeCreateCube_AlreadyExists_HasL0Watermark_NoInsert(t *testing.T) {
 	pool := newTestPostgresPool(t)
 	require.NoError(t, migrate.Apply(context.Background(), pool))
@@ -90,16 +107,22 @@ func TestMaybeCreateCube_AlreadyExists_HasL0Watermark_NoInsert(t *testing.T) {
 	entry := existingCubeEntry(tenant, dims, watermarks)
 	require.NoError(t, blockpack.NewPgCubeRegistry(pool, tenant).Add(context.Background(), entry))
 
-	cqp := &cubeQueryPath{
-		tenants:    make(map[string]*tenantCubeState),
-		createSeen: make(map[string]time.Time),
-		jobStore:   jobstore.New(pool),
-		pgPool:     pool,
-	}
+	resetCubeQueryPathSingleton(t)
+	ConfigureCubeQueryPath(true, newFakeS3Config(t, "e2e-haswatermark-bucket"), pool)
+	cqp := getCubeQueryPath()
+	require.NotNil(t, cqp)
 
-	now := time.Now()
-	minTS, maxTS := uint64(now.Add(-time.Hour).Unix()), uint64(now.Unix())
-	cqp.maybeCreateCube(context.Background(), tenant, dims, nil, "", blockpack.CubeAggAttrTypeFloat64, false, minTS, maxTS)
+	req := &tempopb.QueryRangeRequest{
+		Query: `{} | count_over_time() by (resource.service.name)`,
+		Start: 5000 * 60 * 1_000_000_000,
+		End:   5010 * 60 * 1_000_000_000,
+		Step:  uint64(time.Minute.Nanoseconds()),
+	}
+	_, _, err := cqp.tryQueryFromCube(context.Background(), tenant, req)
+	require.Error(t, err, "the non-overlapping window must still decline (ErrCubeWarming), triggering re-evaluation")
+
+	// Give the background goroutine time to run and (not) insert.
+	time.Sleep(200 * time.Millisecond)
 
 	var count int
 	row := pool.QueryRow(context.Background(),
@@ -122,25 +145,48 @@ func TestMaybeCreateCube_AlreadyExists_NoL0Watermark_ExistingPendingJobIsNotDupl
 	entry := existingCubeEntry(tenant, dims, nil)
 	require.NoError(t, blockpack.NewPgCubeRegistry(pool, tenant).Add(context.Background(), entry))
 
-	js := jobstore.New(pool)
-	require.NoError(t, js.InsertCubeBackfill(context.Background(), tenant, jobstore.CubeBackfillDetail{
+	resetCubeQueryPathSingleton(t)
+	ConfigureCubeQueryPath(true, newFakeS3Config(t, "e2e-dup-bucket"), pool)
+	cqp := getCubeQueryPath()
+	require.NotNil(t, cqp)
+	require.NotNil(t, cqp.jobStore)
+	require.NoError(t, cqp.jobStore.InsertCubeBackfill(context.Background(), tenant, jobstore.CubeBackfillDetail{
 		CubeID: entry.CubeID, WindowMinutes: 42,
 	}))
 
-	cqp := &cubeQueryPath{
-		tenants:    make(map[string]*tenantCubeState),
-		createSeen: make(map[string]time.Time),
-		jobStore:   js,
-		pgPool:     pool,
-	}
-
 	now := time.Now()
-	minTS, maxTS := uint64(now.Add(-time.Hour).Unix()), uint64(now.Unix())
-	cqp.maybeCreateCube(context.Background(), tenant, dims, nil, "", blockpack.CubeAggAttrTypeFloat64, false, minTS, maxTS)
+	req := &tempopb.QueryRangeRequest{
+		Query: `{} | count_over_time() by (resource.service.name)`,
+		Start: uint64(now.Add(-time.Hour).UnixNano()),
+		End:   uint64(now.UnixNano()),
+		Step:  uint64(time.Minute.Nanoseconds()),
+	}
+	_, _, err := cqp.tryQueryFromCube(context.Background(), tenant, req)
+	require.Error(t, err)
+
+	// Give the background goroutine time to run and attempt its (deduped) insert.
+	time.Sleep(200 * time.Millisecond)
 
 	var count int
 	row := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM backend_jobs WHERE job_type = 'cube_backfill' AND tenant = $1`, tenant)
 	require.NoError(t, row.Scan(&count))
 	assert.Equal(t, 1, count, "re-triggering must not duplicate an already-pending job for the same cube")
+}
+
+// resetCubeQueryPathSingleton clears the process-level cube query path singleton for the
+// duration of the test, restoring the previous value on cleanup -- shared by all three tests
+// above, each of which needs its own fresh ConfigureCubeQueryPath call.
+func resetCubeQueryPathSingleton(t *testing.T) {
+	t.Helper()
+	processCubeQueryPathMu.Lock()
+	prev := processCubeQueryPath
+	processCubeQueryPath = nil
+	processCubeQueryPathMu.Unlock()
+	cubeQueryPathOnce = sync.Once{}
+	t.Cleanup(func() {
+		processCubeQueryPathMu.Lock()
+		processCubeQueryPath = prev
+		processCubeQueryPathMu.Unlock()
+	})
 }

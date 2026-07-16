@@ -786,3 +786,92 @@ Tenant, Dimensions, AggAttrs, Resolution, Watermarks) after sorting both by Cube
 **Back-ref:** `internal/modules/cube/pg_entry_store.go`,
 `internal/modules/cube/pg_blob_differential_test.go:TestCubeRegistry_BlobAndPgBackends_
 IdenticalBehavior`. See NOTE-CUBE-030. Issue #506.
+
+## SPEC-CUBE-032: `CubeQueryPath`/`RunCubeBackfill` orchestration contract, at blockpack root (issue #508)
+
+*Added: 2026-07-16. ID-numbering caveat: confirmed via direct inspection of this file's own
+highest existing ID (`SPEC-CUBE-031`) rather than the `blockpack_search_modules` MCP tool or a
+spec-oracle agent scoped to this worktree — neither was reachable in this session.*
+
+**Invariant:** The registry-cache/route/fan-out/rollup/creation-trigger orchestration that used to
+live entirely in tempo (`tempodb/encoding/vblockpack/cubequerypath.go` + `cube_backfill.go`) now
+lives at blockpack root as `CubeQueryPath` (constructor `NewCubeQueryPath` + method `QueryRange`)
+and a standalone `RunCubeBackfill` function. This is a relocation of orchestration, not a new
+architectural layer — the underlying `internal/modules/cube` package (`Registry`, `QueryRouter`,
+`CreationTrigger`, `Backfiller`, `Rollup`) is unchanged by this move.
+
+- **No blockpack-side singleton.** `NewCubeQueryPath` returns a plain `*CubeQueryPath` value.
+  Tempo's existing `sync.Once`-guarded `ConfigureCubeQueryPath`/`getCubeQueryPath` wrapper is
+  unchanged and now simply constructs blockpack's type inside it.
+- **Creation-cooldown semantics:** `CubeQueryPathConfig.CreateCooldown` (default 1 minute) rate-
+  limits `TryCreate` re-attempts to at most once per `(tenant, dims, filters)` key, exactly
+  mirroring tempo's pre-move `createSeen` map — prevents a wide-fan-out query from firing a storm
+  of concurrent creation attempts for the identical shape.
+- **Backfill is caller-launched, not auto-spawned.** `QueryRange` never calls `RunCubeBackfill`
+  itself. On every trigger attempt (`maybeCreateCube`), `CubeQueryPathConfig.OnCreateAttempt` (if
+  non-nil) is invoked synchronously with `(entry, created, hasL0Watermark, triggerErr)` — the
+  caller (tempo) decides whether/how to launch `RunCubeBackfill` (typically in its own goroutine,
+  wrapped in its own metrics/logging). blockpack has zero logging/metrics dependencies by design
+  and must never import tempo's `jobstore` package directly (mirrors `SPEC-CUBE-019`'s existing
+  backend-agnostic-worker-coordination boundary).
+- **Partial-coverage pass-through is verbatim.** `CubeQueryPathResult.PartialCoverage`/
+  `CoveredMinMinute`/`CoveredMaxMinute` mirror `RoutingResult`'s own fields exactly (see
+  `SPEC-CUBE-028`/`SPEC-CUBE-029`) — `QueryRange` narrows the actual cell read to the covered
+  sub-range via `cubeCoveredWindow`, never reading cells outside a resolution level's confirmed-
+  covered window, same as the pre-move tempo code.
+- **File-discovery uses a narrow `Lister`, never `CubeFileStore.List`.** `NewCubeQueryPath` takes
+  a separate `Lister` parameter (`List(ctx, prefix) ([]string, error)`) for its own raw
+  prefix-listing fan-out; `CubeFileStore` is used only for `.Get`/`.Put`. Reusing
+  `CubeFileStore.List` here would issue two GETs per unmerged L0 file (one inside `List`'s
+  `readFileInfo` ranged-header-read fallback, one full GET moments later in the fetch loop) — a
+  real I/O-cost regression against this repo's root `SPEC.md` "single I/O per object where
+  possible" invariant, for exactly the common, high-file-count case a wide-time-range metrics
+  query fans out over.
+- **Cube-file S3 directory names are zero-padded to 16 bytes (32 hex chars), never the raw
+  8-byte/16-hex-char registry `CubeID`.** `Accumulator.FlushTo`/`Filename` always encode the FULL
+  `[16]byte` `Definition.ID` (see `cube_compactor.go`'s `cubeFileStore.List` comment: "Registry
+  stores 16-hex-char IDs (8 bytes); S3 dirs use 32-hex-char (16 bytes, zero-padded)").
+  `QueryRange` MUST zero-pad `RegistryEntry.CubeID` the same way before building its `Lister`
+  listing prefix — using the unpadded registry `CubeID` directly (as the pre-move tempo code did)
+  never matches any real file's actual directory and silently declines every cube query into
+  "not found" forever. See `NOTE-CUBE-034` for the incident this was caught by.
+
+**Back-ref:** `cube_query_path.go:CubeQueryPath,NewCubeQueryPath,QueryRange,loadEntries,
+invalidateCache,maybeCreateCube,buildVCNTSection`, `cube_backfill_runner.go:RunCubeBackfill,
+LoadCubeEntry,NewCubeVIBackfillSource`. See `NOTE-CUBE-031`, `NOTE-CUBE-032`, `NOTE-CUBE-034`.
+Issue #508.
+
+## SPEC-CUBE-033: `AllDimSentinel` — shared dimension placeholder for single- AND zero-dimension cubes (issue #508)
+
+*Added: 2026-07-16. Same ID-numbering caveat as SPEC-CUBE-032.*
+
+**Invariant:** `AllDimSentinel = "__all__"` (`definition.go`, root-aliased as
+`blockpack.CubeAllDimSentinel`) is the ONE fixed placeholder value used whenever a cube
+`Definition` has no real column for a dimension slot:
+
+- A **single-dimension** cube's `Dim2Column` (no second dimension to key on).
+- A **zero-dimension** (ungrouped) cube's `Dim1Column` AND `Dim2Column` (no dimension at all —
+  every span accumulates into one shared cell).
+
+Forward-ingest (`cube_ingest.go:CubeRegistryEntryToDefinition`) and backfill
+(`backfill.go:Backfiller.processMinute`) MUST both use this exact constant for these slots, never
+an independently-hardcoded literal — `CubeRollup` merges series by the literal dictionary-encoded
+dim1/dim2 STRING value, so two different "no dimension" placeholder strings for the same logical
+cube produce two distinct, un-merged series instead of one. See `NOTE-CUBE-033` for the real,
+latent bug this closes (a `"_"` vs `"__all__"` mismatch between backfill- and forward-ingest-
+written files for every single-dimension cube).
+
+**Zero-dimension backfill is a documented, PERMANENT limitation, not a bug.**
+`Backfiller.processMinute`'s `len(entry.Dimensions) == 0` guard (and `RunCubeBackfill`'s own
+mirrored early-exit guard, `cube_backfill_runner.go`) both return a `*DefinitionError`
+immediately, without retrying — never even attempting a single VI lookup. This is intentional:
+`ValueIndexSource.LookupColumn` is fundamentally a per-attribute-value inverted-index lookup
+("which spans have column X = value Y"); there is no "enumerate every span" VI query. A
+zero-dimension cube has no dimension column to anchor such a lookup on, so there is no way to
+reconstruct its historical per-minute counts from the value index at all — a structural
+limitation of the mechanism, not something a different sentinel or extra plumbing would fix. A
+zero-dimension cube therefore only ever accumulates data going FORWARD from its creation moment.
+
+**Back-ref:** `definition.go:AllDimSentinel`, `cube_ingest.go:CubeAllDimSentinel,
+CubeRegistryEntryToDefinition`, `backfill.go:Backfiller.processMinute`,
+`cube_backfill_runner.go:RunCubeBackfill`. See `NOTE-CUBE-033`. Issue #508.

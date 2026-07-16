@@ -37,6 +37,16 @@ type ColumnFilter struct {
 	Op     DefFilterOp `json:"op"`
 }
 
+// AllDimSentinel is the fixed placeholder dimension value used whenever a Definition has no
+// real column for a dimension slot (SPEC-CUBE-033): a single-dimension cube's Dim2Column
+// (there is no second dimension to key on), and a zero-dimension cube's Dim1Column AND
+// Dim2Column (there is no dimension at all — every span accumulates into one shared cell).
+// Using the SAME constant for both cases is deliberate: forward-ingest
+// (CubeRegistryEntryToDefinition) and backfill (Backfiller.processMinute) must agree on this
+// exact string, or CubeRollup treats their respective files' "no dimension" cells as two
+// distinct series instead of merging them.
+const AllDimSentinel = "__all__"
+
 // RegistryEntry is the full, stable description of one active cube.
 // It is stored in the tenant-level index.json and used by ingest, query, and compaction.
 type RegistryEntry struct {

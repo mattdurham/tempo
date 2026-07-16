@@ -34,8 +34,13 @@ import (
 )
 
 const (
-	// cubeDimAll is the sentinel dimension-column value for single-dimension cubes.
-	cubeDimAll = "__all__"
+	// cubeDimAll is the sentinel dimension-column value for single-dimension cubes. #508:
+	// single-sourced from blockpack.CubeAllDimSentinel (internal/modules/cube.AllDimSentinel)
+	// so this literal can never independently drift from the SAME sentinel forward-ingest
+	// (CubeRegistryEntryToDefinition) and backfill (Backfiller.processMinute) now use — see
+	// NOTE-CUBE-030's addendum, which flagged exactly this two-independently-typed-literal
+	// drift risk for a different pair of strings.
+	cubeDimAll = blockpack.CubeAllDimSentinel
 	// cubeColSpanName is the intrinsic column name for a span's name.
 	cubeColSpanName = "span:name"
 	// cubeColServiceName is the resource attribute key for a service's name.

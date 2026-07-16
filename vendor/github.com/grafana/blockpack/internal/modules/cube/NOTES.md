@@ -982,3 +982,162 @@ retire tempo's own copy of the `cube_entries` section of `registries.sql` and tr
 `schema.sql` as the sole source of truth — this closes the gap permanently. Until that happens,
 treat any change to either file as requiring a manual check of the other. See go-presubmit.md /
 review.md Issue 2 (#506 holistic review) for the finding that prompted this addendum.
+
+## NOTE-CUBE-031: Query-path orchestration moved wholesale from tempo to blockpack root; no blockpack-side singleton (issue #508)
+
+Date: 2026-07-16. ID-numbering caveat: confirmed via direct inspection of this file's own highest
+existing ID (`NOTE-CUBE-030`) rather than the `blockpack_search_modules` MCP tool or a spec-oracle
+agent scoped to this worktree — neither was reachable in this session.
+
+**Decision:** `cubequerypath.go`'s registry cache, `Router.Route` + partial-coverage narrowing,
+fan-out file fetch + rollup, and `cube_backfill.go`'s `viBackfillSource`/`buildVCNTSection`/
+backfill-runner/`LoadCubeEntry` all moved from tempo (`tempodb/encoding/vblockpack/`) into
+blockpack root (`cube_query_path.go`, `cube_backfill_runner.go`) as this issue's continuation of
+#506's own stated next step (see this file's schema-drift addendum above). TraceQL string
+parsing (`extractGroupByDims`/`extractFilters`/`extractAggAttr`) and `tempopb` response
+construction stay tempo-side (hard type dependency on tempo's own protobuf types) — everything
+else moved.
+
+**Why no blockpack-side singleton, despite `NewCubeQueryPath` looking superficially similar to a
+constructor tempo would normally wrap in its own `sync.Once`:** an earlier planning pass's
+brainstorm cited `ConfigureValueIndexQuery`'s `sync.Once` wrapper (`value_index_query.go`) as
+precedent for blockpack owning its own singleton. Direct reading corrected this:
+`ConfigureValueIndexQuery` is a **tempo-side** `sync.Once`, not a blockpack-side one — blockpack
+has never owned a package-level singleton for any of its query-path types, and this move does not
+introduce the first one. `NewCubeQueryPath` returns a plain value; tempo's existing
+`cubeQueryPathOnce`/`getCubeQueryPath` wrapper is unchanged, now just constructing blockpack's
+type inside its `Do` closure exactly as it already constructed the pre-move tempo-local struct.
+
+**Why `OnCreateAttempt` is a callback, not an auto-spawned goroutine inside blockpack:** blockpack
+has zero logging/metrics dependencies by design (matches `loadEntries`'s pre-existing "declines
+are silent by design" convention, ported unchanged) and must never import tempo's `jobstore`
+package directly. `RunCubeBackfill` launching itself automatically from inside
+`CubeQueryPath.QueryRange` would force blockpack to either duplicate tempo's `jobstore.
+InsertCubeBackfill` durable-queue insert logic or silently drop it — the callback keeps that
+decision, and all its logging/metrics side effects, entirely on tempo's side of the boundary.
+
+**Back-ref:** `cube_query_path.go`, `cube_backfill_runner.go`. See `SPEC-CUBE-032`. Issue #508.
+
+## NOTE-CUBE-032: `decodeCanonicalVI` numeric-truncation bug fixed during the port, not ported verbatim (issue #508)
+
+Date: 2026-07-16
+
+**The bug:** tempo's original `decodeCanonicalVI` (`cube_backfill.go`, pre-move) byte-sniffed a VI
+column's raw value bytes to guess numeric-vs-string (`for _, c := range b { if c < 0x20 { goto
+numeric } }`), then decoded a guessed-numeric value's 8 bytes as `int64` and took `v % 10` — a
+single decimal digit, discarding the rest of the value. The same heuristic additionally
+mis-decoded a genuine `float64` column's IEEE-754 bit pattern as if it were an `int64`. Both are
+real, untested, pre-existing value-corruption bugs, not introduced by this port — confirmed via
+direct reading of the pre-move source, not a guess.
+
+**Why fixed instead of ported line-for-line (a deliberate, flagged scope decision — this function
+changes signature, unlike the fan-out/panic-recover logic in `QueryRange`, which WAS ported
+verbatim per this issue's own plan):** the VI column's actual type is already available for free
+at the only call site — `NewCubeVIBackfillSource.LookupColumn`'s own `for _, typeName := range
+[]string{"string","int64","uint64","bool","float64"}` list-prefix loop. Threading that type
+through instead of byte-sniffing eliminates BOTH bugs at once, with no additional plumbing beyond
+one new parameter.
+
+**Regression test, written first, real-write-path (not hand-built bytes):**
+`TestNewCubeVIBackfillSource_LookupColumn_DecodesNumericTypesCorrectly`
+(`cube_backfill_runner_test.go`) writes a real VI L0 file via the production `valueindex.Writer`
+for a known `int64` value ≥ 10 (42) and a known `float64` value (3.14), reads both back through
+`LookupColumn`, and asserts the decoded strings are exact (`"42"`, a value that round-trips via
+`strconv.ParseFloat` to `3.14`) — confirmed to fail against a reintroduced `v % 10` variant before
+the type-threaded fix, per this repo's mutation-test rigor bar.
+
+**Back-ref:** `cube_backfill_runner.go:decodeCanonicalVI,cubeVIBackfillSource.LookupColumn`. See
+`SPEC-CUBE-032`. Issue #508.
+
+## NOTE-CUBE-033: Zero-dimension `Dim1Column` sentinel fix, and the backfill dim2-sentinel-mismatch bug it also fixed (issue #508)
+
+Date: 2026-07-16
+
+**Bug 1 (forward-ingest, zero-dim cubes could never accumulate anything):**
+`CubeRegistryEntryToDefinition` (`cube_ingest.go`) already had an `else` branch defaulting
+`Dim2Column` to `"__all__"` for a single-dimension entry, but had **no equivalent `else` branch
+for `Dim1Column`** — a `Dimensions: []` entry produced `Dim1Column: ""`, and
+`Accumulator.Add`'s `SpanValues.String("")` call falls through every real `SpanValues`
+implementer's branches to `return "", false`, rejecting every span. A zero-dimension cube would
+have silently never accumulated anything, forward-ingest included, until this fix.
+
+**Bug 2 (backfill/forward-ingest sentinel mismatch, latent since before this issue, affecting
+EVERY real single-dimension cube):** `internal/modules/cube/backfill.go`'s `processMinute` used a
+hardcoded `"_"` literal for its own dim2 placeholder (`dim2Col := "_"`, `dim2 := "_"`), while
+`CubeRegistryEntryToDefinition`'s forward-ingest path used `"__all__"` for the identical logical
+slot. `CubeRollup` merges series by literal dictionary-encoded dim1/dim2 STRING value — two
+different placeholder strings for "no second dimension" meant a single-dimension cube's
+backfilled and forward-ingested files were NEVER merged into one series by `CubeRollup`, for
+every real single-dimension cube with both backfilled and forward-ingested data (i.e.,
+essentially all of them). Found and fixed in the same pass as Bug 1 because both are instances of
+the same missing single-source-of-truth constant.
+
+**Fix:** added `AllDimSentinel = "__all__"` (`definition.go`), root-aliased as
+`CubeAllDimSentinel` (`cube_ingest.go`) — see `SPEC-CUBE-033`. `CubeRegistryEntryToDefinition` now
+sets `Dim1Column = CubeAllDimSentinel` when `len(entry.Dimensions) == 0`, and both of
+`backfill.go:processMinute`'s dim2 locals use the same constant instead of `"_"`.
+
+**Regression tests, written first, confirmed to fail against the pre-fix code before
+implementing:**
+- `TestCubeRegistryEntryToDefinition_ZeroDimension` (root, `cube_zerodim_publicapi_test.go`) —
+  Bug 1: converts a `Dimensions: nil` entry, asserts `Dim1Column == Dim2Column ==
+  CubeAllDimSentinel`, then drives a real `Accumulator.Add` call through it and asserts
+  `CellCount() == 1`.
+- `TestBackfill_SingleDimDim2SentinelMatchesForwardIngest` (`backfill_test.go`) — Bug 2: builds
+  one cube file via the forward-ingest-style `Definition{Dim2Column: AllDimSentinel}` path and
+  one via the real `Backfiller`/`processMinute` path for the SAME single-dimension
+  `RegistryEntry`, feeds both into `Rollup`, and asserts exactly ONE merged series results (the
+  pre-fix `"_"` literal produces two, confirmed before implementing the fix).
+
+**Zero-dimension backfill remains explicitly, permanently unsupported** — not something this fix
+extends to. See `SPEC-CUBE-033`'s own "documented, PERMANENT limitation" section for the full
+rationale (no VI "enumerate every span" query exists). `backfill.go`'s pre-existing
+`len(entry.Dimensions) == 0` guard is kept, with its doc comment revised to state this precisely
+rather than merely "unsafe to index."
+
+**Back-ref:** `definition.go:AllDimSentinel`, `cube_ingest.go:CubeAllDimSentinel,
+CubeRegistryEntryToDefinition`, `backfill.go:Backfiller.processMinute`. See `SPEC-CUBE-033`.
+Issue #508.
+
+## NOTE-CUBE-034: Cube-file S3 directory-name zero-padding mismatch — found by Phase 8's own end-to-end test (issue #508)
+
+Date: 2026-07-16
+
+**The bug:** `Accumulator.FlushTo` → `Filename(tenant, cubeID [16]byte)` always
+`hex.EncodeToString`s the FULL 16-byte `Definition.ID`. Every real production path that builds
+that `[16]byte` (`CubeRegistryEntryToDefinition` for forward-ingest, `processMinute` for backfill)
+derives it via `IDFromBytes(entry.CubeID)`, which decodes the registry's 8-byte/16-hex-char
+`CubeID` into the FIRST 8 bytes of a `[16]byte` and leaves the remaining 8 bytes zero. The
+resulting S3 directory name is therefore always 32 hex characters: the registry's 16-hex-char
+`CubeID` followed by 16 literal `"0"` characters.
+
+The newly-moved `QueryRange` (ported from tempo's `tryQueryFromCube` verbatim, per this issue's
+own "port line-for-line" instruction for this exact code region) built its file-discovery `Lister`
+prefix from `result.Entry.CubeID` **directly, unpadded** — a `path.Join(tenant, "cubes",
+result.Entry.CubeID) + "/"` prefix that structurally can never match any real file's actual
+32-character directory. This is the exact same convention `cube_compactor.go`'s
+`cubeFileStore.List` already comments on and pads for ("Registry stores 16-hex-char IDs (8
+bytes); S3 dirs use 32-hex-char (16 bytes, zero-padded)") — meaning the pre-move tempo query path
+this was ported from carried this same latent bug, silently and permanently falling back to
+VI/scan for every cube-answerable query (this codebase's own "declines are silent by design"
+convention means a silent zero-file listing looks identical to "no coverage yet," not an error —
+nothing would have surfaced this without an end-to-end test through the real write path).
+
+**Why this had gone unnoticed:** every EARLIER unit test in this issue's own Phase 4 (fan-out/
+rollup logic) used a fake `Lister` that ignores its `prefix` argument entirely and returns a
+fixed key set regardless — those tests correctly proved the fan-out/panic-recover/ordering logic
+itself, but could not have caught a prefix-construction bug by design. Only Phase 8's end-to-end
+test, whose fake `Lister` filters by REAL prefix-matching against a shared `CubeFileStore`'s
+underlying map (`fakeCubeListerFromStore`, `cube_query_path_publicapi_test.go`), exercises the
+actual string comparison and caught it — the exact "individually-tested functions, untested seam"
+failure mode `NOTE-CUBE-024` already documents for a different pair of functions.
+
+**Fix:** `QueryRange` now zero-pads `result.Entry.CubeID` to 32 hex characters (mirroring
+`cubeFileStore.List`'s own string-padding, not a byte-level `IDFromBytes` round-trip, to avoid a
+new error path for what is always a well-formed registry `CubeID` in practice) before building
+its `Lister` prefix.
+
+**Back-ref:** `cube_query_path.go:QueryRange`. Confirmed end-to-end by
+`TestCubeQueryPath_GroupedQuery_TriggersCreationAndBackfill`
+(`cube_query_path_publicapi_test.go`) — this test failed with the unpadded prefix, passed after
+the fix, with no other change. See `SPEC-CUBE-032`. Issue #508.

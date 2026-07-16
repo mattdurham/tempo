@@ -15,7 +15,6 @@ package vblockpack
 import (
 	"context"
 	"errors"
-	"strings"
 	"testing"
 	"time"
 
@@ -47,42 +46,31 @@ func withCubeQueryPath(t *testing.T, cqp *cubeQueryPath) {
 // newEmptyTestCubeQueryPath returns a *cubeQueryPath backed by a genuinely empty (freshly
 // migrated, no cube_entries rows) real Postgres pool — every query with group-by dims and a
 // cube-representable filter reaches tryQueryFromCube's "!result.Found" branch (a genuinely
-// empty registry), firing maybeCreateCube and returning ErrCubeWarming.
+// empty registry), firing blockpack.CubeQueryPath's internal creation trigger and returning
+// ErrCubeWarming.
+//
+// #508: files/lister/vi are all nil -- safe here because blockpack.CubeQueryPath's own
+// not-found/warming path never touches them (only the found/fan-out path does, which these
+// warming-focused tests never reach), and OnCreateAttempt is left nil (the zero value), so the
+// background creation-trigger goroutine never touches S3/minio either -- unlike the pre-#508
+// launchBackfill call this test file used to have to suppress via a cooldown-map hack, there is
+// no longer any nil-client panic risk to guard against.
 func newEmptyTestCubeQueryPath(t *testing.T) *cubeQueryPath {
 	t.Helper()
-	return &cubeQueryPath{
-		tenants:    make(map[string]*tenantCubeState),
-		createSeen: make(map[string]time.Time),
-		pgPool:     newTestPostgresPool(t),
-	}
+	pool := newTestPostgresPool(t)
+	qp := blockpack.NewCubeQueryPath(nil, nil, nil, pool, blockpack.CubeQueryPathConfig{})
+	return &cubeQueryPath{pgPool: pool, qp: qp}
 }
 
-// preventBackgroundCreateAttempt pre-populates cqp.createSeen with a FRESH cooldown entry for
-// (tenant, query)'s exact (dims, filters) key — computed the SAME way maybeCreateCube itself
-// does — so the background goroutine tryQueryFromCube fires (`go cqp.maybeCreateCube(...)`)
-// hits its own cooldown check and returns IMMEDIATELY, before ever reaching fetchVCNTSection/
-// TryCreate/launchBackfill. Those deeper steps need a real S3/minio client (cqp.client, which
-// this test's cqp intentionally leaves nil) and are exercised by
-// cube_scheduler_test.go/cubemanager_test.go elsewhere — NOT this file's concern. Without this,
-// the fire-and-forget goroutine outlives the test function and can panic on a nil *minio.Client
-// asynchronously, crashing an unrelated LATER test in the same process (verified: this is
-// exactly what happened before this helper was added).
-func preventBackgroundCreateAttempt(cqp *cubeQueryPath, tenant, query string) {
-	dims := extractGroupByDims(query)
-	filters, _ := extractFilters(query)
-	key := tenant + "|" + strings.Join(dims, ",") + "|" + filterDedupKey(filters)
-	cqp.createSeen[key] = time.Now()
-}
-
-// TestTryQueryFromCube_NoGroupByDims_DistinctFromCubeWarming is a MUST per F-10: a query with
-// no group-by dims declines at tryQueryFromCube's FIRST check, before any registry/object-store
-// access at all — this must return (nil, false, nil), never ErrCubeWarming, since "not
-// cube-applicable at all" and "cube not yet backfilled" are different, non-conflatable reasons
-// (only the latter is self-healing / worth a "retry shortly" message).
-func TestTryQueryFromCube_NoGroupByDims_DistinctFromCubeWarming(t *testing.T) {
-	// client/bucket/store are all zero-value/nil — if this test reaches any object-store code,
-	// it panics, proving the no-group-by-dims decline really does short-circuit before any I/O.
-	cqp := &cubeQueryPath{tenants: make(map[string]*tenantCubeState), createSeen: make(map[string]time.Time)}
+// TestTryQueryFromCube_NoGroupByDims_NowReachesQueryRange is #508's Zero-Dimension Cube Support
+// regression pin: prior to #508, a query with no group-by dims declined at tryQueryFromCube's
+// FIRST check, before any registry access at all (nil, false, nil), never ErrCubeWarming. #508
+// deliberately REMOVED that early return so an ungrouped query's empty dims flow into
+// CubeQueryPathRequest.Dims and on into blockpack's creation trigger/router unchanged (both are
+// dims-length-agnostic, SPEC-CUBE-033) -- an ungrouped query against a genuinely empty registry
+// now ALSO fires cube creation and returns ErrCubeWarming, exactly like a grouped query.
+func TestTryQueryFromCube_NoGroupByDims_NowReachesQueryRange(t *testing.T) {
+	cqp := newEmptyTestCubeQueryPath(t)
 
 	resp, ok, err := cqp.tryQueryFromCube(context.Background(), "test-tenant", &tempopb.QueryRangeRequest{
 		Query: "{} | count_over_time()", // no `by (...)` — no group-by dims
@@ -92,8 +80,8 @@ func TestTryQueryFromCube_NoGroupByDims_DistinctFromCubeWarming(t *testing.T) {
 	})
 	require.False(t, ok)
 	require.Nil(t, resp)
-	require.NoError(t, err, "no-group-by-dims must decline silently (nil,false,nil), never ErrCubeWarming")
-	require.False(t, errors.Is(err, ErrCubeWarming))
+	require.Error(t, err, "#508: an ungrouped query against an empty registry now reaches QueryRange and triggers creation, no longer a silent (nil,false,nil) decline")
+	require.True(t, errors.Is(err, ErrCubeWarming), "err = %v, want ErrCubeWarming", err)
 }
 
 // TestTryQueryFromCube_EmptyRegistry_ReturnsCubeWarming is F-10's companion positive case: a
@@ -104,7 +92,6 @@ func TestTryQueryFromCube_NoGroupByDims_DistinctFromCubeWarming(t *testing.T) {
 func TestTryQueryFromCube_EmptyRegistry_ReturnsCubeWarming(t *testing.T) {
 	cqp := newEmptyTestCubeQueryPath(t)
 	const query = `{ resource.service.name = "svc-alpha" } | count_over_time() by (resource.service.name)`
-	preventBackgroundCreateAttempt(cqp, "test-tenant", query)
 
 	resp, ok, err := cqp.tryQueryFromCube(context.Background(), "test-tenant", &tempopb.QueryRangeRequest{
 		Query: query,
@@ -130,7 +117,6 @@ func TestTryQueryFromCube_EmptyRegistry_ReturnsCubeWarming(t *testing.T) {
 func TestQueryRange_CubeNotYetBackfilled_ProductionDefault_ReturnsWarmingTypedError_TriggersCreate(t *testing.T) {
 	cqp := newEmptyTestCubeQueryPath(t)
 	const query = `{ resource.service.name = "svc-alpha" } | count_over_time() by (resource.service.name)`
-	preventBackgroundCreateAttempt(cqp, "test-tenant", query)
 	withCubeQueryPath(t, cqp)
 
 	dir := t.TempDir()

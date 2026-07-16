@@ -473,7 +473,7 @@ func (w *BackendWorker) processCubeBackfillJobPostgres(ctx context.Context, job 
 	// RunCubeBackfill with a placeholder entry lacking AggAttrs would fail
 	// cube.Backfiller's per-minute validation on every single minute of the
 	// backfill window, burning the job's entire ctx budget for nothing.
-	entry, err := vblockpack.LoadCubeEntry(ctx, w.pgPool, job.Tenant, detail.CubeID)
+	entry, err := blockpack.LoadCubeEntry(ctx, w.pgPool, job.Tenant, detail.CubeID)
 	if err != nil {
 		return fmt.Errorf("cube backfill: no registry entry found for cube %s: %w", detail.CubeID, err)
 	}

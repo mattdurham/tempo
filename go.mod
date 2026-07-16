@@ -495,5 +495,6 @@ replace (
 // - https://github.com/grafana/memberlist/pull/3
 replace github.com/hashicorp/memberlist => github.com/grafana/memberlist v0.3.1-0.20260410132335-4887d8e8d493
 
-// Local blockpack — use `go mod vendor` to sync changes from ../blockpack
+// Local blockpack — use `go mod vendor` to sync changes from this path. TEMPORARY: pointed at the
+// cube-orchestration-508 worktree (not the primary ../blockpack checkout) for the duration of
 replace github.com/grafana/blockpack => ../blockpack

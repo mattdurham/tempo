@@ -2,6 +2,13 @@ package vblockpack
 
 // cubequerypath.go — cube query path for metrics queries.
 //
+// #508: the registry cache, routing, fan-out file fetch/rollup, and first-query creation
+// trigger all moved into blockpack.CubeQueryPath (constructor NewCubeQueryPath, method
+// QueryRange). This file is now a thin wrapper: it constructs blockpack.CubeQueryPath once
+// (ConfigureCubeQueryPath), extracts TraceQL-string query shape (dims/filters/neededAttr —
+// a hard type dependency on tempo's own tempopb/traceql packages, stays tempo-side), and
+// builds the tempopb response from blockpack's result (also stays tempo-side).
+//
 // On every QueryRange call, CubeQueryPath:
 //  1. Parses the query to extract group-by dimensions.
 //  2. Looks up the registry for a matching cube.
@@ -13,20 +20,14 @@ package vblockpack
 // no full block scan fallback.
 
 import (
-	"bytes"
 	"context"
-	"errors"
 	"fmt"
-	"io"
 	"math"
-	"path"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
-	"time"
 
 	"github.com/go-kit/log/level"
 	blockpack "github.com/grafana/blockpack"
@@ -38,36 +39,25 @@ import (
 	"github.com/grafana/tempo/tempodb/encoding/vblockpack/jobstore"
 	"github.com/jackc/pgx/v5/pgxpool"
 	minio "github.com/minio/minio-go/v7"
-	"golang.org/x/sync/errgroup"
 )
 
-// cubeQueryPath is the process-level cube query path manager.
+// cubeQueryPath is the process-level cube query path manager: a thin tempo-side wrapper
+// around blockpack.CubeQueryPath.
 type cubeQueryPath struct {
 	client *minio.Client
 	bucket string
-	// per-tenant registry cache (refreshed every 5m)
-	mu      sync.RWMutex
-	tenants map[string]*tenantCubeState
-	// createCooldown rate-limits cube creation to at most once per minute
-	// per (tenant+dims) key, preventing per-block fan-out storms.
-	createSeen map[string]time.Time
-	// jobStore is the opt-in durable backend_jobs queue (#181) -- nil when
-	// Postgres isn't configured. Inserting via jobStore in maybeCreateCube's
-	// Created branch is purely additive: it does NOT replace launchBackfill,
-	// both run.
+	// jobStore is the opt-in durable backend_jobs queue (#181) -- nil when Postgres isn't
+	// configured. Inserted from qp's OnCreateAttempt callback below; purely additive (does
+	// NOT replace launchBackfill, both run).
 	jobStore *jobstore.Store
 	// pgPool backs the cube registry (issue #504: Postgres is now the only supported cube
-	// registry backend, no blob/index.json fallback) -- used by loadEntries/maybeCreateCube
-	// below and by cube_backfill.go's launchBackfill (which reads it off the shared
-	// *cubeQueryPath singleton via getCubeQueryPath()). nil in any deployment without
-	// cfg.Postgres configured -- both loadEntries and maybeCreateCube nil-guard this and
-	// decline/skip gracefully rather than dereference a nil pool (see their own doc comments).
+	// registry backend, no blob/index.json fallback) -- also used by cube_backfill.go's
+	// launchBackfill (which reads it off the shared *cubeQueryPath singleton via
+	// getCubeQueryPath()).
 	pgPool *pgxpool.Pool
-}
-
-type tenantCubeState struct {
-	entries     []blockpack.CubeRegistryEntry
-	lastRefresh time.Time
+	// qp owns the registry cache, routing, fan-out fetch/rollup, and creation-trigger
+	// orchestration (#508) -- see blockpack.CubeQueryPath's own doc comment.
+	qp *blockpack.CubeQueryPath
 }
 
 var (
@@ -94,14 +84,111 @@ func ConfigureCubeQueryPath(enabled bool, s3cfg *s3backend.Config, pgPool *pgxpo
 		if pgPool != nil {
 			jobStore = jobstore.New(pgPool)
 		}
+		bucket := s3cfg.Bucket
+		// #508 Decision 2: files (Get/Put) uses cubeFileStore (already satisfies
+		// blockpack.CubeFileStore, cube_compactor.go); lister is a plain raw prefix-lister
+		// over the SAME client/bucket cubeFileStore uses, deliberately NOT going through
+		// cubeFileStore.List's filename-parsing (would double the GET count per unmerged L0
+		// file) -- minioVIStore.List is already a generic, prefix-parameterized lister, reused
+		// here purely for its List method. vi reuses the same shared cachingStore-wrapped
+		// minioVIStore the backfill/cardinality-gate path already reads through (issue #478).
+		fileStore := &cubeFileStore{client: client, bucket: bucket}
+		lister := &minioVIStore{client: client, bucket: bucket}
+		viStore := newBackfillVIStore(client, bucket)
+		qp := blockpack.NewCubeQueryPath(fileStore, lister, viStore, pgPool, blockpack.CubeQueryPathConfig{
+			BackfillIndexPrefix: defaultValueIndexPref,
+			// OnCreateAttempt fires synchronously from blockpack's own background trigger
+			// goroutine, once per TryCreate attempt that isn't cooldown-suppressed --
+			// mirrors the pre-#508 maybeCreateCube's Created/re-evaluation branches exactly,
+			// just via a callback instead of inline logic (blockpack has no logging/metrics
+			// dependency and must never import tempo's jobstore package directly).
+			OnCreateAttempt: func(ctx context.Context, entry blockpack.CubeRegistryEntry, created, hasL0 bool, triggerErr error) {
+				if triggerErr != nil {
+					level.Warn(util_log.Logger).Log("msg", "vblockpack: cube TryCreate failed", "err", triggerErr)
+					return
+				}
+				if created {
+					level.Info(util_log.Logger).Log(
+						"msg", "vblockpack: cube created on first query",
+						"tenant", entry.Tenant, "cube_id", entry.CubeID,
+					)
+					if jobStore != nil {
+						if ierr := jobStore.InsertCubeBackfill(ctx, entry.Tenant, jobstore.CubeBackfillDetail{
+							CubeID:        entry.CubeID,
+							WindowMinutes: math.MaxUint32,
+						}); ierr != nil {
+							level.Warn(util_log.Logger).Log(
+								"msg", "vblockpack: failed to insert durable cube_backfill job",
+								"tenant", entry.Tenant, "cube_id", entry.CubeID, "err", ierr,
+							)
+						}
+					}
+					// Kick off historical backfill from the value index. #508 Phase 12: inlined
+					// from the former launchBackfill (cube_backfill.go) -- verified via grep that
+					// this was its only remaining call site after this file's own Phase 11
+					// rewrite, so a separate function added indirection with no other caller.
+					go func() {
+						metricCubeBackfillStarted.Inc()
+						level.Info(util_log.Logger).Log(
+							"msg", "vblockpack: cube backfill started",
+							"tenant", entry.Tenant, "cube_id", entry.CubeID,
+						)
+						backfillCfg := blockpack.CubeBackfillConfig{
+							Workers: 4,
+							// WindowMinutes: full history, not an artificial cap (2026-07-11
+							// ruling) -- math.MaxUint32 minutes trivially exceeds any real
+							// currentMinute, so Backfiller.Run's endMinute always resolves to 0.
+							WindowMinutes: math.MaxUint32,
+						}
+						backfillErr := blockpack.RunCubeBackfill(
+							context.Background(), entry, viStore, &s3ObjectPutter{client: client, bucket: bucket},
+							pgPool, backfillCfg, 0, defaultValueIndexPref,
+						)
+						if backfillErr != nil {
+							metricCubeBackfillFailed.Inc()
+							level.Warn(util_log.Logger).Log(
+								"msg", "vblockpack: cube backfill error",
+								"tenant", entry.Tenant, "cube_id", entry.CubeID, "err", backfillErr,
+							)
+							return
+						}
+						// blockpack.RunCubeBackfill returns nil if and only if the full backfill
+						// window was genuinely exhausted (SPEC-CUBE-032) -- the metric increment
+						// moves here, out of the per-minute progress callback, since blockpack
+						// owns no metrics dependency.
+						metricCubeBackfillCompleted.Inc()
+					}()
+					return
+				}
+
+				// #181 §6.3/§9 Phase 3: the cube already exists, but a cube whose single
+				// backfill attempt exhausted its retries has no OTHER path back into
+				// backend_jobs now that the poll is gone (§5.3's coverage-gap finding) --
+				// this query-path re-evaluation is the only remaining trigger point. Cube's
+				// RegistryEntry has no explicit "backfill done" flag; the absence of an L0
+				// watermark (hasL0) is the cheapest available heuristic for "never completed
+				// a single successful backfill pass."
+				if jobStore == nil || hasL0 {
+					return
+				}
+				if ierr := jobStore.InsertCubeBackfill(ctx, entry.Tenant, jobstore.CubeBackfillDetail{
+					CubeID:        entry.CubeID,
+					WindowMinutes: math.MaxUint32,
+				}); ierr != nil {
+					level.Warn(util_log.Logger).Log(
+						"msg", "vblockpack: failed to insert durable cube_backfill retry job",
+						"tenant", entry.Tenant, "cube_id", entry.CubeID, "err", ierr,
+					)
+				}
+			},
+		})
 		processCubeQueryPathMu.Lock()
 		processCubeQueryPath = &cubeQueryPath{
-			client:     client,
-			bucket:     s3cfg.Bucket,
-			tenants:    make(map[string]*tenantCubeState),
-			createSeen: make(map[string]time.Time),
-			jobStore:   jobStore,
-			pgPool:     pgPool,
+			client:   client,
+			bucket:   bucket,
+			jobStore: jobStore,
+			pgPool:   pgPool,
+			qp:       qp,
 		}
 		processCubeQueryPathMu.Unlock()
 		level.Info(util_log.Logger).Log("msg", "vblockpack: cube query path configured")
@@ -114,70 +201,23 @@ func getCubeQueryPath() *cubeQueryPath {
 	return processCubeQueryPath
 }
 
-// loadEntries returns cached (or freshly-loaded) cube entries for a tenant.
-func (cqp *cubeQueryPath) loadEntries(ctx context.Context, tenant string) ([]blockpack.CubeRegistryEntry, error) {
-	// cqp.pgPool is nil in any deployment with ValueIndexEnabled+S3 but no cfg.Postgres --
-	// unlike CubeManager (gated by CubeTenants, and hard-failed at config-validation time if
-	// CubeTenants is non-empty without Postgres, tempodb/config.go's validateConfig), the cube
-	// QUERY path's opportunistic creation-trigger runs unconditionally and has no such gate.
-	// Issue #504 removed the blob/index.json registry fallback entirely, so there is no
-	// backend left to serve this call without Postgres -- decline gracefully (the caller,
-	// tryQueryFromCube, already treats any loadEntries error as "cube path not applicable,
-	// fall back to VI/scan", exactly the pre-existing decline contract) rather than let
-	// blockpack.NewPgCubeRegistry's underlying nil pool panic on first use.
-	if cqp.pgPool == nil {
-		return nil, errors.New("vblockpack: cube registry requires postgres, none configured")
-	}
-
-	cqp.mu.Lock()
-	st, ok := cqp.tenants[tenant]
-	if ok && time.Since(st.lastRefresh) < 5*time.Minute {
-		entries := st.entries
-		cqp.mu.Unlock()
-		return entries, nil
-	}
-	cqp.mu.Unlock()
-
-	reg := blockpack.NewPgCubeRegistry(cqp.pgPool, tenant)
-	entries, _, err := reg.Load(ctx)
-	if err != nil {
-		// A real Postgres failure here (pool exhaustion, connectivity blip, etc.) is
-		// otherwise indistinguishable to the caller (tryQueryFromCube) from a benign
-		// "this query shape isn't cube-answerable" decline -- both silently fall back to
-		// the VI/scan path. Log it at Warn (mirroring cubemanager.go's loadDefs failure
-		// logging) so an operator investigating a latency regression during a cube-configured
-		// tenant's Postgres outage has a signal to look at, without changing the fallback
-		// behavior itself.
-		level.Warn(util_log.Logger).Log("msg", "vblockpack: cube query path: registry load failed, falling back to VI/scan", "tenant", tenant, "err", err)
-		return nil, err
-	}
-
-	cqp.mu.Lock()
-	cqp.tenants[tenant] = &tenantCubeState{entries: entries, lastRefresh: time.Now()}
-	cqp.mu.Unlock()
-	return entries, nil
-}
-
-// invalidateCache forces a registry reload on the next call for this tenant.
-func (cqp *cubeQueryPath) invalidateCache(tenant string) {
-	cqp.mu.Lock()
-	delete(cqp.tenants, tenant)
-	cqp.mu.Unlock()
-}
-
 // ErrCubeWarming (issue #481 part 3, F-10, R1's self-healing story) is returned by
 // tryQueryFromCube ONLY for the specific "cube not found (or resolution-incomplete), cube
-// creation just fired" case — cubequerypath.go's `!result.Found` branch below, which triggers
-// maybeCreateCube. This is a tempo-side sentinel, not a shared enum value with blockpack's F-4
-// family (team-lead ruling: cubequerypath.go is tempo code, cube-side declines are tempo's own
-// taxonomy) — it distinguishes "this shape IS cube-answerable, just not backfilled yet, retry
-// shortly" from every OTHER false reason (no group-by dims, filter not cube-representable,
-// registry load failure, list/download/decode failure, rollup failure) — those remain a silent
-// (nil, false, nil) fallback to the VI/typed-error path below with no actionable "retry" signal,
-// since they are not self-healing in the same way (a repeat query would hit the identical
-// permanent condition, not a transient warming window). Joins F-10's declineErrorToHTTPResponse
-// mapper as a 4xx-class, actionable "retry shortly" case.
-var ErrCubeWarming = errors.New("vblockpack: cube not yet backfilled for this shape/window; creation triggered, retry shortly")
+// creation just fired" case. This is a tempo-side sentinel, not a shared enum value with
+// blockpack's F-4 family (team-lead ruling: cubequerypath.go is tempo code, cube-side
+// declines are tempo's own taxonomy) — it distinguishes "this shape IS cube-answerable, just
+// not backfilled yet, retry shortly" from every OTHER false reason (no group-by dims, filter
+// not cube-representable, registry load failure, list/download/decode failure, rollup
+// failure) — those remain a silent (nil, false, nil) fallback to the VI/typed-error path
+// below with no actionable "retry" signal, since they are not self-healing in the same way (a
+// repeat query would hit the identical permanent condition, not a transient warming window).
+// Joins F-10's declineErrorToHTTPResponse mapper as a 4xx-class, actionable "retry shortly"
+// case.
+//
+// #508: aliased directly to blockpack.CubeErrWarming (same underlying value, not a separate
+// wrapped error) so callers using errors.Is(err, ErrCubeWarming) keep working unchanged
+// against the value blockpack.CubeQueryPath.QueryRange actually returns.
+var ErrCubeWarming = blockpack.CubeErrWarming
 
 // tryQueryFromCube attempts to answer req from cube files. Returns (result, true, nil) when the
 // cube path answered the query. Returns (nil, false, err) to fall back to block scan/VI — err is
@@ -188,11 +228,12 @@ func (cqp *cubeQueryPath) tryQueryFromCube(
 	tenant string,
 	req *tempopb.QueryRangeRequest,
 ) (*tempopb.QueryRangeResponse, bool, error) {
+	// #508 Zero-Dimension Cube Support: the `if len(dims) == 0 { return nil, false, nil }`
+	// early return that used to live here is REMOVED. An ungrouped query's empty dims flows
+	// straight into CubeQueryPathRequest.Dims and on into CreationTrigger.TryCreate/
+	// QueryRouter.Route unchanged — both are already dims-length-agnostic (verified in
+	// blockpack, SPEC-CUBE-033).
 	dims := extractGroupByDims(req.Query)
-	if len(dims) == 0 {
-		level.Debug(util_log.Logger).Log("msg", "vblockpack: cube: no group-by dims in query", "query", req.Query)
-		return nil, false, nil // no group-by → cube not applicable
-	}
 
 	// The query's {...} predicate is part of the cube identity (#480): a cube built for
 	// one filter must not answer a query with a different filter. If the predicate cannot
@@ -204,371 +245,57 @@ func (cqp *cubeQueryPath) tryQueryFromCube(
 	}
 	level.Debug(util_log.Logger).Log("msg", "vblockpack: cube: found dims", "dims", strings.Join(dims, ","), "filters", filterDedupKey(filters), "tenant", tenant)
 
-	entries, err := cqp.loadEntries(ctx, tenant)
-	if err != nil {
-		return nil, false, nil
-	}
-
 	// The materialized attribute (if any) this query's function needs — "" for count_over_time/
 	// rate, which match any candidate cube regardless of its AggAttrs set (E-10).
 	neededAttr, neededAttrType, neededAttrOK := extractAggAttr(req.Query)
 
-	router := blockpack.NewCubeQueryRouter(entries)
-	minMinute := uint32(req.Start / 60_000_000_000)
-	maxMinute := uint32(req.End / 60_000_000_000)
-	// req.Step is the query's requested granularity — the hardcoded resolution=1 (always L0)
-	// this call used before E-10 ignored it entirely, serving every query at minute resolution
-	// regardless of what it actually asked for.
-	requestedResolution := requestedResolutionMinutes(req.Step)
-	result, routeErr := router.Route(tenant, dims, filters, neededAttr, requestedResolution, minMinute, maxMinute)
-	if routeErr != nil || !result.Found {
-		// Cube not found, or found but with NO overlap at all with the requested window
-		// (ruling 4(b) revisit, #217/SPEC-CUBE-028 — Route only returns Found=false now for "no
-		// usable overlap," not merely "incomplete" coverage; see PARTIAL coverage handling below
-		// for the edge-truncated case). Attempt cube creation on first query. Fire cube creation
-		// in a background goroutine so QueryRange is not blocked. req.Start/req.End are
-		// nanoseconds; VCNT records are keyed in unix seconds (minute-floored), so pass the
-		// query window in seconds for the cardinality gate.
-		minTS := req.Start / 1_000_000_000
-		maxTS := req.End / 1_000_000_000
-		go cqp.maybeCreateCube(context.Background(), tenant, dims, filters, neededAttr, neededAttrType, neededAttrOK, minTS, maxTS)
-		return nil, false, ErrCubeWarming
-	}
-	// #217/SPEC-CUBE-028 (ruling 4(b) revisit, Phase 3.3): partial coverage — the cube's watermark
-	// overlaps only PART of [minMinute, maxMinute]. Narrow the actual cell read to
-	// result.CoveredMinMinute/CoveredMaxMinute (never read cells outside the confirmed-covered
-	// range — reading past it would silently return an incomplete/wrong rollup for that edge) and
-	// tag the response PartialStatus=PARTIAL with a message identifying the uncovered edge(s).
-	//
-	// Scope note (assessed and deliberately deferred, not silently dropped): the plan doc's own
-	// Phase 3.3 additionally proposed dispatching the existing VI/scan fallback for exactly the
-	// uncovered edge and merging it with the cube's answer within this same call. Investigated
-	// and NOT implemented here: merging a second raw metrics result into an already-cube-rolled-
-	// up answer requires selecting a correct re-aggregation mode (traceql.AggregateMode) generic
-	// across every metrics function this path supports (count_over_time/rate/sum_over_time/
-	// histogram_over_time/quantile_over_time) — sum-like functions merge safely, but rate() and
-	// quantile_over_time() do NOT correctly re-aggregate via simple concatenation or summation
-	// without re-deriving them from finer-grained inputs, and no existing call site in either
-	// repo merges two already-computed metrics results this way today (grep-confirmed). Shipping
-	// that merge without being able to verify numeric correctness for every supported function
-	// risked a SILENT wrong-answer bug, which is worse than the honest partial answer served
-	// here. Serving ONLY the cube's own covered sub-range (this fix) already delivers #217's
-	// core guarantee — never decline a query we have coverage for — for the covered majority of
-	// the window; the uncovered edge simply isn't answered by the cube path, exactly as if the
-	// query had asked for only the covered sub-range. Flagged as a real, explicit follow-up.
-	origMinMinute, origMaxMinute := minMinute, maxMinute
-	minMinute, maxMinute, partialCoverage := cubeCoveredWindow(result, minMinute, maxMinute)
-	if partialCoverage {
-		level.Info(util_log.Logger).Log(
-			"msg", "vblockpack: cube: partial coverage, serving covered sub-range only",
-			"tenant", tenant, "cube_id", result.Entry.CubeID,
-			"requested_min_minute", origMinMinute, "requested_max_minute", origMaxMinute,
-			"covered_min_minute", minMinute, "covered_max_minute", maxMinute,
-		)
-	}
+	minMinute := uint32(req.Start / 60_000_000_000) //nolint:gosec // minute fits uint32 for any realistic query window
+	maxMinute := uint32(req.End / 60_000_000_000)   //nolint:gosec
+	// req.Step is the query's requested granularity, in nanoseconds — converted inline here
+	// (not a dedicated requestedResolutionMinutes function; #508 moved every OTHER piece of
+	// this file's logic into blockpack, but CubeQueryPathRequest.RequestedResolutionMinutes is
+	// deliberately pre-computed by the caller, so this one-line conversion has nowhere to live
+	// except tempo's own thin wrapper).
+	requestedResolution := uint32(req.Step / 60_000_000_000) //nolint:gosec // step fits uint32 for any realistic query window
 
-	// Cube found: list and download L0 files for the time window.
-	prefix := path.Join(tenant, "cubes", result.Entry.CubeID) + "/"
-	keys, listErr := cqp.listObjects(ctx, prefix)
-	if listErr != nil || len(keys) == 0 {
+	result, found, qErr := cqp.qp.QueryRange(ctx, blockpack.CubeQueryPathRequest{
+		Tenant:                     tenant,
+		Dims:                       dims,
+		Filters:                    filters,
+		NeededAttr:                 neededAttr,
+		NeededAttrType:             neededAttrType,
+		NeededAttrOK:               neededAttrOK,
+		RequestedResolutionMinutes: requestedResolution,
+		MinMinute:                  minMinute,
+		MaxMinute:                  maxMinute,
+		// req.Start/req.End are nanoseconds; VCNT records are keyed in unix seconds
+		// (minute-floored), so pass the query window in seconds for the cardinality gate.
+		MinTS: req.Start / 1_000_000_000,
+		MaxTS: req.End / 1_000_000_000,
+	})
+	if qErr != nil {
+		return nil, false, qErr
+	}
+	if !found {
 		return nil, false, nil
 	}
 
-	// Download, open, and validate readers (APPENDIX 3: registry-vs-file consistency check).
-	// cubeBytesRead (issue #218, Phase 5) accumulates every successfully-opened cube reader's
-	// exact byte count (blockpack.CubeReader.BytesRead) — including files later excluded by
-	// classifyCubeFile's registry-vs-file mismatch check, since the decode/download cost was
-	// genuinely incurred regardless of whether the file ends up contributing to the rollup.
-	//
-	// Fanned out concurrently (one goroutine and one GetObject round trip per L0 file,
-	// unconditionally) rather than the prior sequential loop -- mirrors
-	// executor.FindTraceGroupInCandidates' own no-cap fan-out (blockpack NOTE-VI-106): this is
-	// I/O-bound (S3 round trip dominates), and a wide time-range query can have dozens of L0
-	// files, so fetching them one at a time serialized the query's whole latency on round-trip
-	// count. Results are collected into a slice indexed by each key's ORIGINAL position and
-	// filtered back into inputs in that same order once every fetch has resolved, so ordering
-	// stays deterministic regardless of which goroutine finishes first.
-	type cubeFileResult struct {
-		input blockpack.CubeRollupInput
-		ok    bool
-	}
-	results := make([]cubeFileResult, len(keys))
-	var cubeBytesRead int64
-	g, gctx := errgroup.WithContext(ctx)
-	for i, key := range keys {
-		i, key := i, key
-		g.Go(func() (err error) {
-			// A panic in a goroutine (unlike one in this call's own stack) is NOT caught by the
-			// request handler's own recover middleware and crashes the whole process -- this
-			// guard is load-bearing for the fan-out, not just defensive mirroring.
-			defer func() {
-				if rec := recover(); rec != nil {
-					err = fmt.Errorf("tryQueryFromCube: fetch cube file %q: panic: %v", key, rec)
-				}
-			}()
-			data, getErr := cqp.getObject(gctx, key)
-			if getErr != nil {
-				return nil // routine download failure — not a registry/file drift, not logged as one
-			}
-			r, openErr := blockpack.OpenCubeReaderFromBytes(data)
-			if openErr != nil {
-				return nil // routine decode failure — same posture as above
-			}
-			atomic.AddInt64(&cubeBytesRead, r.BytesRead())
-			if ok, mismatchErr := classifyCubeFile(r, result.Entry); !ok {
-				// A registry/file drift (corruption, a buggy writer, or a stale registry entry) —
-				// excluded from CubeRollup's inputs with the SAME posture as the routine failures
-				// above, but logged DISTINCTLY so the drift is operationally discoverable, never
-				// silently indistinguishable "noise" (APPENDIX 3).
-				level.Warn(util_log.Logger).Log(
-					"msg", "vblockpack: cube: registry-vs-file aggAttrs mismatch, excluding file",
-					"tenant", tenant, "cube_id", result.Entry.CubeID, "key", key, "err", mismatchErr,
-				)
-				return nil
-			}
-			results[i] = cubeFileResult{input: blockpack.CubeNewRollupInput(r), ok: true}
-			return nil
-		})
-	}
-	if err := g.Wait(); err != nil {
-		// A goroutine panicked -- treat as no cube coverage (same posture as rollupErr below)
-		// rather than propagating, so a single corrupt file can't take down the query handler.
-		level.Warn(util_log.Logger).Log(
-			"msg", "vblockpack: cube: fetch fan-out failed", "tenant", tenant,
-			"cube_id", result.Entry.CubeID, "err", err,
-		)
-		return nil, false, nil
-	}
-	inputs := make([]blockpack.CubeRollupInput, 0, len(keys))
-	for _, res := range results {
-		if res.ok {
-			inputs = append(inputs, res.input)
-		}
-	}
-	if len(inputs) == 0 {
-		return nil, false, nil
-	}
-
-	cells, rollupErr := rollupCubeInputs(inputs, result, minMinute, maxMinute)
-	if rollupErr != nil {
-		return nil, false, nil
-	}
-
-	resp := buildCubeQueryResponse(cells, result.Entry.Dimensions, result.Entry.AggAttrs, req, cubeBytesRead)
-	if partialCoverage {
+	resp := buildCubeQueryResponse(result.Cells, result.Dimensions, result.AggAttrNames, req, result.BytesRead)
+	if result.PartialCoverage {
 		resp.Status = tempopb.PartialStatus_PARTIAL
-		resp.Message = cubePartialCoverageMessage(minMinute, maxMinute, origMinMinute, origMaxMinute)
+		resp.Message = cubePartialCoverageMessage(result.CoveredMinMinute, result.CoveredMaxMinute, minMinute, maxMinute)
 	}
 	return resp, true, nil
 }
 
-// rollupCubeInputs merges opened cube readers using the ROUTED resolution level
-// (result.Resolution — Route's own decision, E-10) as CubeRollup's target level, never a
-// hardcoded value. Extracted into its own function (mirroring #44's filterValidCubeDefs
-// extraction pattern) so a test can construct a fake CubeRoutingResult and real cube readers (via
-// the production write path, Lesson 2) and assert CubeRollup was invoked with THAT resolution,
-// independently of tryQueryFromCube's S3/minio wiring which is otherwise untestable in isolation.
-func rollupCubeInputs(
-	inputs []blockpack.CubeRollupInput,
-	result blockpack.CubeRoutingResult,
-	minMinute, maxMinute uint32,
-) ([]blockpack.CubeMergedCell, error) {
-	return blockpack.CubeRollup(inputs, result.Resolution, minMinute, maxMinute)
-}
-
-// cubeCoveredWindow (#217/SPEC-CUBE-028, ruling 4(b) revisit, Phase 3.3) narrows
-// [reqMinMinute, reqMaxMinute] to result's actual covered sub-range
-// (CoveredMinMinute/CoveredMaxMinute), reporting whether coverage is partial. Pure — no I/O —
-// extracted into its own function for the SAME reason rollupCubeInputs was (see its own doc
-// comment): tryQueryFromCube's S3/minio wiring is otherwise untestable in isolation, but the
-// narrowing/partial-detection logic itself is worth testing directly against a real
-// router.Route result.
-func cubeCoveredWindow(result blockpack.CubeRoutingResult, reqMinMinute, reqMaxMinute uint32) (minMinute, maxMinute uint32, partial bool) {
-	partial = result.CoveredMinMinute > reqMinMinute || result.CoveredMaxMinute < reqMaxMinute
-	if !partial {
-		return reqMinMinute, reqMaxMinute, false
-	}
-	return result.CoveredMinMinute, result.CoveredMaxMinute, true
-}
-
 // cubePartialCoverageMessage builds the PartialStatus_PARTIAL message for a cube answer that
 // only covers [coveredMin,coveredMax] of the originally requested [reqMin,reqMax]. Pure — no
-// I/O — for the same isolation-testability reason as cubeCoveredWindow above.
+// I/O — stays tempo-side since it only formats a tempopb response field.
 func cubePartialCoverageMessage(coveredMin, coveredMax, reqMin, reqMax uint32) string {
 	return fmt.Sprintf(
 		"cube covers minutes [%d,%d] of the requested [%d,%d]; the uncovered edge is not answered by this cube",
 		coveredMin, coveredMax, reqMin, reqMax,
 	)
-}
-
-// maybeCreateCube fires TryCreate for a (tenant, dims, filters) pattern that had no
-// cube. It is rate-limited to at most once per minute per (tenant+dims+filters) key to
-// prevent the per-block fan-out from creating a storm of concurrent S3 ConditionalPuts.
-// The filters are part of the cube identity (#480): two queries with the same group-by
-// dims but different filters must create (and route to) distinct cubes.
-//
-// neededAttr/neededAttrType/neededAttrOK are extractAggAttr's result for the triggering query
-// (E-10) — when neededAttrOK, the newly-created cube's AggAttrs is {duration} ∪
-// {neededAttr}, so the very first query for a pattern needing e.g. sum_over_time(x) creates a
-// cube that can actually answer it, not a count-only cube requiring a second creation later.
-//
-// minTS/maxTS are the query window in unix seconds; they scope the VCNT read used by
-// the cardinality gate to the same window the query asked for.
-func (cqp *cubeQueryPath) maybeCreateCube(
-	ctx context.Context,
-	tenant string,
-	dims []string,
-	filters []blockpack.CubeColumnFilter,
-	neededAttr string,
-	neededAttrType blockpack.CubeAggAttrType,
-	neededAttrOK bool,
-	minTS, maxTS uint64,
-) {
-	// cqp.pgPool is nil in any deployment with ValueIndexEnabled+S3 but no cfg.Postgres (see
-	// loadEntries' identical nil-guard doc comment above for why this path has no such
-	// hard-fail gate at config-validation time, unlike CubeManager/CubeTenants). Issue #504
-	// removed the blob/index.json registry fallback this used to fall back to
-	// (blockpack.NewCubeRegistry(cqp.objectStore(), tenant)) -- skip cube creation entirely
-	// rather than let blockpack.NewPgCubeRegistry's underlying nil pool panic on first use.
-	// Mirrors this same function's existing cqp.jobStore == nil optional-skip below.
-	if cqp.pgPool == nil {
-		level.Debug(util_log.Logger).Log("msg", "vblockpack: cube: postgres not configured, skipping cube creation", "tenant", tenant)
-		return
-	}
-
-	key := tenant + "|" + strings.Join(dims, ",") + "|" + filterDedupKey(filters)
-
-	cqp.mu.Lock()
-	if last, ok := cqp.createSeen[key]; ok && time.Since(last) < time.Minute {
-		cqp.mu.Unlock()
-		return // already attempted recently
-	}
-	cqp.createSeen[key] = time.Now()
-	cqp.mu.Unlock()
-
-	reg := blockpack.NewPgCubeRegistry(cqp.pgPool, tenant)
-	trigger := blockpack.NewCubeCreationTrigger(reg, blockpack.CubeTriggerConfig{})
-	// Fetch real VCNT data for the proposed dimensions over the query window so the
-	// cardinality gate runs against actual per-dimension distinct-value counts
-	// instead of nil (#483). Reads go through the same shared cachingStore-wrapped
-	// minioVIStore the backfill/query paths use. If no VCNT coverage exists for the
-	// dims/window, the section is empty and the gate passes by default — matching
-	// the prior best-effort behaviour rather than blocking cube creation.
-	vcntData, vcntDir := cqp.fetchVCNTSection(ctx, tenant, dims, minTS, maxTS)
-	// Every v2 cube always materializes duration (ruling 3); the triggering query's own
-	// attribute (if any) joins the set so the cube this query creates can immediately answer
-	// it, per E-10.
-	aggAttrs := buildAggAttrs(neededAttr, neededAttrType, neededAttrOK)
-	result, err := trigger.TryCreate(ctx, tenant, dims, filters, aggAttrs, vcntData, vcntDir, minTS, maxTS)
-	if err != nil {
-		level.Warn(util_log.Logger).Log("msg", "vblockpack: cube TryCreate failed", "tenant", tenant, "dims", dims, "err", err)
-		return
-	}
-	if result.Created {
-		level.Info(util_log.Logger).Log(
-			"msg", "vblockpack: cube created on first query",
-			"tenant", tenant, "dims", dims,
-			"cube_id", result.Entry.CubeID,
-		)
-		cqp.invalidateCache(tenant) // reload registry next time
-		if cqp.jobStore != nil {
-			if ierr := cqp.jobStore.InsertCubeBackfill(ctx, tenant, jobstore.CubeBackfillDetail{
-				CubeID:        result.Entry.CubeID,
-				WindowMinutes: math.MaxUint32,
-			}); ierr != nil {
-				level.Warn(util_log.Logger).Log(
-					"msg", "vblockpack: failed to insert durable cube_backfill job",
-					"tenant", tenant, "cube_id", result.Entry.CubeID, "err", ierr,
-				)
-			}
-		}
-		// Kick off historical backfill from the value index.
-		launchBackfill(result.Entry)
-		return
-	}
-
-	// #181 §6.3/§9 Phase 3: the cube already exists, but a cube whose single backfill
-	// attempt exhausted its retries has no OTHER path back into backend_jobs now that
-	// the poll is gone (§5.3's coverage-gap finding) -- this query-path re-evaluation
-	// (already firing at the createSeen cadence above) is the only remaining trigger
-	// point. Cube's RegistryEntry has no explicit "backfill done" flag (unlike VI's
-	// Entry.Backfill.Done); the absence of an L0 watermark is the cheapest available
-	// heuristic for "never completed a single successful backfill pass" -- a cube that
-	// finished at least one pass has a CubeRollupL0 watermark entry (E-12a's
-	// Compactor.Execute populates it on every successful rollup write), so its absence
-	// here means backfill either never ran or never succeeded even once.
-	if cqp.jobStore == nil {
-		return
-	}
-	if _, hasL0 := result.Entry.Watermarks[blockpack.CubeRollupL0]; hasL0 {
-		return
-	}
-	if ierr := cqp.jobStore.InsertCubeBackfill(ctx, tenant, jobstore.CubeBackfillDetail{
-		CubeID:        result.Entry.CubeID,
-		WindowMinutes: math.MaxUint32,
-	}); ierr != nil {
-		level.Warn(util_log.Logger).Log(
-			"msg", "vblockpack: failed to insert durable cube_backfill retry job",
-			"tenant", tenant, "cube_id", result.Entry.CubeID, "err", ierr,
-		)
-	}
-}
-
-// requestedResolutionMinutes converts a query's Step (nanoseconds) into the router's requested
-// resolution unit (minutes) — E-10 replaces the previous hardcoded resolution=1 (always L0) with
-// the query's own actual requested granularity, so router.ResolutionLevel can select L1/L2 for
-// coarse-step queries instead of always serving minute resolution.
-func requestedResolutionMinutes(stepNanos uint64) uint32 {
-	return uint32(stepNanos / 60_000_000_000) //nolint:gosec // step fits uint32 for any realistic query window
-}
-
-// buildAggAttrs builds the AggAttrs set a newly-created cube materializes: duration
-// unconditionally (ruling 3), plus the triggering query's own needed attribute when
-// extractAggAttr found one and it isn't duration itself (avoiding a duplicate entry).
-func buildAggAttrs(neededAttr string, neededAttrType blockpack.CubeAggAttrType, neededAttrOK bool) []blockpack.CubeAggAttrDef {
-	aggAttrs := []blockpack.CubeAggAttrDef{{Column: blockpack.CubeDurationColumn, Type: blockpack.CubeAggAttrTypeInt64}}
-	if neededAttrOK && neededAttr != blockpack.CubeDurationColumn {
-		aggAttrs = append(aggAttrs, blockpack.CubeAggAttrDef{Column: neededAttr, Type: neededAttrType})
-	}
-	return aggAttrs
-}
-
-// classifyCubeFile validates an already-opened reader's declared NumAggAttrs against entry
-// (APPENDIX 3's registry-vs-file consistency check) — a pure comparison, no I/O. Returns
-// ok=false when they mismatch; the caller must exclude the file from CubeRollup's inputs but log
-// the mismatch DISTINCTLY from a routine download/decode failure (which never reaches this
-// function at all, being a categorically different code path), so a real registry/file drift is
-// operationally discoverable rather than indistinguishable "noise."
-func classifyCubeFile(r *blockpack.CubeReader, entry blockpack.CubeRegistryEntry) (ok bool, mismatchErr error) {
-	if err := blockpack.CubeValidateFileMatchesRegistry(r.NumAggAttrs(), entry); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-// listObjects returns all object keys under prefix.
-func (cqp *cubeQueryPath) listObjects(ctx context.Context, prefix string) ([]string, error) {
-	var keys []string
-	for obj := range cqp.client.ListObjects(ctx, cqp.bucket,
-		minio.ListObjectsOptions{Prefix: prefix, Recursive: true}) {
-		if obj.Err != nil {
-			return nil, obj.Err
-		}
-		keys = append(keys, obj.Key)
-	}
-	return keys, nil
-}
-
-// getObject downloads one object from S3.
-func (cqp *cubeQueryPath) getObject(ctx context.Context, key string) ([]byte, error) {
-	obj, err := cqp.client.GetObject(ctx, cqp.bucket, key, minio.GetObjectOptions{})
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = obj.Close() }()
-	var buf bytes.Buffer
-	_, err = io.Copy(&buf, obj)
-	return buf.Bytes(), err
 }
 
 // byDimGroupRe matches "by (\s*col1\s*,\s*col2\s*)" in a TraceQL metrics query.
@@ -812,8 +539,11 @@ func extractFilters(query string) ([]blockpack.CubeColumnFilter, bool) {
 	return filters, true
 }
 
-// filterDedupKey renders a canonical filter set into a stable string for use in the
-// per-(tenant+dims+filters) creation-cooldown dedup key.
+// filterDedupKey renders a canonical filter set into a stable string, used only for this
+// file's own debug logging. #508: blockpack.CubeQueryPath keeps its own private copy of this
+// exact logic for its creation-cooldown dedup key — the two never need to be the SAME
+// instance (this one is pure/deterministic and used only for a log line), just the same
+// logic, so no drift risk from keeping both.
 func filterDedupKey(filters []blockpack.CubeColumnFilter) string {
 	if len(filters) == 0 {
 		return ""
@@ -862,7 +592,7 @@ func dimLabelKVs(dim1Label, dim2Label, d1, d2 string) []commonpbv1.KeyValue {
 
 // buildCubeQueryResponse builds a QueryRangeResponse from rolled-up cube cells. cubeBytesRead
 // (issue #218, Phase 5) is the exact total byte count of every cube file opened to answer this
-// query (tryQueryFromCube's own accumulator) — set on the response's SearchMetrics.CubeBytesRead
+// query (blockpack.CubeQueryPathResult.BytesRead) — set on the response's SearchMetrics.CubeBytesRead
 // unconditionally; IndexBytesRead/DataFileBytesRead/VcntBytesRead are correctly left at their
 // zero default here, since a cube-answered response never touches VI/scan/VCNT.
 func buildCubeQueryResponse(

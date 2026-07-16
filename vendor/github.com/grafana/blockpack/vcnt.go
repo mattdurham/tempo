@@ -199,6 +199,27 @@ func VCNTBuildSectionFromObjects(objects [][]byte) (data []byte, dir []VCNTChunk
 	return data, dir, skipped
 }
 
+// VCNTFileOverlapsRange reports whether the .vcnt file named name should be fetched to answer a
+// query over [minSec, maxSec] (argument order matches VCNTFileMeta.IsInTimeRange's own
+// (queryMinSec, queryMaxSec) order — do not swap). Ported from tempo's tempodb/encoding/
+// vblockpack/vcnt_prune.go (#508 Decision 3) so the moved cube_backfill_runner.go's
+// buildVCNTSection can call it without a tempo-side dependency; tempo's own vcnt_prune.go now
+// aliases this function so modules/frontend/vcnt_fetch.go's call site needs no change.
+//
+// A v1-shaped or otherwise unparseable name (VCNTParseFilenameV2 returns an error) ALWAYS
+// returns true: unknown range means always fetch, never drop. This is an unconditional,
+// hard-coded safety rule, not a tunable — it deliberately avoids repeating blockpack's own
+// valueindex/discovery.go mistake (NOTE-VI-030) of treating "I don't know this file's range" as
+// "skip it," which silently and permanently drops pre-v2-format files from ever being
+// considered.
+func VCNTFileOverlapsRange(name string, minSec, maxSec uint64) bool {
+	meta, err := VCNTParseFilenameV2(name)
+	if err != nil {
+		return true
+	}
+	return meta.IsInTimeRange(minSec, maxSec)
+}
+
 // VIFileMeta holds the parsed metadata from a v2 value-index filename.
 type VIFileMeta = valueindex.FileMeta
 

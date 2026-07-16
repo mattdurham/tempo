@@ -333,6 +333,13 @@ type CubeAggAttrDef = cube.AggAttrDef
 // spelling; always reference this constant.
 const CubeDurationColumn = cube.DurationColumn
 
+// CubeAllDimSentinel is the fixed placeholder dimension value used whenever a cube Definition
+// has no real column for a dimension slot: a single-dimension cube's Dim2Column, or a
+// zero-dimension cube's Dim1Column AND Dim2Column. Forward-ingest and backfill must both use
+// this exact constant, never independently hardcode the string, or CubeRollup treats their
+// "no dimension" cells as two distinct series instead of merging them.
+const CubeAllDimSentinel = cube.AllDimSentinel
+
 // CubeAccumulator is an in-memory per-minute span counter for one cube.
 type CubeAccumulator = cube.Accumulator
 
@@ -450,13 +457,20 @@ func CubeRegistryEntryToDefinition(
 	}
 	if len(entry.Dimensions) >= 1 {
 		def.Dim1Column = entry.Dimensions[0]
+	} else {
+		// NOTE-CUBE-033 (Bug 1): zero-dimension cube -- use the same fixed sentinel for dim1 as
+		// the single-dimension case already uses for dim2, so the accumulator does not skip
+		// every span (Accumulator.Add requires both dims present; without this, Dim1Column stays
+		// "" and every SpanValues.String("") call falls through to (false, "") -- silently never
+		// accumulating anything for an ungrouped/zero-dim query).
+		def.Dim1Column = CubeAllDimSentinel
 	}
 	if len(entry.Dimensions) >= 2 {
 		def.Dim2Column = entry.Dimensions[1]
 	} else {
-		// Single-dimension cube: use a fixed sentinel for dim2 so the accumulator
+		// Single- or zero-dimension cube: use a fixed sentinel for dim2 so the accumulator
 		// does not skip spans (Accumulator.Add requires both dims present).
-		def.Dim2Column = "__all__"
+		def.Dim2Column = CubeAllDimSentinel
 	}
 	if filterFn != nil {
 		for _, cf := range entry.Filters {
