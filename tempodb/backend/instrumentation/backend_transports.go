@@ -31,6 +31,12 @@ func NewTransport(next http.RoundTripper) http.RoundTripper {
 	}
 }
 
+// Unwrap exposes the wrapped RoundTripper so callers (e.g. tests asserting on the underlying
+// *http.Transport's connection-pool settings) can reach through this pass-through wrapper.
+func (i instrumentedTransport) Unwrap() http.RoundTripper {
+	return i.next
+}
+
 func (i instrumentedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	start := time.Now()
 	resp, err := i.next.RoundTrip(req)

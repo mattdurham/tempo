@@ -470,6 +470,15 @@ func minioOptionsForValueIndex(cfg *s3.Config) (*minio.Options, error) {
 	if err != nil {
 		return nil, fmt.Errorf("newMinioForValueIndex: create default transport: %w", err)
 	}
+	// FindTraceGroupInCandidates (blockpack, NOTE-VI-106) fans every candidate index file's
+	// LookupTraceGroupPartial call out concurrently with no cap, so a single trace-by-id/search
+	// query can issue dozens of simultaneous GETs against this one S3 endpoint host. minio-go's
+	// DefaultTransport only keeps 16 idle conns per host (256 total), far below that fan-out, so
+	// most of those requests were paying a fresh TCP+TLS handshake instead of reusing a pooled
+	// connection. Raised well above the main data-block backend's own bump to 100/100 (s3.go's
+	// createCore) to give this higher-fan-out path room to keep connections warm.
+	transport.MaxIdleConnsPerHost = 512
+	transport.MaxIdleConns = 512
 	return &minio.Options{
 		Creds:     credentials.NewEnvAWS(),
 		Secure:    !cfg.Insecure,

@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-kit/log/level"
@@ -37,6 +38,7 @@ import (
 	"github.com/grafana/tempo/tempodb/encoding/vblockpack/jobstore"
 	"github.com/jackc/pgx/v5/pgxpool"
 	minio "github.com/minio/minio-go/v7"
+	"golang.org/x/sync/errgroup"
 )
 
 // cubeQueryPath is the process-level cube query path manager.
@@ -277,30 +279,71 @@ func (cqp *cubeQueryPath) tryQueryFromCube(
 	// exact byte count (blockpack.CubeReader.BytesRead) — including files later excluded by
 	// classifyCubeFile's registry-vs-file mismatch check, since the decode/download cost was
 	// genuinely incurred regardless of whether the file ends up contributing to the rollup.
+	//
+	// Fanned out concurrently (one goroutine and one GetObject round trip per L0 file,
+	// unconditionally) rather than the prior sequential loop -- mirrors
+	// executor.FindTraceGroupInCandidates' own no-cap fan-out (blockpack NOTE-VI-106): this is
+	// I/O-bound (S3 round trip dominates), and a wide time-range query can have dozens of L0
+	// files, so fetching them one at a time serialized the query's whole latency on round-trip
+	// count. Results are collected into a slice indexed by each key's ORIGINAL position and
+	// filtered back into inputs in that same order once every fetch has resolved, so ordering
+	// stays deterministic regardless of which goroutine finishes first.
+	type cubeFileResult struct {
+		input blockpack.CubeRollupInput
+		ok    bool
+	}
+	results := make([]cubeFileResult, len(keys))
 	var cubeBytesRead int64
+	g, gctx := errgroup.WithContext(ctx)
+	for i, key := range keys {
+		i, key := i, key
+		g.Go(func() (err error) {
+			// A panic in a goroutine (unlike one in this call's own stack) is NOT caught by the
+			// request handler's own recover middleware and crashes the whole process -- this
+			// guard is load-bearing for the fan-out, not just defensive mirroring.
+			defer func() {
+				if rec := recover(); rec != nil {
+					err = fmt.Errorf("tryQueryFromCube: fetch cube file %q: panic: %v", key, rec)
+				}
+			}()
+			data, getErr := cqp.getObject(gctx, key)
+			if getErr != nil {
+				return nil // routine download failure — not a registry/file drift, not logged as one
+			}
+			r, openErr := blockpack.OpenCubeReaderFromBytes(data)
+			if openErr != nil {
+				return nil // routine decode failure — same posture as above
+			}
+			atomic.AddInt64(&cubeBytesRead, r.BytesRead())
+			if ok, mismatchErr := classifyCubeFile(r, result.Entry); !ok {
+				// A registry/file drift (corruption, a buggy writer, or a stale registry entry) —
+				// excluded from CubeRollup's inputs with the SAME posture as the routine failures
+				// above, but logged DISTINCTLY so the drift is operationally discoverable, never
+				// silently indistinguishable "noise" (APPENDIX 3).
+				level.Warn(util_log.Logger).Log(
+					"msg", "vblockpack: cube: registry-vs-file aggAttrs mismatch, excluding file",
+					"tenant", tenant, "cube_id", result.Entry.CubeID, "key", key, "err", mismatchErr,
+				)
+				return nil
+			}
+			results[i] = cubeFileResult{input: blockpack.CubeNewRollupInput(r), ok: true}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		// A goroutine panicked -- treat as no cube coverage (same posture as rollupErr below)
+		// rather than propagating, so a single corrupt file can't take down the query handler.
+		level.Warn(util_log.Logger).Log(
+			"msg", "vblockpack: cube: fetch fan-out failed", "tenant", tenant,
+			"cube_id", result.Entry.CubeID, "err", err,
+		)
+		return nil, false, nil
+	}
 	inputs := make([]blockpack.CubeRollupInput, 0, len(keys))
-	for _, key := range keys {
-		data, getErr := cqp.getObject(ctx, key)
-		if getErr != nil {
-			continue // routine download failure — not a registry/file drift, not logged as one
+	for _, res := range results {
+		if res.ok {
+			inputs = append(inputs, res.input)
 		}
-		r, openErr := blockpack.OpenCubeReaderFromBytes(data)
-		if openErr != nil {
-			continue // routine decode failure — same posture as above
-		}
-		cubeBytesRead += r.BytesRead()
-		if ok, mismatchErr := classifyCubeFile(r, result.Entry); !ok {
-			// A registry/file drift (corruption, a buggy writer, or a stale registry entry) —
-			// excluded from CubeRollup's inputs with the SAME posture as the routine failures
-			// above, but logged DISTINCTLY so the drift is operationally discoverable, never
-			// silently indistinguishable "noise" (APPENDIX 3).
-			level.Warn(util_log.Logger).Log(
-				"msg", "vblockpack: cube: registry-vs-file aggAttrs mismatch, excluding file",
-				"tenant", tenant, "cube_id", result.Entry.CubeID, "key", key, "err", mismatchErr,
-			)
-			continue
-		}
-		inputs = append(inputs, blockpack.CubeNewRollupInput(r))
 	}
 	if len(inputs) == 0 {
 		return nil, false, nil

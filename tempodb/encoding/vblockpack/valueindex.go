@@ -27,6 +27,7 @@ import (
 	blockpack "github.com/grafana/blockpack"
 	"github.com/grafana/tempo/tempodb/backend"
 	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
+	"github.com/grafana/tempo/tempodb/backend/instrumentation"
 )
 
 // minioNoSuchKeyCode is minio's error Code for a 404 (object not found),
@@ -71,10 +72,22 @@ func newMinioClientFromS3Config(s3cfg *s3backend.Config) (*minio.Client, error) 
 		}},
 		&credentials.EnvAWS{},
 	})
+	// Every caller of this constructor (cube backfill, cube manager, cube query path, VI usage
+	// hook, VI backfill) previously got minio-go's bare DefaultTransport -- no pool tuning, no
+	// instrumentation, unlike the value-index query path's own client (tempodb.go's
+	// newMinioForValueIndex). cubequerypath.go's cube-backed metrics queries can fan out many
+	// concurrent GetObject calls for one query's L0 files, so this needs the same treatment.
+	transport, err := minio.DefaultTransport(!s3cfg.Insecure)
+	if err != nil {
+		return nil, err
+	}
+	transport.MaxIdleConnsPerHost = 512
+	transport.MaxIdleConns = 512
 	return minio.New(endpoint, &minio.Options{
-		Creds:  creds,
-		Secure: !s3cfg.Insecure,
-		Region: s3cfg.Region,
+		Creds:     creds,
+		Secure:    !s3cfg.Insecure,
+		Region:    s3cfg.Region,
+		Transport: instrumentation.NewTransport(transport),
 	})
 }
 
