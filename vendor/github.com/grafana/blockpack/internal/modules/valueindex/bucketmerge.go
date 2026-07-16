@@ -232,6 +232,18 @@ func filterDeadRefsBlock(
 		ng := BucketGroup{TimeSec: g.TimeSec, CanonicalValue: g.CanonicalValue}
 		for ri := range g.Refs {
 			r := &g.Refs[ri]
+			// A SourceID out of range for this file's own StringTable means the ref
+			// itself is unresolvable -- table.Lookup would return "" and
+			// checker.IsLive("") would error on the empty path (tempo-dev-test-03
+			// incident, 2026-07-15), turning one corrupt ref into a fatal decode
+			// error for the WHOLE block. This is not the whole-file-decode-failure
+			// class NOTE-VI-115 hardened against (this block decoded successfully;
+			// only this one ref's data is bad) -- drop it, counted separately from
+			// ordinary dead-ref pruning, and keep processing the rest of the block.
+			if int(r.SourceID) >= table.Len() {
+				stats.Corrupt++
+				continue
+			}
 			isLive, ok := live[r.SourceID]
 			if !ok {
 				l, err := checker.IsLive(ctx, table.Lookup(r.SourceID))

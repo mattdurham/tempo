@@ -1224,3 +1224,46 @@ adds a backdated `vi-keymerge-abc123.tmp` fixture file alongside the existing
 **Spec invariants tested:** SPEC-VI-18.
 
 Back-ref: `internal/modules/valueindex/temp_cleanup_test.go:TestSweepOrphanedMergeTempFiles_RemovesKeyMergePrefixToo`.
+
+---
+
+## TEST-VI-46: An out-of-range `SourceID` is dropped as `Corrupt` before ever reaching `RefChecker.IsLive` (tempo-dev-test-03 incident, 2026-07-15)
+*Added: 2026-07-15*
+
+**Scenario:** a live L4 file had refs whose `SourceID` was out of range for the file's own
+(correctly-decoded) `StringTable`. `table.Lookup` returned `""`, and the real S3-backed
+`RefChecker.IsLive("")` errored ("Object name cannot be empty"), which `filterDeadRefsBlock`
+propagated as a fatal decode error for the whole block, permanently stuck-failing that column's
+compaction on every retry. The fix adds an `int(r.SourceID) >= table.Len()` guard before the
+`checker.IsLive` call, dropping the ref and counting it in the new `CompactStats.Corrupt` field
+instead.
+
+**Setup:** two tests in `bucketmerge_test.go`.
+`TestFilterDeadRefsBlock_OutOfRangeSourceIDIsDroppedNotFatal` builds a block containing a mix of
+in-range and out-of-range `SourceID` refs against a small `StringTable`, using a permissive
+counting fake `RefChecker`.
+`TestFilterDeadRefsBlock_OutOfRangeSourceIDNeverReachesRefChecker` repeats the same fixture shape
+but swaps in `erroringOnEmptyRefChecker`, a fake that genuinely returns an error for `IsLive(ctx,
+"")` — faithfully reproducing the real incident's exact error path instead of relying on a
+checker that happens to tolerate the empty string.
+
+**Assertions:** the out-of-range ref is dropped (not retained), `CompactStats.Corrupt` reflects
+the dropped count, `filterDeadRefsBlock` returns no error, and the block's genuinely valid refs
+are still retained/checked normally. With `erroringOnEmptyRefChecker`, the call must still
+succeed with no error — proving the out-of-range check runs BEFORE `checker.IsLive` is ever
+invoked for that ref, not merely that some checker happens not to error on `""`.
+
+**Mutation check:** reverting the `int(r.SourceID) >= table.Len()` guard in
+`filterDeadRefsBlock` makes both tests fail with the exact production error message
+("Object name cannot be empty") surfaced as a fatal `filterDeadRefsBlock` error; restoring the
+guard makes both pass.
+
+**Spec invariants tested:** none new — see `NOTES.md` NOTE-VI-118 for the explicit reconciliation
+with NOTE-VI-115 (this is a narrower, additive per-ref safeguard downstream of a successful
+block decode, not a weakening of NOTE-VI-115's whole-file/whole-block error-on-corruption
+contract).
+
+Back-ref: `internal/modules/valueindex/bucketmerge_test.go:TestFilterDeadRefsBlock_OutOfRangeSourceIDIsDroppedNotFatal,
+TestFilterDeadRefsBlock_OutOfRangeSourceIDNeverReachesRefChecker,erroringOnEmptyRefChecker`,
+`internal/modules/valueindex/bucketmerge.go:filterDeadRefsBlock`,
+`internal/modules/valueindex/compaction.go:CompactStats`.

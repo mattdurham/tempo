@@ -2223,3 +2223,87 @@ TestMergeGroupsAtKey_NoInMemoryStructureExceedsStructuralBound`. See `SPECS.md` 
 (Addendum, 2026-07-15), SPEC-VI-18, SPEC-VI-16. See `NOTES.md` NOTE-VI-111, NOTE-VI-112 (the
 #501 residual risk this note closes, in part). `TESTS.md` TEST-VI-31 through TEST-VI-45. Issue
 #503.
+
+---
+
+## NOTE-VI-118 — an out-of-range `SourceID` within an otherwise-valid block is dropped (Corrupt), not fatal (tempo-dev-test-03 live incident, 2026-07-15)
+
+Date: 2026-07-15
+
+**Incident.** A live L4 value-index compaction file on tempo-dev-test-03 had 169 of 12,830 refs
+in block 0 carrying a `SourceID` (7) that was out of range for the file's own `StringTable`
+(only 2 entries). `StringTable.Lookup` returned `""` for that `SourceID`, the real S3-backed
+`RefChecker.IsLive("")` genuinely errored ("Object name cannot be empty") on the empty path, and
+`filterDeadRefsBlock` (`internal/modules/valueindex/bucketmerge.go`) propagated that as a FATAL
+error for the whole block — permanently stuck-failing that column's L4 compaction on every retry
+(every 5 minutes, indefinitely, with no forward progress possible).
+
+**Root cause of the stale `SourceID` itself: not fully pinned down.** Extensive tracing of
+`MergeBucketFiles`, the streaming k-way merge in `stream_compaction.go`, and the disk-spill
+serialization in `keymerge_spill.go` all looked internally correct on inspection. The leading
+hypothesis is a stale `SourceID` surviving across an earlier L-level rollup without being
+re-interned against the new file's `StringTable`, but this was NOT confirmed to one exact line
+of code. Treat that as an open caveat, not a closed root cause — a future reader should not
+assume the underlying source of bad `SourceID`s has been eliminated, only that its symptom can
+no longer wedge a column's compaction.
+
+**Fix.** `filterDeadRefsBlock` now checks `int(r.SourceID) >= table.Len()` for each ref BEFORE
+calling `checker.IsLive` — an unresolvable ref is dropped immediately, counted in a new,
+separate `CompactStats.Corrupt` field, and processing continues with the rest of the block. The
+`RefChecker` is never probed with an empty/invalid path for this ref. `CompactStats.Corrupt` is
+documented (`internal/modules/valueindex/compaction.go`) as distinct from `CompactStats.Dropped`:
+`Dropped` is expected, routine retention pruning (source confirmed dead); `Corrupt` is a data
+integrity signal (unresolvable `SourceID`) that must be surfaced loudly, not folded into routine
+drop counts. `internal/modules/valueindexcompactor/metrics.go` adds a new
+`entriesCorrupt` Prometheus counter (`blockpack_value_index_compactor_entries_corrupt_total`),
+and `addMergeCounts` widens to a 6th `corrupt int` parameter. `mergeLevel`
+(`internal/modules/valueindexcompactor/service.go`) and `mergeTraceLevel`
+(`internal/modules/valueindexcompactor/traceindex_dispatch.go`) both aggregate `stats.Corrupt`
+across every iterator's `StatsProvider`, emit a `slog.Warn` naming the colDir and the corrupt
+count when non-zero, and pass the aggregate through to `addMergeCounts`.
+
+**Explicit reconciliation with NOTE-VI-115 — this is NOT a violation.** NOTE-VI-115 established
+that a corrupt v2 file must ERROR, not silently skip, for a specific failure class:
+WHOLE-FILE/WHOLE-BLOCK decode failure (bad footer offsets, truncated block index, snappy
+failure, block-body overrun) — skipping that class silently drops an entire block's worth of
+real postings with no signal, under-counting authoritative coverage. This fix addresses a
+narrower, different failure class: the block/file decodes successfully in full; only specific
+refs WITHIN an otherwise-valid, successfully-decoded block carry unresolvable `SourceID`s. Those
+individual refs are dropped LOUDLY — a dedicated `Corrupt` counter, a `slog.Warn` log line, and a
+new Prometheus metric all fire — not silently, and the rest of the block's genuinely valid refs
+still compact normally. NOTE-VI-115's own two IsLive/skip-vs-error distinctions (bad-magic files
+vs. genuine mid-decode corruption) are about whether to keep reading a FILE at all; this fix
+operates strictly downstream of a successful decode, at the individual-ref level, and does not
+reopen or weaken either of NOTE-VI-115's file-level error paths. A future audit for "did anyone
+violate NOTE-VI-115" should not flag this entry as a regression — it is a distinct, additive
+safeguard at a different granularity.
+
+**Tests.** Two new regression tests in `internal/modules/valueindex/bucketmerge_test.go`:
+`TestFilterDeadRefsBlock_OutOfRangeSourceIDIsDroppedNotFatal` (asserts the out-of-range ref is
+dropped, counted in `Corrupt`, and does not abort the block) and
+`TestFilterDeadRefsBlock_OutOfRangeSourceIDNeverReachesRefChecker` (uses a fake `RefChecker`,
+`erroringOnEmptyRefChecker`, that genuinely errors on `""` — faithfully reproducing the real
+incident's exact error path — to prove the out-of-range check fires BEFORE `checker.IsLive` is
+ever called, not merely that some checker happens to tolerate `""`). Both were mutation-tested:
+reverting the `int(r.SourceID) >= table.Len()` check reproduces the exact production fatal-error
+message on both tests; restoring the fix makes both pass. See `TESTS.md` TEST-VI-46.
+`internal/modules/valueindexcompactor/metrics_test.go`'s stale `addMergeCounts` call site was
+updated for the new 6-argument signature (no new test there — a signature-migration fix, not new
+coverage).
+
+**No SPECS.md entry added.** `SPECS.md` has no existing SPEC-VI entry documenting
+`filterDeadRefsBlock`'s or `RefChecker`'s error-handling contract specifically (SPEC-VI-6 covers
+`MergeTraceGroups`'s unrelated `RefChecker` signature, not this function). Per this module's
+documentation convention, a NOTES.md entry is sufficient for a bug fix that narrows an
+undocumented function's error-handling behavior; a new SPEC-ID-tagged contract was deliberately
+not invented here.
+
+Back-refs: `internal/modules/valueindex/bucketmerge.go:filterDeadRefsBlock`,
+`internal/modules/valueindex/compaction.go:CompactStats` (`Corrupt` field),
+`internal/modules/valueindex/bucketmerge_test.go:TestFilterDeadRefsBlock_OutOfRangeSourceIDIsDroppedNotFatal,
+TestFilterDeadRefsBlock_OutOfRangeSourceIDNeverReachesRefChecker`,
+`internal/modules/valueindexcompactor/metrics.go:entriesCorrupt,addMergeCounts`,
+`internal/modules/valueindexcompactor/service.go:mergeLevel`,
+`internal/modules/valueindexcompactor/traceindex_dispatch.go:mergeTraceLevel`,
+`internal/modules/valueindexcompactor/metrics_test.go`. See NOTE-VI-115. `TESTS.md` TEST-VI-46.
+Incident: tempo-dev-test-03, 2026-07-15.

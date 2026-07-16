@@ -27,13 +27,20 @@ type CompactConfig struct {
 // CompactStats reports the entry-level outcome of one CompactFiles call so the
 // caller can drive observability metrics. Retained counts entries kept (source
 // still live, or no Checker configured); Dropped counts entries discarded
-// because their source blockpack was confirmed deleted by the Checker. Both are
-// pre-dedup counts (each input occurrence is counted once), so Retained is the
-// number of live entries that flowed into the merge, not the deduped output
-// cardinality.
+// because their source blockpack was confirmed deleted by the Checker. Corrupt
+// counts entries discarded because their SourceID could not be resolved at all
+// (out of range for the file's own StringTable) -- a distinct signal from Dropped
+// deliberately kept separate: Dropped is expected, routine retention pruning;
+// Corrupt indicates the input file itself carries unresolvable ref data and
+// should be surfaced loudly, not folded into ordinary drop counts (see NOTES.md
+// for the incident this was added to guard against).
+// All three are pre-dedup counts (each input occurrence is counted once), so
+// Retained is the number of live entries that flowed into the merge, not the
+// deduped output cardinality.
 type CompactStats struct {
 	Retained int
 	Dropped  int
+	Corrupt  int
 }
 
 // CompactFiles merges and deduplicates the given readers into one or more output files.

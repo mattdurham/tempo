@@ -62,6 +62,7 @@ type compactorMetrics struct {
 	filesSkipped    prometheus.Counter // unparseable / wrong-magic files
 	entriesRetained prometheus.Counter
 	entriesDropped  prometheus.Counter
+	entriesCorrupt  prometheus.Counter // refs with an unresolvable SourceID -- data corruption, not routine retention
 
 	// oversizedLevelsSkipped counts levels skipped because even the minimum
 	// forced-progress batch (2 files) would vastly exceed effectiveBatchBytes --
@@ -156,6 +157,12 @@ func newCompactorMetrics(reg prometheus.Registerer) *compactorMetrics {
 		Name: "blockpack_value_index_compactor_entries_dropped_total",
 		Help: "Posting-list entries dropped because their source block was deleted by retention.",
 	}))
+	m.entriesCorrupt = compactorRegisterCounter(reg, prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "blockpack_value_index_compactor_entries_corrupt_total",
+		Help: "Posting-list entries dropped because their SourceID could not be resolved against " +
+			"the input file's own StringTable -- data corruption, not routine retention pruning. " +
+			"Any non-zero rate should be investigated (tempo-dev-test-03 incident, 2026-07-15).",
+	}))
 
 	m.columnsCompacted = compactorRegisterCounterVec(reg, prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "blockpack_value_index_compactor_columns_compacted_total",
@@ -247,7 +254,7 @@ func (m *compactorMetrics) observeMerge(d time.Duration) {
 	m.mergeDur.Observe(d.Seconds())
 }
 
-func (m *compactorMetrics) addMergeCounts(read, written, deleted, retained, dropped int) {
+func (m *compactorMetrics) addMergeCounts(read, written, deleted, retained, dropped, corrupt int) {
 	if m == nil {
 		return
 	}
@@ -265,6 +272,9 @@ func (m *compactorMetrics) addMergeCounts(read, written, deleted, retained, drop
 	}
 	if dropped > 0 {
 		m.entriesDropped.Add(float64(dropped))
+	}
+	if corrupt > 0 {
+		m.entriesCorrupt.Add(float64(corrupt))
 	}
 }
 

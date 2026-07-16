@@ -581,7 +581,12 @@ func (s *Service) mergeLevel(ctx context.Context, colDir string, files []levelFi
 			fstats := sp.Stats()
 			stats.Retained += fstats.Retained
 			stats.Dropped += fstats.Dropped
+			stats.Corrupt += fstats.Corrupt
 		}
+	}
+	if stats.Corrupt > 0 {
+		slog.Warn("valueindexcompactor: dropped refs with unresolvable SourceID (data corruption, not routine retention)",
+			"colDir", colDir, "corrupt", stats.Corrupt)
 	}
 
 	// Delete inputs only after all outputs are durably written.
@@ -599,7 +604,7 @@ func (s *Service) mergeLevel(ctx context.Context, colDir string, files []levelFi
 	}
 
 	s.metrics.observeMerge(s.now().Sub(mergeStart))
-	s.metrics.addMergeCounts(len(files), written, deleted, stats.Retained, stats.Dropped)
+	s.metrics.addMergeCounts(len(files), written, deleted, stats.Retained, stats.Dropped, stats.Corrupt)
 	return firstErr
 }
 

@@ -166,7 +166,12 @@ func (s *Service) mergeTraceLevel(ctx context.Context, colDir string, files []le
 			fstats := sp.Stats()
 			stats.Retained += fstats.Retained
 			stats.Dropped += fstats.Dropped
+			stats.Corrupt += fstats.Corrupt
 		}
+	}
+	if stats.Corrupt > 0 {
+		slog.Warn("valueindexcompactor: dropped refs with unresolvable SourceID (data corruption, not routine retention)",
+			"colDir", colDir, "corrupt", stats.Corrupt)
 	}
 
 	// Delete only the inputs that were successfully decoded and incorporated
@@ -187,7 +192,7 @@ func (s *Service) mergeTraceLevel(ctx context.Context, colDir string, files []le
 	}
 
 	s.metrics.observeMerge(s.now().Sub(mergeStart))
-	s.metrics.addMergeCounts(len(validFiles), written, deleted, stats.Retained, stats.Dropped)
+	s.metrics.addMergeCounts(len(validFiles), written, deleted, stats.Retained, stats.Dropped, stats.Corrupt)
 	if corrupted > 0 {
 		s.metrics.incSkipped(corrupted)
 	}
