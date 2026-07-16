@@ -135,7 +135,7 @@ kubectl wait --for=condition=Ready pod/postgres-viusage-0 -n "$NAMESPACE" --time
 # Push configs from .k8s/configs/ reference files
 CONFIGS_DIR="$(dirname "$0")/.k8s/configs"
 echo "--- Pushing configs from ${CONFIGS_DIR} ---"
-for component in block-builder backend-worker querier query-frontend live-store; do
+for component in block-builder backend-worker querier query-frontend live-store backend-scheduler; do
     cfg="${CONFIGS_DIR}/${component}.yaml"
     if [[ -f "$cfg" ]]; then
         kubectl patch configmap "tempo-${component}" -n "$NAMESPACE" --type=merge \
