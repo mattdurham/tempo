@@ -475,6 +475,28 @@ func (s *Service) compactColumn(ctx context.Context, tenant, colDir string, objs
 // issue #501, unaffected by it) — distinct from the transient per-key MERGE-buffer bound
 // inside valueindex.StreamCompactBucketFiles itself (SPEC-VI-2, amended by #501; see that
 // function's doc comment), which this comment does not cover.
+// markFileCorrupted preserves a genuinely corrupt input file for forensic inspection instead
+// of deleting it, and removes it from its original key so discovery/ParseFilename-based
+// listing (both DiscoverIndexFiles and this compactor's own buildWorkList/compactColumn) never
+// finds and retries it again -- ".corrupted" fails ParseFilename's expected
+// "L<level>-<min>-<max>-<id>.blockpack" pattern and is silently skipped like any other
+// unparseable key, the same mechanism that already makes legacy v1 filenames invisible to
+// both paths (NOTE-VI-118 follow-up, tempo-dev-test-03 incident, 2026-07-15).
+//
+// Write-then-delete ordering (mirrors this package's existing crash-safety convention,
+// e.g. mergeLevel's own output-then-input-delete ordering below): a crash between the two
+// calls leaves BOTH the original and the marked copy, never neither.
+func (s *Service) markFileCorrupted(ctx context.Context, key string, data []byte) error {
+	markedKey := key + ".corrupted"
+	if err := s.store.Put(ctx, markedKey, data); err != nil {
+		return fmt.Errorf("put %q: %w", markedKey, err)
+	}
+	if err := s.store.Delete(ctx, key); err != nil {
+		return fmt.Errorf("delete original %q: %w", key, err)
+	}
+	return nil
+}
+
 func (s *Service) mergeLevel(ctx context.Context, colDir string, files []levelFile) error {
 	mergeStart := s.now()
 
@@ -511,6 +533,10 @@ func (s *Service) mergeLevel(ctx context.Context, colDir string, files []levelFi
 	// decodes one block at a time. Magic was already checked in compactColumn via Peek;
 	// download only known-VBG2 files.
 	iterators := make([]valueindex.GroupIterator, 0, len(files))
+	// alreadyHandled tracks keys markFileCorrupted has already deleted (as part of its own
+	// write-then-delete rename), so the final "delete every input" loop below doesn't issue a
+	// second, redundant Delete against an already-gone key.
+	alreadyHandled := make(map[string]struct{})
 	defer func() {
 		for _, it := range iterators {
 			_ = it.Close()
@@ -532,7 +558,22 @@ func (s *Service) mergeLevel(ctx context.Context, colDir string, files []levelFi
 		it, err := valueindex.NewDiskBucketFileIterator(ctx, tmpPath, checker)
 		if err != nil {
 			_ = os.Remove(tmpPath)
-			return fmt.Errorf("valueindexcompactor: decode %q: %w", f.key, err)
+			// A genuinely corrupt v2 file (NOTE-VI-115's "(b) decode failure past the
+			// magic" class) is marked "<key>.corrupted" and skipped -- NOT deleted, so it
+			// stays available for forensic inspection, and NOT left under its original
+			// name either, so the compactor doesn't retry (and re-fail) it every cycle
+			// forever. Skipping this one file must not abort the merge for every other
+			// valid file in the same batch (tempo-dev-test-03 incident, 2026-07-15).
+			if merr := s.markFileCorrupted(ctx, f.key, data); merr != nil {
+				// Can't even verify we preserved the file -- fall back to the original,
+				// safer all-or-nothing behavior rather than risk losing track of it.
+				return fmt.Errorf("valueindexcompactor: decode %q: %w (also failed to mark corrupted: %v)", f.key, err, merr)
+			}
+			alreadyHandled[f.key] = struct{}{}
+			s.metrics.incFilesCorrupted()
+			slog.Warn("valueindexcompactor: marked corrupt input as .corrupted and skipped (not aborting merge)",
+				"key", f.key, "err", err)
+			continue
 		}
 		if it == nil {
 			// Legacy pre-v2 file: skip, not abort. No iterator was constructed, so
@@ -593,6 +634,9 @@ func (s *Service) mergeLevel(ctx context.Context, colDir string, files []levelFi
 	var firstErr error
 	var deleted int
 	for _, f := range files {
+		if _, handled := alreadyHandled[f.key]; handled {
+			continue
+		}
 		if err := s.store.Delete(ctx, f.key); err != nil {
 			s.metrics.incError(compactorOpDelete)
 			if firstErr == nil {

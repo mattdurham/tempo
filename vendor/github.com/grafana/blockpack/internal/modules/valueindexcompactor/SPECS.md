@@ -209,6 +209,7 @@ Back-ref: `internal/modules/valueindexcompactor/service.go:compactColumn` (the
 
 ## SPEC-VI-7: Trace-index format-dispatch — colDir detection, magic-purge skip, `mergeTraceLevel` crash/retention contract
 *Added: 2026-07-04*
+*Updated: 2026-07-15 (step 5's "corrupt input... left in place, never deleted" claim narrowed — see below and SPEC-VI-8's update)*
 
 **Dispatch condition:** `compactColumn` (`service.go`) branches on `isTraceIndexColDir(colDir)`
 (`traceindex_dispatch.go`) — a hash-equality check, `path.Base(path.Dir(colDir)) ==
@@ -264,6 +265,13 @@ underlying mechanism changed, per SPEC-VI-8.
    place preserves the option to investigate a possible producer-side bug. A `Put` failure
    leaves every input untouched (`TestMergeTraceLevel_PutFailureKeepsInputs`), identical
    ordering guarantee to `mergeLevel`.
+   **[Updated 2026-07-15, `valueindex/NOTES.md` NOTE-VI-119 / this package's own NOTE-VI-120]:**
+   "left in place, never deleted" is no longer the whole story for the genuine-decode-error
+   subcase (SPEC-VI-8 case 3) — that subcase's original key is now deleted as part of a
+   write-then-delete `markFileCorrupted` rename to `<key>.corrupted`, so the file is preserved
+   under a new name rather than literally left in place under its old one. The bad-magic
+   subcase (SPEC-VI-8 case 2) is untouched and still literally left in place, never deleted, as
+   originally documented here. See SPEC-VI-8's own update for the full current contract.
 6. [SUPERSEDED by SPEC-VI-8] The merged output's filename embeds `[wallMinSec, wallMaxSec]`
    computed directly from the in-memory merged `[]TraceGroup` (`traceGroupWallRange`) —
    `TraceGroup` files carry no footer to decode a range back out of (unlike `BucketGroup`'s
@@ -280,6 +288,7 @@ counterpart this write-side work makes possible).
 
 ## SPEC-VI-8: `mergeTraceLevel` disk-streaming wiring contract (issue #500)
 *Added: 2026-07-14*
+*Updated: 2026-07-15 (case 3 below — see the tempo-dev-test-03 incident follow-up)*
 
 **What changed from SPEC-VI-7's original contract.** `mergeTraceLevel` (`traceindex_dispatch.go`)
 now stages each input to local disk and decodes it one block at a time, exactly mirroring
@@ -309,12 +318,24 @@ third (deliberately preserving `mergeTraceLevel`'s own pre-existing corrupt-file
    sibling, where an analogous bad-magic file IS still deleted (it is unconditionally included
    in `mergeLevel`'s own unfiltered final delete loop over the original `files` list).
 3. **Genuine decode error** (`it == nil, err != nil` — a corrupt footer/string-table/
-   block-directory): same skip-not-delete treatment as case 2. This is the one point where
-   `mergeTraceLevel` genuinely diverges from `mergeLevel`'s posture: `mergeLevel` treats the
-   analogous `NewDiskBucketFileIterator` error as FATAL, aborting the whole merge
-   (`return fmt.Errorf(...)`); `mergeTraceLevel` does not, preserving its own pre-existing policy
-   (this same behavior, unchanged, previously applied to a `DecodeTraceGroups` failure under
-   SPEC-VI-7 step 2).
+   block-directory): skip-not-abort, same as case 2 — this is still the one point where
+   `mergeTraceLevel` genuinely diverges from `mergeLevel`'s posture on whether to keep going:
+   `mergeLevel` (as of this same 2026-07-15 fix) also no longer aborts on the analogous
+   `NewDiskBucketFileIterator` error, but the two functions' reasons for not aborting differ —
+   `mergeLevel`'s decode-error path is new territory this fix opened up, while
+   `mergeTraceLevel`'s was already true before this fix, preserving its own long-standing
+   policy (this same behavior, unchanged, previously applied to a `DecodeTraceGroups` failure
+   under SPEC-VI-7 step 2).
+   **[Updated 2026-07-15, `valueindex/NOTES.md` NOTE-VI-119 / this package's own NOTE-VI-120]:**
+   the file's DISPOSITION once skipped is no longer identical to case 2. `markFileCorrupted`
+   (`service.go`) is called: the file's bytes are `Put` under `<key>.corrupted`, then the
+   original `key` is deleted (write-then-delete) — preserved for forensic inspection under a
+   new name, and no longer discoverable by `ParseFilename` on any future compaction pass, so it
+   is never retried again. If `markFileCorrupted` itself fails, this case falls back to case 2's
+   original treatment (leave the file in place under its original key, log a second warning) —
+   it does NOT fall back to aborting the merge, since that would make this function's
+   genuine-decode-error path newly fatal, which it never was before this fix and must not become
+   now.
 
 **Merge (replaces SPEC-VI-7 step 3):** `valueindex.StreamCompactTraceGroups(ctx, iterators, 0,
 s.cfg.MaxOutputBytes, tmpDir, output)` — the heap-based k-way streaming merge

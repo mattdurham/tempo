@@ -728,3 +728,85 @@ Back-ref: `internal/modules/valueindexcompactor/service.go:mergeLevel`. See this
 SPEC-VI-9 (`SPECS.md`), `valueindex/SPECS.md` SPEC-VI-18, `valueindex/NOTES.md` NOTE-VI-113
 (the corresponding valueindex-side entry, written in the same #503 implementation pass). Issue
 #503.
+
+## NOTE-VI-120 — `mergeLevel` no longer aborts the whole merge on a genuinely corrupt input; `mergeTraceLevel`'s existing skip-and-leave-in-place becomes skip-and-mark (tempo-dev-test-03 incident follow-up, 2026-07-15)
+
+**ID caveat, read first (same pattern as NOTE-VI-114's own caveat above):** `NOTE-VI-*` is a
+single counter shared across at least this package's `NOTES.md`, `valueindex/NOTES.md`,
+`valueindexconsumer/NOTES.md`, `vibuilder/NOTES.md`, `executor/NOTES.md`, and
+`blockevents/NOTES.md`. This entry's sibling, `valueindex/NOTES.md` NOTE-VI-119, documents
+(and its own ID caveat explains in full) a pre-existing, unrelated ID collision at 118 between
+`valueindex/NOTES.md` and `valueindexconsumer/NOTES.md`, found by direct inspection immediately
+before writing both entries. This entry claims **120** (119 + 1, both written in the same pass,
+same day). Re-confirm against the live team-wide counter before treating either as final.
+
+Date: 2026-07-15
+
+This entry documents the same fix as `valueindex/NOTES.md` NOTE-VI-119 (full incident context,
+root cause, and the NOTE-VI-115 reconciliation argument live there — not repeated here) from
+this package's own implementation-contract point of view: what changed in `mergeLevel` and
+`mergeTraceLevel` specifically, and how it relates to this package's own prior notes.
+
+**`mergeLevel` (`service.go`): abort becomes mark-and-skip.** Previously, `mergeLevel` treated
+any `valueindex.NewDiskBucketFileIterator` error other than the legacy-pre-v2 `(nil, nil)` case
+as fatal — `return fmt.Errorf(...)` immediately, discarding every already-fetched-but-not-yet-
+merged iterator via the existing `defer` close loop, and leaving every input (including the
+good ones) untouched for the next retry. This was itself a deliberate contract choice
+(NOTE-VI-052, tested by the now-superseded `TestMergeLevel_ErrorMidMergeLeavesInputsUntouched`)
+made when the alternative — silently skipping a corrupt file exactly like a legacy one — was
+judged worse. That framing missed a third option, which this fix adds: skip the file but mark
+it loudly and permanently, so the merge for every OTHER file in the batch is no longer held
+hostage by one input that will never successfully decode no matter how many times it's retried.
+`markFileCorrupted` (new, `service.go`) is called in this branch; on success the key is recorded
+in a new `alreadyHandled map[string]struct{}` so `mergeLevel`'s final "delete every input" loop
+doesn't issue a second, redundant `Delete` against a key `markFileCorrupted` already removed
+(this exact double-delete would otherwise have shown up as a wasted RPC on every corrupt file,
+caught by `TestMergeLevel_CorruptInputMarkedNotAborted`'s exact `Delete`-count assertion, not
+guessed at). If `markFileCorrupted` itself errors, `mergeLevel` falls back to the original
+all-or-nothing `return fmt.Errorf(...)` — this fix trades "abort forever on a corrupt file" for
+"skip a corrupt file we successfully preserved," not for "abort forever *or* silently lose
+one," so an unpreservable file still gets the old, safer treatment.
+
+**`mergeTraceLevel` (`traceindex_dispatch.go`): skip-and-leave-in-place becomes skip-and-mark,
+for the genuine-decode-error branch only.** NOTE-VI-066 and NOTE-VI-109 both documented (and
+SPEC-VI-7/SPEC-VI-8 both formalized) that a corrupt trace-index input is skipped, not deleted,
+and does not abort the merge — that "skip, don't abort" half of the contract is UNCHANGED by
+this fix and remains this function's oldest, most load-bearing invariant. What changes is only
+the corrupt file's disposition once skipped: the genuine-decode-error branch (`NewDiskTraceGroupFileIterator`
+returning `(nil, err)` — SPEC-VI-8 case 3) now also calls `markFileCorrupted`, so the file stops
+being retried (and re-failing) on every future compaction cycle, exactly like `mergeLevel`'s
+fix above. The bad-magic branch (`(nil, nil)` — SPEC-VI-8 case 2, "not a v2 VTG2 file at all")
+is deliberately UNTOUCHED: it still just logs and leaves the file in place, since that case was
+never part of this incident and this fix does not widen its own scope to cover it. Unlike
+`mergeLevel`, a `markFileCorrupted` failure here does NOT fall back to aborting the merge — it
+falls back to the function's own pre-existing behavior (leave the file in place, log a second
+warning, keep going), because this function's "never fatal here" contract predates this fix and
+this fix must not be the thing that makes a single corrupt trace-index file newly capable of
+failing a merge outright.
+
+**Metrics.** `metrics.go` adds `filesCorrupted` (`blockpack_value_index_compactor_files_corrupted_total`)
+and `incFilesCorrupted()`, incremented from both branches above. This is a distinct counter from
+NOTE-VI-118's `entriesCorrupt` (`blockpack_value_index_compactor_entries_corrupt_total`) —
+`entriesCorrupt` counts individual bad-`SourceID` refs dropped from an otherwise-healthy,
+successfully-decoded file; `filesCorrupted` counts whole files that failed to decode at all and
+were marked `.corrupted`. Conflating the two would hide a qualitatively worse failure mode
+(entire files unrecoverable) behind a metric dominated by routine per-ref drops.
+
+**Tests.** `corruption_test.go` (new): `TestMergeLevel_CorruptFileMarkedAndSkipped_NotAborted`,
+`TestMergeLevel_MarkCorruptedPutFails_FallsBackToAbortingMerge`,
+`TestMergeTraceLevel_CorruptFileMarkedAndSkipped_NotAborted`. `mergelevel_crash_test.go`'s
+`TestMergeLevel_ErrorMidMergeLeavesInputsUntouched` rewritten to
+`TestMergeLevel_CorruptInputMarkedNotAborted` (exact `Put`=2/`Delete`=3 count assertions — see
+`valueindex/NOTES.md` NOTE-VI-119 for the full count rationale). All mutation-tested: reverting
+the fix reproduces each test's exact expected failure symptom; restoring it passes. See
+`TESTS.md` TEST-VI-5 (rewritten), TEST-VI-21, TEST-VI-22, TEST-VI-23.
+
+Back-ref: `internal/modules/valueindexcompactor/service.go:markFileCorrupted,mergeLevel`,
+`internal/modules/valueindexcompactor/traceindex_dispatch.go:mergeTraceLevel`,
+`internal/modules/valueindexcompactor/metrics.go:filesCorrupted,incFilesCorrupted`,
+`internal/modules/valueindexcompactor/corruption_test.go`,
+`internal/modules/valueindexcompactor/mergelevel_crash_test.go:TestMergeLevel_CorruptInputMarkedNotAborted`.
+See NOTE-VI-066, NOTE-VI-109, NOTE-VI-118 (`entriesCorrupt`, the sibling metric), and
+`valueindex/NOTES.md` NOTE-VI-119 (the pipeline-wide incident/reconciliation writeup). See
+`SPECS.md` SPEC-VI-7, SPEC-VI-8 (both updated in place for this fix). `TESTS.md` TEST-VI-5,
+TEST-VI-21, TEST-VI-22, TEST-VI-23. Incident: tempo-dev-test-03, 2026-07-15.

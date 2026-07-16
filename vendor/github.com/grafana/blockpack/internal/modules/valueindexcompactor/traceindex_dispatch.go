@@ -108,13 +108,24 @@ func (s *Service) mergeTraceLevel(ctx context.Context, colDir string, files []le
 		if ierr != nil {
 			// A genuinely corrupt trace-index file (footer/string-table/block-directory
 			// decode failure) is skipped, not fatal -- mergeTraceLevel's own long-standing
-			// contract (unlike mergeLevel's BucketGroup sibling, which treats the analogous
-			// NewDiskBucketFileIterator error as aborting the whole merge): retrying can't fix
-			// a genuinely malformed payload, so the file is left in place for investigation.
+			// contract (unlike mergeLevel's BucketGroup sibling, which used to abort the
+			// whole merge on the analogous NewDiskBucketFileIterator error; both now skip
+			// consistently, see markFileCorrupted). Marked "<key>.corrupted" so it's
+			// preserved for inspection but never retried again (tempo-dev-test-03 incident
+			// follow-up, 2026-07-15) -- if marking itself fails, fall back to the ORIGINAL
+			// leave-in-place behavior (retried next cycle) rather than making a single
+			// corrupt file newly fatal, since that was never this function's contract.
 			_ = os.Remove(tmpPath)
 			corrupted++
 			s.metrics.incError(compactorOpDecode)
-			slog.Warn("valueindexcompactor: skipping corrupt trace index input", "key", f.key, "err", ierr)
+			if merr := s.markFileCorrupted(ctx, f.key, data); merr != nil {
+				slog.Warn("valueindexcompactor: skipping corrupt trace index input (failed to mark, left in place)",
+					"key", f.key, "err", ierr, "markErr", merr)
+			} else {
+				s.metrics.incFilesCorrupted()
+				slog.Warn("valueindexcompactor: marked corrupt trace index input as .corrupted and skipped",
+					"key", f.key, "err", ierr)
+			}
 			continue
 		}
 		if it == nil {

@@ -2307,3 +2307,116 @@ TestFilterDeadRefsBlock_OutOfRangeSourceIDNeverReachesRefChecker`,
 `internal/modules/valueindexcompactor/traceindex_dispatch.go:mergeTraceLevel`,
 `internal/modules/valueindexcompactor/metrics_test.go`. See NOTE-VI-115. `TESTS.md` TEST-VI-46.
 Incident: tempo-dev-test-03, 2026-07-15.
+
+---
+
+## NOTE-VI-119 — a genuinely corrupt WHOLE value-index file no longer aborts `mergeLevel`'s entire batch: marked `.corrupted` and skipped, not deleted, not retried forever (tempo-dev-test-03 incident follow-up, 2026-07-15)
+
+Date: 2026-07-15
+
+**ID caveat, read first (same pattern as NOTE-VI-113/NOTE-VI-114's own caveats):** `NOTE-VI-*`
+is a single counter shared across at least `valueindex`, `valueindexcompactor`,
+`valueindexconsumer`, `vibuilder`, `executor`, and `blockevents`'s `NOTES.md` files. Direct
+inspection immediately before writing this entry (2026-07-15) found the true global max was
+already **inconsistent**: `valueindex`=118 (this file, the entry directly above) and
+`valueindexconsumer`=118 (a *different*, unrelated entry — `recordManifestEntry` caching,
+task #216) collide on the same ID. That collision was NOT introduced by this entry and is left
+unresolved here — renumbering another in-flight entry risks breaking a concurrent agent's own
+cross-refs. This entry claims **119** as the next free ID counting from the higher of the two
+colliding 118s; whoever reviews or merges this must re-confirm 119 is still correct against the
+live team-wide counter, and separately flag/fix the pre-existing 118 collision.
+
+**Context.** Same-day follow-up to NOTE-VI-118 (directly above), in the same incident family,
+but a different and more severe failure mode. NOTE-VI-118 fixed a per-ref corruption within an
+otherwise-valid, successfully-decoded block (a stale/out-of-range `SourceID`) — dropping the
+bad ref and continuing to compact the rest of the block. This entry addresses NOTE-VI-115's
+OTHER documented failure class: "(b) a decode failure past the magic" — a genuinely corrupt
+WHOLE FILE (broken footer, block index, or snappy-compressed block body, not a per-ref issue).
+Before this fix, `valueindexcompactor.mergeLevel` treated `valueindex.NewDiskBucketFileIterator`
+returning a non-nil error as FATAL: it aborted the ENTIRE merge for that colDir/level, blocking
+every OTHER valid file in the same batch too. Since the corrupt file was never deleted or
+renamed, the identical batch was rebuilt and the identical abort repeated on every subsequent
+compaction cycle (every 5 minutes) — permanently wedged, zero forward progress, for that
+colDir/level.
+
+**Fix.** A new `(s *Service) markFileCorrupted(ctx, key, data)` helper
+(`internal/modules/valueindexcompactor/service.go`) writes `data` to `key+".corrupted"`, then
+deletes the original `key` (write-then-delete: a crash between the two calls leaves BOTH
+copies, never neither — mirrors this package's existing output-then-input-delete convention).
+A `.corrupted` suffix fails `valueindex.ParseFilename`'s expected
+`L<level>-<min>-<max>-<id>.blockpack` pattern, so both the query path's `DiscoverIndexFiles` and
+this compactor's own `buildWorkList`/`compactColumn` (both route through `ParseFilename`)
+silently and permanently skip it afterward — no changes needed to discovery itself. `mergeLevel`'s
+genuine-decode-error branch (`NewDiskBucketFileIterator` returning a non-nil `err` — NOT the
+`it == nil` legacy-pre-v2-skip case, which is untouched) now calls `markFileCorrupted` and
+`continue`s instead of aborting; if `markFileCorrupted` itself fails, it falls back to the
+ORIGINAL abort-the-merge behavior, since losing track of an unpreserved corrupt file is worse
+than a stuck retry. `mergeTraceLevel` (`traceindex_dispatch.go`), the `TraceGroup` sibling,
+already had a "skip, don't abort" contract for this case (NOTE-VI-066, NOTE-VI-109) but
+previously just left the corrupt file under its original name forever, so it was still retried
+(and re-failed) every cycle; it now ALSO calls `markFileCorrupted` on a genuine decode error,
+while preserving its own long-standing "never fatal here" contract — if marking fails, it logs
+a second warning and falls back to leaving the file in place (not aborting), since that path
+was never fatal before this fix and must not become fatal now. A new
+`blockpack_value_index_compactor_files_corrupted_total` Prometheus counter (`metrics.go`,
+`incFilesCorrupted`) tracks how often either path fires.
+
+**Explicit reconciliation with NOTE-VI-115 — this is NOT a violation.** NOTE-VI-115 established
+that a corrupt v2 file must ERROR, not silently skip, because the QUERY path
+(`DiscoverIndexFiles`/search) skipping a whole-file decode failure silently under-counts
+authoritative search/metrics coverage — a real span of data goes missing from results with no
+signal at all. This fix operates in a different place with a different failure mode: it is the
+COMPACTOR's own retry/blocking behavior, not the query path, and it is not silent. Marking a
+file `.corrupted` fires a `slog.Warn`, increments a dedicated Prometheus counter, and durably
+preserves the file's exact bytes under a forensically-findable name — the loudest, least-silent
+way to skip something available in this pipeline. Critically, the file is genuinely never going
+to decode successfully no matter how many times it is retried (its footer/block-index/
+compressed payload is broken); continuing to abort-and-retry it forever serves no purpose while
+it actively blocks every sibling file in the same batch from ever compacting. NOTE-VI-115's
+policy is about not letting a query silently drop real, resolvable data; this fix is about not
+letting one irrecoverable file hold an entire batch of otherwise-healthy files hostage forever.
+A future audit for "did anyone violate NOTE-VI-115" should not flag this entry as a regression
+— it is a distinct, additive safeguard operating at a different layer of the pipeline (compactor
+retry policy, not query-time coverage).
+
+**Tests.** New `internal/modules/valueindexcompactor/corruption_test.go`:
+`TestMergeLevel_CorruptFileMarkedAndSkipped_NotAborted` (a corrupt sibling among valid inputs
+does not abort the merge; the valid files still produce an L1 output; the corrupt file's
+original key is gone and a `.corrupted` copy with the exact same bytes exists),
+`TestMergeLevel_MarkCorruptedPutFails_FallsBackToAbortingMerge` (if the store can't even write
+the `.corrupted` copy, the merge aborts and nothing is deleted — matching the ORIGINAL
+all-or-nothing behavior exactly), and `TestMergeTraceLevel_CorruptFileMarkedAndSkipped_NotAborted`
+(the same marking now also applies to `mergeTraceLevel`'s genuine-decode-error path).
+`mergelevel_crash_test.go`'s pre-existing `TestMergeLevel_ErrorMidMergeLeavesInputsUntouched` —
+itself a documented "Phase 4 TDD" contract change asserting the OLD abort-and-preserve-everything
+contract (zero `Put`/`Delete` calls) — was rewritten to `TestMergeLevel_CorruptInputMarkedNotAborted`,
+asserting the NEW contract with an exact-count assertion: `Put` called exactly twice (one for
+the merged L1 output of the two valid files, one for the `.corrupted` marker copy), `Delete`
+called exactly three times (the two valid inputs plus the corrupt file's original key — not a
+fourth, redundant delete against the already-gone corrupt key). All new/rewritten tests were
+mutation-tested: reverting the fix reproduces each test's exact expected failure symptom;
+restoring it passes. See `internal/modules/valueindexcompactor/TESTS.md` TEST-VI-5 (rewritten),
+TEST-VI-21/TEST-VI-22/TEST-VI-23 (new). See also `internal/modules/valueindexcompactor/NOTES.md`
+NOTE-VI-120 for the compactor-package-local implementation writeup (this entry is
+pipeline-wide/query-path-reconciliation-focused; NOTE-VI-120 is
+`mergeLevel`/`mergeTraceLevel`-contract-focused).
+
+**SPECS.md updated in place, not a new entry.** `internal/modules/valueindexcompactor/SPECS.md`
+SPEC-VI-7 step 5 and SPEC-VI-8 case 3 already documented the OLD "corrupt input left in place,
+never deleted" contract for `mergeTraceLevel`'s genuine-decode-error case; both were updated
+in place (with an inline "Updated 2026-07-15" note, per this module's convention of correcting
+rather than duplicating superseded entries) rather than adding a new SPEC-ID, since the
+underlying public contract (skip-not-abort) is unchanged — only the disposition of the skipped
+file (mark-and-rename vs. leave-in-place) changed. `mergeLevel`'s own abort-vs-skip contract for
+a genuine decode error was never SPEC-tagged at all (SPEC-VI-1 covers only the
+streaming-wiring/crash-safety-ordering contract, not this branch specifically); per this
+module's stated preference for not inventing a new SPEC-ID when a NOTES.md entry documenting a
+bug-fix-driven contract change is sufficient, none was added for it either.
+
+Back-refs: `internal/modules/valueindexcompactor/service.go:markFileCorrupted,mergeLevel`,
+`internal/modules/valueindexcompactor/traceindex_dispatch.go:mergeTraceLevel`,
+`internal/modules/valueindexcompactor/metrics.go:filesCorrupted,incFilesCorrupted`,
+`internal/modules/valueindexcompactor/corruption_test.go`,
+`internal/modules/valueindexcompactor/mergelevel_crash_test.go:TestMergeLevel_CorruptInputMarkedNotAborted`.
+See NOTE-VI-115, NOTE-VI-118, and `valueindexcompactor/NOTES.md` NOTE-VI-120. `TESTS.md`
+TEST-VI-5, TEST-VI-21, TEST-VI-22, TEST-VI-23. Incident: tempo-dev-test-03, 2026-07-15.

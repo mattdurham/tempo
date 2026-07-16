@@ -63,6 +63,7 @@ type compactorMetrics struct {
 	entriesRetained prometheus.Counter
 	entriesDropped  prometheus.Counter
 	entriesCorrupt  prometheus.Counter // refs with an unresolvable SourceID -- data corruption, not routine retention
+	filesCorrupted  prometheus.Counter // whole input files marked "<key>.corrupted" and skipped -- genuine decode failures
 
 	// oversizedLevelsSkipped counts levels skipped because even the minimum
 	// forced-progress batch (2 files) would vastly exceed effectiveBatchBytes --
@@ -142,6 +143,12 @@ func newCompactorMetrics(reg prometheus.Registerer) *compactorMetrics {
 	m.filesSkipped = compactorRegisterCounter(reg, prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "blockpack_value_index_compactor_files_skipped_total",
 		Help: "Files skipped because their name could not be parsed (wrong magic / old format).",
+	}))
+	m.filesCorrupted = compactorRegisterCounter(reg, prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "blockpack_value_index_compactor_files_corrupted_total",
+		Help: "Input files that failed to decode past their header magic (a genuine, non-skippable " +
+			"decode failure), marked \"<key>.corrupted\" and preserved for inspection instead of being " +
+			"retried forever. Any non-zero rate should be investigated.",
 	}))
 	m.oversizedLevelsSkipped = compactorRegisterCounter(reg, prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "blockpack_value_index_compactor_oversized_levels_skipped_total",
@@ -283,6 +290,13 @@ func (m *compactorMetrics) incSkipped(n int) {
 		return
 	}
 	m.filesSkipped.Add(float64(n))
+}
+
+func (m *compactorMetrics) incFilesCorrupted() {
+	if m == nil {
+		return
+	}
+	m.filesCorrupted.Add(1)
 }
 
 func (m *compactorMetrics) incOversizedLevelsSkipped() {

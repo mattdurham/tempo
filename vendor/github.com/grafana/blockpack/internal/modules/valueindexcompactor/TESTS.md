@@ -11,7 +11,7 @@ SPEC-ROOT-009 — distinct from the `NOTE-VI-N` numbering in `NOTES.md`, and ind
 `internal/modules/valueindex/TESTS.md`'s own `TEST-VI-N` sequence — each module's TESTS.md
 numbers from 1). IDs are assigned in ascending order and never reused or renumbered.
 
-Next free ID: **TEST-VI-21**.
+Next free ID: **TEST-VI-24**.
 
 ---
 
@@ -143,29 +143,47 @@ Back-ref: `internal/modules/valueindexcompactor/diskstage_test.go:TestMergeLevel
 
 ---
 
-## TEST-VI-5: A genuinely corrupt (non-legacy) input aborts the whole merge and leaks no local temp files
+## TEST-VI-5: A genuinely corrupt (non-legacy) input is marked `.corrupted` and skipped, not aborting the merge, and leaks no local temp files
 *Added: 2026-07-03*
+*Rewritten: 2026-07-15 (tempo-dev-test-03 incident follow-up — see below)*
 
-**Scenario:** Per NOTE-VI-052's documented corruption-handling behavior change: a decode
-failure other than a header-magic mismatch (e.g. a corrupted compressed block payload) must
-abort the entire merge rather than being silently skipped as a legacy file would be — this is
-a deliberate divergence from the pre-redesign behavior, where `DecodeFilteredBucketFile`
-treated every decode failure identically to a legacy-format skip.
+**Scenario, current (2026-07-15):** a decode failure other than a header-magic mismatch (e.g.
+a corrupted compressed block payload) is marked `<key>.corrupted` (preserved for forensic
+inspection, no longer discoverable by `ParseFilename` on any future pass) and skipped — it must
+NOT abort the merge for every other, valid file in the same batch. See
+`valueindex/NOTES.md` NOTE-VI-119 and this package's own `NOTES.md` NOTE-VI-120 for the full
+incident and rationale (a prior version of this exact abort-the-whole-merge behavior left a
+production colDir/level permanently stuck retrying and re-failing every compaction cycle).
 
-**Setup:** `TestMergeLevel_ErrorMidMergeLeavesInputsUntouched` (`mergelevel_crash_test.go`)
-seeds 2 good input files plus a 3rd whose compressed block payload has been corrupted (one
-byte flipped inside the block body, header/footer magic untouched), in a call-counting fake
+**Setup:** `TestMergeLevel_CorruptInputMarkedNotAborted` (`mergelevel_crash_test.go`, renamed
+from `TestMergeLevel_ErrorMidMergeLeavesInputsUntouched` — see superseded history below) seeds
+2 good input files plus a 3rd whose compressed block payload has been corrupted (one byte
+flipped inside the block body, header/footer magic untouched), in a call-counting fake
 `IndexStore`, then calls `mergeLevel` directly.
 
-**Assertions:** `mergeLevel` returns an error; the fake store's `Put`/`Delete` call counts are
-both 0; all 3 input keys (including the 2 good ones) are still retrievable via `Get`
-afterward; a `vi-merge-*.tmp` glob of `os.TempDir()` taken before and after the call is
-identical (no local temp file — input or output — leaks on the error path, proving `defer`
-cleanup fired).
+**Assertions:** `mergeLevel` returns no error. The fake store's `Put` call count is exactly 2
+(one for the merged L1 output of the two valid files, one for the `.corrupted` marker copy of
+the corrupt file) and `Delete` call count is exactly 3 (the two valid inputs incorporated into
+the output, plus the corrupt file's original key — deliberately not a 4th, redundant delete
+against the already-gone corrupt key, guarded by `mergeLevel`'s `alreadyHandled` map). The 2
+valid input keys are gone via `Get` afterward; the corrupt file's original key is also gone,
+but `<corruptKey>.corrupted` exists and holds byte-for-byte the same (corrupted) data. A
+`vi-merge-*.tmp`/`vi-keymerge-*.tmp` glob of `os.TempDir()` taken before and after the call is
+identical (no local temp file — input or output — leaks, proving `defer` cleanup still fires on
+this path).
 
-**Spec invariants tested:** SPEC-VI-1 (valueindexcompactor, corrected).
+**Spec invariants tested:** SPEC-VI-1 (valueindexcompactor, corrected); SPEC-VI-7 step 5 and
+SPEC-VI-8 case 3 (both updated 2026-07-15 for this same contract change).
 
-Back-ref: `internal/modules/valueindexcompactor/mergelevel_crash_test.go:TestMergeLevel_ErrorMidMergeLeavesInputsUntouched`.
+**Superseded history:** this test used to be `TestMergeLevel_ErrorMidMergeLeavesInputsUntouched`,
+asserting the OPPOSITE contract — `mergeLevel` returns an error, `Put`/`Delete` call counts are
+both 0, and all 3 input keys (including the 2 good ones) are still retrievable afterward. That
+was itself NOTE-VI-052's documented "Phase 4 TDD" fix for an even OLDER contract (every decode
+failure silently skipped like a legacy file, indistinguishable from genuine corruption).
+Contracts have moved twice now; this entry documents the CURRENT one, not either predecessor —
+see NOTE-VI-119/NOTE-VI-120 for the full three-contract history.
+
+Back-ref: `internal/modules/valueindexcompactor/mergelevel_crash_test.go:TestMergeLevel_CorruptInputMarkedNotAborted`.
 
 ---
 
@@ -535,3 +553,79 @@ contracts, re-verified).
 
 Back-refs: `internal/modules/valueindexcompactor/mergetracelevel_diskstage_test.go`,
 `internal/modules/valueindexcompactor/traceindex_dispatch_test.go` (pre-existing, unchanged).
+
+---
+
+## TEST-VI-21: A corrupt `BucketGroup` input among valid siblings is marked `.corrupted` and skipped, and the valid siblings still merge (tempo-dev-test-03 incident follow-up)
+*Added: 2026-07-15*
+
+**Scenario:** the real end-to-end regression for NOTE-VI-119/NOTE-VI-120's fix, exercised
+through `RunOnce` (not the lower-level `mergeLevel` unit test, TEST-VI-5) — a genuinely corrupt
+v2 `BucketGroup` file (footer byte flipped, header magic untouched, so
+`NewDiskBucketFileIterator` returns a genuine decode error, not the legacy bad-magic skip) must
+not prevent its two valid siblings from compacting normally.
+
+**Setup:** `TestMergeLevel_CorruptFileMarkedAndSkipped_NotAborted` (`corruption_test.go`) seeds
+2 valid L0 files plus a 3rd whose footer bytes are corrupted via `corruptV2FileBytes` (flips a
+byte inside the fixed-size footer region, past the header magic), then runs `svc.RunOnce`.
+
+**Assertions:** `RunOnce` returns no error. Both valid files' original keys are gone (merged).
+The corrupt file's original key is gone; a `<corruptKey>.corrupted` key exists holding the
+exact corrupted bytes unchanged. Listing the store afterward finds at least one genuine L1
+output file (`valueindex.ParseFilename` reports level 1) — proving the two valid files actually
+produced a real merged output, not just "didn't error."
+
+**Spec invariants tested:** SPEC-VI-1 (corrected); SPEC-VI-7 step 5 / SPEC-VI-8 case 3 (both
+updated 2026-07-15).
+
+Back-ref: `internal/modules/valueindexcompactor/corruption_test.go:TestMergeLevel_CorruptFileMarkedAndSkipped_NotAborted`.
+
+---
+
+## TEST-VI-22: If the `.corrupted` marker write itself fails, `mergeLevel` falls back to the original abort-the-whole-merge behavior
+*Added: 2026-07-15*
+
+**Scenario:** `markFileCorrupted`'s own `Put` call can fail (e.g. a transient object-store
+error) — losing track of a corrupt file without ever having durably preserved it is worse than
+a stuck retry, so this must degrade to the pre-fix, safer all-or-nothing behavior rather than
+silently deleting or otherwise losing the file.
+
+**Setup:** `TestMergeLevel_MarkCorruptedPutFails_FallsBackToAbortingMerge` (`corruption_test.go`)
+seeds the same 2-valid-plus-1-corrupt fixture as TEST-VI-21, but configures the fake store to
+return an error specifically on `Put(corruptKey + ".corrupted")`, then runs `svc.RunOnce`.
+
+**Assertions:** `RunOnce` returns an error. All three original keys (2 valid + 1 corrupt) are
+still present afterward via `Get` — nothing was deleted, matching TEST-VI-5's original
+(pre-2026-07-15) all-or-nothing contract exactly for this one degrade path.
+
+**Spec invariants tested:** SPEC-VI-1 (corrected) — the write-then-delete/all-or-nothing
+fallback guarantee.
+
+Back-ref: `internal/modules/valueindexcompactor/corruption_test.go:TestMergeLevel_MarkCorruptedPutFails_FallsBackToAbortingMerge`.
+
+---
+
+## TEST-VI-23: A corrupt trace-index input's genuine-decode-error path is also marked `.corrupted`, not just left in place forever
+*Added: 2026-07-15*
+
+**Scenario:** `mergeTraceLevel`'s trace-index sibling to TEST-VI-21 — its pre-existing
+"skip, don't abort" contract (TEST-VI-16, NOTE-VI-066) is unchanged, but the corrupt file's
+disposition once skipped is not: it is now marked `.corrupted` (SPEC-VI-8 case 3, updated
+2026-07-15) instead of being left under its original name to be retried and re-fail every
+future compaction cycle forever.
+
+**Setup:** `TestMergeTraceLevel_CorruptFileMarkedAndSkipped_NotAborted` (`corruption_test.go`)
+seeds 2 valid `TraceGroup` files plus a 3rd whose footer bytes are corrupted via
+`corruptTraceGroupFileBytes` (the `TraceFooterSize`-scoped counterpart of TEST-VI-21's
+`corruptV2FileBytes`), runs `svc.RunOnce`.
+
+**Assertions:** `RunOnce` returns no error. Both valid files' original keys are gone (merged).
+The corrupt file's original key is gone; a `<corruptKey>.corrupted` key exists holding the
+exact corrupted bytes unchanged — distinguishing this from TEST-VI-16's older assertion that a
+corrupt trace-index input's original key must still be present (that test exercises the
+UNCHANGED bad-magic branch, SPEC-VI-8 case 2, not this genuine-decode-error branch, case 3;
+both tests remain simultaneously valid because they target different branches).
+
+**Spec invariants tested:** SPEC-VI-7 step 5 / SPEC-VI-8 case 3 (both updated 2026-07-15).
+
+Back-ref: `internal/modules/valueindexcompactor/corruption_test.go:TestMergeTraceLevel_CorruptFileMarkedAndSkipped_NotAborted`.
