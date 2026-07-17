@@ -297,3 +297,29 @@ func TestIsSharded(t *testing.T) {
 		})
 	}
 }
+
+// TestEffectiveBlockRetentionMinutes pins the 2026-07-17 fix (follow-up to blockpack#512): a
+// cube backfill's window is now bounded by the tenant's actual effective retention instead of
+// an unconditional math.MaxUint32. Mirrors tempodb.go's retainTenant precedence exactly:
+// per-tenant override wins when nonzero, else the compactor's configured default; a resolved
+// retention of zero (both unset) means "unbounded" (0), matching RunCubeBackfill's own
+// zero-means-unbounded convention.
+func TestEffectiveBlockRetentionMinutes(t *testing.T) {
+	tests := []struct {
+		name           string
+		cfgDefault     time.Duration
+		tenantOverride time.Duration
+		want           uint32
+	}{
+		{"both unset means unbounded", 0, 0, 0},
+		{"cfg default only", 30 * 24 * time.Hour, 0, 43200},
+		{"tenant override wins over cfg default", 30 * 24 * time.Hour, 24 * time.Hour, 1440},
+		{"tenant override alone with no cfg default", 0, 24 * time.Hour, 1440},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := effectiveBlockRetentionMinutes(tc.cfgDefault, tc.tenantOverride)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}

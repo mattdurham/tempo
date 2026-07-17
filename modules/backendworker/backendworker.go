@@ -478,8 +478,15 @@ func (w *BackendWorker) processCubeBackfillJobPostgres(ctx context.Context, job 
 		return fmt.Errorf("cube backfill: no registry entry found for cube %s: %w", detail.CubeID, err)
 	}
 
+	// Bound the backfill window by the tenant's actual effective retention (2026-07-17,
+	// follow-up to #512): blocks physically cannot exist past this point, so bounding the
+	// backfill window here is not an artificial cap, just an accurate one -- an unbounded
+	// window still terminates (empty per-minute lookups are cheap), but wastes serial
+	// iterations discovering that on its own instead of knowing it upfront.
+	retentionMinutes := effectiveBlockRetentionMinutes(w.cfg.Compactor.BlockRetention, w.BlockRetentionForTenant(job.Tenant))
+
 	// Run backfill synchronously (the worker goroutine is already async).
-	if err := vblockpack.RunCubeBackfill(ctx, entry, w.s3Cfg, w.pgPool); err != nil {
+	if err := vblockpack.RunCubeBackfill(ctx, entry, w.s3Cfg, w.pgPool, retentionMinutes); err != nil {
 		return fmt.Errorf("cube backfill failed: %w", err)
 	}
 
@@ -700,6 +707,24 @@ func (w *BackendWorker) Owns(hash string) bool {
 	level.Debug(log.Logger).Log("msg", "checking addresses", "owning_addr", rs.Instances[0].Addr, "this_addr", ringAddr)
 
 	return rs.Instances[0].Addr == ringAddr
+}
+
+// effectiveBlockRetentionMinutes resolves a tenant's effective block retention, in minutes, for
+// bounding a cube backfill window (2026-07-17, follow-up to blockpack#512): tenantOverride wins
+// when set (nonzero), else cfgDefault -- the SAME "check for overrides" precedence tempodb.go's
+// retainTenant already uses for compaction retention. Returns 0 (RunCubeBackfill's own
+// "unbounded" convention) when the resolved retention is itself zero/unset. Pure, extracted so
+// this precedence logic has a direct unit test independent of BackendWorker's ring/S3/Postgres
+// wiring.
+func effectiveBlockRetentionMinutes(cfgDefault, tenantOverride time.Duration) uint32 {
+	retention := cfgDefault
+	if tenantOverride != 0 {
+		retention = tenantOverride
+	}
+	if retention <= 0 {
+		return 0
+	}
+	return uint32(retention / time.Minute) //nolint:gosec // retention fits uint32 minutes for any realistic config
 }
 
 func (w *BackendWorker) RecordDiscardedSpans(count int, tenantID string, traceID string, rootSpanName string, rootServiceName string) {

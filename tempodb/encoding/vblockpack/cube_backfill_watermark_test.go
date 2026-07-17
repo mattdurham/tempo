@@ -13,19 +13,21 @@ package vblockpack
 // What remains testable from tempo's side: RunCubeBackfill (this package) is now a thin
 // wrapper with NO fake-injection seam of its own (it builds a real *minio.Client from
 // *s3backend.Config and delegates to blockpack.RunCubeBackfill directly) -- a genuinely
-// completed run is not practically testable here in reasonable time (WindowMinutes is
-// hardcoded to math.MaxUint32 with no override, and Backfiller.Run's own doc comment/#181
-// Phase 4's investigation both independently confirmed an unbounded from-scratch run never
-// returns quickly regardless of real or fake S3 -- this was already true before #508, not a
-// regression). What IS fast and deterministic to test here is the metric-increment LOGIC this
-// wrapper itself now owns (moved out of the old per-callback progressFn, since blockpack has no
-// metrics dependency): an already-cancelled ctx makes Backfiller.Run's very first loop
-// iteration return ctx.Err() immediately, before any S3/VI I/O, letting this test observe
-// RunCubeBackfill's real error-handling branch without waiting on an unbounded window.
+// completed run is not practically testable here in reasonable time even after #512 gave
+// Backfiller.Run real parallelism, since that still means real S3 I/O for however many minutes
+// the resolved retention window covers. What IS fast and deterministic to test here is the
+// metric-increment LOGIC this wrapper itself now owns (moved out of the old per-callback
+// progressFn, since blockpack has no metrics dependency): an already-cancelled ctx makes
+// Backfiller.Run's very first loop iteration return ctx.Err() immediately, before any S3/VI I/O,
+// letting this test observe RunCubeBackfill's real error-handling branch without waiting on the
+// window. cubeBackfillWindowMinutes (2026-07-17, WindowMinutes bounded by tenant retention
+// instead of hardcoded math.MaxUint32) is extracted as a small pure function specifically so
+// this one piece of new logic has a real, direct unit test too.
 
 import (
 	"context"
 	"errors"
+	"math"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -46,7 +48,7 @@ func TestRunCubeBackfill_NilS3Config_NoOpNoMetrics(t *testing.T) {
 	completedBefore := testutil.ToFloat64(metricCubeBackfillCompleted)
 	failedBefore := testutil.ToFloat64(metricCubeBackfillFailed)
 
-	err := RunCubeBackfill(context.Background(), entry, nil, nil)
+	err := RunCubeBackfill(context.Background(), entry, nil, nil, 0)
 	require.NoError(t, err)
 
 	assert.Equal(t, startedBefore, testutil.ToFloat64(metricCubeBackfillStarted), "nil s3cfg must be a no-op before metricCubeBackfillStarted")
@@ -79,11 +81,34 @@ func TestRunCubeBackfill_CtxAlreadyCancelled_ReturnsErrorWithoutIncrementingFail
 	completedBefore := testutil.ToFloat64(metricCubeBackfillCompleted)
 	failedBefore := testutil.ToFloat64(metricCubeBackfillFailed)
 
-	err := RunCubeBackfill(ctx, entry, s3cfg, pool)
+	err := RunCubeBackfill(ctx, entry, s3cfg, pool, 0)
 	require.Error(t, err)
 	require.True(t, errors.Is(err, context.Canceled), "err = %v, want context.Canceled", err)
 
 	assert.Equal(t, startedBefore+1, testutil.ToFloat64(metricCubeBackfillStarted), "every attempt increments Started, successful or not")
 	assert.Equal(t, completedBefore, testutil.ToFloat64(metricCubeBackfillCompleted), "a cancelled ctx must never increment Completed")
 	assert.Equal(t, failedBefore, testutil.ToFloat64(metricCubeBackfillFailed), "a ctx cancellation is the caller's own decision, not a genuine backfill failure")
+}
+
+// TestCubeBackfillWindowMinutes pins the 2026-07-17 fix (follow-up to #512): WindowMinutes is
+// now bounded by the tenant's actual resolved retention instead of an unconditional
+// math.MaxUint32. retentionMinutes == 0 means "retention disabled/unbounded for this tenant" (the
+// same convention tempodb.go's retainTenant uses for CompactorOverrides.BlockRetentionForTenant's
+// zero value) and must preserve the original unbounded-window behavior exactly.
+func TestCubeBackfillWindowMinutes(t *testing.T) {
+	tests := []struct {
+		name             string
+		retentionMinutes uint32
+		want             uint32
+	}{
+		{"zero retention means unbounded", 0, math.MaxUint32},
+		{"real retention passes through unchanged", 43200, 43200},
+		{"small real retention passes through unchanged", 1, 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := cubeBackfillWindowMinutes(tc.retentionMinutes)
+			assert.Equal(t, tc.want, got)
+		})
+	}
 }

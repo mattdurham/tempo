@@ -72,7 +72,20 @@ func newBackfillVIStore(client *minio.Client, bucket string) valueIndexStore {
 // blockpack.RunCubeBackfill error, including context cancellation/deadline) so the caller
 // (processCubeBackfillJobPostgres) can report the job as failed rather than unconditionally as
 // succeeded.
-func RunCubeBackfill(ctx context.Context, entry blockpack.CubeRegistryEntry, s3cfg *s3backend.Config, pgPool *pgxpool.Pool) error {
+//
+// retentionMinutes bounds the backfill window (2026-07-17 follow-up to the 2026-07-11
+// "full history, not an artificial cap" ruling): blocks physically cannot exist past the
+// tenant's own block retention, so a genuinely unbounded math.MaxUint32 window was never
+// actually "full history" — it was "iterate one real minute at a time, serially, all the way
+// back to whenever data first runs out", discovered live to be impractically slow once
+// #512 exposed that Run had zero parallelism. retentionMinutes == 0 (retention disabled/
+// unbounded for this tenant) preserves the original unbounded-window behavior; the caller is
+// responsible for resolving the tenant's effective retention (per-tenant override, else the
+// compactor's configured default).
+func RunCubeBackfill(
+	ctx context.Context, entry blockpack.CubeRegistryEntry, s3cfg *s3backend.Config, pgPool *pgxpool.Pool,
+	retentionMinutes uint32,
+) error {
 	if s3cfg == nil {
 		return nil
 	}
@@ -84,12 +97,8 @@ func RunCubeBackfill(ctx context.Context, entry blockpack.CubeRegistryEntry, s3c
 	viStore := newBackfillVIStore(client, s3cfg.Bucket)
 	store := &s3ObjectPutter{client: client, bucket: s3cfg.Bucket}
 	cfg := blockpack.CubeBackfillConfig{
-		Workers: 4,
-		// WindowMinutes: full history, not an artificial cap (2026-07-11 ruling) --
-		// math.MaxUint32 minutes trivially exceeds any real currentMinute, so
-		// Backfiller.Run's endMinute always resolves to 0. Bounded only by how far
-		// back the value index itself actually has data, not by this config.
-		WindowMinutes: math.MaxUint32,
+		Workers:       4,
+		WindowMinutes: cubeBackfillWindowMinutes(retentionMinutes),
 	}
 	metricCubeBackfillStarted.Inc()
 	err = blockpack.RunCubeBackfill(ctx, entry, viStore, store, pgPool, cfg, 0, defaultValueIndexPref)
@@ -109,4 +118,16 @@ func RunCubeBackfill(ctx context.Context, entry blockpack.CubeRegistryEntry, s3c
 	// per-minute progress callback, since blockpack owns no metrics dependency.
 	metricCubeBackfillCompleted.Inc()
 	return nil
+}
+
+// cubeBackfillWindowMinutes converts a resolved tenant retention (in minutes, 0 meaning
+// "retention disabled/unbounded for this tenant") into the WindowMinutes value RunCubeBackfill
+// passes to blockpack.CubeBackfillConfig. Pure and extracted from RunCubeBackfill specifically
+// so this one piece of logic is unit-testable without S3/ctx machinery (RunCubeBackfill itself
+// has no fake-injection seam — see this file's own test file doc comment).
+func cubeBackfillWindowMinutes(retentionMinutes uint32) uint32 {
+	if retentionMinutes == 0 {
+		return math.MaxUint32
+	}
+	return retentionMinutes
 }

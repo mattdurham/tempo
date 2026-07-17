@@ -317,7 +317,7 @@ func TestE2E_ViBackfill_FailureThenReclaimSucceeds(t *testing.T) {
 }
 
 // TestE2E_CubeBackfill_WorkerClaimsAndExecutesWithoutGRPC is #181 Phase 6.2 steps 2-3.
-// RunCubeBackfill hardcodes WindowMinutes=math.MaxUint32 with no caller-side override
+// RunCubeBackfill resolves WindowMinutes from the tenant's effective retention, which defaults to math.MaxUint32 when unset (as it is in this test's Config)
 // (confirmed: #181 Phase 4's own backendworker_postgres_jobstore_test.go documented that
 // a from-scratch cube backfill never returns in reasonable test time, real S3 or not),
 // so this test bounds the call with a short ctx deadline and asserts REAL partial
