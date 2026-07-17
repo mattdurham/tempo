@@ -1203,3 +1203,51 @@ preserving prior behavior exactly.
 lookupAggAttrValues`, `cube_backfill_runner.go:RunCubeBackfill`. See
 `SPEC-CUBE-033`'s 2026-07-16 Addendum, `NOTE-CUBE-017` (the colType-defaulting convention this
 inherits unchanged). Issue #511.
+
+## NOTE-CUBE-036: Run's dead Workers config made real — ordered-publish concurrent minute processing (issue #512)
+
+**Problem, found live, not by inspection.** `BackfillConfig.Workers` has always been documented
+("number of parallel minute-workers") but `Run` was a strictly serial `for m := startMinute; m >=
+endMinute; m--` loop that never referenced `cfg.Workers` at all. This went unnoticed because
+`cube_backfill`/`vi_backfill` job-queue execution had never actually run against real production
+data before #511/#512's own debugging session — the tempo-side Postgres wiring that dispatches
+these jobs to a worker had its own separate, independent gap (backend-worker's own `cfg.Postgres`
+was never configured) that had to be fixed first before this code path ever executed for real.
+Once it did, a `cube_backfill` job's 30-minute lease expired mid-run and got silently re-claimed
+by a different worker, which hung in the identical spot. A goroutine dump showed genuine forward
+progress (not a hang) at roughly 1 real-data-minute per 60-90s of wall time — consistent with a
+fully serial loop over per-minute value-index network round trips.
+
+**Why not a naive unordered fan-out.** The obvious fix — spawn `Workers` goroutines each pulling
+from a shared minute cursor, calling `progressFn` as each one finishes — breaks SPEC-CUBE-026's
+watermark contract: a querier trusts that every minute from `startMinute` down to the
+last-persisted `WatermarkMinute` is genuinely complete. If a later (larger-numbered, i.e. more
+recent) minute happened to finish before an earlier one still in flight, publishing its watermark
+first would tell the querier a CONTIGUOUS range is backfilled when it actually has a gap — and a
+crash-resume reading that watermark would skip the still-incomplete earlier minute forever.
+
+**Design shipped: split build from publish.** `processMinute`/`processMinuteZeroDim` now return
+`(*Accumulator, error)` instead of flushing directly — the network-bound half of the work (VI
+`LookupColumn` calls, `Accumulator.Add`) is the ONLY part that runs across multiple goroutines
+(up to `Workers` at once, via `runConcurrent`'s worker pool claiming minutes off a shared
+descending cursor). The flush-to-store (`Accumulator.FlushTo`) and `progressFn` publish steps run
+exclusively on `Run`'s own calling goroutine, one minute at a time, via a single "drain" loop that
+buffers each worker's completed-but-not-yet-publishable result in a `map[uint32]minuteBuildResult`
+until the next expected (strictly descending) minute is actually ready — then publishes it and
+advances. This also sidesteps a second, independent hazard: `cfg.Store` (a real S3 client, or the
+in-memory test fakes) is never written to from two goroutines at once, since only one goroutine
+(the drain loop) ever calls `FlushTo`.
+
+**Correctness pinned by test, not just reasoned about.** `TestBackfiller_Run_
+PublishesWatermarkInDescendingOrderDespiteOutOfOrderCompletion` deliberately makes the
+newest (first-claimed) minute resolve SLOWEST and the oldest (last-claimed) minute resolve
+FASTEST — the exact inversion that would expose an unordered-publish bug — and asserts every
+`progressFn` call's `WatermarkMinute` is still strictly descending.
+`TestBackfiller_Run_ProcessesMinutesConcurrently` is the companion positive case: with an
+artificial per-minute delay and `Workers=4`, it asserts more than one minute is ever genuinely
+in-flight at once (mutation-tested by temporarily forcing `workers=1` in `Run` and confirming this
+test fails — it does).
+
+**Back-ref:** `internal/modules/cube/backfill.go:Backfiller.Run,runConcurrent,publishMinute,
+flushMinute,minuteBuildResult,processMinute,processMinuteZeroDim`. See `SPEC-CUBE-026`'s
+2026-07-17 Addendum. Issue #512 (grafana/blockpack).

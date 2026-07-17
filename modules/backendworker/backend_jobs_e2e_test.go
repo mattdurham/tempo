@@ -22,89 +22,31 @@ package backendworker
 //
 // For VI backfill, the entry itself is ALSO seeded via the real, exported
 // blockpack.RecordUseAndMaybeTrigger (not a hand-built blockpack.Entry) against a real
-// minio-backed ObjectStore pointed at the fake S3 server -- production's own
-// onShouldBackfill closure performs exactly these two actions (trigger the entry, insert
-// the durable row) together; this test performs them the same way, just via the public
-// blockpack API instead of vblockpack's unexported wrapper. Cube backfill mirrors this
-// with blockpack.NewPgCubeRegistry(...).Add for the same reason (cube's real trigger,
-// TryCreate, is also unexported and unreachable from this package) -- issue #504
-// (2026-07-15): cube's registry is Postgres-only now (no blob/index.json fallback), so
-// this seeds into the SAME real Postgres container newTestPostgresPoolAndDSN already
-// provisions for the job queue, not a separate blob-backed fixture.
+// blockpack.NewPgViUsageRegistry-backed registry (2026-07-17: was blob/S3-backed, see
+// TestE2E_ViBackfill_WorkerClaimsAndExecutesWithoutGRPC's own doc comment for why) --
+// production's own onShouldBackfill closure performs exactly these two actions (trigger
+// the entry, insert the durable row) together; this test performs them the same way,
+// just via the public blockpack API instead of vblockpack's unexported wrapper. Cube
+// backfill mirrors this with blockpack.NewPgCubeRegistry(...).Add for the same reason
+// (cube's real trigger, TryCreate, is also unexported and unreachable from this package)
+// -- issue #504 (2026-07-15): cube's registry is Postgres-only now (no blob/index.json
+// fallback), so this seeds into the SAME real Postgres container newTestPostgresPoolAndDSN
+// already provisions for the job queue, not a separate blob-backed fixture.
 
 import (
-	"bytes"
 	"context"
-	"io"
 	"testing"
 	"time"
 
 	blockpack "github.com/grafana/blockpack"
 	"github.com/jackc/pgx/v5/pgxpool"
-	minio "github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/stretchr/testify/require"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
 	"github.com/grafana/tempo/modules/postgres"
-	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
 	"github.com/grafana/tempo/tempodb/encoding/vblockpack/jobstore"
 	"github.com/grafana/tempo/tempodb/encoding/vblockpack/migrate"
 )
-
-// testMinioObjectStore is a minimal blockpack.ObjectStore/blockpack.CubeObjectStore
-// adapter over a real *minio.Client -- structurally identical to vblockpack's own
-// unexported viUsageObjectStore/minioObjectStore (same Get/ConditionalPut shape, same
-// NoSuchKey->notFoundErr translation), rewritten here because those types are unexported
-// and this package cannot import vblockpack privates. notFoundErr lets one adapter type
-// serve both blockpack.ErrNotFound (viusage) and blockpack.CubeErrNotFound (cube)
-// contracts.
-type testMinioObjectStore struct {
-	client      *minio.Client
-	bucket      string
-	notFoundErr error
-}
-
-func (s *testMinioObjectStore) Get(ctx context.Context, path string) ([]byte, string, error) {
-	obj, err := s.client.GetObject(ctx, s.bucket, path, minio.GetObjectOptions{})
-	if err != nil {
-		return nil, "", s.mapNotFound(err)
-	}
-	defer func() { _ = obj.Close() }()
-	data, err := io.ReadAll(obj)
-	if err != nil {
-		return nil, "", s.mapNotFound(err)
-	}
-	info, statErr := s.client.StatObject(ctx, s.bucket, path, minio.StatObjectOptions{})
-	if statErr != nil {
-		return data, "", nil
-	}
-	return data, info.ETag, nil
-}
-
-func (s *testMinioObjectStore) mapNotFound(err error) error {
-	resp := minio.ToErrorResponse(err)
-	if resp.Code == "NoSuchKey" || resp.StatusCode == 404 {
-		return s.notFoundErr
-	}
-	return err
-}
-
-func (s *testMinioObjectStore) ConditionalPut(ctx context.Context, path string, data []byte, etag string) error {
-	opts := minio.PutObjectOptions{ContentType: "application/json"}
-	if etag != "" {
-		opts.SetMatchETag(etag)
-	}
-	_, err := s.client.PutObject(ctx, s.bucket, path, bytes.NewReader(data), int64(len(data)), opts)
-	if err != nil {
-		resp := minio.ToErrorResponse(err)
-		if resp.StatusCode == 412 {
-			return blockpack.ErrConflict
-		}
-		return err
-	}
-	return nil
-}
 
 // newTestPostgresPoolAndDSN mirrors newTestPostgresPool (backendworker_postgres_jobstore_test.go)
 // but also returns the raw DSN, needed here to configure a real *BackendWorker's own
@@ -146,18 +88,12 @@ func newTestPostgresPoolAndDSN(t *testing.T) (*pgxpool.Pool, string) {
 	// TestE2E_CubeBackfill_* tests, which seed real registry fixtures via
 	// blockpack.NewPgCubeRegistry against this same pool.
 	require.NoError(t, blockpack.ApplyCubeSchema(ctx, pool))
+	// 2026-07-17: viusage_entries, needed by this file's TestE2E_ViBackfill_* tests once they
+	// seed/verify fixtures via blockpack.NewPgViUsageRegistry against this same pool -- matches
+	// production once NewViBackfillDepsWithPgRegistry makes backend-worker's own RunViBackfill
+	// call site use the SAME Postgres-backed registry the querier-side trigger already does.
+	require.NoError(t, blockpack.ApplyViUsageSchema(ctx, pool))
 	return pool, dsn
-}
-
-func newTestMinioClient(t *testing.T, s3cfg *s3backend.Config) *minio.Client {
-	t.Helper()
-	client, err := minio.New(s3cfg.Endpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(s3cfg.AccessKey, "test-secret-key", ""),
-		Secure: false,
-		Region: s3cfg.Region,
-	})
-	require.NoError(t, err)
-	return client
 }
 
 // TestE2E_ViBackfill_WorkerClaimsAndExecutesWithoutGRPC is #181 Phase 6.1 steps 2-3: a
@@ -166,16 +102,22 @@ func newTestMinioClient(t *testing.T, s3cfg *s3backend.Config) *minio.Client {
 // executes it via the real Postgres-claim path -- WITHOUT ever calling the gRPC
 // scheduler's Next/UpdateJob (a counting mockScheduler proves zero calls) -- and the
 // real side effect (the viusage registry's Done=true watermark) is verified by reading
-// the SAME real S3-backed store the worker itself wrote to.
+// the SAME real Postgres-backed registry the worker itself wrote to.
+//
+// 2026-07-17: switched from a blob(S3)-backed registry to blockpack.NewPgViUsageRegistry,
+// matching production now that NewViBackfillDepsWithPgRegistry makes backend-worker's own
+// RunViBackfill call site use the Postgres-backed registry whenever cfg.Postgres is
+// configured (as it is here) -- before this fix, this test happened to pass only because
+// RunViBackfill unconditionally fell back to a fresh blob-backed registry regardless of
+// what the caller's own Postgres config said, silently masking the exact bug this test
+// would otherwise have caught.
 func TestE2E_ViBackfill_WorkerClaimsAndExecutesWithoutGRPC(t *testing.T) {
 	ctx := context.Background()
 	pool, dsn := newTestPostgresPoolAndDSN(t)
 	s3cfg := newFakeS3Config(t, "e2e-worker-vi-bucket")
-	client := newTestMinioClient(t, s3cfg)
 
 	tenant := "e2e-worker-vi-tenant"
-	viStore := &testMinioObjectStore{client: client, bucket: s3cfg.Bucket, notFoundErr: blockpack.ErrNotFound}
-	registry := blockpack.NewRegistry(viStore, tenant)
+	registry := blockpack.NewPgViUsageRegistry(pool, tenant)
 	triggerResult, err := blockpack.RecordUseAndMaybeTrigger(
 		ctx, registry, tenant, "span.custom.attr", "string", time.Now(),
 		blockpack.TriggerConfig{LeaseTTLSeconds: 1800},
@@ -215,13 +157,14 @@ func TestE2E_ViBackfill_WorkerClaimsAndExecutesWithoutGRPC(t *testing.T) {
 	require.NoError(t, loadErr)
 	require.Len(t, entries, 1)
 	require.True(t, entries[0].Backfill.Done,
-		"the worker's real RunViBackfill call must have persisted Done=true to the real S3-backed registry")
+		"the worker's real RunViBackfill call must have persisted Done=true to the real Postgres-backed registry")
 }
 
 // TestE2E_ViBackfill_FailureThenReclaimSucceeds is #181 Phase 6.3: a real execution
 // failure (the durable row references a column with NO corresponding registry entry --
 // runViBackfillCore's UpdateWatermark call genuinely fails with "entry not found" against
-// the real S3-backed registry, exactly the failure mode a crashed/inconsistent trigger
+// the real Postgres-backed registry (2026-07-17: was S3-backed; see the sibling test's own
+// doc comment for why), exactly the failure mode a crashed/inconsistent trigger
 // would produce -- not a mocked error) must schedule a retry per §8.2 (doubling backoff
 // from 1 minute: retry 1 at +2m). Rather than a real 2-minute wall-clock wait, this test
 // moves next_retry_at into the past via direct SQL (the mechanism the plan itself
@@ -259,7 +202,7 @@ func TestE2E_ViBackfill_FailureThenReclaimSucceeds(t *testing.T) {
 
 	// Attempt 1: no registry entry exists for this (tenant, column) at all --
 	// runViBackfillCore's UpdateWatermark call genuinely fails "entry ... not found"
-	// against the real S3-backed registry, a real failure, not an injected one.
+	// against the real Postgres-backed registry, a real failure, not an injected one.
 	err = w.processJobs(ctx)
 	require.NoError(t, err, "Store.Fail itself must succeed even though the underlying backfill failed")
 	require.Equal(t, 0, *nextCalls)
@@ -286,10 +229,9 @@ func TestE2E_ViBackfill_FailureThenReclaimSucceeds(t *testing.T) {
 	require.NoError(t, err)
 
 	// Seed the real registry entry for real, in between attempts -- the second attempt
-	// must be able to genuinely succeed, not just be reclaimable.
-	client := newTestMinioClient(t, s3cfg)
-	viStore := &testMinioObjectStore{client: client, bucket: s3cfg.Bucket, notFoundErr: blockpack.ErrNotFound}
-	registry := blockpack.NewRegistry(viStore, tenant)
+	// must be able to genuinely succeed, not just be reclaimable. Postgres-backed (2026-07-17),
+	// matching what RunViBackfill now actually looks up (see this test's own doc comment).
+	registry := blockpack.NewPgViUsageRegistry(pool, tenant)
 	triggerResult, err := blockpack.RecordUseAndMaybeTrigger(
 		ctx, registry, tenant, "span.custom.attr", "string", time.Now(),
 		blockpack.TriggerConfig{LeaseTTLSeconds: 1800},

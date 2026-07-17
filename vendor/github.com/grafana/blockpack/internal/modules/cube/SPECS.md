@@ -643,6 +643,27 @@ pre-existing collision with `trigger.go`'s own, correct `SPEC-CUBE-015` citation
 the same original commit) — this is the file's real, authoritative entry; the code comment should
 be updated to cite `SPEC-CUBE-026` when convenient, not treated as a landing blocker.
 
+**Addendum (2026-07-17, issue #512):** `Run` now builds each minute's accumulator (the
+network-bound value-index lookups via `processMinute`/`processMinuteZeroDim`) concurrently, up to
+`BackfillConfig.Workers` at once, via `runConcurrent`. `Workers` was documented ("number of
+parallel minute-workers") since the original `BackfillConfig` but never actually read anywhere in
+`Run` — every real caller's configured worker count (tempo's `RunCubeBackfill` passes `Workers:
+4`) was silently ignored, and every minute's value-index lookups ran fully serially. This was
+found live: a `cube_backfill` job's real network round trips were slow enough that a 30-minute
+Postgres job lease expired mid-backfill and the job was silently re-claimed and re-run by another
+worker, hanging in the identical spot — not a hang, but ~1500x slower than the per-minute
+round-trip latency alone would suggest, consistent with zero parallelism.
+
+The invariant this addendum preserves exactly: minutes still publish via `progressFn` strictly
+newest→oldest, and `cfg.Store` still never sees a write from two different minutes concurrently.
+Only the accumulator-building phase (network I/O, no shared mutable state) runs across multiple
+goroutines; the flush-to-store and progressFn-publish phase runs exclusively on `Run`'s own
+calling goroutine, one minute at a time, via a single in-order "drain" loop that buffers
+out-of-order-completed results until the next expected minute is ready. See `NOTE-CUBE-036` for
+why this design (rather than an unordered fan-out) was necessary.
+
+**Back-ref:** `internal/modules/cube/backfill.go:Backfiller.Run,runConcurrent,publishMinute,flushMinute,minuteBuildResult`
+
 **Addendum (2026-07-08, issue #491 Phase E fix pass, review.md Issue 3):** `aggAttrDefsFor` was
 renamed/exported as `AggAttrDefsFor` (see SPEC-CUBE-012's addendum below) so
 `CubeRegistryEntryToDefinition` (cube_ingest.go) can reuse it. `processMinute`'s `Definition` now

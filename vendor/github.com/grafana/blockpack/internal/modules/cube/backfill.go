@@ -4,12 +4,16 @@ package cube
 // index (no data-block reads) and aggregating per-(dim1,dim2) counts per minute. It processes
 // newest→oldest so recent data becomes available first. Progress is tracked by a watermark
 // stored alongside the RegistryEntry; the querier uses cube files for minutes ≥ watermark
-// and falls back to the value index for earlier minutes.
+// and falls back to the value index for earlier minutes. Building each minute's accumulator
+// (the value-index lookups) runs concurrently, up to BackfillConfig.Workers at once; flushing
+// and publishing progress always happens strictly in that same newest→oldest order, on one
+// goroutine only — see SPEC-CUBE-026's 2026-07-17 addendum and NOTE-CUBE-036 (issue #512).
 
 import (
 	"context"
 	"fmt"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/grafana/blockpack/internal/modules/valueindex"
@@ -78,6 +82,12 @@ func NewBackfiller(entry RegistryEntry, src ValueIndexSource, cfg BackfillConfig
 //
 // progressFn may return an error to abort the backfill. Run returns when the full
 // window is complete or ctx is canceled or progressFn returns an error.
+//
+// Minutes are BUILT (the network-bound value-index lookups) concurrently, up to cfg.Workers at
+// once (issue #512: Workers used to be dead -- this was a strictly serial loop regardless of its
+// configured value). Every minute is still FLUSHED to cfg.Store and PUBLISHED via progressFn
+// strictly newest→oldest, on this call's own goroutine only -- see runConcurrent's doc comment
+// for why (watermark contiguity, and cfg.Store concurrent-write safety).
 func (b *Backfiller) Run(
 	ctx context.Context,
 	currentMinute uint32,
@@ -93,30 +103,175 @@ func (b *Backfiller) Run(
 		endMinute = currentMinute - b.cfg.WindowMinutes
 	}
 
-	// Process minutes newest→oldest so recent data becomes available first.
-	for m := startMinute; m >= endMinute; m-- {
-		if ctx.Err() != nil {
-			return ctx.Err()
+	workers := b.cfg.Workers
+	if workers < 1 {
+		workers = 1
+	}
+
+	return b.runConcurrent(ctx, startMinute, endMinute, workers, progressFn)
+}
+
+// minuteBuildResult is one worker's completed (but not yet flushed/published) outcome for a
+// single minute.
+type minuteBuildResult struct {
+	err    error
+	acc    *Accumulator // nil when the minute had no data (idle) or errored
+	minute uint32
+}
+
+// runConcurrent processes [endMinute, startMinute] newest→oldest with up to workers goroutines
+// building each minute's accumulator concurrently (the expensive part: value-index network
+// lookups via processMinute/processMinuteZeroDim). The flush-to-store and progressFn publish
+// steps run exclusively on this function's own goroutine, strictly in descending-minute order:
+//  1. cfg.Store never sees concurrent writes from two different minutes -- real ObjectPutter
+//     implementations are not guaranteed safe for concurrent use, and the in-memory test fakes
+//     are not.
+//  2. progressFn's watermark contract (SPEC-CUBE-026: a querier trusts every minute from
+//     startMinute down to the last-persisted watermark is genuinely complete) holds exactly as
+//     it did before this fix -- a worker finishing a later, larger-numbered minute before an
+//     earlier, smaller-numbered one finishes can never let the later minute's watermark publish
+//     first.
+func (b *Backfiller) runConcurrent(
+	ctx context.Context,
+	startMinute, endMinute uint32,
+	workers int,
+	progressFn func(BackfillProgress) error,
+) error {
+	resultsCh := make(chan minuteBuildResult, workers)
+
+	var (
+		cursorMu  sync.Mutex
+		cursor    = startMinute
+		exhausted bool
+	)
+	claimNext := func() (uint32, bool) {
+		cursorMu.Lock()
+		defer cursorMu.Unlock()
+		if exhausted {
+			return 0, false
 		}
-		if err := b.processMinute(ctx, m); err != nil {
-			prog := BackfillProgress{
-				Watermark: BackfillWatermark{CubeID: b.entry.CubeID, WatermarkMinute: m + 1},
-				LastError: err,
+		m := cursor
+		if m == endMinute {
+			exhausted = true
+		} else {
+			cursor--
+		}
+		return m, true
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				if runCtx.Err() != nil {
+					return
+				}
+				m, ok := claimNext()
+				if !ok {
+					return
+				}
+				acc, err := b.processMinute(runCtx, m)
+				select {
+				case resultsCh <- minuteBuildResult{minute: m, acc: acc, err: err}:
+				case <-runCtx.Done():
+					return
+				}
 			}
-			if fnErr := progressFn(prog); fnErr != nil {
-				return fnErr
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(resultsCh)
+	}()
+
+	pending := make(map[uint32]minuteBuildResult)
+	next := startMinute
+	var retErr error
+
+drain:
+	for {
+		if err := ctx.Err(); err != nil {
+			retErr = err
+			break drain
+		}
+		for {
+			res, ok := pending[next]
+			if !ok {
+				break
 			}
-			continue
+			delete(pending, next)
+
+			if pubErr := b.publishMinute(res, endMinute, progressFn); pubErr != nil {
+				retErr = pubErr
+				break drain
+			}
+			if next == endMinute {
+				break drain
+			}
+			next--
+			if err := ctx.Err(); err != nil {
+				retErr = err
+				break drain
+			}
 		}
-		prog := BackfillProgress{
-			Watermark: BackfillWatermark{CubeID: b.entry.CubeID, WatermarkMinute: m, Done: m == endMinute},
+
+		select {
+		case res, ok := <-resultsCh:
+			if !ok {
+				// retErr is still nil here: every path that sets it also breaks out of drain
+				// immediately, so reaching this branch means the channel simply drained naturally.
+				retErr = ctx.Err()
+				break drain
+			}
+			pending[res.minute] = res
+		case <-ctx.Done():
+			retErr = ctx.Err()
+			break drain
 		}
-		if fnErr := progressFn(prog); fnErr != nil {
-			return fnErr
+	}
+
+	cancel()
+	wg.Wait()
+	return retErr
+}
+
+// publishMinute flushes (on success, non-idle) and reports one minute's outcome via progressFn,
+// matching the pre-#512 serial Run's per-minute reporting contract exactly.
+func (b *Backfiller) publishMinute(
+	res minuteBuildResult,
+	endMinute uint32,
+	progressFn func(BackfillProgress) error,
+) error {
+	if res.err != nil {
+		return progressFn(BackfillProgress{
+			Watermark: BackfillWatermark{CubeID: b.entry.CubeID, WatermarkMinute: res.minute + 1},
+			LastError: res.err,
+		})
+	}
+	if res.acc != nil {
+		if flushErr := b.flushMinute(res.acc, res.minute); flushErr != nil {
+			return progressFn(BackfillProgress{
+				Watermark: BackfillWatermark{CubeID: b.entry.CubeID, WatermarkMinute: res.minute + 1},
+				LastError: flushErr,
+			})
 		}
-		if m == 0 { // guard against uint32 underflow on edge case
-			break
-		}
+	}
+	return progressFn(BackfillProgress{
+		Watermark: BackfillWatermark{CubeID: b.entry.CubeID, WatermarkMinute: res.minute, Done: res.minute == endMinute},
+	})
+}
+
+// flushMinute writes acc's accumulated cells for minute to cfg.Store. Called exclusively from
+// runConcurrent's own goroutine (never concurrently with another minute's flush) — see
+// runConcurrent's doc comment.
+func (b *Backfiller) flushMinute(acc *Accumulator, minute uint32) error {
+	if _, err := acc.FlushTo(b.cfg.Store, b.tenant); err != nil {
+		return fmt.Errorf("cube backfill: flush minute %d: %w", minute, err)
 	}
 	return nil
 }
@@ -203,8 +358,9 @@ func buildSpanVals(
 	return vals
 }
 
-// processMinute builds one cube file for the given minute from value index data.
-func (b *Backfiller) processMinute(ctx context.Context, minute uint32) error {
+// processMinute builds (but does not flush) one minute's accumulator from value index data.
+// Returns (nil, nil) for an idle minute (no data — the caller writes nothing, a sparse cube).
+func (b *Backfiller) processMinute(ctx context.Context, minute uint32) (*Accumulator, error) {
 	// zeroDim (ungrouped, len(Dimensions)==0) cubes have no dimension column to anchor a VI
 	// lookup on, so processMinuteZeroDim below reuses the mandatory DurationColumn AggAttr lookup
 	// as the span-enumeration source instead -- see its own doc comment for the full strategy.
@@ -254,7 +410,7 @@ func (b *Backfiller) processMinute(ctx context.Context, minute uint32) error {
 		Resolution: b.entry.Resolution,
 	}, minute)
 	if err != nil {
-		return fmt.Errorf("cube backfill: new accumulator: %w", err)
+		return nil, fmt.Errorf("cube backfill: new accumulator: %w", err)
 	}
 
 	if zeroDim {
@@ -264,16 +420,16 @@ func (b *Backfiller) processMinute(ctx context.Context, minute uint32) error {
 	// Read dim1 entries from the value index.
 	dim1Entries, err := b.src.LookupColumn(ctx, b.tenant, b.entry.Dimensions[0], minSec, maxSec)
 	if err != nil {
-		return fmt.Errorf("cube backfill: lookup dim1 %q minute %d: %w", b.entry.Dimensions[0], minute, err)
+		return nil, fmt.Errorf("cube backfill: lookup dim1 %q minute %d: %w", b.entry.Dimensions[0], minute, err)
 	}
 
 	if len(dim1Entries) == 0 {
-		return nil // no data for this minute — write nothing (sparse cube)
+		return nil, nil // no data for this minute — write nothing (sparse cube)
 	}
 
 	aggAttrValues, err := b.lookupAggAttrValues(ctx, minute, minSec, maxSec, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// If there is only one dimension, use a fixed sentinel for dim2 (must match dim2Col above,
@@ -288,7 +444,7 @@ func (b *Backfiller) processMinute(ctx context.Context, minute uint32) error {
 		}
 		dim2Entries, dim2Err := b.src.LookupColumn(ctx, b.tenant, b.entry.Dimensions[1], minSec, maxSec)
 		if dim2Err != nil {
-			return fmt.Errorf("cube backfill: lookup dim2 %q minute %d: %w", b.entry.Dimensions[1], minute, dim2Err)
+			return nil, fmt.Errorf("cube backfill: lookup dim2 %q minute %d: %w", b.entry.Dimensions[1], minute, dim2Err)
 		}
 		for _, e2 := range dim2Entries {
 			key := viEntryKey(e2.TraceID, e2.SpanID)
@@ -306,7 +462,7 @@ func (b *Backfiller) processMinute(ctx context.Context, minute uint32) error {
 				vals: buildSpanVals(b.entry.Dimensions[0], b.entry.Dimensions[1], d1val, d2val, key, aggAttrValues),
 			}
 			if _, addErr := acc.Add(sv); addErr != nil {
-				return fmt.Errorf("cube backfill: add cell: %w", addErr)
+				return nil, fmt.Errorf("cube backfill: add cell: %w", addErr)
 			}
 		}
 	} else {
@@ -318,22 +474,15 @@ func (b *Backfiller) processMinute(ctx context.Context, minute uint32) error {
 				vals: buildSpanVals(b.entry.Dimensions[0], dim2Col, d1val, dim2, key, aggAttrValues),
 			}
 			if _, addErr := acc.Add(sv); addErr != nil {
-				return fmt.Errorf("cube backfill: add cell: %w", addErr)
+				return nil, fmt.Errorf("cube backfill: add cell: %w", addErr)
 			}
 		}
 	}
 
 	if acc.CellCount() == 0 {
-		return nil // no data accumulated for this minute
+		return nil, nil // no data accumulated for this minute
 	}
-
-	// Flush to object store.
-	key, err := acc.FlushTo(b.cfg.Store, b.tenant)
-	if err != nil {
-		return fmt.Errorf("cube backfill: flush minute %d: %w", minute, err)
-	}
-	_ = key
-	return nil
+	return acc, nil
 }
 
 // processMinuteZeroDim handles the ungrouped (len(Dimensions)==0) case: every span in the
@@ -346,18 +495,18 @@ func (b *Backfiller) processMinute(ctx context.Context, minute uint32) error {
 // zero-dim cube may also declare -- see lookupAggAttrValues's extraExcluded param).
 func (b *Backfiller) processMinuteZeroDim(
 	ctx context.Context, acc *Accumulator, minute uint32, minSec, maxSec uint64,
-) error {
+) (*Accumulator, error) {
 	anchorEntries, err := b.src.LookupColumn(ctx, b.tenant, DurationColumn, minSec, maxSec)
 	if err != nil {
-		return fmt.Errorf("cube backfill: lookup zero-dim anchor %q minute %d: %w", DurationColumn, minute, err)
+		return nil, fmt.Errorf("cube backfill: lookup zero-dim anchor %q minute %d: %w", DurationColumn, minute, err)
 	}
 	if len(anchorEntries) == 0 {
-		return nil // no data for this minute -- write nothing (sparse cube)
+		return nil, nil // no data for this minute -- write nothing (sparse cube)
 	}
 
 	aggAttrValues, err := b.lookupAggAttrValues(ctx, minute, minSec, maxSec, map[string]bool{DurationColumn: true})
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	for _, e := range anchorEntries {
@@ -366,17 +515,14 @@ func (b *Backfiller) processMinuteZeroDim(
 		vals[DurationColumn] = e.SourceRef // anchor entry IS the duration lookup; reuse its value directly
 		sv := valueIndexSpanValues{vals: vals}
 		if _, addErr := acc.Add(sv); addErr != nil {
-			return fmt.Errorf("cube backfill: add cell: %w", addErr)
+			return nil, fmt.Errorf("cube backfill: add cell: %w", addErr)
 		}
 	}
 
 	if acc.CellCount() == 0 {
-		return nil
+		return nil, nil
 	}
-	if _, err := acc.FlushTo(b.cfg.Store, b.tenant); err != nil {
-		return fmt.Errorf("cube backfill: flush minute %d: %w", minute, err)
-	}
-	return nil
+	return acc, nil
 }
 
 // valueIndexSpanValues wraps pre-resolved (column→val) pairs as SpanValues for the Accumulator.

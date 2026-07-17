@@ -429,6 +429,12 @@ func (w *BackendWorker) processViBackfillJobPostgres(ctx context.Context, job *j
 	if err != nil {
 		return fmt.Errorf("vi backfill: failed to construct deps: %w", err)
 	}
+	// 2026-07-17: use the SAME Postgres-backed registry the querier-side trigger (onShouldBackfill)
+	// already writes entries through -- without this, RunViBackfill falls back to a fresh
+	// blob-backed registry that has never heard of an entry Postgres already created, and every
+	// watermark-persist call fails with "entry ... not found" (see NewViBackfillDepsWithPgRegistry's
+	// own doc comment for the full history).
+	deps = vblockpack.NewViBackfillDepsWithPgRegistry(deps, w.pgPool, job.Tenant)
 
 	if err := vblockpack.RunViBackfill(ctx, entry, deps); err != nil {
 		return fmt.Errorf("vi backfill failed: %w", err)
