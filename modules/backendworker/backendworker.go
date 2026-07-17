@@ -44,12 +44,6 @@ const (
 
 	backendWorkerRingKey = "backend-worker"
 
-	// maxRetries is the #181 §8.1 locked default for Postgres-claimed
-	// vi_backfill/cube_backfill jobs: 5 attempts (doubling backoff from 1m,
-	// capped at 30m, per jobstore.backoffDuration) before a job is left
-	// permanently failed.
-	maxRetries = 5
-
 	// postgresJobReportTimeout bounds reportPostgresJobOutcome's final
 	// Store.Fail/Store.Complete call (2026-07-14 fix). This call must run on
 	// a FRESH context, not the job's own (possibly already-expired) ctx: if
@@ -390,7 +384,7 @@ func (w *BackendWorker) reportPostgresJobOutcome(jobID string, jobErr error) err
 
 	if jobErr != nil {
 		level.Error(log.Logger).Log("msg", "postgres job failed", "job_id", jobID, "err", jobErr)
-		return w.jobStore.Fail(reportCtx, jobID, jobErr.Error(), maxRetries)
+		return w.jobStore.Fail(reportCtx, jobID, jobErr.Error())
 	}
 	return w.jobStore.Complete(reportCtx, jobID)
 }

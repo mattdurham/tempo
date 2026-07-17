@@ -165,14 +165,14 @@ func (s *Store) Complete(ctx context.Context, jobID string) error {
 	return nil
 }
 
-// Fail records a failed attempt for jobID. If the incremented retry count is
-// still below maxRetries, a retry is scheduled (next_retry_at set per
-// backoffDuration, status stays 'failed' but is claimable again per Claim's
-// retry-due clause). Otherwise the job is left permanently failed
-// (next_retry_at explicitly NULLed -- required so a stale past next_retry_at
-// from an earlier, since-reclaimed failure doesn't leave the job wrongly
-// claimable).
-func (s *Store) Fail(ctx context.Context, jobID, errMsg string, maxRetries int) error {
+// Fail records a failed attempt for jobID and unconditionally schedules a retry
+// (next_retry_at set per backoffDuration, status stays 'failed' but is claimable again per
+// Claim's retry-due clause) -- 2026-07-17: reversal of the prior "#181 §8.1 locked default: 5
+// attempts, then permanently failed" ruling. A transient failure (a compacted-away block, a
+// registry entry not yet visible to a stale connection, ...) has no reason to ever stop
+// retrying; the exponential backoff (capped at 30m, backoffDuration) already bounds how much
+// worker capacity a persistently-failing job can consume, without ever giving up on it outright.
+func (s *Store) Fail(ctx context.Context, jobID, errMsg string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("jobstore: fail: begin: %w", err)
@@ -189,11 +189,7 @@ func (s *Store) Fail(ctx context.Context, jobID, errMsg string, maxRetries int) 
 	}
 
 	newRetries := retries + 1
-	var nextRetryAt *time.Time
-	if newRetries < maxRetries {
-		t := time.Now().Add(backoffDuration(newRetries))
-		nextRetryAt = &t
-	}
+	nextRetryAt := time.Now().Add(backoffDuration(newRetries))
 
 	if _, err := tx.Exec(ctx, `
 		UPDATE backend_jobs

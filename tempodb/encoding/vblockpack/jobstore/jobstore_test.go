@@ -376,7 +376,7 @@ func TestStore_Complete_SetsSucceededAndFinishedAt(t *testing.T) {
 	}
 }
 
-func TestStore_Fail_BelowMaxRetries_SchedulesRetryWithBackoff(t *testing.T) {
+func TestStore_Fail_SchedulesRetryWithBackoff(t *testing.T) {
 	pool := newTestPostgresPool(t)
 	store := New(pool)
 	ctx := context.Background()
@@ -390,7 +390,7 @@ func TestStore_Fail_BelowMaxRetries_SchedulesRetryWithBackoff(t *testing.T) {
 	}
 
 	before := time.Now()
-	if err := store.Fail(ctx, job.ID, "transient error", 5); err != nil {
+	if err := store.Fail(ctx, job.ID, "transient error"); err != nil {
 		t.Fatalf("Fail: %v", err)
 	}
 
@@ -412,7 +412,7 @@ func TestStore_Fail_BelowMaxRetries_SchedulesRetryWithBackoff(t *testing.T) {
 		t.Fatalf("expected last_error to be recorded, got %q", lastError)
 	}
 	if nextRetryAt == nil {
-		t.Fatal("expected next_retry_at to be set (below maxRetries), got NULL")
+		t.Fatal("expected next_retry_at to always be set (no retry limit), got NULL")
 	}
 	// backoffDuration(1) == 2 minutes.
 	wantMin := before.Add(90 * time.Second)
@@ -422,7 +422,13 @@ func TestStore_Fail_BelowMaxRetries_SchedulesRetryWithBackoff(t *testing.T) {
 	}
 }
 
-func TestStore_Fail_AtMaxRetries_PermanentlyFails(t *testing.T) {
+// TestStore_Fail_NeverPermanentlyFails_RetriesIndefinitely is the 2026-07-17 reversal of the
+// prior "#181 §8.1 locked default: 5 attempts, then permanently failed" ruling: Fail must
+// unconditionally schedule a retry no matter how many times a job has already failed. Drives
+// 10 consecutive failures (well past the old maxRetries=5 bound) and asserts next_retry_at is
+// non-NULL and the job remains reclaimable after every single one, with backoff correctly
+// capping at 30 minutes (backoffDuration) rather than growing unbounded.
+func TestStore_Fail_NeverPermanentlyFails_RetriesIndefinitely(t *testing.T) {
 	pool := newTestPostgresPool(t)
 	store := New(pool)
 	ctx := context.Background()
@@ -430,40 +436,45 @@ func TestStore_Fail_AtMaxRetries_PermanentlyFails(t *testing.T) {
 	if err := store.InsertViBackfill(ctx, "tenant-a", ViBackfillDetail{ColumnHash: "h1", ColumnType: "string"}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	job, err := store.Claim(ctx, JobTypeViBackfill, "worker-1")
-	if err != nil || job == nil {
-		t.Fatalf("Claim: job=%+v err=%v", job, err)
+
+	const attempts = 10
+	for i := 1; i <= attempts; i++ {
+		job, err := store.Claim(ctx, JobTypeViBackfill, "worker-1")
+		if err != nil || job == nil {
+			t.Fatalf("Claim (attempt %d): job=%+v err=%v", i, job, err)
+		}
+		if err := store.Fail(ctx, job.ID, fmt.Sprintf("failure %d", i)); err != nil {
+			t.Fatalf("Fail (attempt %d): %v", i, err)
+		}
+
+		var retries int
+		var nextRetryAt *time.Time
+		row := pool.QueryRow(ctx, `SELECT retries, next_retry_at FROM backend_jobs WHERE id = $1`, job.ID)
+		if err := row.Scan(&retries, &nextRetryAt); err != nil {
+			t.Fatalf("querying failed row (attempt %d): %v", i, err)
+		}
+		if retries != i {
+			t.Fatalf("attempt %d: expected retries=%d, got %d", i, i, retries)
+		}
+		if nextRetryAt == nil {
+			t.Fatalf("attempt %d: expected next_retry_at to be set (no retry limit), got NULL", i)
+		}
+
+		// Move next_retry_at into the past so the loop's next Claim can reclaim it
+		// immediately, without a real wall-clock wait.
+		if _, err := pool.Exec(ctx, `UPDATE backend_jobs SET next_retry_at = now() - interval '1 second' WHERE id = $1`, job.ID); err != nil {
+			t.Fatalf("attempt %d: rewinding next_retry_at: %v", i, err)
+		}
 	}
 
-	// maxRetries=1: the first failure already reaches the bound.
-	if err := store.Fail(ctx, job.ID, "final error", 1); err != nil {
-		t.Fatalf("Fail: %v", err)
-	}
-
-	var status string
-	var retries int
-	var nextRetryAt *time.Time
-	row := pool.QueryRow(ctx, `SELECT status, retries, next_retry_at FROM backend_jobs WHERE id = $1`, job.ID)
-	if err := row.Scan(&status, &retries, &nextRetryAt); err != nil {
-		t.Fatalf("querying failed row: %v", err)
-	}
-	if status != string(StatusFailed) {
-		t.Fatalf("expected status=failed, got %q", status)
-	}
-	if retries != 1 {
-		t.Fatalf("expected retries=1, got %d", retries)
-	}
-	if nextRetryAt != nil {
-		t.Fatalf("expected next_retry_at to be NULL (permanently failed, retries>=maxRetries), got %v", nextRetryAt)
-	}
-
-	// A permanently-failed job must never be reclaimable.
-	reclaimed, err := store.Claim(ctx, JobTypeViBackfill, "worker-2")
+	// After 10 failures (double the old maxRetries=5 default), the job must still be
+	// reclaimable -- proving there is genuinely no upper bound anymore.
+	job, err := store.Claim(ctx, JobTypeViBackfill, "worker-2")
 	if err != nil {
-		t.Fatalf("Claim after permanent failure: %v", err)
+		t.Fatalf("Claim after %d failures: %v", attempts, err)
 	}
-	if reclaimed != nil {
-		t.Fatalf("expected permanently-failed job to never be reclaimable, got: %+v", reclaimed)
+	if job == nil {
+		t.Fatalf("expected the job to still be reclaimable after %d failures, got nil", attempts)
 	}
 }
 
