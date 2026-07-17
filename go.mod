@@ -75,7 +75,7 @@ require (
 	github.com/bytedance/sonic v1.15.1
 	github.com/evanphx/json-patch v5.9.11+incompatible
 	github.com/googleapis/gax-go/v2 v2.22.0
-	github.com/grafana/blockpack v0.0.0-20260713083211-29726744
+	github.com/grafana/blockpack v0.0.0-20260716133354-fad4a20b
 	github.com/grafana/gomemcache v0.0.0-20251127154401-74f93547077b
 	github.com/grpc-ecosystem/go-grpc-middleware v1.4.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
@@ -495,6 +495,5 @@ replace (
 // - https://github.com/grafana/memberlist/pull/3
 replace github.com/hashicorp/memberlist => github.com/grafana/memberlist v0.3.1-0.20260410132335-4887d8e8d493
 
-// Local blockpack — use `go mod vendor` to sync changes from this path. TEMPORARY: pointed at the
-// cube-orchestration-508 worktree (not the primary ../blockpack checkout) for the duration of
+// Local blockpack — use `go mod vendor` to sync changes from this path.
 replace github.com/grafana/blockpack => ../blockpack

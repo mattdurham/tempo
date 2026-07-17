@@ -50,6 +50,7 @@ import (
 	"github.com/grafana/tempo/tempodb/backend/local"
 	"github.com/grafana/tempo/tempodb/backend/s3"
 	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
+	"github.com/grafana/tempo/tempodb/encoding/vblockpack"
 )
 
 // The various modules that make up tempo.
@@ -416,6 +417,13 @@ func (t *App) initQuerier() (services.Service, error) {
 	}
 
 	liveStoreRing := t.readRings[ringLiveStore]
+
+	// #511 Fix 2: installs the process-level lazy-lookup accessor recordCubeColumnUsage's
+	// OnCreateAttempt wiring (cubequerypath.go) uses to obtain a tenant's CURRENT
+	// backend.DedicatedColumns at query time. initQuerier is the only production call site
+	// confirmed (by direct trace) to have both t.store and t.Overrides already constructed AND
+	// to be the only path reaching OnCreateAttempt at all.
+	vblockpack.ConfigureDedicatedColumnsLookup(t.Overrides.DedicatedColumns)
 
 	querier, err := querier.New(
 		t.cfg.Querier,

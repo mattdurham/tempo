@@ -26,6 +26,7 @@ import (
 
 	blockpack "github.com/grafana/blockpack"
 	"github.com/grafana/tempo/pkg/tempopb"
+	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -172,6 +173,99 @@ func TestMaybeCreateCube_AlreadyExists_NoL0Watermark_ExistingPendingJobIsNotDupl
 		`SELECT count(*) FROM backend_jobs WHERE job_type = 'cube_backfill' AND tenant = $1`, tenant)
 	require.NoError(t, row.Scan(&count))
 	assert.Equal(t, 1, count, "re-triggering must not duplicate an already-pending job for the same cube")
+}
+
+// TestOnCreateAttempt_CreatedBranch_RecordsCubeColumnUsage (#511 Step 2D.1): OnCreateAttempt's
+// created==true branch must call recordCubeColumnUsage for the newly-created cube's dims and
+// AggAttrs, giving Fix 1's LookupColumn(DurationColumn)-anchored backfill data to actually find.
+func TestOnCreateAttempt_CreatedBranch_RecordsCubeColumnUsage(t *testing.T) {
+	resetViUsageRateLimit(t)
+	rec := &fakeUsageRecorder{}
+	withUsageRecorder(t, rec)
+	withDedicatedColumnsLookup(t, func(string) backend.DedicatedColumns { return nil })
+
+	pool := newTestPostgresPool(t)
+	require.NoError(t, migrate.Apply(context.Background(), pool))
+
+	resetCubeQueryPathSingleton(t)
+	ConfigureCubeQueryPath(true, newFakeS3Config(t, "e2e-oncreate-usage-bucket"), pool)
+	cqp := getCubeQueryPath()
+	require.NotNil(t, cqp)
+
+	tenant := "tenant-oncreate-usage"
+	now := time.Now()
+	req := &tempopb.QueryRangeRequest{
+		Query: `{} | count_over_time() by (resource.service.name)`,
+		Start: uint64(now.Add(-time.Hour).UnixNano()),
+		End:   uint64(now.UnixNano()),
+		Step:  uint64(time.Minute.Nanoseconds()),
+	}
+	_, _, err := cqp.tryQueryFromCube(context.Background(), tenant, req)
+	require.Error(t, err, "creation triggered on a genuinely empty registry")
+
+	require.Eventually(t, func() bool {
+		cols := rec.columns()
+		hasDim, hasDuration := false, false
+		for _, c := range cols {
+			if c == "resource.service.name" {
+				hasDim = true
+			}
+			if c == blockpack.CubeDurationColumn {
+				hasDuration = true
+			}
+		}
+		return hasDim && hasDuration
+	}, 5*time.Second, 10*time.Millisecond,
+		"expected recordCubeColumnUsage to eventually record both the dim and CubeDurationColumn")
+}
+
+// TestOnCreateAttempt_ReEvaluationBranch_RecordsCubeColumnUsage (#511 Step 2D.1): mirrors
+// TestMaybeCreateCube_AlreadyExists_NoL0Watermark_InsertsRetryJob's exact setup -- usage must
+// also be recorded on the re-evaluation branch (a stalled, never-backfilled existing cube), not
+// just on first creation.
+func TestOnCreateAttempt_ReEvaluationBranch_RecordsCubeColumnUsage(t *testing.T) {
+	resetViUsageRateLimit(t)
+	rec := &fakeUsageRecorder{}
+	withUsageRecorder(t, rec)
+	withDedicatedColumnsLookup(t, func(string) backend.DedicatedColumns { return nil })
+
+	pool := newTestPostgresPool(t)
+	require.NoError(t, migrate.Apply(context.Background(), pool))
+
+	tenant := "tenant-reeval-usage"
+	dims := []string{"resource.service.name"}
+	entry := existingCubeEntry(tenant, dims, nil) // no watermarks at all -> no L0 entry
+	require.NoError(t, blockpack.NewPgCubeRegistry(pool, tenant).Add(context.Background(), entry))
+
+	resetCubeQueryPathSingleton(t)
+	ConfigureCubeQueryPath(true, newFakeS3Config(t, "e2e-reeval-usage-bucket"), pool)
+	cqp := getCubeQueryPath()
+	require.NotNil(t, cqp)
+
+	now := time.Now()
+	req := &tempopb.QueryRangeRequest{
+		Query: `{} | count_over_time() by (resource.service.name)`,
+		Start: uint64(now.Add(-time.Hour).UnixNano()),
+		End:   uint64(now.UnixNano()),
+		Step:  uint64(time.Minute.Nanoseconds()),
+	}
+	_, _, err := cqp.tryQueryFromCube(context.Background(), tenant, req)
+	require.Error(t, err)
+
+	require.Eventually(t, func() bool {
+		cols := rec.columns()
+		hasDim, hasDuration := false, false
+		for _, c := range cols {
+			if c == "resource.service.name" {
+				hasDim = true
+			}
+			if c == blockpack.CubeDurationColumn {
+				hasDuration = true
+			}
+		}
+		return hasDim && hasDuration
+	}, 5*time.Second, 10*time.Millisecond,
+		"expected recordCubeColumnUsage to eventually record both the dim and CubeDurationColumn on re-evaluation too")
 }
 
 // resetCubeQueryPathSingleton clears the process-level cube query path singleton for the

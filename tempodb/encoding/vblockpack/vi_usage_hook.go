@@ -375,6 +375,39 @@ const viUsageRateLimitMaxTrackedKeys = 100_000
 
 var viUsageRateLimit = newViUsageRateLimiter(viUsageRateLimitWindow)
 
+var (
+	dedicatedColumnsLookupMu sync.RWMutex
+	dedicatedColumnsLookupFn func(tenantID string) backend.DedicatedColumns
+)
+
+// ConfigureDedicatedColumnsLookup installs the process-level accessor recordCubeColumnUsage's
+// OnCreateAttempt wiring (cubequerypath.go) uses to obtain a tenant's CURRENT
+// backend.DedicatedColumns at query time -- NOT at ConfigureCubeQueryPath's construction time
+// (which runs from tempodb.New(), before the Overrides module is guaranteed to exist; the Store
+// module has no dependency edge on Overrides in cmd/tempo/app/modules.go's DAG). Wired from
+// cmd/tempo/app's initQuerier: the module-init function confirmed (by direct trace, #511 Fix 2)
+// to have BOTH t.store and t.Overrides already constructed, and confirmed to be the ONLY
+// production caller reaching OnCreateAttempt at all (tryQueryFromCube's sole caller is
+// backend_block.go, querier-side; initQueryFrontend does not need this wiring). A nil fn
+// (never configured, e.g. non-S3 backends where ConfigureCubeQueryPath itself never installs a
+// callback) makes getDedicatedColumnsForTenant return nil, matching every other *ColumnsLookup/
+// singleton's "unconfigured means no-op" convention in this file.
+func ConfigureDedicatedColumnsLookup(fn func(tenantID string) backend.DedicatedColumns) {
+	dedicatedColumnsLookupMu.Lock()
+	defer dedicatedColumnsLookupMu.Unlock()
+	dedicatedColumnsLookupFn = fn
+}
+
+func getDedicatedColumnsForTenant(tenantID string) backend.DedicatedColumns {
+	dedicatedColumnsLookupMu.RLock()
+	fn := dedicatedColumnsLookupFn
+	dedicatedColumnsLookupMu.RUnlock()
+	if fn == nil {
+		return nil
+	}
+	return fn(tenantID)
+}
+
 // dedicatedColumnSet builds a lookup set of blockpack scope-prefixed column names (e.g.
 // "resource.service.name", "span.http.request.method") from dcs, for R3's "column not in
 // backend.DedicatedColumns" check. Mirrors the same Scope+"."+Name convention
@@ -420,6 +453,63 @@ func reduceLeafColumnsAllIndexable(prog *blockpack.Program) (order []string, byC
 	return order, byCol
 }
 
+// recordColumnUsageIfDue is the shared per-column "check dedicated -> check rate limit -> call
+// RecordUse" primitive both recordUsageForDeclinedQuery and RecordUsageIfNoIndexCoverage's loops
+// used to duplicate inline. Extracted (Fix 2 for #511) so a 3rd, differently-shaped caller
+// (recordCubeColumnUsage) can reuse the SAME dedicated-check/rate-limit-key convention without a
+// 3rd independently-drifting copy. No-ops when no recorder is installed, mirroring every other
+// call site's rec==nil convention.
+func recordColumnUsageIfDue(
+	ctx context.Context, tenant, col, colType string, dedicated map[string]struct{}, now time.Time,
+) {
+	rec := getViUsageRecorder()
+	if rec == nil {
+		return
+	}
+	if _, ok := dedicated[col]; ok {
+		return // already forward-indexed -- no backfill needed
+	}
+	key := tenant + "|" + col
+	if !viUsageRateLimit.allow(key, now) {
+		return
+	}
+	_, _ = rec.RecordUse(ctx, tenant, col, colType, now)
+}
+
+// recordCubeColumnUsage records a usage-recording attempt for every column a cube's dims/AggAttrs
+// actually need VI coverage for -- the columns Fix 1's LookupColumn(DurationColumn)-anchored
+// backfill (blockpack's internal/modules/cube/backfill.go) depends on to find any data at all.
+// This is NOT a 4th call to recordUsageForDeclinedQuery/RecordUsageIfNoIndexCoverage: those take
+// a compiled *blockpack.Program and walk its LEAVES (blockpack.LeafColumns), which requires a
+// comparison operator to exist -- a bare group-by dim or a materialized AggAttr column has no
+// operator and no leaf shape at all, so this calls the shared recordColumnUsageIfDue primitive
+// directly per column instead (#511 Fix 2, Approach B). dims-length-agnostic: works identically
+// for a zero-dimension entry (Fix 1's exact new shape), a single-dim, or a two-dim entry.
+//
+// colType defaulting (accepted, documented risk -- #511 plan.md): every dim defaults to "string"
+// (no counter-example of a non-string TraceQL group-by dimension in this codebase today); every
+// AggAttr uses the SAME Duration-int64/else-float64 convention cube.AggAttrDefsFor and
+// extractAggAttr already use elsewhere (not a new risk, an existing one this function inherits).
+// Literal "string"/"int64"/"float64" strings are used rather than blockpack.ColTypeName because
+// that function takes a blockpack.ColumnType (shared.ColumnType), a DIFFERENT type from
+// blockpack.CubeAggAttrType (cube.AggAttrType) with a different zero-value meaning -- converting
+// between them would silently misname the type, not just add friction.
+func recordCubeColumnUsage(
+	ctx context.Context, tenant string, entry blockpack.CubeRegistryEntry,
+	dedicated map[string]struct{}, now time.Time,
+) {
+	for _, dim := range entry.Dimensions {
+		recordColumnUsageIfDue(ctx, tenant, dim, "string", dedicated, now)
+	}
+	for _, attr := range entry.AggAttrs {
+		colType := "float64"
+		if attr == blockpack.CubeDurationColumn {
+			colType = "int64"
+		}
+		recordColumnUsageIfDue(ctx, tenant, attr, colType, dedicated, now)
+	}
+}
+
 // recordUsageForDeclinedQuery is the shared R3 decision function for all 3 call sites.
 // For every column blockpack.LeafColumns finds leaves for in prog, it records a use IFF:
 //   - EVERY leaf referencing that column has an indexable shape (ALL-not-ANY, mirroring
@@ -455,15 +545,8 @@ func recordUsageForDeclinedQuery(
 		if !info.allIndexable {
 			continue // R3: permanent decline -- negation/RequirePresent-only/multi-value
 		}
-		if _, ok := dedicated[col]; ok {
-			continue // already forward-indexed -- no backfill needed
-		}
-		key := tenant + "|" + col
-		if !viUsageRateLimit.allow(key, now) {
-			continue
-		}
 		colTypeName := blockpack.ColTypeName(info.colType)
-		_, _ = rec.RecordUse(ctx, tenant, col, colTypeName, now)
+		recordColumnUsageIfDue(ctx, tenant, col, colTypeName, dedicated, now)
 	}
 }
 
@@ -509,19 +592,12 @@ func RecordUsageIfNoIndexCoverage(
 		if !info.allIndexable {
 			continue // R3: permanent decline -- negation/RequirePresent-only/multi-value
 		}
-		if _, ok := dedicatedSet[col]; ok {
-			continue // already forward-indexed
-		}
 		colTypeName := blockpack.ColTypeName(info.colType)
 		colHash := blockpack.ColHash(col)
 		files, err := cache.FilesForTimeRange(ctx, colHash, colTypeName, minSec, maxSec)
 		if err != nil || len(files) > 0 {
 			continue // discovery error, or genuine coverage: not a "missing index" signal
 		}
-		key := tenant + "|" + col
-		if !viUsageRateLimit.allow(key, now) {
-			continue
-		}
-		_, _ = rec.RecordUse(ctx, tenant, col, colTypeName, now)
+		recordColumnUsageIfDue(ctx, tenant, col, colTypeName, dedicatedSet, now)
 	}
 }

@@ -1141,3 +1141,65 @@ its `Lister` prefix.
 `TestCubeQueryPath_GroupedQuery_TriggersCreationAndBackfill`
 (`cube_query_path_publicapi_test.go`) — this test failed with the unpadded prefix, passed after
 the fix, with no other change. See `SPEC-CUBE-032`. Issue #508.
+
+## NOTE-CUBE-035: Zero-dimension backfill lifted — anchoring on the mandatory DurationColumn lookup, and two superseded design revisions (issue #511)
+
+Date: 2026-07-16
+
+**Decision:** `SPEC-CUBE-033`'s "PERMANENT limitation, not a bug" claim for zero-dimension
+backfill (see that entry's own 2026-07-16/#511 Addendum) is lifted. `Backfiller.processMinute`'s
+`len(entry.Dimensions) == 0` guard and `RunCubeBackfill`'s mirrored guard
+(`cube_backfill_runner.go`) are both removed; a new `processMinuteZeroDim` method
+(`backfill.go`) backfills a zero-dimension entry by anchoring on `LookupColumn(DurationColumn,
+minSec, maxSec)` instead of a dimension column — since `duration` is mandatory in every v2
+cube's `AggAttrs` (E-4/`SPEC-CUBE-025`), this lookup returns one VI entry per span carrying a
+duration value in the window, which in practice is every span, giving the missing
+"enumerate every span" primitive `SPEC-CUBE-033` correctly noted the VI does not otherwise
+expose. Every span in the minute window collapses into the single `(AllDimSentinel,
+AllDimSentinel)` cell.
+
+**Issue history — two superseded design revisions before the shipped one, recorded so a reader
+following #511's own edit history from the top isn't confused by earlier framing still visible
+in the issue title/body:**
+
+1. **Original (not built):** a raw block-scan `ValueIndexSource`/`BlockSource` API — read every
+   data block directly rather than through the existing per-attribute-value `LookupColumn`
+   inverted-index interface. This would have required a genuinely new read path into the value
+   index (or a fallback into raw block scanning) with its own I/O-cost and correctness
+   implications, and was abandoned before implementation.
+2. **First correction (also not built as originally scoped):** reuse the existing
+   `LookupColumn(DurationColumn)` call as the anchor, plus wire VI-usage-recording (the
+   tempo-side "was this column ever looked up" bookkeeping, Phase 2 of #511) into the same call
+   path.
+3. **Shipped (this entry):** the `LookupColumn(DurationColumn)`-anchor half of design 2, built
+   entirely on the blockpack side in Phase 1 (this package). The VI-usage-recording half is
+   tempo-side, tracked separately as #511's Phase 2 (tasks #102-#106) — not part of this
+   package's own change.
+
+**Accepted, pre-existing colType-defaulting risk — unchanged by this fix, not a new risk.**
+`AggAttrDefsFor` (`backfill.go`, `NOTE-CUBE-017` Decision 2) defaults `DurationColumn` to
+`AggAttrTypeInt64` and every other `AggAttrs` column to `AggAttrTypeFloat64` — a bare registry
+column name carries no type tag, so a non-duration numeric aggAttr on a zero-dimension cube
+inherits this SAME pre-existing conservative default (correct `Sum`/`Min`/`Max`/`SampleCount`,
+but never populates `Buckets[]`, since bucketing is scoped to Int64/Duration-typed attributes
+only per ruling 1). This is not a new gap `processMinuteZeroDim` introduces — it is the existing
+`NOTE-CUBE-017` risk, reachable via a new path (a zero-dimension cube) rather than only a
+dimensioned one. There is no analogous "dimension colType" risk on the blockpack side for a
+zero-dimension cube specifically, because `AllDimSentinel` is a literal constant assigned
+directly to `Dim1Column`/`Dim2Column` — it is never looked up or type-inferred at all, unlike a
+real dimension column name would be.
+
+**`lookupAggAttrValues`'s `extraExcluded` param is a deliberate efficiency choice, not an
+oversight.** `processMinuteZeroDim`'s anchor lookup on `DurationColumn` already yields that
+column's value directly via each entry's own `SourceRef` (assigned straight into
+`vals[DurationColumn]`, no join needed). Without `extraExcluded`, the subsequent
+`lookupAggAttrValues` call (which fetches every OTHER declared `AggAttrs` column) would
+redundantly re-fetch `DurationColumn` a second time via its own `LookupColumn` call — correct but
+wasteful, doubling the VI cost for the one column that never needed a second fetch. The
+non-zero-dimension path is unaffected: its existing call site passes `nil` for the new parameter,
+preserving prior behavior exactly.
+
+**Back-ref:** `internal/modules/cube/backfill.go:Backfiller.processMinute,processMinuteZeroDim,
+lookupAggAttrValues`, `cube_backfill_runner.go:RunCubeBackfill`. See
+`SPEC-CUBE-033`'s 2026-07-16 Addendum, `NOTE-CUBE-017` (the colType-defaulting convention this
+inherits unchanged). Issue #511.

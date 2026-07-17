@@ -205,6 +205,34 @@ func TestRecordUsage_RateLimitCollapsesBurst(t *testing.T) {
 	assert.Len(t, rec.columns(), 1, "a burst within the rate-limit window must collapse to one recorded use")
 }
 
+// TestRecordUsageForDeclinedQuery_RefactorPreservesBehavior_AllThreeGates is the #511 Step 2A.1
+// regression harness protecting the recordColumnUsageIfDue extraction (Step 2A.3): a single
+// Program with 3 leaves on 3 different columns exercises all 3 gates the shared body must still
+// apply post-refactor -- run against CURRENT (pre-refactor) code, this establishes the baseline
+// the refactor must not change.
+//   - resource.service.name is dedicated -> must NOT be recorded (dedicated-skip gate).
+//   - span.custom.attr's leaf is negated (`!=`), so not allIndexable -> must NOT be recorded (R3 gate).
+//   - span.never.indexed is indexable and not dedicated -> MUST be recorded exactly once, with the
+//     correct colType ("string", from blockpack.ColTypeName(info.colType)).
+func TestRecordUsageForDeclinedQuery_RefactorPreservesBehavior_AllThreeGates(t *testing.T) {
+	resetViUsageRateLimit(t)
+	rec := &fakeUsageRecorder{}
+	withUsageRecorder(t, rec)
+
+	prog, err := blockpack.CompileTraceQL(
+		`{ resource.service.name = "svc-a" && span.custom.attr != "x" && span.never.indexed = "y" }`,
+		blockpack.QueryOptions{},
+	)
+	require.NoError(t, err)
+
+	recordUsageForDeclinedQuery(context.Background(), "tenant-a", prog, testDedicatedColumns(), time.Now())
+
+	require.Len(t, rec.calls, 1,
+		"exactly one column must be recorded: resource.service.name is dedicated, "+
+			"span.custom.attr's leaf is unindexable (negation)")
+	assert.Equal(t, fakeUsageCall{tenant: "tenant-a", colName: "span.never.indexed", colType: "string"}, rec.calls[0])
+}
+
 // TestViUsageRateLimiter_SweepsExpiredEntriesPastThreshold is the go-presubmit.md HIGH
 // finding's regression pin: viUsageRateLimiter.seen must not grow unboundedly for the
 // process lifetime. A small maxTrackedKeys (not the real 100k default -- this test needs
@@ -709,4 +737,204 @@ func TestRealUsageRecorder_DisabledConfigSkipsRegistryAndBackfill(t *testing.T) 
 	entries, _, err := registry.Load(context.Background())
 	require.NoError(t, err)
 	assert.Empty(t, entries, "a disabled Config must produce zero registry I/O")
+}
+
+// TestRecordColumnUsageIfDue_DedicatedColumnSkipped: a column already in dedicated must never
+// be recorded, regardless of rate limit state.
+func TestRecordColumnUsageIfDue_DedicatedColumnSkipped(t *testing.T) {
+	resetViUsageRateLimit(t)
+	rec := &fakeUsageRecorder{}
+	withUsageRecorder(t, rec)
+
+	dedicated := map[string]struct{}{"resource.service.name": {}}
+	recordColumnUsageIfDue(context.Background(), "tenant-a", "resource.service.name", "string", dedicated, time.Now())
+
+	assert.Empty(t, rec.calls, "a dedicated column must never be recorded")
+}
+
+// TestRecordColumnUsageIfDue_RateLimitedColumnSkipped: calling twice within the rate-limit
+// window for the same (tenant, col) must record exactly once.
+func TestRecordColumnUsageIfDue_RateLimitedColumnSkipped(t *testing.T) {
+	resetViUsageRateLimit(t)
+	rec := &fakeUsageRecorder{}
+	withUsageRecorder(t, rec)
+
+	now := time.Now()
+	recordColumnUsageIfDue(context.Background(), "tenant-a", "span.custom.attr", "string", nil, now)
+	recordColumnUsageIfDue(context.Background(), "tenant-a", "span.custom.attr", "string", nil, now)
+
+	assert.Len(t, rec.calls, 1, "a burst within the rate-limit window must collapse to one recorded use")
+}
+
+// TestRecordColumnUsageIfDue_NilRecorderNoOps: with no recorder installed, the function must
+// return immediately -- no panic, no calls -- mirroring the existing 2 functions' own rec==nil
+// early-return convention.
+func TestRecordColumnUsageIfDue_NilRecorderNoOps(t *testing.T) {
+	resetViUsageRateLimit(t)
+	withUsageRecorder(t, nil)
+
+	assert.NotPanics(t, func() {
+		recordColumnUsageIfDue(context.Background(), "tenant-a", "span.custom.attr", "string", nil, time.Now())
+	})
+}
+
+// TestRecordColumnUsageIfDue_RecordsWhenEligible: not dedicated, not rate-limited -> exactly 1
+// RecordUse call with the exact (tenant, col, colType) passed through unchanged.
+func TestRecordColumnUsageIfDue_RecordsWhenEligible(t *testing.T) {
+	resetViUsageRateLimit(t)
+	rec := &fakeUsageRecorder{}
+	withUsageRecorder(t, rec)
+
+	recordColumnUsageIfDue(context.Background(), "tenant-a", "span.custom.attr", "string", nil, time.Now())
+
+	require.Len(t, rec.calls, 1)
+	assert.Equal(t, fakeUsageCall{tenant: "tenant-a", colName: "span.custom.attr", colType: "string"}, rec.calls[0])
+}
+
+// TestRecordCubeColumnUsage_RecordsEveryDimAndAggAttr (#511 Step 2B.1): a cube entry with one
+// dimension and duration as its AggAttr records BOTH columns, with the correct colType each --
+// "string" for the dim (the accepted, documented dim-colType-defaulting risk) and "int64" for
+// blockpack.CubeDurationColumn (the pre-existing Duration->int64 convention cube.AggAttrDefsFor
+// already uses elsewhere).
+func TestRecordCubeColumnUsage_RecordsEveryDimAndAggAttr(t *testing.T) {
+	resetViUsageRateLimit(t)
+	rec := &fakeUsageRecorder{}
+	withUsageRecorder(t, rec)
+
+	entry := blockpack.CubeRegistryEntry{
+		Tenant:     "tenant-a",
+		Dimensions: []string{"resource.service.name"},
+		AggAttrs:   []string{blockpack.CubeDurationColumn},
+	}
+	recordCubeColumnUsage(context.Background(), "tenant-a", entry, nil, time.Now())
+
+	require.Len(t, rec.calls, 2)
+	assert.Contains(t, rec.calls, fakeUsageCall{tenant: "tenant-a", colName: "resource.service.name", colType: "string"})
+	assert.Contains(t, rec.calls, fakeUsageCall{tenant: "tenant-a", colName: blockpack.CubeDurationColumn, colType: "int64"})
+}
+
+// TestRecordCubeColumnUsage_ZeroDimEntry_RecordsAggAttrsOnly (#511 Fix 1's exact shape): a
+// Dimensions:nil entry records only its AggAttrs, no panic and no dim entries -- proves this
+// function is dims-length-agnostic, matching #508's own "dims-length-agnostic" convention.
+func TestRecordCubeColumnUsage_ZeroDimEntry_RecordsAggAttrsOnly(t *testing.T) {
+	resetViUsageRateLimit(t)
+	rec := &fakeUsageRecorder{}
+	withUsageRecorder(t, rec)
+
+	entry := blockpack.CubeRegistryEntry{
+		Tenant:     "tenant-a",
+		Dimensions: nil,
+		AggAttrs:   []string{blockpack.CubeDurationColumn},
+	}
+	assert.NotPanics(t, func() {
+		recordCubeColumnUsage(context.Background(), "tenant-a", entry, nil, time.Now())
+	})
+
+	assert.Equal(t, []string{blockpack.CubeDurationColumn}, rec.columns())
+}
+
+// TestRecordCubeColumnUsage_DedicatedColumnSkipped: a dim already in dedicated is not recorded,
+// an AggAttr already in dedicated is not recorded -- both paths through the shared
+// recordColumnUsageIfDue helper. Also covers Edge Case 6 (#511 plan.md): when EVERY column a
+// cube's dims/AggAttrs touch is already dedicated, recordCubeColumnUsage is a complete no-op,
+// not an error or a partial recording.
+func TestRecordCubeColumnUsage_DedicatedColumnSkipped(t *testing.T) {
+	entry := blockpack.CubeRegistryEntry{
+		Tenant:     "tenant-a",
+		Dimensions: []string{"resource.service.name"},
+		AggAttrs:   []string{blockpack.CubeDurationColumn},
+	}
+
+	t.Run("dim dedicated, aggAttr not", func(t *testing.T) {
+		resetViUsageRateLimit(t)
+		rec := &fakeUsageRecorder{}
+		withUsageRecorder(t, rec)
+
+		dedicated := map[string]struct{}{"resource.service.name": {}}
+		recordCubeColumnUsage(context.Background(), "tenant-a", entry, dedicated, time.Now())
+
+		assert.Equal(t, []string{blockpack.CubeDurationColumn}, rec.columns())
+	})
+
+	t.Run("aggAttr dedicated, dim not", func(t *testing.T) {
+		resetViUsageRateLimit(t)
+		rec := &fakeUsageRecorder{}
+		withUsageRecorder(t, rec)
+
+		dedicated := map[string]struct{}{blockpack.CubeDurationColumn: {}}
+		recordCubeColumnUsage(context.Background(), "tenant-a", entry, dedicated, time.Now())
+
+		assert.Equal(t, []string{"resource.service.name"}, rec.columns())
+	})
+
+	t.Run("all dedicated", func(t *testing.T) {
+		resetViUsageRateLimit(t)
+		rec := &fakeUsageRecorder{}
+		withUsageRecorder(t, rec)
+
+		dedicated := map[string]struct{}{"resource.service.name": {}, blockpack.CubeDurationColumn: {}}
+		recordCubeColumnUsage(context.Background(), "tenant-a", entry, dedicated, time.Now())
+
+		assert.Len(t, rec.calls, 0, "every column already dedicated must be a complete no-op")
+	})
+}
+
+// TestRecordCubeColumnUsage_NonDurationAggAttrDefaultsFloat64: an AggAttr other than
+// blockpack.CubeDurationColumn gets colType "float64" -- pins the reused, pre-existing
+// Duration->int64/else-float64 convention explicitly, not just implicitly.
+func TestRecordCubeColumnUsage_NonDurationAggAttrDefaultsFloat64(t *testing.T) {
+	resetViUsageRateLimit(t)
+	rec := &fakeUsageRecorder{}
+	withUsageRecorder(t, rec)
+
+	entry := blockpack.CubeRegistryEntry{
+		Tenant:     "tenant-a",
+		Dimensions: nil,
+		AggAttrs:   []string{"custom.count"},
+	}
+	recordCubeColumnUsage(context.Background(), "tenant-a", entry, nil, time.Now())
+
+	require.Len(t, rec.calls, 1)
+	assert.Equal(t, fakeUsageCall{tenant: "tenant-a", colName: "custom.count", colType: "float64"}, rec.calls[0])
+}
+
+// withDedicatedColumnsLookup installs fn via the real ConfigureDedicatedColumnsLookup (not a
+// direct write to the package var) so this helper also exercises the production setter, restoring
+// the prior value afterward — mirrors withUsageRecorder's own pattern.
+func withDedicatedColumnsLookup(t *testing.T, fn func(tenantID string) backend.DedicatedColumns) {
+	t.Helper()
+	dedicatedColumnsLookupMu.Lock()
+	prev := dedicatedColumnsLookupFn
+	dedicatedColumnsLookupMu.Unlock()
+	ConfigureDedicatedColumnsLookup(fn)
+	t.Cleanup(func() {
+		ConfigureDedicatedColumnsLookup(prev)
+	})
+}
+
+// TestConfigureDedicatedColumnsLookup_UnconfiguredReturnsNil: no Configure* call has ever
+// installed a lookup fn -> getDedicatedColumnsForTenant must return nil, not panic.
+func TestConfigureDedicatedColumnsLookup_UnconfiguredReturnsNil(t *testing.T) {
+	withDedicatedColumnsLookup(t, nil)
+
+	assert.Nil(t, getDedicatedColumnsForTenant("any-tenant"))
+}
+
+// TestConfigureDedicatedColumnsLookup_InstalledFnCalledWithTenant: an installed fn must be
+// invoked with the exact tenant ID passed to getDedicatedColumnsForTenant, and its return
+// value passed straight through.
+func TestConfigureDedicatedColumnsLookup_InstalledFnCalledWithTenant(t *testing.T) {
+	want := backend.DedicatedColumns{
+		{Scope: backend.DedicatedColumnScopeResource, Name: "service.name"},
+	}
+	var gotTenant string
+	withDedicatedColumnsLookup(t, func(tenantID string) backend.DedicatedColumns {
+		gotTenant = tenantID
+		return want
+	})
+
+	got := getDedicatedColumnsForTenant("tenant-x")
+
+	assert.Equal(t, "tenant-x", gotTenant)
+	assert.Equal(t, want, got)
 }

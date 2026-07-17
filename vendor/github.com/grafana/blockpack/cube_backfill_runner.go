@@ -8,7 +8,9 @@ package blockpack
 // cube_query_path.go's loadEntries convention) -- every decline here is silent; callers that
 // want visibility inspect the returned error themselves.
 // SPEC-CUBE-032: orchestration contract. NOTE-CUBE-032: decodeCanonicalVI's type-threaded fix
-// (Decision 1, not ported verbatim). SPEC-CUBE-033: zero-dimension entries decline immediately.
+// (Decision 1, not ported verbatim). SPEC-CUBE-033 (#511): zero-dimension entries backfill via
+// internal/modules/cube/backfill.go's processMinuteZeroDim, anchored on the mandatory
+// DurationColumn AggAttr lookup instead of a dimension column.
 
 import (
 	"context"
@@ -19,7 +21,6 @@ import (
 	"path"
 	"strconv"
 
-	"github.com/grafana/blockpack/internal/modules/cube"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -244,14 +245,13 @@ func runCubeBackfillCore(
 // a non-nil error. Callers relying on "err == nil implies done" (e.g. a completion metric) may
 // do so without a separate progress callback.
 //
-// A zero-dimension (ungrouped) entry declines immediately with a *cube.DefinitionError, without
-// ever entering the per-minute retry loop (#508 Phase 7, Edge Case 8): the VI-based backfill
-// mechanism has no "enumerate every span" query -- only per-attribute-value lookups -- so such an
-// entry has no dimension column to anchor a historical read on, a permanent structural property
-// of the entry's shape, not a transient condition the circuit breaker's consecutive-failure
-// counting would ever meaningfully arbitrate. Mirrors internal/modules/cube/backfill.go's
-// processMinute guard (kept, unchanged) so a caller invoking the Backfiller directly gets the
-// identical decline.
+// A zero-dimension (ungrouped) entry backfills successfully like any other entry (#511): it has
+// no dimension column to anchor a historical VI lookup on, so
+// internal/modules/cube/backfill.go's processMinuteZeroDim instead anchors on the mandatory
+// DurationColumn AggAttr lookup (every v2 cube materializes duration) as the span-enumeration
+// source, collapsing every span into one (AllDimSentinel, AllDimSentinel) cell per minute. This
+// mirrors that same file's processMinute, which RunCubeBackfill delegates to via
+// runCubeBackfillCore/CubeBackfiller -- no zero-dim-specific guard exists here anymore.
 func RunCubeBackfill(
 	ctx context.Context,
 	entry CubeRegistryEntry,
@@ -264,12 +264,6 @@ func RunCubeBackfill(
 ) error {
 	if pgPool == nil {
 		return errors.New("blockpack: RunCubeBackfill: postgres not configured")
-	}
-	if len(entry.Dimensions) == 0 {
-		return &cube.DefinitionError{
-			Reason:     fmt.Sprintf("cube backfill: RegistryEntry %q has no Dimensions", entry.CubeID),
-			Suggestion: "a RegistryEntry must have at least one Dimensions entry before it can be backfilled",
-		}
 	}
 	src := newCubeVIBackfillSource(vi, indexPrefix)
 	cfg.Store = files

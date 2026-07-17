@@ -154,11 +154,16 @@ func AggAttrDefsFor(columns []string) []AggAttrDef {
 
 // lookupAggAttrValues fetches VI entries for every aggAttr column not already covered by the
 // cube's own dimensions, returning column → (traceID,spanID) → value-string, ready to join
-// against whichever dimension entries drive the per-span loop in processMinute.
+// against whichever dimension entries drive the per-span loop in processMinute. extraExcluded
+// additionally skips columns whose value the caller already has via a different lookup (e.g. the
+// zero-dim anchor lookup on DurationColumn, whose SourceRef already IS that column's value) — a
+// nil extraExcluded is safe (zero-value map lookups are always false) and behaves exactly as
+// before this parameter existed.
 func (b *Backfiller) lookupAggAttrValues(
 	ctx context.Context,
 	minute uint32,
 	minSec, maxSec uint64,
+	extraExcluded map[string]bool,
 ) (map[string]map[[24]byte]string, error) {
 	dimSet := make(map[string]bool, len(b.entry.Dimensions))
 	for _, d := range b.entry.Dimensions {
@@ -166,8 +171,8 @@ func (b *Backfiller) lookupAggAttrValues(
 	}
 	out := make(map[string]map[[24]byte]string, len(b.entry.AggAttrs))
 	for _, col := range b.entry.AggAttrs {
-		if dimSet[col] {
-			continue // already covered by a dimension lookup, no separate fetch needed
+		if dimSet[col] || extraExcluded[col] {
+			continue // already covered by a dimension lookup or an extra caller-supplied lookup
 		}
 		entries, err := b.src.LookupColumn(ctx, b.tenant, col, minSec, maxSec)
 		if err != nil {
@@ -200,22 +205,10 @@ func buildSpanVals(
 
 // processMinute builds one cube file for the given minute from value index data.
 func (b *Backfiller) processMinute(ctx context.Context, minute uint32) error {
-	// b.entry.Dimensions[0] is indexed unconditionally below. SPEC-CUBE-033: this is a PERMANENT
-	// limitation of the VI-based backfill mechanism, not merely a defensive guard against a
-	// malformed caller -- LookupColumn is fundamentally a per-attribute-value inverted-index
-	// lookup ("which spans have column X = value Y"), never an "enumerate every span" query. A
-	// zero-dimension (ungrouped) cube has no dimension column to anchor such a lookup on, so
-	// there is no way to reconstruct its historical per-minute counts from the value index at
-	// all -- a structural limitation, not something a different sentinel or extra plumbing
-	// would fix. A zero-dimension cube therefore only ever accumulates data going FORWARD from
-	// its creation moment (via forward ingest, which needs no VI lookup); this guard declines
-	// cleanly, once, rather than let Dimensions[0] panic on an out-of-bounds index.
-	if len(b.entry.Dimensions) == 0 {
-		return &DefinitionError{
-			Reason:     fmt.Sprintf("cube backfill: RegistryEntry %q has no Dimensions", b.entry.CubeID),
-			Suggestion: "a RegistryEntry must have at least one Dimensions entry before it can be backfilled",
-		}
-	}
+	// zeroDim (ungrouped, len(Dimensions)==0) cubes have no dimension column to anchor a VI
+	// lookup on, so processMinuteZeroDim below reuses the mandatory DurationColumn AggAttr lookup
+	// as the span-enumeration source instead -- see its own doc comment for the full strategy.
+	zeroDim := len(b.entry.Dimensions) == 0
 
 	minSec := uint64(minute) * 60
 	maxSec := minSec + 59
@@ -246,8 +239,14 @@ func (b *Backfiller) processMinute(ctx context.Context, minute uint32) error {
 			filters = append(filters, f)
 		}
 	}
+	// dim2Col is already AllDimSentinel here when zeroDim (len(Dimensions)==0 implies the
+	// len(Dimensions)>1 branch above never ran).
+	dim1Col := AllDimSentinel
+	if !zeroDim {
+		dim1Col = b.entry.Dimensions[0]
+	}
 	acc, err := NewAccumulator(Definition{
-		Dim1Column: b.entry.Dimensions[0],
+		Dim1Column: dim1Col,
 		Dim2Column: dim2Col,
 		Filters:    filters,
 		AggAttrs:   AggAttrDefsFor(b.entry.AggAttrs),
@@ -256,6 +255,10 @@ func (b *Backfiller) processMinute(ctx context.Context, minute uint32) error {
 	}, minute)
 	if err != nil {
 		return fmt.Errorf("cube backfill: new accumulator: %w", err)
+	}
+
+	if zeroDim {
+		return b.processMinuteZeroDim(ctx, acc, minute, minSec, maxSec)
 	}
 
 	// Read dim1 entries from the value index.
@@ -268,7 +271,7 @@ func (b *Backfiller) processMinute(ctx context.Context, minute uint32) error {
 		return nil // no data for this minute — write nothing (sparse cube)
 	}
 
-	aggAttrValues, err := b.lookupAggAttrValues(ctx, minute, minSec, maxSec)
+	aggAttrValues, err := b.lookupAggAttrValues(ctx, minute, minSec, maxSec, nil)
 	if err != nil {
 		return err
 	}
@@ -330,6 +333,49 @@ func (b *Backfiller) processMinute(ctx context.Context, minute uint32) error {
 		return fmt.Errorf("cube backfill: flush minute %d: %w", minute, err)
 	}
 	_ = key
+	return nil
+}
+
+// processMinuteZeroDim handles the ungrouped (len(Dimensions)==0) case: every span in the
+// minute window collapses into ONE (AllDimSentinel, AllDimSentinel) cell. There is no dimension
+// column to anchor a VI lookup on, so this reuses the mandatory DurationColumn AggAttr lookup
+// (every v2 cube materializes duration, validateDefinition/E-4) as the span-enumeration source
+// instead -- LookupColumn(DurationColumn) returns one VI entry per span with a duration value in
+// the window (effectively every span), and each entry's SourceRef IS that span's duration value,
+// so no separate aggAttr join is needed for DurationColumn itself (only for any OTHER AggAttrs a
+// zero-dim cube may also declare -- see lookupAggAttrValues's extraExcluded param).
+func (b *Backfiller) processMinuteZeroDim(
+	ctx context.Context, acc *Accumulator, minute uint32, minSec, maxSec uint64,
+) error {
+	anchorEntries, err := b.src.LookupColumn(ctx, b.tenant, DurationColumn, minSec, maxSec)
+	if err != nil {
+		return fmt.Errorf("cube backfill: lookup zero-dim anchor %q minute %d: %w", DurationColumn, minute, err)
+	}
+	if len(anchorEntries) == 0 {
+		return nil // no data for this minute -- write nothing (sparse cube)
+	}
+
+	aggAttrValues, err := b.lookupAggAttrValues(ctx, minute, minSec, maxSec, map[string]bool{DurationColumn: true})
+	if err != nil {
+		return err
+	}
+
+	for _, e := range anchorEntries {
+		key := viEntryKey(e.TraceID, e.SpanID)
+		vals := buildSpanVals(AllDimSentinel, AllDimSentinel, AllDimSentinel, AllDimSentinel, key, aggAttrValues)
+		vals[DurationColumn] = e.SourceRef // anchor entry IS the duration lookup; reuse its value directly
+		sv := valueIndexSpanValues{vals: vals}
+		if _, addErr := acc.Add(sv); addErr != nil {
+			return fmt.Errorf("cube backfill: add cell: %w", addErr)
+		}
+	}
+
+	if acc.CellCount() == 0 {
+		return nil
+	}
+	if _, err := acc.FlushTo(b.cfg.Store, b.tenant); err != nil {
+		return fmt.Errorf("cube backfill: flush minute %d: %w", minute, err)
+	}
 	return nil
 }
 

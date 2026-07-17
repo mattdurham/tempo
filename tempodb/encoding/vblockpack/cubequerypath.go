@@ -28,6 +28,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-kit/log/level"
 	blockpack "github.com/grafana/blockpack"
@@ -112,6 +113,8 @@ func ConfigureCubeQueryPath(enabled bool, s3cfg *s3backend.Config, pgPool *pgxpo
 						"msg", "vblockpack: cube created on first query",
 						"tenant", entry.Tenant, "cube_id", entry.CubeID,
 					)
+					dedicated := dedicatedColumnSet(getDedicatedColumnsForTenant(entry.Tenant))
+					recordCubeColumnUsage(ctx, entry.Tenant, entry, dedicated, time.Now())
 					if jobStore != nil {
 						if ierr := jobStore.InsertCubeBackfill(ctx, entry.Tenant, jobstore.CubeBackfillDetail{
 							CubeID:        entry.CubeID,
@@ -171,6 +174,8 @@ func ConfigureCubeQueryPath(enabled bool, s3cfg *s3backend.Config, pgPool *pgxpo
 				if jobStore == nil || hasL0 {
 					return
 				}
+				dedicated := dedicatedColumnSet(getDedicatedColumnsForTenant(entry.Tenant))
+				recordCubeColumnUsage(ctx, entry.Tenant, entry, dedicated, time.Now())
 				if ierr := jobStore.InsertCubeBackfill(ctx, entry.Tenant, jobstore.CubeBackfillDetail{
 					CubeID:        entry.CubeID,
 					WindowMinutes: math.MaxUint32,
