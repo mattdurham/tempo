@@ -330,6 +330,82 @@ func TestE2E_ViBackfill_FailureThenReclaimSucceeds(t *testing.T) {
 // See TestE2E_CubeBackfill_FailureThenReclaimSucceeds for the dedicated real-failure ->
 // Store.Fail proof (2026-07-14: RunCubeBackfill now returns a real error instead of the
 // void return this comment used to document as a gap).
+// TestE2E_CubeBackfill_BoundedRetention_ReachesFullCompletion is the deterministic,
+// no-live-cluster proof that the 2026-07-17 fixes (blockpack#512's Backfiller.Run
+// parallelism, and this package's effectiveBlockRetentionMinutes window-bounding) actually
+// work together through the REAL production wiring: processJobs -> dispatchPostgresJob ->
+// processCubeBackfillJobPostgres -> effectiveBlockRetentionMinutes -> vblockpack.
+// RunCubeBackfill -> cubeBackfillWindowMinutes -> blockpack.RunCubeBackfill -> Backfiller.Run.
+//
+// Before either fix this was impossible to assert in reasonable test time: WindowMinutes was
+// unconditionally math.MaxUint32, so Backfiller.Run's endMinute always resolved to 0 -- a
+// "genuinely completed" run only terminates once minute 0 is reached, which
+// TestE2E_CubeBackfill_WorkerClaimsAndExecutesWithoutGRPC's own doc comment documents as never
+// happening in reasonable test time, hence that test's 3-second bounded-ctx workaround
+// asserting only PARTIAL progress. Configuring a small workerCfg.Compactor.BlockRetention here
+// makes effectiveBlockRetentionMinutes resolve a real, small window (3 minutes) instead --
+// letting this test use a normal, generous ctx and assert genuine full completion: the
+// registry's persisted L0 watermark covers the ENTIRE resolved window, down to its floor.
+func TestE2E_CubeBackfill_BoundedRetention_ReachesFullCompletion(t *testing.T) {
+	ctx := context.Background()
+	pool, dsn := newTestPostgresPoolAndDSN(t)
+	s3cfg := newFakeS3Config(t, "e2e-worker-cube-bounded-bucket")
+
+	tenant := "e2e-worker-cube-bounded-tenant"
+	entry := blockpack.CubeRegistryEntry{
+		CubeID:     "e2e-cube-bounded-1",
+		Tenant:     tenant,
+		Dimensions: []string{"resource.service.name"},
+		AggAttrs:   []string{blockpack.CubeDurationColumn},
+		Resolution: 1,
+	}
+	cubeRegistry := blockpack.NewPgCubeRegistry(pool, tenant)
+	require.NoError(t, cubeRegistry.Add(ctx, entry))
+
+	store := jobstore.New(pool)
+	require.NoError(t, store.InsertCubeBackfill(ctx, tenant, jobstore.CubeBackfillDetail{
+		CubeID: entry.CubeID, WindowMinutes: 60,
+	}))
+
+	limitCfg := overridesConfigForTest(t)
+	workerCfg, schedulerClientCfg, overridesSvc, _, workerStore := setupDependencies(ctx, t, limitCfg)
+	workerCfg.Postgres = &postgres.Config{DSN: dsn}
+	const retentionMinutes = 3
+	workerCfg.Compactor.BlockRetention = retentionMinutes * time.Minute
+
+	w, err := New(workerCfg, schedulerClientCfg, s3cfg, workerStore, overridesSvc, nil)
+	require.NoError(t, err)
+	require.NotNil(t, w.jobStore)
+
+	scheduler, nextCalls, _ := newCountingScheduler(nil)
+	w.backendScheduler = scheduler
+
+	currentMinute := uint32(time.Now().Unix() / 60) //nolint:gosec // unix timestamp fits uint32 until 2106
+	wantFloor := currentMinute - retentionMinutes
+
+	// A generous but bounded ctx (unlike the sibling test's deliberate 3s partial-progress
+	// window): a real, tiny, all-idle 3-minute backfill against a fake S3 server should finish
+	// in well under this even serially -- this is not a "wait for the timeout" test.
+	boundedCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	err = w.processJobs(boundedCtx)
+	require.NoError(t, err, "a bounded, resolvable retention window must let the backfill genuinely finish, not time out")
+	require.Equal(t, 0, *nextCalls, "the gRPC scheduler's Next must never be called for a Postgres-claimed job")
+
+	var status string
+	row := pool.QueryRow(ctx, `SELECT status FROM backend_jobs WHERE job_type = 'cube_backfill' AND tenant = $1`, tenant)
+	require.NoError(t, row.Scan(&status))
+	require.Equal(t, string(jobstore.StatusSucceeded), status, "a genuinely completed backfill must report success, not merely have made partial progress")
+
+	entries, _, loadErr := cubeRegistry.Load(ctx)
+	require.NoError(t, loadErr)
+	require.Len(t, entries, 1)
+	wm, ok := entries[0].Watermarks[blockpack.CubeRollupL0]
+	require.True(t, ok, "the worker's real RunCubeBackfill call must have persisted at least one real L0 watermark update")
+	require.LessOrEqual(t, wm.MinMinute, wantFloor,
+		"a genuinely COMPLETE backfill must cover all the way down to the resolved retention floor, not just make partial progress into it")
+}
+
 func TestE2E_CubeBackfill_WorkerClaimsAndExecutesWithoutGRPC(t *testing.T) {
 	ctx := context.Background()
 	pool, dsn := newTestPostgresPoolAndDSN(t)
