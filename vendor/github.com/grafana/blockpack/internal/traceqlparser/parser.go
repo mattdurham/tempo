@@ -412,7 +412,7 @@ func parsePipeline(input string) (*PipelineStage, error) {
 		var byPart string
 		aggStage := stage
 		if inlineBy != -1 {
-			byPart = strings.TrimSpace(stage[inlineBy+3:]) // skip " by"
+			byPart = strings.TrimSpace(stage[inlineBy+2:]) // skip "by"
 			aggStage = strings.TrimSpace(stage[:inlineBy])
 		}
 
@@ -589,10 +589,17 @@ func parseThresholdValue(s string) (interface{}, error) {
 	return nil, fmt.Errorf("cannot parse %q as number or duration", s)
 }
 
-// findByClause finds the position of " by " in the input that's not inside parentheses
-// Returns -1 if no by clause is found
+// findByClause finds the position where an inline "by" clause begins (the index of the 'b' in
+// "by"), scanning only at paren-depth 0. Returns -1 if no by clause is found.
+//
+// "by" is recognized as the keyword when immediately preceded by whitespace (a normal token
+// boundary, e.g. "rate() by (...)") OR by a closing paren ')' (e.g. "rate()by(...)") -- a
+// closing paren already unambiguously ends the aggregate call, so "by" right after one is never
+// ambiguous with an identifier and needs no additional space to be recognized. Before this,
+// "rate()by(...)" (no space) was silently NOT detected as a by-clause at all, so the whole
+// "by(...)" text fell through to parseAggregateFunc's argument extraction as if it were part of
+// rate()'s own arguments, producing the misleading error "rate() takes no arguments".
 func findByClause(input string) int {
-	// Look for " by " keyword that's not inside parentheses
 	parenDepth := 0
 	for i := 0; i < len(input); i++ {
 		switch input[i] {
@@ -601,14 +608,12 @@ func findByClause(input string) int {
 		case ')':
 			parenDepth--
 		default:
-			if parenDepth == 0 {
-				// Check if we're at " by " or " by(" (with space before, space or paren after)
-				if i > 0 && input[i] == 'b' && i+2 < len(input) && input[i:i+2] == "by" {
-					afterBy := input[i+2]
-					if (afterBy == ' ' || afterBy == '\t' || afterBy == '(') &&
-						(input[i-1] == ' ' || input[i-1] == '\t' || input[i-1] == '\n' || input[i-1] == '\r') {
-						return i - 1 // Return position of space before "by"
-					}
+			if parenDepth == 0 && i > 0 && input[i] == 'b' && i+2 < len(input) && input[i:i+2] == "by" {
+				afterBy := input[i+2]
+				before := input[i-1]
+				if (afterBy == ' ' || afterBy == '\t' || afterBy == '(') &&
+					(before == ' ' || before == '\t' || before == '\n' || before == '\r' || before == ')') {
+					return i
 				}
 			}
 		}
