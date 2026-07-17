@@ -35,14 +35,19 @@ package backendworker
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	blockpack "github.com/grafana/blockpack"
+	"github.com/grafana/dskit/services"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
+	"github.com/grafana/tempo/modules/overrides"
 	"github.com/grafana/tempo/modules/postgres"
 	"github.com/grafana/tempo/tempodb/encoding/vblockpack/jobstore"
 	"github.com/grafana/tempo/tempodb/encoding/vblockpack/migrate"
@@ -344,8 +349,183 @@ func TestE2E_CubeBackfill_BoundedRetention_ReachesFullCompletion(t *testing.T) {
 	require.Len(t, entries, 1)
 	wm, ok := entries[0].Watermarks[blockpack.CubeRollupL0]
 	require.True(t, ok, "the worker's real RunCubeBackfill call must have persisted at least one real L0 watermark update")
-	require.LessOrEqual(t, wm.MinMinute, wantFloor,
-		"a genuinely COMPLETE backfill must cover all the way down to the resolved retention floor, not just make partial progress into it")
+	// Equal, not just LessOrEqual (2026-07-17 mutation-testing fix): idle minutes are cheap
+	// against a fake S3 server regardless of window size, so a wrongly-much-LARGER window would
+	// ALSO finish inside the bounded ctx and satisfy a mere "<=" check -- only exact equality to
+	// the resolved floor actually proves THIS SPECIFIC window size was the one used.
+	require.Equal(t, wantFloor, wm.MinMinute,
+		"a genuinely COMPLETE backfill's watermark must land exactly on the resolved retention floor, not merely reach or pass it")
+}
+
+// overridesConfigWithPerTenantBlockRetention writes a real per-tenant runtime-config-override
+// YAML file (the scoped/new format overridesConfigForTest's own default ConfigType expects) and
+// returns an overrides.Config pointing at it -- the same mechanism a production
+// per_tenant_override_config file uses, not a hand-built in-memory limits override. The caller
+// must start the resulting overrides.Service (services.StartAndAwaitRunning) before
+// BlockRetention(tenant) reflects the file's contents: runtimeConfigOverridesManager only loads
+// PerTenantOverrideConfig inside its own starting() hook, not at construction time.
+func overridesConfigWithPerTenantBlockRetention(t *testing.T, tenant string, retention time.Duration) overrides.Config {
+	t.Helper()
+	cfg := overridesConfigForTest(t)
+
+	overridesYAML := fmt.Sprintf(`
+overrides:
+  %s:
+    compaction:
+      block_retention: %s
+`, tenant, retention.String())
+	overridesFile := filepath.Join(t.TempDir(), "per-tenant-overrides.yaml")
+	require.NoError(t, os.WriteFile(overridesFile, []byte(overridesYAML), 0o600))
+
+	cfg.PerTenantOverrideConfig = overridesFile
+	return cfg
+}
+
+// TestE2E_CubeBackfill_PerTenantRetentionOverride_BoundsWindow is the per-tenant-override half
+// of TestE2E_CubeBackfill_BoundedRetention_ReachesFullCompletion's coverage: that test proves
+// effectiveBlockRetentionMinutes' CFG-DEFAULT branch (workerCfg.Compactor.BlockRetention) reaches
+// full completion through the real wiring; this test proves the PER-TENANT-OVERRIDE branch does
+// too, driven through a real overrides.Service loading a real runtime-config-override YAML file
+// (production's actual mechanism), not a hand-built limits struct. The configured cfg default
+// (30 days) is deliberately much LARGER than the per-tenant override (2 minutes) so a passing
+// test can only mean the override actually won -- effectiveBlockRetentionMinutes' own unit test
+// already pins the precedence in isolation; this proves the real overrides.Service wiring
+// reaches the same real RunCubeBackfill call path this file's other cube_backfill tests do.
+func TestE2E_CubeBackfill_PerTenantRetentionOverride_BoundsWindow(t *testing.T) {
+	ctx := context.Background()
+	pool, dsn := newTestPostgresPoolAndDSN(t)
+	s3cfg := newFakeS3Config(t, "e2e-worker-cube-tenant-override-bucket")
+
+	tenant := "e2e-worker-cube-tenant-override-tenant"
+	entry := blockpack.CubeRegistryEntry{
+		CubeID:     "e2e-cube-tenant-override-1",
+		Tenant:     tenant,
+		Dimensions: []string{"resource.service.name"},
+		AggAttrs:   []string{blockpack.CubeDurationColumn},
+		Resolution: 1,
+	}
+	cubeRegistry := blockpack.NewPgCubeRegistry(pool, tenant)
+	require.NoError(t, cubeRegistry.Add(ctx, entry))
+
+	store := jobstore.New(pool)
+	require.NoError(t, store.InsertCubeBackfill(ctx, tenant, jobstore.CubeBackfillDetail{
+		CubeID: entry.CubeID, WindowMinutes: 60,
+	}))
+
+	const tenantRetentionMinutes = 2
+	limitCfg := overridesConfigWithPerTenantBlockRetention(t, tenant, tenantRetentionMinutes*time.Minute)
+	workerCfg, schedulerClientCfg, overridesSvc, _, workerStore := setupDependencies(ctx, t, limitCfg)
+	workerCfg.Postgres = &postgres.Config{DSN: dsn}
+	workerCfg.Compactor.BlockRetention = 30 * 24 * time.Hour // deliberately much larger -- see doc comment
+
+	require.NoError(t, services.StartAndAwaitRunning(ctx, overridesSvc))
+	t.Cleanup(func() {
+		_ = services.StopAndAwaitTerminated(context.Background(), overridesSvc)
+	})
+	require.Equal(t, tenantRetentionMinutes*time.Minute, overridesSvc.BlockRetention(tenant),
+		"sanity check: the per-tenant override file must actually be loaded before proceeding")
+
+	w, err := New(workerCfg, schedulerClientCfg, s3cfg, workerStore, overridesSvc, nil)
+	require.NoError(t, err)
+	require.NotNil(t, w.jobStore)
+
+	scheduler, nextCalls, _ := newCountingScheduler(nil)
+	w.backendScheduler = scheduler
+
+	currentMinute := uint32(time.Now().Unix() / 60) //nolint:gosec // unix timestamp fits uint32 until 2106
+	wantFloor := currentMinute - tenantRetentionMinutes
+
+	boundedCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	err = w.processJobs(boundedCtx)
+	require.NoError(t, err, "the per-tenant override must resolve to a small, genuinely completable window, not the much larger cfg default")
+	require.Equal(t, 0, *nextCalls)
+
+	var status string
+	row := pool.QueryRow(ctx, `SELECT status FROM backend_jobs WHERE job_type = 'cube_backfill' AND tenant = $1`, tenant)
+	require.NoError(t, row.Scan(&status))
+	require.Equal(t, string(jobstore.StatusSucceeded), status)
+
+	entries, _, loadErr := cubeRegistry.Load(ctx)
+	require.NoError(t, loadErr)
+	require.Len(t, entries, 1)
+	wm, ok := entries[0].Watermarks[blockpack.CubeRollupL0]
+	require.True(t, ok)
+	// Equal, not LessOrEqual: idle minutes are cheap against a fake S3 server regardless of
+	// window size, so even the (wrong) 30-day cfg default would finish inside a 30s bounded ctx
+	// against this fast fake server and satisfy a mere "<=" check -- only exact equality to the
+	// SMALL per-tenant-override floor proves the override actually won, not the cfg default.
+	require.Equal(t, wantFloor, wm.MinMinute,
+		"the per-tenant override's small window must be what actually bounded this run, not the 30-day cfg default")
+}
+
+// TestE2E_CubeBackfill_TwoDimensions_BoundedRetention_ReachesFullCompletion closes the
+// grouped/2-dimension gap in this file's cube_backfill coverage: every other cube_backfill test
+// here uses a single-dimension entry. Mirrors TestE2E_CubeBackfill_BoundedRetention_
+// ReachesFullCompletion exactly, just with Dimensions holding two columns, proving the real
+// wiring (dim2Col resolution, the entry.Dimensions[1] LookupColumn branch inside
+// Backfiller.processMinute) doesn't misbehave for a 2-dimension entry specifically -- e.g. a
+// panic on entry.Dimensions[1], or an AllDimSentinel/dim2Col mismatch that would only surface
+// with a real 2-dimension RegistryEntry. This is an all-idle window (no real per-span VI data
+// seeded), matching this file's own established idle-backfill testing convention for the
+// windowing/completion contract; join-correctness for real 2-dimension data is already covered
+// at the blockpack unit level (internal/modules/cube/backfill_test.go).
+func TestE2E_CubeBackfill_TwoDimensions_BoundedRetention_ReachesFullCompletion(t *testing.T) {
+	ctx := context.Background()
+	pool, dsn := newTestPostgresPoolAndDSN(t)
+	s3cfg := newFakeS3Config(t, "e2e-worker-cube-twodim-bucket")
+
+	tenant := "e2e-worker-cube-twodim-tenant"
+	entry := blockpack.CubeRegistryEntry{
+		CubeID:     "e2e-cube-twodim-1",
+		Tenant:     tenant,
+		Dimensions: []string{"resource.service.name", "span.name"},
+		AggAttrs:   []string{blockpack.CubeDurationColumn},
+		Resolution: 1,
+	}
+	cubeRegistry := blockpack.NewPgCubeRegistry(pool, tenant)
+	require.NoError(t, cubeRegistry.Add(ctx, entry))
+
+	store := jobstore.New(pool)
+	require.NoError(t, store.InsertCubeBackfill(ctx, tenant, jobstore.CubeBackfillDetail{
+		CubeID: entry.CubeID, WindowMinutes: 60,
+	}))
+
+	limitCfg := overridesConfigForTest(t)
+	workerCfg, schedulerClientCfg, overridesSvc, _, workerStore := setupDependencies(ctx, t, limitCfg)
+	workerCfg.Postgres = &postgres.Config{DSN: dsn}
+	const retentionMinutes = 3
+	workerCfg.Compactor.BlockRetention = retentionMinutes * time.Minute
+
+	w, err := New(workerCfg, schedulerClientCfg, s3cfg, workerStore, overridesSvc, nil)
+	require.NoError(t, err)
+	require.NotNil(t, w.jobStore)
+
+	scheduler, nextCalls, _ := newCountingScheduler(nil)
+	w.backendScheduler = scheduler
+
+	currentMinute := uint32(time.Now().Unix() / 60) //nolint:gosec // unix timestamp fits uint32 until 2106
+	wantFloor := currentMinute - retentionMinutes
+
+	boundedCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	err = w.processJobs(boundedCtx)
+	require.NoError(t, err, "a 2-dimension entry must complete a bounded backfill exactly like a 1-dimension one")
+	require.Equal(t, 0, *nextCalls)
+
+	var status string
+	row := pool.QueryRow(ctx, `SELECT status FROM backend_jobs WHERE job_type = 'cube_backfill' AND tenant = $1`, tenant)
+	require.NoError(t, row.Scan(&status))
+	require.Equal(t, string(jobstore.StatusSucceeded), status)
+
+	entries, _, loadErr := cubeRegistry.Load(ctx)
+	require.NoError(t, loadErr)
+	require.Len(t, entries, 1)
+	require.Equal(t, []string{"resource.service.name", "span.name"}, entries[0].Dimensions,
+		"sanity check: the loaded entry really is the 2-dimension one this test seeded")
+	wm, ok := entries[0].Watermarks[blockpack.CubeRollupL0]
+	require.True(t, ok)
+	require.Equal(t, wantFloor, wm.MinMinute)
 }
 
 func TestE2E_CubeBackfill_WorkerClaimsAndExecutesWithoutGRPC(t *testing.T) {

@@ -323,3 +323,49 @@ func TestEffectiveBlockRetentionMinutes(t *testing.T) {
 		})
 	}
 }
+
+// TestFailJob_CompactionJobWithEmptyTenant_ReportsFailureViaSchedulerUpdateJob closes failJob's
+// coverage gap (0% before this test): failJob is real, live production code for the
+// gRPC-scheduler-dispatched job types (compaction, redaction) that were never migrated to the
+// Postgres job queue the way vi_backfill/cube_backfill were (see processCompactionJob/
+// processRedactionJob's own resp *tempopb.NextJobResponse signature -- they're reached only via
+// the gRPC Next() path, never dispatchPostgresJob) -- it was simply never exercised by a test.
+// An empty-tenant compaction job is the cheapest real trigger: processCompactionJob's very first
+// guard calls failJob before touching the store/compactor at all.
+func TestFailJob_CompactionJobWithEmptyTenant_ReportsFailureViaSchedulerUpdateJob(t *testing.T) {
+	limitCfg := overrides.Config{}
+	limitCfg.RegisterFlagsAndApplyDefaults(&flag.FlagSet{})
+
+	ctx := context.Background()
+	workerCfg, schedulerClientCfg, overridesSvc, _, store := setupDependencies(ctx, t, limitCfg)
+
+	w, err := New(workerCfg, schedulerClientCfg, nil, store, overridesSvc, nil)
+	require.NoError(t, err)
+
+	var captured *tempopb.UpdateJobStatusRequest
+	jobID := uuid.New().String()
+	w.backendScheduler = &mockScheduler{
+		next: func(context.Context, *tempopb.NextJobRequest, ...grpc.CallOption) (*tempopb.NextJobResponse, error) {
+			return &tempopb.NextJobResponse{
+				JobId: jobID,
+				Type:  tempopb.JobType_JOB_TYPE_COMPACTION,
+				Detail: tempopb.JobDetail{
+					Tenant: "", // triggers processCompactionJob's empty-tenant guard -> failJob
+				},
+			}, nil
+		},
+		updateJob: func(_ context.Context, req *tempopb.UpdateJobStatusRequest, _ ...grpc.CallOption) (*tempopb.UpdateJobStatusResponse, error) {
+			captured = req
+			return &tempopb.UpdateJobStatusResponse{}, nil
+		},
+	}
+
+	err = w.processJobs(ctx)
+	require.Error(t, err, "failJob must surface the failure to its caller, not swallow it")
+	require.Contains(t, err.Error(), "received compaction job with empty tenant")
+
+	require.NotNil(t, captured, "failJob must report the failure via the scheduler's real UpdateJob RPC")
+	assert.Equal(t, jobID, captured.JobId)
+	assert.Equal(t, tempopb.JobStatus_JOB_STATUS_FAILED, captured.Status)
+	assert.Equal(t, "received compaction job with empty tenant", captured.Error)
+}
