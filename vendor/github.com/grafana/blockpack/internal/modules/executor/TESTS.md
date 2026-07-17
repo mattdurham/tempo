@@ -3866,3 +3866,247 @@ Back-ref: `internal/modules/executor/stream_topk.go:topKScanBlocks,processGroup`
 `internal/modules/executor/stream_topk_intrinsic_unbounded_test.go:TestCollect_IntrinsicOnlyPredicate_MostRecentLimit_ScansEntireFile`.
 See SPECS.md's back-ref under the `topKScanBlocks`/SPEC-STREAM-11 entry for the fix-side
 spec. Issue #197.
+
+---
+
+## Regex Fast-Path Extension Tests (issue #513)
+
+Real regex-engine equivalence and real write→query end-to-end coverage for extending the fast
+path beyond case-insensitive pure-contains, per `internal/vm/SPECS.md` SPEC-VM-2.
+
+### EX-42: TestRegexFastPath_Equivalence_ContainsCI
+
+**Scenario:** Property test — 1200 randomly generated (pattern, string) pairs for
+`RegexFastContainsCI`. For each, a literal is drawn from `regexFastPathLiterals`, embedded into a
+noise string at a random `embedPosition` (start/end/middle/none) with randomized per-rune case,
+and compared against `"(?i)"+literal`.
+
+**Assertions:** `vm.AnalyzeRegex` classifies to `RegexFastContainsCI`; `regexFastMatch` agrees
+with the real `coregex` engine's `MatchString` result for every pair. 1/50 iterations use the
+empty string as an explicit boundary case.
+
+Back-ref: `internal/modules/executor/regex_fastpath_property_test.go:
+TestRegexFastPath_Equivalence_ContainsCI`.
+
+---
+
+### EX-43: TestRegexFastPath_Equivalence_ContainsCS
+
+**Scenario:** Property test — 1200 pairs for `RegexFastContainsCS`, additionally randomly
+combining ~50% of iterations with `CaseInsensitive` (the one CI combination that resolves to a
+real fast-pathed kind, `RegexFastContainsCI`, rather than a `RegexFastNone` demotion). Some CI
+iterations draw from `regexFastPathUnicodeCIMatchLiterals` (CJK-only) to exercise multi-byte
+literal case-folding through the actual matcher-vs-oracle comparison.
+
+**Assertions:** Classification matches (`RegexFastContainsCS` for case-sensitive iterations,
+`RegexFastContainsCI` for CI iterations); `regexFastMatch` agrees with the oracle for every pair.
+
+Back-ref: `internal/modules/executor/regex_fastpath_property_test.go:
+TestRegexFastPath_Equivalence_ContainsCS`.
+
+---
+
+### EX-44: TestRegexFastPath_Equivalence_TrailingChar
+
+**Scenario:** Property test — 1200 pairs for `RegexFastTrailingChar` (`"literal.+"`), with ~50%
+of iterations combining `CaseInsensitive` (which must demote to `RegexFastNone` — task #119,
+`vm/NOTES.md` NOTE-515 — since `anyPrefixHasTrailingChar` never folds case). String generation
+explicitly exercises: empty string; the leftmost-occurrence-invalid/later-occurrence-valid shape
+(`literal+"\n"+literal+noise`, the exact NOTE-516 bug shape); literal at the very end with
+nothing after (must not match); literal followed only by `\n` (must not match); literal embedded
+mid-string; pure noise. Some CI iterations draw from `regexFastPathUnicodeLiterals`.
+
+**Assertions:** Classification matches (`RegexFastTrailingChar` or the CI-demoted
+`RegexFastNone`); for non-`RegexFastNone` results, `regexFastMatch` agrees with the oracle.
+
+Back-ref: `internal/modules/executor/regex_fastpath_property_test.go:
+TestRegexFastPath_Equivalence_TrailingChar`.
+
+---
+
+### EX-45: TestRegexFastPath_Equivalence_AnchoredPrefix
+
+**Scenario:** Property test — 1200 pairs for `RegexFastAnchoredPrefix` (`"^literal"` or
+`"^literal.*"`), with ~50% of iterations combining `CaseInsensitive` (demotes to
+`RegexFastNone`, task #119). String generation exercises: empty string; literal ending exactly
+at `len(s)`; literal at index 0 with suffix noise; literal NOT at start (must not match); pure
+noise. Some CI iterations draw from `regexFastPathUnicodeLiterals`.
+
+**Assertions:** Classification matches; for non-`RegexFastNone` results, `regexFastMatch` agrees
+with the oracle.
+
+Back-ref: `internal/modules/executor/regex_fastpath_property_test.go:
+TestRegexFastPath_Equivalence_AnchoredPrefix`.
+
+---
+
+### EX-46: TestRegexFastPath_Equivalence_AnchoredExact
+
+**Scenario:** Property test — 1200 pairs for `RegexFastAnchoredExact` (`"^literal$"`), with ~50%
+of iterations combining `CaseInsensitive` (demotes to `RegexFastNone`, task #119). String
+generation exercises: empty string; exact match; extra suffix (must not match); extra prefix
+(must not match); pure noise. Some CI iterations draw from `regexFastPathUnicodeLiterals`.
+
+**Assertions:** Classification matches; for non-`RegexFastNone` results, `regexFastMatch` agrees
+with the oracle.
+
+Back-ref: `internal/modules/executor/regex_fastpath_property_test.go:
+TestRegexFastPath_Equivalence_AnchoredExact`.
+
+---
+
+### EX-47: TestRegexFastPath_TrailingChar_MultiOccurrence_Newline
+
+**Scenario:** Named regression for the `"bob\nbobX"` leftmost-occurrence bug (NOTE-516,
+`executor/NOTES.md`): the leftmost occurrence of `"bob"` is immediately followed by `\n`
+(invalid), but the second occurrence is followed by `'X'` (valid) — the pattern DOES match.
+
+**Setup:** `pattern = "bob.+"`, `s = "bob\nbobX"`.
+
+**Assertions:** The real regex engine matches (sanity check); `anyPrefixHasTrailingChar` agrees.
+
+Back-ref: `internal/modules/executor/regex_fastpath_property_test.go:
+TestRegexFastPath_TrailingChar_MultiOccurrence_Newline`.
+
+---
+
+### EX-48: TestRegexFastPath_UnanchoredStarEndAnchor_NotMisclassifiedAsContains
+
+**Scenario:** Named regression for the `"foo.*$"` latent misclassification bug (NOTE-514,
+`vm/NOTES.md`): an embedded `\n` between the literal and end-of-string blocks `.*` from reaching
+`$`, so `"foo.*$"` is NOT equivalent to `strings.Contains("foo")`.
+
+**Setup:** `pattern = "foo.*$"`, `s = "fooX\nY"`.
+
+**Assertions:** The real regex engine does NOT match (sanity check); `vm.AnalyzeRegex(pattern)
+.IsLiteralContains` is false.
+
+Back-ref: `internal/modules/executor/regex_fastpath_property_test.go:
+TestRegexFastPath_UnanchoredStarEndAnchor_NotMisclassifiedAsContains`.
+
+---
+
+### EX-49: TestRegexFastPath_CaseInsensitiveAnchoredOrTrailing_FallsBackSafely
+
+**Scenario:** Named regression for the CRITICAL task #119 bug (NOTE-515, `vm/NOTES.md`):
+`"(?i)^bob"`, `"(?i)bob.+"`, `"(?i)^bob$"` were previously classified to a fast-path kind despite
+their leaf matchers never folding case — a silent false negative in production.
+
+**Setup:** Table-driven cases: `("(?i)^bob", "BobXYZ")`, `("(?i)bob.+", "BOB extra")`,
+`("(?i)^bob$", "BOB")` — the real engine matches all three (sanity check).
+
+**Assertions:** For each case, `vm.AnalyzeRegex` + `classifyAnalysis` resolves to
+`vm.RegexFastNone` (safe fallback), never a wrong fast-path kind.
+
+Back-ref: `internal/modules/executor/regex_fastpath_property_test.go:
+TestRegexFastPath_CaseInsensitiveAnchoredOrTrailing_FallsBackSafely`. Issue #513, task #119.
+
+---
+
+### EX-50: TestScanRegexFast_CaseSensitiveContains
+
+**Scenario:** Real write→query end-to-end test proving case-sensitive contains (`"error"`, no
+`(?i)`) now takes the fast path (`RegexFastContainsCS`) and still respects case.
+
+**Setup:** 3 spans with `span.level` = `"Error"`, `"error"`, `"WARN"`. Query:
+`{ span.level =~ "error" }`.
+
+**Assertions:** Only the exact-case `"error"` value matches.
+
+Back-ref: `internal/modules/executor/scan_regex_fast_shapes_test.go:
+TestScanRegexFast_CaseSensitiveContains`.
+
+---
+
+### EX-51: TestScanRegexFast_TrailingCharRequired
+
+**Scenario:** Real write→query end-to-end test for the `anyPrefixHasTrailingChar`
+multi-occurrence fix (NOTE-516).
+
+**Setup:** 4 spans with `span.tier` = `"bob"`, `"bobX"`, `"bob\nbobX"`, `"bob\n"`. Query:
+`{ span.tier =~ "bob.+" }`.
+
+**Assertions:** Matches exactly `"bobX"` and `"bob\nbobX"` (the multi-occurrence fix); does NOT
+match `"bob"` (no trailing char) or `"bob\n"` (trailing char is a newline).
+
+Back-ref: `internal/modules/executor/scan_regex_fast_shapes_test.go:
+TestScanRegexFast_TrailingCharRequired`.
+
+---
+
+### EX-52: TestScanRegexFast_AnchoredPrefix
+
+**Scenario:** Real write→query end-to-end test covering both anchored-prefix variants —
+`"^bob"` and `"^bob.*"` (no `$`) — which must behave identically.
+
+**Setup:** 3 spans with `span.tier` = `"bobby"`, `"notbob"`, `"bob"`. Queries:
+`{ span.tier =~ "^bob" }` and `{ span.tier =~ "^bob.*" }`.
+
+**Assertions:** Both queries match exactly `"bob"` and `"bobby"`, never `"notbob"`.
+
+Back-ref: `internal/modules/executor/scan_regex_fast_shapes_test.go:
+TestScanRegexFast_AnchoredPrefix`.
+
+---
+
+### EX-53: TestScanRegexFast_AnchoredExact
+
+**Scenario:** Real write→query end-to-end test proving `"^bob$"` matches only the exact literal.
+
+**Setup:** 2 spans with `span.tier` = `"bob"`, `"bobby"`. Query: `{ span.tier =~ "^bob$" }`.
+
+**Assertions:** Matches only `"bob"`.
+
+Back-ref: `internal/modules/executor/scan_regex_fast_shapes_test.go:
+TestScanRegexFast_AnchoredExact`.
+
+---
+
+### EX-54: TestScanRegexNotMatchFast_NewShapes
+
+**Scenario:** Real write→query end-to-end test repeating each new shape with `!~` (OpNotRegex),
+asserting the complement set, plus the absent-attribute-always-satisfies-NOT-MATCH invariant.
+
+**Setup:** Table-driven sub-tests, one per shape (`"bob"`, `"bob.+"`, `"^bob"`, `"^bob$"`), each
+writing the shape's present-value set plus one span with the attribute entirely absent. Query:
+`{ span.tier !~ "<pattern>" }` per sub-test.
+
+**Assertions:** Per sub-test, the present-value NOT-MATCH complement set matches exactly
+(sorted); the absent-attribute row always appears in the NOT-MATCH result regardless of shape.
+
+Back-ref: `internal/modules/executor/scan_regex_fast_shapes_test.go:
+TestScanRegexNotMatchFast_NewShapes`.
+
+---
+
+### EX-55: TestScanRegexFast_DeferredShapesStillCorrect
+
+**Scenario:** Real write→query end-to-end test locking in that deliberately deferred shapes
+(`OpQuest`, mixed-shape alternation, `"^prefix.*$"`) are still CORRECT via the full regex-engine
+fallback — a permanent regression guard against a future change silently misclassifying one of
+these into a wrong fast path.
+
+**Setup:** 5 spans with `span.tier` = `"bob"`, `"bo"`, `"bob\nX"`, `"baz123"`, `"other"`.
+Queries: `"^bob.*$"` (expect `["bob"]` only — embedded `\n` blocks `.*` from reaching `$"`),
+`"bob?"` (expect `["bo", "bob", "bob\nX"]` — unanchored, optional trailing `'b'`), `"bob|baz.+"`
+(expect `["baz123", "bob", "bob\nX"]` — mixed-shape alternation).
+
+**Assertions:** Each pattern's matched set equals the documented expected set exactly.
+
+Back-ref: `internal/modules/executor/scan_regex_fast_shapes_test.go:
+TestScanRegexFast_DeferredShapesStillCorrect`.
+
+---
+
+### EX-56: TestScanRegexFast_AnchoredPrefixNonStringColumn
+
+**Scenario:** Real write→query end-to-end test extending the existing non-string-column guard
+to a new-shape query: an anchored-prefix regex against an int column must return 0 rows, never
+panic or false-match via the empty-string fallback.
+
+**Setup:** 1 span with `span.status = 500` (int attribute). Query: `{ span.status =~ "^5" }`.
+
+**Assertions:** 0 rows returned.
+
+Back-ref: `internal/modules/executor/scan_regex_fast_shapes_test.go:
+TestScanRegexFast_AnchoredPrefixNonStringColumn`. Issue #513.

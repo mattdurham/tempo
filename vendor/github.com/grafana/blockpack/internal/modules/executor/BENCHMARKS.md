@@ -837,3 +837,47 @@ to this benchmark, but no such comparison has been built or scoped as of this en
 
 Back-ref: (none — the file no longer exists; confirmed via repo-wide grep for
 `TestTraceMetricsCorrectness`/`BenchmarkTraceMetricsComparison`, zero hits). Issue #481.
+
+## BENCH-EX-22: BenchmarkRegexFastPath_* (issue #513)
+
+_Added: 2026-07-17_
+
+Permanent (not scratch) A/B benchmark comparing the OLD path (full `coregex` engine +
+existing prefix pre-filter, `kind=vm.RegexFastNone`) against the NEW fast path (`kind` set to
+the real shape) for each of #513's four new shapes. Both sides are pure stdlib string
+operations / a single pre-compiled regex call — zero allocation on either side — so
+`b.ReportAllocs()` is used to confirm allocation parity is preserved as a regression signal in
+its own right, not just the ns/op delta.
+
+**Setup (outside timed loop, per sub-benchmark):** 5000 realistic service-name-shaped strings
+(`"<svc>-service-<N>-<svc>-service-instance"` for contains/trailing-char shapes,
+`"<svc>-service-<N>-instance"` for anchored-prefix, or exactly `<svc>` for anchored-exact), ~30%
+guaranteed-hit rate, deterministic per-shape seeded `rand.NewSource`.
+
+**Run command:**
+
+```
+go test -run='^$' -bench='BenchmarkRegexFastPath_' -benchmem -benchtime=200x -count=3 \
+    ./internal/modules/executor/
+```
+
+**Measured baseline (2026-07-17, 13th Gen Intel Core i5-13500):**
+
+| Sub-benchmark | Old path (ns/op) | New path (ns/op) | Speedup |
+|---|---|---|---|
+| `ContainsCS` | ~335,760 | ~75,672 | ~4.4x |
+| `TrailingChar` | ~304,451 | ~81,786 | ~3.7x |
+| `AnchoredPrefix` | ~130,052 | ~35,201 | ~3.7x |
+| `AnchoredExact` | ~130,635 | ~37,436 | ~3.5x |
+
+**Allocation parity:** `allocs/op = 0` on both the old and new path for all four shapes (8
+sub-benchmark variants total, old+new × 4 shapes) — a nonzero `allocs/op` on either side is
+itself a regression signal per this benchmark's own doc comment, not just the ns/op number.
+
+**Regression threshold:** each shape's `NewPath_FastMatch` sub-benchmark must remain
+substantially faster (≥3x) than its `OldPath_FullRegex` counterpart, and `allocs/op` must remain
+`0` on both sides.
+
+Back-ref: `internal/modules/executor/regex_fastpath_bench_test.go:
+BenchmarkRegexFastPath_ContainsCS,BenchmarkRegexFastPath_TrailingChar,
+BenchmarkRegexFastPath_AnchoredPrefix,BenchmarkRegexFastPath_AnchoredExact`. Issue #513.

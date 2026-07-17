@@ -1008,12 +1008,83 @@ func containsAnySubstring(s string, subs []string) bool {
 	return false
 }
 
-// streamScanRegexFast is the optimized scan: pre-compiled regex, optional prefix
-// pre-filter, and batch string extraction via col.StringValues().
-// When re is nil, prefixes are pre-lowercased CI literals and fold-contains is used
-// instead of the regex engine (avoids NFA backtracking for (?i)literal patterns).
+// hasAnyPrefix reports whether v starts with any element of prefixes.
+func hasAnyPrefix(v string, prefixes []string) bool {
+	for _, p := range prefixes {
+		if strings.HasPrefix(v, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// equalsAny reports whether v equals any element of prefixes exactly.
+func equalsAny(v string, prefixes []string) bool {
+	for _, p := range prefixes {
+		if v == p {
+			return true
+		}
+	}
+	return false
+}
+
+// NOTE-516: anyPrefixHasTrailingChar reports whether v contains an occurrence of any
+// element of prefixes that is followed by at least one non-newline character. Go's `.` never
+// matches '\n' without (?s), so checking only the LEFTMOST occurrence of a prefix is
+// insufficient: for "bob\nbobX" against "bob.+", the leftmost "bob" (index 0) is
+// immediately followed by '\n' (invalid), but the second occurrence (index 4) is
+// followed by 'X' (valid) — the pattern DOES match. This loop advances the search
+// start by 1 byte past each found occurrence's start (not len(prefix)), so overlapping
+// occurrences are never skipped over.
+func anyPrefixHasTrailingChar(v string, prefixes []string) bool {
+	for _, p := range prefixes {
+		if p == "" {
+			continue
+		}
+		start := 0
+		for start <= len(v)-len(p) {
+			idx := strings.Index(v[start:], p)
+			if idx < 0 {
+				break
+			}
+			occ := start + idx
+			end := occ + len(p)
+			if end < len(v) && v[end] != '\n' {
+				return true
+			}
+			start = occ + 1
+		}
+	}
+	return false
+}
+
+// NOTE-516: regexFastMatch dispatches to the leaf matcher for kind. Callers must not
+// pass vm.RegexFastNone — that shape must go through the full regex engine instead.
+func regexFastMatch(v string, prefixes []string, kind vm.RegexFastKind) bool {
+	switch kind {
+	case vm.RegexFastContainsCI:
+		return containsAnySubstring(strings.ToLower(v), prefixes)
+	case vm.RegexFastContainsCS:
+		return containsAnySubstring(v, prefixes)
+	case vm.RegexFastTrailingChar:
+		return anyPrefixHasTrailingChar(v, prefixes)
+	case vm.RegexFastAnchoredPrefix:
+		return hasAnyPrefix(v, prefixes)
+	case vm.RegexFastAnchoredExact:
+		return equalsAny(v, prefixes)
+	default:
+		return false
+	}
+}
+
+// NOTE-516: streamScanRegexFast is the optimized scan: pre-compiled regex, optional
+// prefix pre-filter, and batch string extraction via col.StringValues().
+// When kind != vm.RegexFastNone, re.MatchString is skipped entirely — the
+// shape-specific leaf matcher (regexFastMatch) fully determines the result, and re may
+// be nil. When kind == vm.RegexFastNone, re (which must be non-nil) is used with the
+// existing prefix-pre-filter + re.MatchString fallback.
 func (p *blockColumnProvider) streamScanRegexFast(
-	col *modules_reader.Column, re *regexp.Regexp, prefixes []string, cb vm.RowCallback,
+	col *modules_reader.Column, re *regexp.Regexp, prefixes []string, kind vm.RegexFastKind, cb vm.RowCallback,
 ) (int, error) {
 	// Regex applies only to string-typed columns. For other types (int64, bool, etc.),
 	// StringValue returns ("", false) for present rows; without this guard, patterns like
@@ -1024,30 +1095,21 @@ func (p *blockColumnProvider) streamScanRegexFast(
 	values := col.StringValues()
 	present := col.PresenceView()
 	count := 0
-	if re == nil {
-		// CI fold-contains path: prefixes are pre-lowercased by AnalyzeRegex.
-		for i, v := range values {
-			if v == "" && !presentAt(present, i) {
-				continue
-			}
-			if containsAnySubstring(strings.ToLower(v), prefixes) {
-				if !cb(i) {
-					return count, nil
-				}
-				count++
-			}
-		}
-		return count, nil
-	}
 	for i, v := range values {
 		if v == "" && !presentAt(present, i) {
 			continue // absent row
 		}
-		// Prefix pre-filter: skip regex if no prefix matches (safe — no false negatives).
-		if len(prefixes) > 0 && !containsAnySubstring(v, prefixes) {
-			continue
+		var matched bool
+		if kind != vm.RegexFastNone {
+			matched = regexFastMatch(v, prefixes, kind)
+		} else {
+			// Prefix pre-filter: skip regex if no prefix matches (safe — no false negatives).
+			if len(prefixes) > 0 && !containsAnySubstring(v, prefixes) {
+				continue
+			}
+			matched = re.MatchString(v)
 		}
-		if re.MatchString(v) {
+		if matched {
 			if !cb(i) {
 				return count, nil
 			}
@@ -1057,10 +1119,10 @@ func (p *blockColumnProvider) streamScanRegexFast(
 	return count, nil
 }
 
-// streamScanRegexNotMatchFast emits rows that do NOT match the pre-compiled regex.
-// When re is nil, fold-contains with pre-lowercased prefixes is used (CI literal bypass).
+// NOTE-516: streamScanRegexNotMatchFast emits rows that do NOT match the pre-compiled
+// regex. Follows the same kind-driven dispatch as streamScanRegexFast (see its doc comment).
 func (p *blockColumnProvider) streamScanRegexNotMatchFast(
-	col *modules_reader.Column, re *regexp.Regexp, prefixes []string, cb vm.RowCallback,
+	col *modules_reader.Column, re *regexp.Regexp, prefixes []string, kind vm.RegexFastKind, cb vm.RowCallback,
 ) (int, error) {
 	count := 0
 	n := p.block.SpanCount()
@@ -1077,26 +1139,21 @@ func (p *blockColumnProvider) streamScanRegexNotMatchFast(
 	}
 	values := col.StringValues()
 	present := col.PresenceView()
-	if re == nil {
-		// CI fold-contains path: prefixes are pre-lowercased by AnalyzeRegex.
-		for i := range n {
-			v := values[i]
-			absent := v == "" && !presentAt(present, i)
-			matches := !absent && containsAnySubstring(strings.ToLower(v), prefixes)
-			if !matches {
-				if !cb(i) {
-					return count, nil
-				}
-				count++
-			}
-		}
-		return count, nil
-	}
 	for i := range n {
 		v := values[i]
 		absent := v == "" && !presentAt(present, i)
-		// Absent rows do not match regex → they satisfy NOT MATCH.
-		matches := !absent && re.MatchString(v)
+		var matches bool
+		if !absent {
+			if kind != vm.RegexFastNone {
+				matches = regexFastMatch(v, prefixes, kind)
+			} else {
+				// Absent rows do not match regex → they satisfy NOT MATCH (handled above
+				// via the !absent guard). No prefix pre-filter here — deliberately left
+				// unchanged from the pre-kind fallback behavior; see .bob/state/plan.md
+				// Step 2.3.
+				matches = re.MatchString(v)
+			}
+		}
 		if !matches {
 			if !cb(i) {
 				return count, nil
@@ -1110,7 +1167,9 @@ func (p *blockColumnProvider) streamScanRegexNotMatchFast(
 // NOTE-015: ScanRegexFast implements the three-layer regex optimization (pre-compiled regex,
 // prefix pre-filter, flat batch string extraction). See executor/NOTES.md NOTE-015.
 // ScanRegexFast returns a RowSet of rows where column matches the pre-compiled regex.
-func (p *blockColumnProvider) ScanRegexFast(column string, re *regexp.Regexp, prefixes []string) (vm.RowSet, error) {
+func (p *blockColumnProvider) ScanRegexFast(
+	column string, re *regexp.Regexp, prefixes []string, kind vm.RegexFastKind,
+) (vm.RowSet, error) {
 	col := p.lookupColumn(column)
 	if col == nil {
 		// Regex on absent intrinsic column: FullScan only for string-typed intrinsic columns
@@ -1122,7 +1181,7 @@ func (p *blockColumnProvider) ScanRegexFast(column string, re *regexp.Regexp, pr
 		return &rowSet{}, nil
 	}
 	return p.collectStreamInto(func(cb vm.RowCallback) (int, error) {
-		return p.streamScanRegexFast(col, re, prefixes, cb)
+		return p.streamScanRegexFast(col, re, prefixes, kind, cb)
 	})
 }
 
@@ -1131,6 +1190,7 @@ func (p *blockColumnProvider) ScanRegexNotMatchFast(
 	column string,
 	re *regexp.Regexp,
 	prefixes []string,
+	kind vm.RegexFastKind,
 ) (vm.RowSet, error) {
 	col := p.lookupColumn(column)
 	if col == nil {
@@ -1138,7 +1198,7 @@ func (p *blockColumnProvider) ScanRegexNotMatchFast(
 		return p.FullScan(), nil
 	}
 	return p.collectStreamInto(func(cb vm.RowCallback) (int, error) {
-		return p.streamScanRegexNotMatchFast(col, re, prefixes, cb)
+		return p.streamScanRegexNotMatchFast(col, re, prefixes, kind, cb)
 	})
 }
 

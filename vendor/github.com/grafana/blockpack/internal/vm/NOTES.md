@@ -359,3 +359,102 @@ exact same function).
 Back-refs: `internal/vm/traceql_compiler.go:extractTraceQLNodes`,
 `internal/modules/vibuilder/builder.go:BuildSource, BuildSourceBounded`,
 `internal/modules/executor/metrics_trace.go:viMatchSpans`. Issues #208, #210, #211.
+
+## NOTE-514 — "foo.*$" latent misclassification bug fixed; single `RegexFastKind` enum replaces stacked sentinels (issue #513)
+*Added: 2026-07-17*
+
+**The bug.** Before issue #513's restructuring, `extractPrefixFromConcat` returned as soon as it
+saw a trailing `OpStar` (e.g. `"foo.*"`), classifying the pattern as pure `strings.Contains`
+equivalent (`IsLiteralContains = true`) without ever inspecting what came after the `OpStar` in
+`subs`. This was correct for `"foo.*"` itself, but wrong for `"foo.*$"`: Go's `.` never matches
+`\n` without `(?s)`, so an embedded `\n` between the literal and end-of-string blocks `.*` from
+ever reaching `$` — `"foo.*$"` is NOT equivalent to `strings.Contains("foo")`
+(`regexp.MustCompile("foo.*$").MatchString("fooX\nY")` is `false`, but
+`strings.Contains("fooX\nY", "foo")` is `true`). The bug was latent under the pre-#513 code
+because `AnalyzeRegex`'s only consumer at the time was the range-index prefix-pruning path
+(`BuildPredicates`, `executor/SPECS.md` §5a), which only ever uses `Prefixes` for a conservative,
+false-positive-tolerant pre-filter — a wrong `IsLiteralContains` classification there could not
+cause an incorrect query result, only an unnecessary regex-engine call. It became a
+correctness-affecting bug the moment issue #513 wired `IsLiteralContains` to a leaf matcher that
+bypasses the regex engine entirely (`regexFastMatch`'s `RegexFastContainsCS`/`RegexFastContainsCI`
+branches, `internal/modules/executor/column_provider.go`) — at that point, a wrong classification
+becomes a wrong query answer, not just a missed optimization.
+
+**Why it mattered once the CI guard dropped.** Prior to #513, `AnalyzeRegex`'s only fast-pathable
+output was the CI pure-contains guard (`a.IsLiteralContains && a.CaseInsensitive`) — a narrow
+enough surface that the `"foo.*$"` shape combined with `(?i)` was apparently never exercised by
+existing coverage. #513's whole purpose is to widen the fast-pathable surface (adding
+`RegexFastContainsCS`, `RegexFastTrailingChar`, `RegexFastAnchoredPrefix`,
+`RegexFastAnchoredExact`), which meant this pre-existing correctness gap needed to be closed
+before shipping a case-sensitive `RegexFastContainsCS` leaf matcher — case-sensitive `"foo.*$"` is
+a far more common query shape than its `(?i)` variant.
+
+**The fix.** `extractPrefixFromConcat` no longer short-circuits on the tail's leading op. It
+always finishes consuming the literal run first, then calls `classifyTail`/`resolveTailKind`
+(SPEC-VM-2, `vm/SPECS.md`) on whatever remains — `tailStarEnd` (a trailing `OpStar` followed by
+`EndText`/`EndLine`) resolves to `RegexFastNone` in every leading-anchor combination, never
+`RegexFastContainsCS`. `TestAnalyzeRegex_UnanchoredStarEndAnchor_Fixed` (`vm/TESTS.md` VM-T-09) and
+the property-test file's named regression
+`TestRegexFastPath_UnanchoredStarEndAnchor_NotMisclassifiedAsContains` (`executor/TESTS.md`
+EX-48) both lock this in; the latter's doc comment records that it was written to fail against
+the pre-fix code, as a target-state assertion.
+
+**Single-enum design decision.** Rather than growing `RegexAnalysis`'s boolean-flag surface
+further (a 5th field for each new shape, each independently checked and easy to get
+out-of-sync with the others) or reintroducing more `re == nil`-style sentinel checks at call
+sites, #513 introduces `RegexFastKind` (`regexanalysis.go`) as the one enum both compile-time
+classification (`AnalyzeRegex`, via `regexFastPathKind`) and runtime dispatch
+(`regexFastMatch`) switch on. `RegexAnalysis`'s four booleans are retained (mutually exclusive by
+construction) as the public field surface consumed by existing callers, but `regexFastPathKind`
+collapses them to a single `RegexFastKind` value at the point where dispatch actually happens —
+new fast-path shapes added in the future extend one switch statement in one place, rather than
+adding another independently-checked boolean that every dispatch site must remember to test.
+
+Back-ref: `internal/vm/regex_optimize.go:extractPrefixFromConcat,classifyTail,resolveTailKind`,
+`internal/vm/regexanalysis.go:RegexFastKind`, `internal/vm/traceql_compiler.go:regexFastPathKind`.
+See `SPECS.md` SPEC-VM-2. Tests: `internal/vm/regex_optimize_shapes_test.go:
+TestAnalyzeRegex_UnanchoredStarEndAnchor_Fixed` (VM-T-09),
+`internal/modules/executor/regex_fastpath_property_test.go:
+TestRegexFastPath_UnanchoredStarEndAnchor_NotMisclassifiedAsContains` (EX-48). Issue #513.
+
+## NOTE-515 — CaseInsensitive forces RegexFastNone for anchored/trailing shapes: a CRITICAL production false-negative found in review (issue #513, task #119)
+*Added: 2026-07-17*
+
+**The bug.** `AnalyzeRegex` originally resolved `"(?i)^bob"`, `"(?i)bob.+"`, and `"(?i)^bob$"` to
+`AnchoredPrefix`/`RequiresTrailingChar`/`AnchoredExact = true` respectively — the same booleans
+it sets for the case-sensitive variants — without accounting for the fact that the three
+corresponding leaf matchers (`hasAnyPrefix`, `anyPrefixHasTrailingChar`, `equalsAny`, all in
+`internal/modules/executor/column_provider.go`) compare `v` byte-for-byte and never fold case.
+A live TraceQL query like `{ span.attr =~ "(?i)^bob" }` against a value `"BobXYZ"` would resolve
+to `RegexFastAnchoredPrefix` and then silently fail to match via `hasAnyPrefix` (which only
+recognizes the literal, lowercased-if-CI, exact-byte prefix) — a false negative in production,
+not merely a missed optimization, because #513 wires these kinds directly to the leaf matcher
+with `re.MatchString` skipped entirely (`streamScanRegexFast`'s `kind != vm.RegexFastNone`
+branch, `executor/NOTES.md` NOTE-516).
+
+**Why the fix is a blanket exclusion, not a case-folding leaf matcher.** Unlike
+`RegexFastContainsCI` (which DOES fold case — `strings.Contains(strings.ToLower(v), prefix)` —
+because that leaf matcher was already shipped and load-bearing before #513 started), the three
+anchored/trailing leaf matchers have zero existing CI coverage or benchmark evidence to justify
+adding a case-folding variant of each. `AnalyzeRegex` therefore forces `RegexFastNone` for all
+three CI combinations unconditionally (`CaseInsensitive` stays `true` on the returned
+`RegexAnalysis` for callers that need it, e.g. prefix-lowercasing for range-index pruning; only
+the four fast-path booleans are demoted) — a safe fallback to the full regex engine, never a
+partially-correct fast path. Extending CI support to these three shapes remains a legitimate
+future increment, scoped separately if a real need arises.
+
+**Found by:** holistic review of issue #513 (task #119), which also found and fixed the same
+gap for `AnalyzeRegex`'s alternation path (`extractPrefixFromAlternate`'s per-branch kind
+comparison already treats CI as orthogonal to tail shape at the top level, so no separate fix
+was needed there) and drove the property test's expansion to combine `CaseInsensitive` with all
+five fast-path shapes explicitly, including multi-byte Latin-1/CJK literals
+(`regexFastPathUnicodeLiterals`) to rule out an AST-shape divergence for non-ASCII case-folded
+literals — see NOTE-513 (`executor/NOTES.md`) for a real, unrelated bug that same expanded
+coverage incidentally surfaced in the fallback engine itself.
+
+Back-ref: `internal/vm/regex_optimize.go:AnalyzeRegex` (the `if caseInsensitive` demotion switch).
+See `SPECS.md` SPEC-VM-2. Tests: `internal/vm/regex_optimize_shapes_test.go:
+TestAnalyzeRegex_CaseInsensitiveAnchoredOrTrailingFallsBackSafely` (VM-T-10),
+`internal/modules/executor/regex_fastpath_property_test.go:
+TestRegexFastPath_CaseInsensitiveAnchoredOrTrailing_FallsBackSafely` (EX-49). Issue #513, task
+#119.

@@ -395,13 +395,17 @@ func (c *traceqlCompiler) compileColumnPredicateComparison(expr *traceqlparser.B
 	if operator == traceqlparser.OpRegex || operator == traceqlparser.OpNotRegex {
 		if strVal, ok := value.(string); ok {
 			notMatch := operator == traceqlparser.OpNotRegex
-			// CI literal bypass: pure (?i)literal patterns use fold-contains instead
-			// of the NFA regex engine, avoiding tryBacktrack overhead.
-			if a := AnalyzeRegex(strVal); a != nil && a.IsLiteralContains && a.CaseInsensitive {
-				lp := a.Prefixes // pre-lowercased
-				return unscopedOrScoped(fieldExpr, attrName, func(p ColumnDataProvider, name string) (RowSet, error) {
-					return scanColumnRegexFast(p, name, nil, lp, notMatch)
-				}), nil
+			// Fast-path bypass: any shape regexFastPathKind recognizes (case-insensitive
+			// or case-sensitive pure-contains, OpPlus trailing-required, anchored-prefix,
+			// anchored-exact) skips the NFA regex engine entirely — see regexFastMatch in
+			// internal/modules/executor for the leaf matchers.
+			if a := AnalyzeRegex(strVal); a != nil {
+				if kind := regexFastPathKind(a); kind != RegexFastNone {
+					prefixes := a.Prefixes // pre-lowercased only when CaseInsensitive
+					return unscopedOrScoped(fieldExpr, attrName, func(p ColumnDataProvider, name string) (RowSet, error) {
+						return scanColumnRegexFast(p, name, nil, prefixes, kind, notMatch)
+					}), nil
+				}
 			}
 			re, err := regexp.Compile(strVal)
 			if err != nil {
@@ -409,7 +413,7 @@ func (c *traceqlCompiler) compileColumnPredicateComparison(expr *traceqlparser.B
 			}
 			prefixes := RegexPrefixes(strVal)
 			return unscopedOrScoped(fieldExpr, attrName, func(p ColumnDataProvider, name string) (RowSet, error) {
-				return scanColumnRegexFast(p, name, re, prefixes, notMatch)
+				return scanColumnRegexFast(p, name, re, prefixes, RegexFastNone, notMatch)
 			}), nil
 		}
 		return nil, fmt.Errorf("regex operator requires string value")
@@ -468,18 +472,43 @@ func scanColumnByOp(
 	}
 }
 
-// scanColumnRegexFast dispatches a pre-compiled regex scan (match or not-match).
+// SPEC-VM-2: regexFastPathKind maps a RegexAnalysis's resolved shape booleans to the
+// RegexFastKind that drives both scanColumnRegexFast's re-bypass decision and the
+// executor's leaf-matcher dispatch. The four booleans are mutually exclusive by
+// construction (see AnalyzeRegex), so this is a flat switch with no nesting.
+func regexFastPathKind(a *RegexAnalysis) RegexFastKind {
+	switch {
+	case a.IsLiteralContains && a.CaseInsensitive:
+		return RegexFastContainsCI
+	case a.IsLiteralContains:
+		return RegexFastContainsCS
+	case a.RequiresTrailingChar:
+		return RegexFastTrailingChar
+	case a.AnchoredPrefix:
+		return RegexFastAnchoredPrefix
+	case a.AnchoredExact:
+		return RegexFastAnchoredExact
+	default:
+		return RegexFastNone
+	}
+}
+
+// scanColumnRegexFast dispatches a pre-compiled regex scan (match or not-match). When
+// kind == RegexFastNone, re must be non-nil and the fallback path (prefix pre-filter +
+// re.MatchString) is used; for any other kind, re is ignored (may be nil) and the
+// shape-specific fast matcher fully determines the result.
 func scanColumnRegexFast(
 	provider ColumnDataProvider,
 	col string,
 	re *regexp.Regexp,
 	prefixes []string,
+	kind RegexFastKind,
 	notMatch bool,
 ) (RowSet, error) {
 	if notMatch {
-		return provider.ScanRegexNotMatchFast(col, re, prefixes)
+		return provider.ScanRegexNotMatchFast(col, re, prefixes, kind)
 	}
-	return provider.ScanRegexFast(col, re, prefixes)
+	return provider.ScanRegexFast(col, re, prefixes, kind)
 }
 
 // gatherOrEqualAny walks an OR expression tree and returns the common FieldExpr and the

@@ -16,7 +16,7 @@ renumbered; superseded entries are marked `[SUPERSEDED by SPEC-VM-N]` rather tha
 (see that file's own entries and their cross-file back-refs) — this `SPEC-VM-N` prefix applies
 only to this file.
 
-Next free ID: **SPEC-VM-2**.
+Next free ID: **SPEC-VM-3**.
 
 ---
 
@@ -76,3 +76,94 @@ was extracted from — now delegates to it, see `NOTES.md` NOTE-491),
 `internal/vm/metrics_compiler_test.go` (`TestMetricsShapeIsVIAnswerable`,
 `TestCompileTraceQLMetrics_RealQueriesMatchVIAnswerability`), `metricsfilter_test.go` (all 6
 cases). Issue #487.
+
+---
+
+## SPEC-VM-2: `RegexFastKind` shape taxonomy and tail-classification invariant (issue #513)
+*Added: 2026-07-17 (issue #513, extending the regex fast-path bypass beyond CI pure-contains)*
+
+**Contract:** `AnalyzeRegex(pattern string) *RegexAnalysis` classifies a regex pattern into
+exactly one `RegexFastKind` — the single source of truth shared by compile-time analysis
+(`regexFastPathKind`, `traceql_compiler.go`) and the executor's row-level leaf-matcher dispatch
+(`regexFastMatch`, `internal/modules/executor/column_provider.go`). `RegexAnalysis`'s four
+boolean fields (`IsLiteralContains`, `RequiresTrailingChar`, `AnchoredPrefix`, `AnchoredExact`)
+are mutually exclusive by construction — at most one is ever `true` for a given analysis.
+
+**Shape taxonomy:**
+
+| `RegexFastKind` | Pattern shape | Example |
+|---|---|---|
+| `RegexFastContainsCS` | Case-sensitive pure contains | `"bob"`, `"bob.*"` |
+| `RegexFastContainsCI` | Case-insensitive pure contains | `"(?i)bob"` |
+| `RegexFastTrailingChar` | Literal followed by ≥1 non-newline char | `"bob.+"` |
+| `RegexFastAnchoredPrefix` | Literal at start of string, no end anchor | `"^bob"`, `"^bob.*"` |
+| `RegexFastAnchoredExact` | Literal equals the whole string | `"^bob$"` |
+| `RegexFastNone` | Not fast-pathable — falls back to the full regex engine | see Deferred shapes below |
+
+**Tail-classification table.** `extractPrefixFromConcat` splits a concatenation into a leading
+anchor (`^`/`(?m)^`, optional), a run of `OpLiteral` subs (the extracted prefix), and a "tail" —
+whatever `syntax.Regexp` nodes remain. `classifyTail` buckets the tail into one of
+`tailEmpty`/`tailStar`/`tailStarEnd`/`tailPlus`/`tailPlusEnd`/`tailEndOnly`/`tailQuest`/`tailOther`;
+`resolveTailKind` maps `(leadingAnchor, tailKind)` to a `RegexFastKind`:
+
+| Tail \ Anchor | No leading anchor | Leading anchor (`^`) |
+|---|---|---|
+| `tailEmpty` (e.g. `"bob"`) | `RegexFastContainsCS` | `RegexFastAnchoredPrefix` |
+| `tailStar` (e.g. `"bob.*"`) | `RegexFastContainsCS` | `RegexFastAnchoredPrefix` |
+| `tailPlus` (e.g. `"bob.+"`) | `RegexFastTrailingChar` | `RegexFastNone` |
+| `tailEndOnly` (e.g. `"bob$"`) | `RegexFastNone` | `RegexFastAnchoredExact` |
+| `tailStarEnd` (e.g. `"bob.*$"`) | `RegexFastNone` | `RegexFastNone` |
+| `tailPlusEnd` (e.g. `"bob.+$"`) | `RegexFastNone` | `RegexFastNone` |
+| `tailQuest` (e.g. `"bob?"`) | `RegexFastNone` | `RegexFastNone` |
+| `tailOther` (anything else) | `RegexFastNone` | `RegexFastNone` |
+
+**The `\n`-exclusion rule.** Go's `.` never matches `\n` without the `(?s)` flag. This means
+`"bob.*$"` and `"bob.+$"` are NOT equivalent to their no-`$` counterparts (`"bob.*"`,
+`"bob.+"`): an embedded `\n` between the literal and end-of-string blocks `.*`/`.+` from ever
+reaching `$`. The tail-classification table's `tailStarEnd`/`tailPlusEnd` rows are `RegexFastNone`
+in every column specifically to encode this — collapsing them into `tailStar`/`tailPlus`'s rows
+would silently misclassify these patterns as pure contains / trailing-char (see NOTE-514,
+`vm/NOTES.md`, for the historical bug this closes). The same rule governs
+`anyPrefixHasTrailingChar` (`internal/modules/executor/column_provider.go`) at the leaf-matcher
+level: it treats a literal occurrence followed by `\n` as non-matching and must check every
+occurrence of the literal in the string, not just the leftmost, because the leftmost occurrence
+may be invalid while a later one is valid (e.g. `"bob\nbobX"` against `"bob.+"`).
+
+**Deferred shapes.** The following shapes are deliberately classified to `RegexFastNone`
+(correct via full-regex-engine fallback, just not fast) rather than given a dedicated fast path,
+because no benchmark/property-test evidence justifies the added dispatch complexity for them:
+
+- `tailQuest` — `OpQuest` anywhere at the head of the tail (e.g. `"bob?"`), unconditionally,
+  regardless of anchor. Position-dependent semantics (`"bo"` alone also matches) make this a
+  poor fit for a byte-comparison leaf matcher.
+- Mixed-shape alternations — e.g. `"bob|baz.+"` (bare literal OR trailing-char shape).
+  `extractPrefixFromAlternate` requires every branch to resolve to the SAME `RegexFastKind`;
+  a mismatch demotes the whole alternation to `RegexFastNone` even though prefixes are still
+  returned for scan pre-filtering.
+- `"^prefix.*$"` (leading anchor + trailing wildcard + end anchor together, `tailStarEnd` with
+  `leadingAnchor=true`) — same `\n`-exclusion rule as the unanchored case; anchoring the front
+  doesn't change that the tail's `.*$` can be blocked by an embedded `\n`.
+
+**CI exclusion for anchored/trailing shapes (task #119).** `AnalyzeRegex` promotes
+`CaseInsensitive` + `RegexFastContainsCS` to `RegexFastContainsCI` (a supported, case-folding
+leaf matcher — `strings.Contains(strings.ToLower(v), prefix)`), but for
+`RegexFastTrailingChar`/`RegexFastAnchoredPrefix`/`RegexFastAnchoredExact`, `CaseInsensitive`
+unconditionally forces `RegexFastNone` instead. The corresponding leaf matchers
+(`anyPrefixHasTrailingChar`, `hasAnyPrefix`, `equalsAny`) compare byte-for-byte and never fold
+case; without this exclusion, `"(?i)^bob"` would resolve to `AnchoredPrefix=true` and then
+silently fail to match `"BobXYZ"` in production. See NOTE-515 (`vm/NOTES.md`) for the
+review-finding history.
+
+**Invariant:** a nil-safe caller must always check `RegexFastKind` (via `regexFastPathKind`) for
+`RegexFastNone` before invoking a shape-specific leaf matcher — `regexFastMatch`'s `RegexFastNone`
+branch always returns `false` by contract and must never be reached by a real caller for that
+kind (see SPEC-STREAM references in `executor/SPECS.md` §5a for the compiler-side prefix-analysis
+contract this feeds).
+
+Back-ref: `internal/vm/regex_optimize.go:AnalyzeRegex,extractPrefixFromConcat,classifyTail,
+resolveTailKind,extractPrefixFromAlternate`, `internal/vm/regexanalysis.go:RegexFastKind,
+RegexAnalysis`, `internal/vm/traceql_compiler.go:regexFastPathKind`,
+`internal/modules/executor/column_provider.go:regexFastMatch,anyPrefixHasTrailingChar,
+hasAnyPrefix,equalsAny`. Tests: `internal/vm/regex_optimize_shapes_test.go` (VM-T-05 through
+VM-T-10, `vm/TESTS.md`), `internal/modules/executor/regex_fastpath_property_test.go` (EX-42
+through EX-49, `executor/TESTS.md`). Issue #513, task #119.

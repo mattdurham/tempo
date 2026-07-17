@@ -8104,3 +8104,105 @@ Back-ref: `internal/modules/executor/structural_tracegroup.go:FindTraceGroupInCa
 root `gettracebyid_candidate_concurrency_test.go`. See SPEC-VIS-5 (`SPECS.md`) for the updated
 contract, NOTE-VI-106 for the original (now-superseded) capped fix. Issue #489, task #199, task
 #216.
+
+---
+
+## NOTE-513: coregex v0.12.4 has an asymmetric case-folding bug for Latin-1-accented literals — pre-existing RegexFastContainsCI gap, out of scope for #513/#119 (2026-07-17)
+
+**Finding.** `github.com/coregx/coregex` v0.12.4's case-insensitive matching for literals
+containing Latin-1 accented characters (e.g. `ï`, `ü`) is asymmetric and, in some cases, does not
+even match the literal's own exact string. `regexp/syntax.Parse` normalizes a case-folded
+literal's runes to UPPERCASE internally (`(?i)naïve` parses to a single `OpLiteral` node with
+`Rune="NAÏVE"`), and coregex's compiled matcher only recognizes the accented character in that
+uppercase form as case-insensitively equivalent — every input containing the character in
+lowercase form fails to match, regardless of the surrounding ASCII characters' case. Deterministic
+repro (isolated from blockpack code, calling coregex directly):
+
+| input   | `regexp.MustCompile("(?i)naïve").MatchString(input)` |
+|---------|--------------------------------------------------------|
+| `naïve` | `false` — pattern does not match its own literal string |
+| `NAÏVE` | `true` |
+| `Naïve` | `false` |
+| `naïVE` | `false` |
+| `naÏve` | `true` |
+| `naÏVE` | `true` |
+| `NAïVE` | `false` |
+
+**Why this matters for blockpack.** `RegexFastContainsCI`'s leaf matcher (`regexFastMatch` in
+`column_provider.go` — pre-existing, shipped before issue #513) uses
+`strings.Contains(strings.ToLower(v), prefix)`, i.e. standard Unicode case folding via Go's
+`strings` package. That disagrees with coregex's own `(?i)` semantics for the exact character
+class above: the fast path is Unicode-fold-*correct*, while the one authoritative fallback engine
+(coregex, which every non-fast-pathed regex query still uses) is not. This means a live TraceQL
+query like `{ span.attr =~ "(?i)naïve" }` could, in principle, disagree between the fast path
+(bypassing coregex, matching `"Naïve"`) and what the same pattern would do if it fell through to
+`regexp.Compile` instead (NOT matching `"Naïve"`) — a latent production discrepancy that predates
+issue #513 and is not introduced or worsened by it.
+
+**How this was found.** Issue #513's property-test suite (`regex_fastpath_property_test.go`) was
+extended, per review (task #119's Unicode-AST-shape follow-up), to randomly combine
+`CaseInsensitive` with Latin-1-accented literals across all fast-path shapes. The AST-shape risk
+that motivated the extension was verified to NOT exist — `regexp/syntax` produces an identical
+`OpLiteral`+`FoldCase` node for ASCII and Unicode literals alike, confirmed via a direct AST dump,
+not assumed — but the property test's matcher-vs-oracle equivalence check
+(`TestRegexFastPath_Equivalence_ContainsCS`'s CI branch, the one combination that resolves to a
+real fast-pathed kind rather than `RegexFastNone`) caught this pre-existing, unrelated
+discrepancy incidentally.
+
+**Scope decision.** Out of scope for issue #513 (a fast-path *extension*, not a correctness audit
+of the pre-existing CI-contains bypass) and for task #119 (whose actual bug — anchored/trailing
+kinds ignoring `CaseInsensitive` entirely — is unrelated and already fixed in `AnalyzeRegex`).
+Fixing this would mean either patching coregex's own Unicode tables (a third-party dependency) or
+reworking the pre-existing `RegexFastContainsCI` matcher's folding strategy to deliberately
+replicate coregex's asymmetric behavior (worse, not better, correctness). Filed and tracked as a
+separate follow-up, **grafana/blockpack#514** (includes the repro table above and the
+AST-shape-disproven finding), rather than blocking #513.
+
+**Test-suite handling.** `regexFastPathUnicodeCIMatchLiterals` (CJK-only, no case distinction) is
+used specifically where a generator's CI branch invokes the real coregex oracle for a
+match-equivalence comparison; `regexFastPathUnicodeLiterals` (includes the Latin-1-accented
+literals that trip this bug) remains valid for the three CI branches that only assert
+classification (`RegexFastNone`) and never call the oracle — see
+`checkRegexFastPathEquivalence`'s doc comment.
+
+Back-ref: `internal/modules/executor/column_provider.go:regexFastMatch` (`RegexFastContainsCI`
+case), `internal/modules/executor/regex_fastpath_property_test.go`. Issue #513, task #119, issue
+#514.
+
+## NOTE-516 — anyPrefixHasTrailingChar's multi-occurrence loop, and skipping re.MatchString entirely for kind != RegexFastNone (issue #513)
+*Added: 2026-07-17*
+
+**Multi-occurrence loop design.** `anyPrefixHasTrailingChar(v string, prefixes []string) bool`
+cannot check only the LEFTMOST occurrence of each prefix — Go's `.` never matches `\n` without
+`(?s)`, so the leftmost occurrence of a literal may be immediately followed by `\n` (invalid)
+while a LATER occurrence is followed by a valid non-newline character. The canonical example:
+`"bob.+"` against `"bob\nbobX"` — the leftmost `"bob"` (index 0) is followed by `\n`, but the
+second occurrence (index 4) is followed by `'X'`, so the pattern DOES match overall. A naive
+`strings.Index`-once implementation checking only the first hit would wrongly return `false`.
+The fix advances the search start by 1 byte past each found occurrence's *start* (not
+`len(prefix)`), so overlapping occurrences of the prefix are never skipped over — necessary
+because a prefix can occur again starting from any byte offset, not just after the previous
+occurrence's full length. `TestRegexFastPath_TrailingChar_MultiOccurrence_Newline`
+(`executor/TESTS.md` EX-47) is the named regression covering exactly this shape, and
+`TestScanRegexFast_TrailingCharRequired` (EX-51) exercises it end-to-end through the real
+write→query path with the identical `"bob\nbobX"` value.
+
+**re.MatchString skip decision.** `streamScanRegexFast`/`streamScanRegexNotMatchFast`
+(`column_provider.go`) dispatch on `kind`: for any `kind != vm.RegexFastNone`, the shape-specific
+leaf matcher (`regexFastMatch`) fully determines the match result and `re.MatchString` is never
+called — `re` may even be `nil` for these kinds (see `scanColumnRegexFast`'s doc comment,
+`traceql_compiler.go`). Only `kind == vm.RegexFastNone` falls through to the pre-#513 behavior:
+prefix pre-filter (`containsAnySubstring`) followed by `re.MatchString`. This is safe precisely
+because `AnalyzeRegex`/`regexFastPathKind` (SPEC-VM-2, `vm/NOTES.md` NOTE-514) guarantee that a
+non-`RegexFastNone` kind's leaf matcher is a byte-for-byte equivalent of what the real regex
+engine would decide for that exact shape — the property-test suite
+(`regex_fastpath_property_test.go`, EX-42 through EX-46) is the correctness evidence for this
+equivalence claim across ~6000 randomly generated (pattern, string) pairs per shape. Skipping the
+regex engine call entirely (rather than calling it AND the fast matcher and asserting agreement)
+is what delivers #513's ~3.5–4.4x throughput improvement (BENCH-EX-22, `executor/BENCHMARKS.md`)
+— a defense-in-depth "call both and compare" approach would have kept the full regex engine on
+the hot path and eliminated the performance win entirely.
+
+Back-ref: `internal/modules/executor/column_provider.go:anyPrefixHasTrailingChar,regexFastMatch,
+streamScanRegexFast,streamScanRegexNotMatchFast`, `internal/vm/traceql_compiler.go:
+scanColumnRegexFast`. See `internal/vm/SPECS.md` SPEC-VM-2. Issue #513.
