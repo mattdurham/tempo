@@ -447,12 +447,20 @@ func (b *blockpackBlock) QueryRange(ctx context.Context, req *tempopb.QueryRange
 				)
 				return cubePartialResp, nil
 			}
-			if cubeWarming && errors.Is(err, blockpack.ErrMetricsShapeNotAnswerable) {
+			if cubeWarming && (errors.Is(err, blockpack.ErrMetricsShapeNotAnswerable) || errors.Is(err, blockpack.ErrMetricsNoCoverage)) {
 				// R1's self-healing story: this shape IS potentially cube-answerable (it just
 				// declined on VI's narrower count/rate-only engine too), and the cube path fired
 				// creation on this exact query moments ago — surface the distinguishable,
-				// actionable "retry shortly" reason instead of the permanent "shape not
-				// answerable" one, which would incorrectly suggest retrying is pointless.
+				// actionable "retry shortly" reason instead of the permanent decline, which would
+				// incorrectly suggest retrying is pointless.
+				//
+				// ErrMetricsNoCoverage joined this override post-#511: a match-all zero-dim query
+				// (`{} | rate()`) has no leaf column at all, so VI declines with ErrMetricsNoCoverage
+				// rather than ErrMetricsShapeNotAnswerable — before #511 removed tryQueryFromCube's
+				// zero-dim early return, cubeWarming could never be true for this shape, so the gap
+				// was invisible. ErrMetricsLegacyTimeSecZero deliberately stays excluded: it is
+				// per-block data-driven (a block predating per-span timestamps), not a query-shape
+				// limitation, so cube backfill can never resolve it.
 				return nil, fmt.Errorf("blockpack QueryRange: %w", ErrCubeWarming)
 			}
 			return nil, fmt.Errorf("blockpack QueryRange: %w", err)

@@ -144,3 +144,43 @@ func TestQueryRange_CubeNotYetBackfilled_ProductionDefault_ReturnsWarmingTypedEr
 	require.False(t, errors.Is(err, blockpack.ErrMetricsShapeNotAnswerable),
 		"must NOT surface the permanent 'shape not answerable' reason once cube creation has been triggered — that would incorrectly discourage retrying")
 }
+
+// TestQueryRange_ZeroDimCubeNotYetBackfilled_ReturnsWarmingTypedError_TriggersCreate is #511's
+// companion regression pin to the ErrMetricsShapeNotAnswerable case above: a genuinely
+// zero-dimension, match-all query (`{} | rate()`, no `by (...)`, no leaf predicate at all)
+// declines from VI with blockpack.ErrMetricsNoCoverage (unfiltered_metrics_vi_misattribution_
+// test.go's #198 fixture — "no column list to enumerate", not an unsupported aggregate shape),
+// never ErrMetricsShapeNotAnswerable.
+//
+// Before #511 removed tryQueryFromCube's `len(dims) == 0` early return, a zero-dim query could
+// never reach blockpack's cube creation trigger at all, so cubeWarming was always false here —
+// backend_block.go's cube-warming override only ever needed to check ErrMetricsShapeNotAnswerable
+// (the grouped-query case). #511 made cubeWarming reachable for this shape too, exposing a real
+// gap: the override's condition still only matched ErrMetricsShapeNotAnswerable, so a zero-dim
+// cube's "creation just triggered, retry shortly" signal was silently dropped in favor of the
+// permanent-sounding ErrMetricsNoCoverage — discovered via a live retest against the deployed
+// cluster, not by inspection. Fixed by adding ErrMetricsNoCoverage to the override condition.
+func TestQueryRange_ZeroDimCubeNotYetBackfilled_ReturnsWarmingTypedError_TriggersCreate(t *testing.T) {
+	cqp := newEmptyTestCubeQueryPath(t)
+	withCubeQueryPath(t, cqp)
+
+	dir := t.TempDir()
+	viStore := &fakeVISink{}
+	withVISink(t, viStore, "indexes")
+	withVIQueryReader(t, viStore, "indexes")
+
+	tenant := "test-tenant"
+	metaA, _ := writeSvcBlock(t, dir, viStore, tenant, uuid.New(), "svc-alpha", 300)
+
+	rawR, _, _, err := local.New(&local.Config{Path: dir})
+	require.NoError(t, err)
+	block := newBackendBlock(metaA, backend.NewReader(rawR))
+
+	req := countOverTimeReq("{} | rate()")
+	_, err = block.QueryRange(context.Background(), req, common.SearchOptions{})
+	require.Error(t, err, "a zero-dim query against an empty cube registry must still hard-error, never scan")
+	require.True(t, errors.Is(err, ErrCubeWarming),
+		"err = %v, want ErrCubeWarming (cube creation was triggered on this exact zero-dim query, self-healing per R1/#511)", err)
+	require.False(t, errors.Is(err, blockpack.ErrMetricsNoCoverage),
+		"must NOT surface the permanent 'no coverage' reason once zero-dim cube creation has been triggered — that would incorrectly discourage retrying")
+}
