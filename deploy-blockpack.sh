@@ -93,6 +93,16 @@ spec:
       containers:
         - name: postgres
           image: postgres:16-alpine
+          # max_connections=300 (2026-07-17): the default 100 was exhausted by this
+          # namespace's own fleet -- 20 querier + 4 backend-worker + 20
+          # value-index-compactor + backend-scheduler, each holding its own pgxpool,
+          # sustained "FATAL: sorry, too many clients already" under normal load, not
+          # a spike. shared_buffers bumped alongside it (rule of thumb ~a few MB of
+          # overhead per connection); memory requests/limits raised to match.
+          # args (not command!) so the image's default entrypoint (docker-entrypoint.sh) stays
+          # in effect -- it drops root privileges before exec'ing postgres; overriding command
+          # directly bypasses that and postgres refuses to run as root.
+          args: ["-c", "max_connections=300", "-c", "shared_buffers=256MB"]
           env:
             - name: POSTGRES_HOST_AUTH_METHOD
               value: trust
@@ -113,11 +123,11 @@ spec:
             periodSeconds: 10
           resources:
             requests:
-              cpu: 100m
-              memory: 256Mi
-            limits:
-              cpu: 500m
+              cpu: 200m
               memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
