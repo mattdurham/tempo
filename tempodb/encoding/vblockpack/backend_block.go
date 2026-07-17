@@ -83,17 +83,42 @@ func (p *tempoReaderProvider) ReadAt(buf []byte, off int64, _ blockpack.DataType
 // blockpackCache is the process-level TypedTieredCache for blockpack section reads.
 // It is built once via getCache() using NewTypedTieredCache. A nil SectionCache is safe —
 // all reads fall through to the provider.
+// blockpackCacheConfig holds the ConfigureCacheTiered inputs snapshotted under
+// blockpackCacheMu before getCache's one-time initialization runs.
+type blockpackCacheConfig struct {
+	filePath           string
+	fileMaxBytes       int64
+	memServers         []string
+	metadataMemServers []string
+}
+
 var (
 	blockpackCacheMu   sync.Mutex
 	blockpackCache     blockpack.SectionCache
 	blockpackCacheOnce sync.Once
-	blockpackCacheCfg  struct {
-		filePath           string
-		fileMaxBytes       int64
-		memServers         []string
-		metadataMemServers []string
-	}
+	blockpackCacheCfg  blockpackCacheConfig
 )
+
+// metaAndDataMemCacheConfigs builds the metadata- and data-tier MemCacheConfig
+// values getCache passes to blockpack.OpenMemCache. Extracted as a pure function
+// (no OpenMemCache call, no I/O) so the TierLabel/Registerer shape at this exact
+// call site is directly unit-testable — see #515 Phase 1 (TierLabel avoids the
+// registration collision that prometheus.WrapRegistererWith would cause here).
+func metaAndDataMemCacheConfigs(cfg blockpackCacheConfig) (metaCfg, dataCfg blockpack.MemCacheConfig) {
+	metaCfg = blockpack.MemCacheConfig{
+		Servers:    cfg.metadataMemServers,
+		Enabled:    true,
+		Registerer: prometheus.DefaultRegisterer,
+		TierLabel:  "metadata",
+	}
+	dataCfg = blockpack.MemCacheConfig{
+		Servers:    cfg.memServers,
+		Enabled:    true,
+		Registerer: prometheus.DefaultRegisterer,
+		TierLabel:  "data",
+	}
+	return metaCfg, dataCfg
+}
 
 // ConfigureCache sets the cache configuration for blockpack blocks.
 // Concurrent calls are safe. The first call before any getCache invocation wins.
@@ -145,16 +170,9 @@ func getCache() blockpack.SectionCache {
 		// When metadata+data memcache servers are both configured, remote caches back the
 		// metadata (small, high-reuse) and page (large block-column) chains respectively.
 		if len(cfg.metadataMemServers) > 0 && len(cfg.memServers) > 0 {
-			metaRemote, err := blockpack.OpenMemCache(blockpack.MemCacheConfig{
-				Servers:    cfg.metadataMemServers,
-				Enabled:    true,
-				Registerer: prometheus.WrapRegistererWith(prometheus.Labels{"tier": "metadata"}, prometheus.DefaultRegisterer),
-			})
-			dataRemote, err2 := blockpack.OpenMemCache(blockpack.MemCacheConfig{
-				Servers:    cfg.memServers,
-				Enabled:    true,
-				Registerer: prometheus.WrapRegistererWith(prometheus.Labels{"tier": "data"}, prometheus.DefaultRegisterer),
-			})
+			metaCfg, dataCfg := metaAndDataMemCacheConfigs(cfg)
+			metaRemote, err := blockpack.OpenMemCache(metaCfg)
+			dataRemote, err2 := blockpack.OpenMemCache(dataCfg)
 			if err == nil && err2 == nil && metaRemote != nil && dataRemote != nil {
 				// Split by entry size: small metadata entries (Footer/TOC/Bloom/Metadata/TraceIdx)
 				// go to metaRemote (memcached-01) to keep hit rate high; large column-page blobs (Block)

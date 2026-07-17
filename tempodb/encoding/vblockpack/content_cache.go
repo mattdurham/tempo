@@ -50,6 +50,19 @@ package vblockpack
 // not: SectionCache (getCache()) is wired only to the main data-block reader,
 // never to minioVIStore; IndexFileCache caches directory LISTINGS only, never
 // downloaded bytes.
+//
+// NOTE-VI-107: this package's caches (contentCache/listCache) are in-process-only
+// by design (immutable-key LRU + singleflight, no memcache tier) — considered and
+// deliberately deferred during issue #515 (querier blockpack cache backing audit,
+// 2026-07-17). #515 wired a memcache tier for the MAIN data-block path
+// (backend_block.go's getCache()/TypedTieredCache) but explicitly left this
+// package's value-index/trace-by-ID index-file cache out of scope: adding a
+// memcache tier here would change cachingStore's public constructor shape
+// (newCachingStoreWithListTTL etc.), a larger surface change than #515's
+// config-only fix, for a lower-priority benefit (this cache's cold-after-restart
+// exposure is real but smaller-blast-radius than the bulk Block-content path that
+// actually triggered #515's production retry storm). Revisit if telemetry shows
+// this path's cold-start cost is independently significant.
 
 import (
 	"context"

@@ -199,10 +199,26 @@ esac
 GOMEMLIMIT_MIB=$(( MEM_MIB * 80 / 100 ))
 echo "    querier memory limit: ${MEM_LIMIT} -> GOMEMLIMIT=${GOMEMLIMIT_MIB}MiB (80%)"
 kubectl set env deployment/querier -n "$NAMESPACE" "GOMEMLIMIT=${GOMEMLIMIT_MIB}MiB"
-# Add 10 Gi emptyDir for blockpack disk cache (file_cache_path: /var/tempo/blockpack-cache).
-# Strategic merge patch is idempotent — safe to re-apply on every deploy.
+# Blockpack disk cache (file_cache_path: /var/tempo/blockpack-cache) — issue #515:
+# was a 10Gi emptyDir (node-local disk, risked overwhelming node capacity across
+# co-scheduled pods — same class of problem as #500). Now a 40Gi generic ephemeral
+# volume (spec.volumes[].ephemeral.volumeClaimTemplate): a real PVC provisioned via
+# the cluster's default StorageClass, off node-local disk, auto-deleted with its
+# pod. 40Gi matches file_cache_max_bytes's own "32 GiB = 80% of 40 GiB" comment in
+# querier.yaml (the OLD 10Gi here was already stale/inconsistent with that comment
+# before this change). Does NOT survive pod recreation (cache is cold after every
+# restart either way, same as emptyDir) — closing that gap relies on the memcache
+# role-swap fix (querier.yaml's memcache_servers/metadata_memcache_servers), not on
+# volume type. fsGroup:10001 matches cmd/tempo/Dockerfile's USER 10001:10001 — a
+# fresh CSI-provisioned volume defaults to root:root and querier would get
+# permission denied writing to /var/tempo/blockpack-cache without it.
+# "emptyDir":null explicitly removes the old volume-source field — Kubernetes
+# Volume is a union type; a strategic-merge patch that added "ephemeral" without
+# nulling "emptyDir" would leave BOTH set on the same volume entry, which the API
+# server rejects as invalid. Strategic merge patch is idempotent — safe to
+# re-apply on every deploy.
 kubectl patch deployment/querier -n "$NAMESPACE" --type=strategic -p \
-    '{"spec":{"template":{"spec":{"volumes":[{"name":"blockpack-cache","emptyDir":{"sizeLimit":"10Gi"}}],"containers":[{"name":"querier","volumeMounts":[{"name":"blockpack-cache","mountPath":"/var/tempo/blockpack-cache"}]}]}}}}'
+    '{"spec":{"template":{"spec":{"securityContext":{"fsGroup":10001},"volumes":[{"name":"blockpack-cache","emptyDir":null,"ephemeral":{"volumeClaimTemplate":{"spec":{"accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":"40Gi"}}}}}}],"containers":[{"name":"querier","volumeMounts":[{"name":"blockpack-cache","mountPath":"/var/tempo/blockpack-cache"}]}]}}}}'
 kubectl rollout restart deployment/querier -n "$NAMESPACE"
 
 echo "--- Updating query-frontend ---"
