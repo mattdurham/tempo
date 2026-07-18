@@ -53,6 +53,89 @@ import (
 	"github.com/grafana/tempo/tempodb/encoding/vblockpack/migrate"
 )
 
+// TestE2E_ViBackfill_ClaimedAndExecuted_WhileRingDegraded is #516's actual proof that
+// the production symptom is fixed: a real, durably-inserted vi_backfill row gets claimed
+// and executed via the real worker dispatch path even though the ring never reaches
+// ACTIVE. Byte-identical setup to TestE2E_ViBackfill_WorkerClaimsAndExecutesWithoutGRPC
+// (above) except for the ring config -- the only variable under test is ring health, not
+// the job/registry plumbing. Before #516's fix, w.starting(ctx) below returns a non-nil
+// error and, through the real dskit service lifecycle (services.NewBasicService's
+// documented contract: "if StartingFn returns error, no other functions are called"),
+// running()/processJobs() would never be invoked at all -- this job would be
+// permanently unreachable, not merely delayed.
+func TestE2E_ViBackfill_ClaimedAndExecuted_WhileRingDegraded(t *testing.T) {
+	ctx := context.Background()
+	pool, dsn := newTestPostgresPoolAndDSN(t)
+	s3cfg := newFakeS3Config(t, "e2e-worker-vi-ring-degraded-bucket")
+
+	tenant := "e2e-worker-vi-ring-degraded-tenant"
+	registry := blockpack.NewPgViUsageRegistry(pool, tenant)
+	triggerResult, err := blockpack.RecordUseAndMaybeTrigger(
+		ctx, registry, tenant, "span.custom.attr", "string", time.Now(),
+		blockpack.TriggerConfig{LeaseTTLSeconds: 1800},
+	)
+	require.NoError(t, err)
+	require.True(t, triggerResult.ShouldBackfill, "first-ever use must trigger immediately (R4)")
+
+	store := jobstore.New(pool)
+	require.NoError(t, store.InsertViBackfill(ctx, tenant, jobstore.ViBackfillDetail{
+		ColumnHash: triggerResult.Entry.ColumnHash,
+		ColumnName: triggerResult.Entry.ColumnName,
+		ColumnType: triggerResult.Entry.ColumnType,
+	}))
+
+	limitCfg := overridesConfigForTest(t)
+	workerCfg, schedulerClientCfg, overridesSvc, _, _ := setupDependencies(ctx, t, limitCfg)
+	// setupDependencies's own fixture store already has blocklist polling enabled (see
+	// newStoreWithLogger) -- w.starting(ctx) below unconditionally enables it a SECOND time
+	// on whatever store it's given, which would race two concurrent pollers on the same
+	// underlying blocklist state if given that same store (this test doesn't need
+	// blocklist data at all, only the Postgres/ring behavior). storeWithoutPolling gives
+	// starting() a store that was never separately polling-enabled, so its own call is the
+	// only one.
+	workerStore := storeWithoutPolling(t)
+	workerCfg.Postgres = &postgres.Config{DSN: dsn}
+	// Ring config matching TestStarting_RingNeverReachesActive_ReturnsNilNotError
+	// (backendworker_test.go): nilKVClient can structurally never produce an ACTIVE ring
+	// state, so ring.WaitInstanceState deterministically times out.
+	workerCfg.Ring.KVStore.Store = "mock"
+	workerCfg.Ring.KVStore.Mock = nilKVClient{}
+	workerCfg.Ring.WaitActiveInstanceTimeout = 500 * time.Millisecond
+	workerCfg.Ring.WaitStabilityMinDuration = 0
+
+	w, err := New(workerCfg, schedulerClientCfg, s3cfg, workerStore, overridesSvc, nil)
+	require.NoError(t, err)
+	require.NotNil(t, w.jobStore, "New must auto-wire jobStore from cfg.Postgres")
+	require.True(t, w.isSharded(), "precondition: the ring-gated branch of starting() must actually be exercised")
+
+	scheduler, nextCalls, updateCalls := newCountingScheduler(nil)
+	w.backendScheduler = scheduler
+
+	err = w.starting(ctx)
+	t.Cleanup(func() {
+		if w.subservices != nil {
+			_ = services.StopManagerAndAwaitStopped(context.Background(), w.subservices)
+		}
+	})
+	require.NoError(t, err, "starting() must unblock the service lifecycle even though the ring never reaches ACTIVE")
+
+	err = w.processJobs(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 0, *nextCalls, "the gRPC scheduler's Next must never be called for a Postgres-claimed job")
+	require.Equal(t, 0, *updateCalls, "the gRPC scheduler's UpdateJob must never be called for a Postgres-claimed job")
+
+	var status string
+	row := pool.QueryRow(ctx, `SELECT status FROM backend_jobs WHERE job_type = 'vi_backfill' AND tenant = $1`, tenant)
+	require.NoError(t, row.Scan(&status))
+	require.Equal(t, string(jobstore.StatusSucceeded), status)
+
+	entries, _, loadErr := registry.Load(ctx)
+	require.NoError(t, loadErr)
+	require.Len(t, entries, 1)
+	require.True(t, entries[0].Backfill.Done,
+		"the worker's real RunViBackfill call must have persisted Done=true to the real Postgres-backed registry, proving the job was genuinely claimed and executed while the ring was degraded")
+}
+
 // newTestPostgresPoolAndDSN mirrors newTestPostgresPool (backendworker_postgres_jobstore_test.go)
 // but also returns the raw DSN, needed here to configure a real *BackendWorker's own
 // cfg.Postgres (BackendWorker.New constructs its own separate pgxpool.Pool from the DSN;

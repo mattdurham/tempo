@@ -190,33 +190,33 @@ func (w *BackendWorker) starting(ctx context.Context) (err error) {
 		w.subservicesWatcher = services.NewFailureWatcher()
 		w.subservicesWatcher.WatchManager(w.subservices)
 
-		err := services.StartManagerAndAwaitHealthy(ctx, w.subservices)
-		if err != nil {
-			return fmt.Errorf("failed to start subservices: %w", err)
-		}
-
-		// Wait until the ring client detected this instance in the ACTIVE state.
-		level.Info(log.Logger).Log("msg", "waiting until backend-worker is ACTIVE in the ring")
-		ctxWithTimeout, cancel := context.WithTimeout(ctx, w.cfg.Ring.WaitActiveInstanceTimeout)
-		defer cancel()
-		if err := ring.WaitInstanceState(ctxWithTimeout, w.Ring, w.ringLifecycler.GetInstanceID(), ring.ACTIVE); err != nil {
-			return err
-		}
-		level.Info(log.Logger).Log("msg", "backend-worker is ACTIVE in the ring")
-
-		// In the event of a cluster cold start we may end up in a situation where each new backend-worker
-		// instance starts at a slightly different time and thus each one starts with a different state
-		// of the ring. It's better to just wait the ring stability for a short time.
-		if w.cfg.Ring.WaitStabilityMinDuration > 0 {
-			minWaiting := w.cfg.Ring.WaitStabilityMinDuration
-			maxWaiting := w.cfg.Ring.WaitStabilityMaxDuration
-
-			level.Info(log.Logger).Log("msg", "waiting until backend-worker ring topology is stable", "min_waiting", minWaiting.String(), "max_waiting", maxWaiting.String())
-			if err := ring.WaitRingStability(ctx, w.Ring, ringOp, minWaiting, maxWaiting); err != nil {
-				level.Warn(log.Logger).Log("msg", "backend-worker ring topology is not stable after the max waiting time, proceeding anyway")
+		if err := services.StartManagerAndAwaitHealthy(ctx, w.subservices); err != nil {
+			level.Warn(log.Logger).Log("msg", "backend-worker failed to start ring subservices, proceeding anyway", "err", err)
+		} else {
+			// Wait until the ring client detected this instance in the ACTIVE state.
+			level.Info(log.Logger).Log("msg", "waiting until backend-worker is ACTIVE in the ring")
+			ctxWithTimeout, cancel := context.WithTimeout(ctx, w.cfg.Ring.WaitActiveInstanceTimeout)
+			if err := ring.WaitInstanceState(ctxWithTimeout, w.Ring, w.ringLifecycler.GetInstanceID(), ring.ACTIVE); err != nil {
+				level.Warn(log.Logger).Log("msg", "backend-worker did not become ACTIVE in the ring, proceeding anyway", "err", err)
 			} else {
-				level.Info(log.Logger).Log("msg", "backend-worker ring topology is stable")
+				level.Info(log.Logger).Log("msg", "backend-worker is ACTIVE in the ring")
+
+				// In the event of a cluster cold start we may end up in a situation where each new backend-worker
+				// instance starts at a slightly different time and thus each one starts with a different state
+				// of the ring. It's better to just wait the ring stability for a short time.
+				if w.cfg.Ring.WaitStabilityMinDuration > 0 {
+					minWaiting := w.cfg.Ring.WaitStabilityMinDuration
+					maxWaiting := w.cfg.Ring.WaitStabilityMaxDuration
+
+					level.Info(log.Logger).Log("msg", "waiting until backend-worker ring topology is stable", "min_waiting", minWaiting.String(), "max_waiting", maxWaiting.String())
+					if err := ring.WaitRingStability(ctx, w.Ring, ringOp, minWaiting, maxWaiting); err != nil {
+						level.Warn(log.Logger).Log("msg", "backend-worker ring topology is not stable after the max waiting time, proceeding anyway")
+					} else {
+						level.Info(log.Logger).Log("msg", "backend-worker ring topology is stable")
+					}
+				}
 			}
+			cancel()
 		}
 	}
 
@@ -680,6 +680,20 @@ func (w *BackendWorker) compact(ctx context.Context, blockMetas []*backend.Block
 	return w.store.CompactWithConfig(ctx, blockMetas, tenantID, &w.cfg.Compactor, w, w)
 }
 
+// Owns implements tempodb.CompactorSharder. It IS live today (blockpack#516): w is passed
+// as a blocklist.JobSharder to store.EnablePolling (see starting() above), and
+// blocklist.Poller.tenantIndexBuilder calls sharder.Owns(job) on every poll cycle, for
+// every tenant, to decide whether this instance should (re)build that tenant's index.
+// (EnableCompaction's separate Owns-consuming blockSelector loop, tempodb/compactor.go,
+// is still never invoked for backend-worker -- backend-worker's own compaction dispatch
+// calls store.CompactWithConfig directly, which doesn't consult the sharder's Owns.)
+// Since starting() above no longer blocks service startup on ring health (#516), Owns can
+// be called here before the ring ever reaches ACTIVE. That's safe: Owns already fails
+// closed on ring errors (returns false, see below), and tenantIndexBuilder's own
+// PollFallback (defaults true in production, modules/storage/config.go) makes the poller
+// build+write the tenant index anyway when ownership can't be determined -- confirmed via
+// TestStarting_RingNeverReachesActive_ReturnsNilNotError's logs, which show successful
+// "writing tenant index" every poll cycle despite the ring never reaching ACTIVE.
 func (w *BackendWorker) Owns(hash string) bool {
 	if !w.isSharded() {
 		return true
