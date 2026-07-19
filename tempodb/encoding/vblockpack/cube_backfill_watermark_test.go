@@ -48,7 +48,7 @@ func TestRunCubeBackfill_NilS3Config_NoOpNoMetrics(t *testing.T) {
 	completedBefore := testutil.ToFloat64(metricCubeBackfillCompleted)
 	failedBefore := testutil.ToFloat64(metricCubeBackfillFailed)
 
-	err := RunCubeBackfill(context.Background(), entry, nil, nil, 0)
+	err := RunCubeBackfill(context.Background(), entry, nil, nil, math.MaxUint32, 0)
 	require.NoError(t, err)
 
 	assert.Equal(t, startedBefore, testutil.ToFloat64(metricCubeBackfillStarted), "nil s3cfg must be a no-op before metricCubeBackfillStarted")
@@ -81,7 +81,7 @@ func TestRunCubeBackfill_CtxAlreadyCancelled_ReturnsErrorWithoutIncrementingFail
 	completedBefore := testutil.ToFloat64(metricCubeBackfillCompleted)
 	failedBefore := testutil.ToFloat64(metricCubeBackfillFailed)
 
-	err := RunCubeBackfill(ctx, entry, s3cfg, pool, 0)
+	err := RunCubeBackfill(ctx, entry, s3cfg, pool, math.MaxUint32, 0)
 	require.Error(t, err)
 	require.True(t, errors.Is(err, context.Canceled), "err = %v, want context.Canceled", err)
 
@@ -111,4 +111,30 @@ func TestCubeBackfillWindowMinutes(t *testing.T) {
 			assert.Equal(t, tc.want, got)
 		})
 	}
+}
+
+// TestCurrentMinuteAnchor_UsesExistingL0Watermark pins issue #518's Correction 1
+// fix: cube_backfill_runner.go's Backfiller.Run computes
+// [currentMinute-1, currentMinute-WindowMinutes] -- every call site in this
+// codebase used to pass currentMinute=0 unconditionally, meaning every chained
+// job reprocessed the same "most recent WindowMinutes" slice relative to
+// wall-clock now and never made backward progress. currentMinuteAnchor resolves
+// the real resume point from the cube's own persisted L0 watermark instead.
+func TestCurrentMinuteAnchor_UsesExistingL0Watermark(t *testing.T) {
+	entry := blockpack.CubeRegistryEntry{
+		Watermarks: map[uint32]blockpack.CubeResolutionWatermark{
+			blockpack.CubeRollupL0: {MinMinute: 12345, MaxMinute: 12399},
+		},
+	}
+	assert.Equal(t, uint32(12345), currentMinuteAnchor(entry),
+		"must resume from the oldest minute already confirmed backfilled (MinMinute), not MaxMinute or MinMinute-1")
+}
+
+// TestCurrentMinuteAnchor_ZeroWhenNoWatermarkYet proves a cube with no L0
+// watermark yet (its first-ever backfill pass) still anchors to 0, which is
+// blockpack's own "use wall-clock now" zero-value convention (Backfiller.Run) --
+// preserving today's first-pass behavior exactly.
+func TestCurrentMinuteAnchor_ZeroWhenNoWatermarkYet(t *testing.T) {
+	entry := blockpack.CubeRegistryEntry{}
+	assert.Equal(t, uint32(0), currentMinuteAnchor(entry))
 }

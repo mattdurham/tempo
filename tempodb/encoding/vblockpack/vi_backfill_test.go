@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -69,7 +70,7 @@ func TestNewViBackfillDepsRaw_ConstructsGenericDeps(t *testing.T) {
 // metricViBackfillStarted.
 func TestRunViBackfill_ZeroValueDepsIsNoop(t *testing.T) {
 	before := testutil.ToFloat64(metricViBackfillStarted)
-	err := RunViBackfill(context.Background(), blockpack.Entry{Tenant: "t"}, RunViBackfillDeps{})
+	err := RunViBackfill(context.Background(), blockpack.Entry{Tenant: "t"}, RunViBackfillDeps{}, 0)
 	require.NoError(t, err)
 	assert.Equal(t, before, testutil.ToFloat64(metricViBackfillStarted),
 		"zero-value deps must not increment metricViBackfillStarted")
@@ -107,7 +108,7 @@ func TestRunViBackfill_UsesProvidedRegistry_NotFreshFromObjStore(t *testing.T) {
 		Registry: providedRegistry,
 	}
 
-	err := RunViBackfill(context.Background(), entry, deps)
+	err := RunViBackfill(context.Background(), entry, deps, 0)
 	require.NoError(t, err, "must use deps.Registry, not rebuild one from the stale ObjStore")
 
 	assert.Equal(t, 0, staleObjStore.putCalls, "the stale ObjStore must never be touched when Registry is provided")
@@ -173,11 +174,15 @@ func (p *fakeViPutter) Put(key string, data []byte) error {
 // fakeViBlockFetcher implements blockpack.BlockFetcher against an in-memory
 // list of (sourceRef, blockBytes), in the exact order given.
 type fakeViBlockFetcher struct {
-	refs   []string
-	blocks map[string][]byte
+	refs       []string
+	blocks     map[string][]byte
+	lastMinSec uint64
+	lastMaxSec uint64
 }
 
-func (f *fakeViBlockFetcher) ListBlocksInRange(_ context.Context, _ string, _, _ uint64) ([]string, error) {
+func (f *fakeViBlockFetcher) ListBlocksInRange(_ context.Context, _ string, minSec, maxSec uint64) ([]string, error) {
+	f.lastMinSec = minSec
+	f.lastMaxSec = maxSec
 	return f.refs, nil
 }
 
@@ -274,7 +279,7 @@ func TestRunViBackfillCore_CallsUpdateWatermarkOnEachProgress(t *testing.T) {
 
 	completedBefore := testutil.ToFloat64(metricViBackfillCompleted)
 
-	err := runViBackfillCore(context.Background(), entry, fetcher, registry, putter, "indexes")
+	err := runViBackfillCore(context.Background(), entry, fetcher, registry, putter, "indexes", math.MaxUint64)
 	require.NoError(t, err)
 
 	// One ConditionalPut for the initial seedTriggeredEntry call, plus one per
@@ -310,8 +315,28 @@ func TestRunViBackfillCore_PersistFailureAbortsRun(t *testing.T) {
 	failing := &alwaysConflictStore{inner: store}
 	failingRegistry := blockpack.NewRegistry(failing, entry.Tenant)
 
-	err := runViBackfillCore(context.Background(), entry, fetcher, failingRegistry, putter, "indexes")
+	err := runViBackfillCore(context.Background(), entry, fetcher, failingRegistry, putter, "indexes", math.MaxUint64)
 	require.Error(t, err)
+}
+
+// TestRunViBackfillCore_UsesEntryWatermarkAsAnchor pins issue #518's fix: a
+// chained continuation job must anchor its window to the column's
+// already-persisted watermark, not to wall-clock now -- otherwise every
+// chained job would reprocess the same "most recent WindowSeconds" slice
+// forever and never make backward progress into older history.
+func TestRunViBackfillCore_UsesEntryWatermarkAsAnchor(t *testing.T) {
+	store := newFakeViObjectStore()
+	entry := seedTriggeredEntry(t, store, "tenant-a", "span.custom.attr", "string")
+	entry.Backfill.WatermarkSec = 5000 // simulates resuming from a previously-persisted watermark
+
+	fetcher := &fakeViBlockFetcher{}
+	putter := newFakeViPutter()
+	registry := blockpack.NewRegistry(store, entry.Tenant)
+
+	err := runViBackfillCore(context.Background(), entry, fetcher, registry, putter, "indexes", 100)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(5000), fetcher.lastMaxSec, "maxSec must come from entry.Backfill.WatermarkSec, not now()")
+	assert.Equal(t, uint64(4900), fetcher.lastMinSec, "minSec must be WatermarkSec-windowSeconds")
 }
 
 type alwaysConflictStore struct {
@@ -334,7 +359,7 @@ func (s *alwaysConflictStore) ConditionalPut(context.Context, string, []byte, st
 func TestLaunchViBackfill_StartsGoroutine(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
-		launchViBackfill(blockpack.Entry{Tenant: "t", ColumnName: "span.x"}, RunViBackfillDeps{})
+		launchViBackfill(blockpack.Entry{Tenant: "t", ColumnName: "span.x"}, RunViBackfillDeps{}, 0)
 		close(done)
 	}()
 	select {

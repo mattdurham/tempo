@@ -2,6 +2,7 @@ package jobstore
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"testing"
@@ -29,6 +30,35 @@ func TestStore_InsertViBackfill_CreatesPendingRow(t *testing.T) {
 	}
 	if jobType != string(JobTypeViBackfill) {
 		t.Fatalf("expected job_type=vi_backfill, got %q", jobType)
+	}
+}
+
+// TestStore_InsertViBackfill_WindowSecondsRoundTrips pins issue #518's new
+// bounded-window field: it must survive the JSONB detail column round-trip
+// unchanged, since job-planner's chained continuation jobs rely on it.
+func TestStore_InsertViBackfill_WindowSecondsRoundTrips(t *testing.T) {
+	pool := newTestPostgresPool(t)
+	store := New(pool)
+	ctx := context.Background()
+
+	detail := ViBackfillDetail{ColumnHash: "h1", ColumnName: "span.name", ColumnType: "string", WindowSeconds: 21600}
+	if err := store.InsertViBackfill(ctx, "tenant-a", detail); err != nil {
+		t.Fatalf("InsertViBackfill: %v", err)
+	}
+
+	job, err := store.Claim(ctx, JobTypeViBackfill, "worker-1")
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if job == nil {
+		t.Fatal("expected a claimable job")
+	}
+	var got ViBackfillDetail
+	if err := json.Unmarshal(job.Detail, &got); err != nil {
+		t.Fatalf("unmarshal detail: %v", err)
+	}
+	if got.WindowSeconds != 21600 {
+		t.Fatalf("expected WindowSeconds=21600 to round-trip, got %d", got.WindowSeconds)
 	}
 }
 
@@ -475,6 +505,131 @@ func TestStore_Fail_NeverPermanentlyFails_RetriesIndefinitely(t *testing.T) {
 	}
 	if job == nil {
 		t.Fatalf("expected the job to still be reclaimable after %d failures, got nil", attempts)
+	}
+}
+
+// TestStore_RenewLease_ExtendsLeaseExpiresAt pins issue #520's core fix: a
+// claimed job's lease can be pushed forward by another 30 minutes from the
+// CURRENT now(), not just the original claim time -- proving RenewLease
+// actually does something, independent of the reclaim-prevention proof below.
+func TestStore_RenewLease_ExtendsLeaseExpiresAt(t *testing.T) {
+	pool := newTestPostgresPool(t)
+	store := New(pool)
+	ctx := context.Background()
+
+	if err := store.InsertViBackfill(ctx, "tenant-a", ViBackfillDetail{ColumnHash: "h1", ColumnType: "string"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	job, err := store.Claim(ctx, JobTypeViBackfill, "worker-1")
+	if err != nil || job == nil {
+		t.Fatalf("Claim: job=%+v err=%v", job, err)
+	}
+
+	// Rewind the original claim's lease so the renewed value is unambiguously
+	// attributable to RenewLease's own now()+30m, not the original claim's.
+	if _, err := pool.Exec(ctx, `UPDATE backend_jobs SET lease_expires_at = now() + interval '1 minute' WHERE id = $1`, job.ID); err != nil {
+		t.Fatalf("rewinding lease: %v", err)
+	}
+
+	before := time.Now()
+	if err := store.RenewLease(ctx, job.ID); err != nil {
+		t.Fatalf("RenewLease: %v", err)
+	}
+
+	var leaseExpiresAt time.Time
+	row := pool.QueryRow(ctx, `SELECT lease_expires_at FROM backend_jobs WHERE id = $1`, job.ID)
+	if err := row.Scan(&leaseExpiresAt); err != nil {
+		t.Fatalf("querying lease_expires_at: %v", err)
+	}
+	wantMin := before.Add(25 * time.Minute)
+	if leaseExpiresAt.Before(wantMin) {
+		t.Fatalf("expected lease_expires_at extended to ~now+30m (>= %v), got %v", wantMin, leaseExpiresAt)
+	}
+}
+
+// TestStore_RenewLease_NoopForTerminalJob proves the status IN ('claimed',
+// 'running') guard: renewing a job that has already reached a terminal state
+// must not touch its lease_expires_at -- renewal only ever runs concurrently
+// with active processing, so this is defense-in-depth against a benign race
+// between the renewal loop's last tick and Complete/Fail, not a condition
+// expected to matter in practice.
+func TestStore_RenewLease_NoopForTerminalJob(t *testing.T) {
+	pool := newTestPostgresPool(t)
+	store := New(pool)
+	ctx := context.Background()
+
+	if err := store.InsertViBackfill(ctx, "tenant-a", ViBackfillDetail{ColumnHash: "h1", ColumnType: "string"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	job, err := store.Claim(ctx, JobTypeViBackfill, "worker-1")
+	if err != nil || job == nil {
+		t.Fatalf("Claim: job=%+v err=%v", job, err)
+	}
+	if err := store.Complete(ctx, job.ID); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+
+	var before time.Time
+	row := pool.QueryRow(ctx, `SELECT lease_expires_at FROM backend_jobs WHERE id = $1`, job.ID)
+	if err := row.Scan(&before); err != nil {
+		t.Fatalf("querying lease_expires_at before renew: %v", err)
+	}
+
+	if err := store.RenewLease(ctx, job.ID); err != nil {
+		t.Fatalf("RenewLease: %v", err)
+	}
+
+	var after time.Time
+	row = pool.QueryRow(ctx, `SELECT lease_expires_at FROM backend_jobs WHERE id = $1`, job.ID)
+	if err := row.Scan(&after); err != nil {
+		t.Fatalf("querying lease_expires_at after renew: %v", err)
+	}
+	if !after.Equal(before) {
+		t.Fatalf("expected RenewLease to be a no-op for a terminal (succeeded) job, lease_expires_at changed from %v to %v", before, after)
+	}
+}
+
+// TestStore_RenewLease_PreventsReclaimPastOriginalLeaseWindow is issue #520's
+// core regression pin. Without renewal, a job whose original lease has
+// expired becomes reclaimable by a second worker while the first is still
+// actively processing it -- exactly what
+// TestStore_Claim_ExpiredLeaseOnClaimedRowIsReclaimable (above) already
+// proves happens today for that same simulated state. This test proves
+// RenewLease closes that gap: given the IDENTICAL simulated "past the
+// original lease window" state, calling RenewLease first makes the job NOT
+// reclaimable, because renewal sets a fresh lease_expires_at relative to the
+// CURRENT now(), independent of how stale the original claim's lease was.
+func TestStore_RenewLease_PreventsReclaimPastOriginalLeaseWindow(t *testing.T) {
+	pool := newTestPostgresPool(t)
+	store := New(pool)
+	ctx := context.Background()
+
+	if err := store.InsertViBackfill(ctx, "tenant-a", ViBackfillDetail{ColumnHash: "h1", ColumnType: "string"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	job, err := store.Claim(ctx, JobTypeViBackfill, "worker-1")
+	if err != nil || job == nil {
+		t.Fatalf("Claim: job=%+v err=%v", job, err)
+	}
+
+	// Simulate the original 30-minute lease having already expired -- the exact
+	// state that (without renewal) makes a job reclaimable.
+	if _, err := pool.Exec(ctx, `
+		UPDATE backend_jobs SET claimed_at = now() - interval '1 hour', lease_expires_at = now() - interval '5 minutes'
+		WHERE id = $1`, job.ID); err != nil {
+		t.Fatalf("simulating expired original lease: %v", err)
+	}
+
+	if err := store.RenewLease(ctx, job.ID); err != nil {
+		t.Fatalf("RenewLease: %v", err)
+	}
+
+	reclaimed, err := store.Claim(ctx, JobTypeViBackfill, "worker-2")
+	if err != nil {
+		t.Fatalf("Claim (worker-2): %v", err)
+	}
+	if reclaimed != nil {
+		t.Fatalf("expected the job to NOT be reclaimable after RenewLease, but worker-2 claimed job %s", reclaimed.ID)
 	}
 }
 

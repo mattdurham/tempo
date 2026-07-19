@@ -69,6 +69,20 @@ func TestConfig_DedicatedColumnsEnabled_ExplicitFalsePreserved(t *testing.T) {
 	assert.False(t, cfg.DedicatedColumnsEnabled)
 }
 
+// TestJobPlannerConfig_Defaults pins issue #518's job-planner poll-loop config
+// defaults (60s poll interval, 6h VI window, 24h cube window) -- applied
+// transitively via BlockpackConfig.applyDefaults(), mirroring ViUsageConfig's
+// applyDefaults() call convention above.
+func TestJobPlannerConfig_Defaults(t *testing.T) {
+	cfg := BlockpackConfig{JobPlanner: JobPlannerConfig{Enabled: true}}
+	cfg.applyDefaults()
+
+	assert.True(t, cfg.JobPlanner.Enabled)
+	assert.Equal(t, 60*time.Second, cfg.JobPlanner.PollInterval)
+	assert.Equal(t, uint64(6*3600), cfg.JobPlanner.ViWindowSeconds)
+	assert.Equal(t, uint32(1440), cfg.JobPlanner.CubeWindowMinutes)
+}
+
 func TestBlockpackConfigValidation(t *testing.T) {
 	tests := []struct {
 		name        string

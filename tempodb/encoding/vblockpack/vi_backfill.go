@@ -201,16 +201,19 @@ func runViBackfillCore(
 	registry *blockpack.Registry,
 	putter blockpack.ObjectPutter,
 	indexPrefix string,
+	windowSeconds uint64,
 ) error {
 	eng := blockpack.NewBackfillEngine(entry, blockpack.BackfillConfig{
 		Store:       putter,
 		Fetcher:     fetcher,
 		IndexPrefix: indexPrefix,
-		// WindowSeconds: full history, matching the cube backfill ruling (2026-07-11) --
-		// math.MaxUint64 trivially exceeds any real current unix time, so Run's minSec
-		// always resolves to 0. Bounded only by how far back real blocks exist, not by
-		// an artificial cap.
-		WindowSeconds: math.MaxUint64,
+		// AnchorSec resumes a chained backfill (issue #518) from the column's
+		// already-persisted watermark instead of wall-clock now -- zero for a
+		// never-backfilled column (WatermarkSec is genuinely 0), which
+		// BackfillConfig's own zero-value fallback already treats as "anchor to
+		// now," exactly the correct behavior for a first pass.
+		AnchorSec:     entry.Backfill.WatermarkSec,
+		WindowSeconds: windowSeconds,
 	})
 	runErr := eng.Run(ctx, func(prog blockpack.BackfillProgress) error {
 		if uwErr := registry.UpdateWatermark(
@@ -382,7 +385,10 @@ func NewViBackfillDepsWithPgRegistry(deps RunViBackfillDeps, pool *pgxpool.Pool,
 // the new home for RunViBackfill's former "s3cfg == nil" early return. Used
 // by the backend-worker job executor (B2's JOB_TYPE_VI_BACKFILL dispatch
 // case) and launchViBackfill's async wrapper below.
-func RunViBackfill(ctx context.Context, entry blockpack.Entry, deps RunViBackfillDeps) error {
+// windowSeconds bounds how far back from entry's watermark this run
+// processes; zero means unbounded (full remaining history), matching
+// vi_usage_hook.go's reactive first-trigger contract.
+func RunViBackfill(ctx context.Context, entry blockpack.Entry, deps RunViBackfillDeps, windowSeconds uint64) error {
 	if deps.Fetcher == nil || deps.ObjStore == nil || deps.Putter == nil {
 		return nil
 	}
@@ -394,8 +400,11 @@ func RunViBackfill(ctx context.Context, entry blockpack.Entry, deps RunViBackfil
 		// always builds the blob-backed registry regardless.
 		registry = blockpack.NewRegistry(deps.ObjStore, entry.Tenant)
 	}
+	if windowSeconds == 0 {
+		windowSeconds = math.MaxUint64
+	}
 	metricViBackfillStarted.Inc()
-	err := runViBackfillCore(ctx, entry, deps.Fetcher, registry, deps.Putter, defaultValueIndexPref)
+	err := runViBackfillCore(ctx, entry, deps.Fetcher, registry, deps.Putter, defaultValueIndexPref, windowSeconds)
 	if err != nil && !isContextErr(ctx, err) {
 		metricViBackfillFailed.Inc()
 		level.Warn(util_log.Logger).Log(
@@ -409,13 +418,13 @@ func RunViBackfill(ctx context.Context, entry blockpack.Entry, deps RunViBackfil
 // launchViBackfill starts a background goroutine that runs entry's column
 // backfill (the async, querier-triggered path -- B1's hook calls this when
 // RecordUseAndMaybeTrigger returns ShouldBackfill=true).
-func launchViBackfill(entry blockpack.Entry, deps RunViBackfillDeps) {
+func launchViBackfill(entry blockpack.Entry, deps RunViBackfillDeps, windowSeconds uint64) {
 	go func() {
 		level.Info(util_log.Logger).Log(
 			"msg", "vblockpack: VI backfill started",
 			"tenant", entry.Tenant, "column", entry.ColumnName,
 		)
-		_ = RunViBackfill(context.Background(), entry, deps)
+		_ = RunViBackfill(context.Background(), entry, deps, windowSeconds)
 	}()
 }
 

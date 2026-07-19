@@ -202,6 +202,11 @@ func ConfigureViUsage(
 					ColumnHash: entry.ColumnHash,
 					ColumnName: entry.ColumnName,
 					ColumnType: entry.ColumnType,
+					// WindowSeconds: 0 -- this reactive first-trigger path is
+					// unbounded (issue #518 decision (c): the very first backfill of a
+					// column always does everything; job-planner's chained
+					// continuation jobs are the ones that pass a real bound).
+					WindowSeconds: 0,
 				}); ierr != nil {
 					level.Warn(util_log.Logger).Log(
 						"msg", "vblockpack: failed to insert durable vi_backfill job",
@@ -221,7 +226,10 @@ func ConfigureViUsage(
 			if pgPool != nil {
 				deps = NewViBackfillDepsCatalogOverride(deps, pgPool, entry, backend.NewReader(rawR))
 			}
-			launchViBackfill(entry, deps)
+			// windowSeconds: 0 -- unbounded, matching the InsertViBackfill call
+			// above (this is the reactive first-trigger path, issue #518
+			// decision (c)).
+			launchViBackfill(entry, deps, 0)
 		},
 	}
 	ConfigureViUsageRecorder(rec)

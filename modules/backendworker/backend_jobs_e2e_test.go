@@ -346,6 +346,88 @@ func TestE2E_ViBackfill_FailureThenReclaimSucceeds(t *testing.T) {
 	require.True(t, entries[0].Backfill.Done)
 }
 
+// TestE2E_ViBackfill_ChainedJobAnchorsToPersistedWatermarkNotNow is issue #518's
+// real end-to-end proof of Correction 2's fix: a chained continuation job (the
+// shape job-planner will enqueue) must anchor its window to the column's
+// already-persisted watermark, not wall-clock now. Before this fix,
+// processViBackfillJobPostgres built its blockpack.Entry fresh from job.Detail's
+// column-identity fields alone, leaving Backfill (and therefore AnchorSec) at its
+// zero value on every real dispatch -- silently defeating the whole feature even
+// though unit-level tests that construct the entry directly (bypassing the
+// worker's real load step) would still pass.
+//
+// Simulates "job-planner already chained once, more history remains" by directly
+// persisting a non-zero watermark via registry.UpdateWatermark(done=false) --
+// exactly the state a prior bounded-window job leaves behind -- then dispatches a
+// SECOND bounded-window (3600s) job through the real worker. The bucket has zero
+// real blocks for this tenant, so the run completes immediately (a real, valid
+// "nothing left in this window" outcome, same as every sibling test's empty-bucket
+// case) -- what matters is WHERE the resulting watermark lands: WatermarkSec-3600
+// (anchored, correct) versus something within 3600 seconds of the current wall
+// clock (unanchored, the bug), values that differ by decades and can never be
+// confused for each other.
+//
+// #519 follow-up: Done is asserted FALSE here, not true -- resolved minSec
+// (seededWatermarkSec-windowSeconds = 1400) is nonzero, so under #519's corrected
+// contract (Done requires minSec==0, not just "this call's own listing was
+// exhausted") this bounded window correctly does NOT claim full historical
+// coverage. This is the exact property #519 fixed: before it, this assertion was
+// (incorrectly) True, which would have made CoversRange trust a column as fully
+// covered after just one small chained window.
+func TestE2E_ViBackfill_ChainedJobAnchorsToPersistedWatermarkNotNow(t *testing.T) {
+	ctx := context.Background()
+	pool, dsn := newTestPostgresPoolAndDSN(t)
+	s3cfg := newFakeS3Config(t, "e2e-worker-vi-anchor-bucket")
+
+	tenant := "e2e-worker-vi-anchor-tenant"
+	registry := blockpack.NewPgViUsageRegistry(pool, tenant)
+	triggerResult, err := blockpack.RecordUseAndMaybeTrigger(
+		ctx, registry, tenant, "span.custom.attr", "string", time.Now(),
+		blockpack.TriggerConfig{LeaseTTLSeconds: 1800},
+	)
+	require.NoError(t, err)
+	require.True(t, triggerResult.ShouldBackfill, "first-ever use must trigger immediately (R4)")
+
+	// Simulate a prior chained job's partial progress: watermark advanced to 5000,
+	// not yet Done -- exactly the state job-planner's poll loop would find and
+	// continue from.
+	const seededWatermarkSec = 5000
+	require.NoError(t, registry.UpdateWatermark(
+		ctx, tenant, triggerResult.Entry.ColumnHash, triggerResult.Entry.ColumnType,
+		seededWatermarkSec, 0, seededWatermarkSec, false,
+	))
+
+	const windowSeconds = 3600
+	store := jobstore.New(pool)
+	require.NoError(t, store.InsertViBackfill(ctx, tenant, jobstore.ViBackfillDetail{
+		ColumnHash: triggerResult.Entry.ColumnHash, ColumnName: triggerResult.Entry.ColumnName,
+		ColumnType: triggerResult.Entry.ColumnType, WindowSeconds: windowSeconds,
+	}))
+
+	limitCfg := overridesConfigForTest(t)
+	workerCfg, schedulerClientCfg, overridesSvc, _, workerStore := setupDependencies(ctx, t, limitCfg)
+	workerCfg.Postgres = &postgres.Config{DSN: dsn}
+
+	w, err := New(workerCfg, schedulerClientCfg, s3cfg, workerStore, overridesSvc, nil)
+	require.NoError(t, err)
+
+	require.NoError(t, w.processJobs(ctx))
+
+	var status string
+	row := pool.QueryRow(ctx, `SELECT status FROM backend_jobs WHERE job_type = 'vi_backfill' AND tenant = $1`, tenant)
+	require.NoError(t, row.Scan(&status))
+	require.Equal(t, string(jobstore.StatusSucceeded), status)
+
+	entries, _, loadErr := registry.Load(ctx)
+	require.NoError(t, loadErr)
+	require.Len(t, entries, 1)
+	require.False(t, entries[0].Backfill.Done,
+		"a bounded window with nonzero resolved minSec must NOT claim Done (#519) -- more history may exist below WatermarkSec")
+	require.EqualValues(t, seededWatermarkSec-windowSeconds, entries[0].Backfill.WatermarkSec,
+		"the resulting watermark must be seededWatermarkSec-windowSeconds (anchored to the persisted watermark), "+
+			"not anywhere near now()-windowSeconds (which would be off by decades) -- this is Correction 2's exact regression")
+}
+
 // TestE2E_CubeBackfill_WorkerClaimsAndExecutesWithoutGRPC is #181 Phase 6.2 steps 2-3.
 // RunCubeBackfill resolves WindowMinutes from the tenant's effective retention, which defaults to math.MaxUint32 when unset (as it is in this test's Config)
 // (confirmed: #181 Phase 4's own backendworker_postgres_jobstore_test.go documented that
@@ -438,6 +520,90 @@ func TestE2E_CubeBackfill_BoundedRetention_ReachesFullCompletion(t *testing.T) {
 	// the resolved floor actually proves THIS SPECIFIC window size was the one used.
 	require.Equal(t, wantFloor, wm.MinMinute,
 		"a genuinely COMPLETE backfill's watermark must land exactly on the resolved retention floor, not merely reach or pass it")
+}
+
+// TestE2E_CubeBackfill_WindowMinutesIsLoadBearingAndChainsFromExistingWatermark is
+// issue #518's single highest-value regression test (plan.md Part 2.5): before this
+// fix, jobstore.CubeBackfillDetail.WindowMinutes was written by cubequerypath.go's
+// job-creation call sites but never read by processCubeBackfillJobPostgres --
+// RunCubeBackfill resolved its window from retentionMinutes alone. Separately (Part
+// 2.4/Correction 1), every call site anchored Backfiller.Run to currentMinute=0
+// (wall-clock now) regardless of any existing watermark, so a chained job would
+// always reprocess the same "most recent WindowMinutes" slice and never make
+// backward progress.
+//
+// This test seeds a cube entry with an EXISTING, non-zero L0 watermark (simulating a
+// backfill that already completed one window), inserts a job with a small
+// WindowMinutes (5) and leaves tenant retention unset (unbounded ceiling, so retention
+// alone could never explain a narrow result), and asserts the resulting watermark
+// lands exactly `WindowMinutes` older than the pre-existing watermark -- proving BOTH
+// that WindowMinutes is now genuinely load-bearing (not silently ignored) AND that the
+// next window resumed from the existing watermark instead of wall-clock now (genuine
+// backward progress, pinning Correction 1).
+func TestE2E_CubeBackfill_WindowMinutesIsLoadBearingAndChainsFromExistingWatermark(t *testing.T) {
+	ctx := context.Background()
+	pool, dsn := newTestPostgresPoolAndDSN(t)
+	s3cfg := newFakeS3Config(t, "e2e-worker-cube-chain-bucket")
+
+	tenant := "e2e-worker-cube-chain-tenant"
+	entry := blockpack.CubeRegistryEntry{
+		CubeID:     "e2e-cube-chain-1",
+		Tenant:     tenant,
+		Dimensions: []string{"resource.service.name"},
+		AggAttrs:   []string{blockpack.CubeDurationColumn},
+		Resolution: 1,
+	}
+	cubeRegistry := blockpack.NewPgCubeRegistry(pool, tenant)
+	require.NoError(t, cubeRegistry.Add(ctx, entry))
+
+	// Seed an existing L0 watermark far in the past, decoupled from wall-clock now, so
+	// the resulting window's placement can only be explained by resuming from THIS
+	// value, not by "now" or by any retention-ceiling coincidence.
+	const existingMinMinute = uint32(1_000_000)
+	const jobWindowMinutes = uint32(5)
+	require.NoError(t, cubeRegistry.UpdateWatermarks(
+		ctx, entry.CubeID, blockpack.CubeRollupL0, existingMinMinute, existingMinMinute+50,
+	))
+
+	store := jobstore.New(pool)
+	require.NoError(t, store.InsertCubeBackfill(ctx, tenant, jobstore.CubeBackfillDetail{
+		CubeID: entry.CubeID, WindowMinutes: jobWindowMinutes,
+	}))
+
+	limitCfg := overridesConfigForTest(t)
+	workerCfg, schedulerClientCfg, overridesSvc, _, workerStore := setupDependencies(ctx, t, limitCfg)
+	workerCfg.Postgres = &postgres.Config{DSN: dsn}
+	// Deliberately leave workerCfg.Compactor.BlockRetention unset (0 -> unbounded
+	// ceiling, math.MaxUint32): if the observed result were narrow only because of
+	// retention, this test would prove nothing about WindowMinutes actually being read.
+
+	w, err := New(workerCfg, schedulerClientCfg, s3cfg, workerStore, overridesSvc, nil)
+	require.NoError(t, err)
+	require.NotNil(t, w.jobStore)
+
+	scheduler, nextCalls, _ := newCountingScheduler(nil)
+	w.backendScheduler = scheduler
+
+	boundedCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	err = w.processJobs(boundedCtx)
+	require.NoError(t, err, "a small, resolvable job window must let the backfill genuinely finish, not time out")
+	require.Equal(t, 0, *nextCalls, "the gRPC scheduler's Next must never be called for a Postgres-claimed job")
+
+	var status string
+	row := pool.QueryRow(ctx, `SELECT status FROM backend_jobs WHERE job_type = 'cube_backfill' AND tenant = $1`, tenant)
+	require.NoError(t, row.Scan(&status))
+	require.Equal(t, string(jobstore.StatusSucceeded), status)
+
+	entries, _, loadErr := cubeRegistry.Load(ctx)
+	require.NoError(t, loadErr)
+	require.Len(t, entries, 1)
+	wm, ok := entries[0].Watermarks[blockpack.CubeRollupL0]
+	require.True(t, ok)
+	require.Equal(t, existingMinMinute-jobWindowMinutes, wm.MinMinute,
+		"the chained job's window must resume from the existing watermark (currentMinuteAnchor) and be bounded by the job's own WindowMinutes, not retention or wall-clock now")
+	require.Less(t, wm.MinMinute, existingMinMinute,
+		"the watermark must have made genuine backward progress, not reprocessed the same already-covered slice")
 }
 
 // overridesConfigWithPerTenantBlockRetention writes a real per-tenant runtime-config-override

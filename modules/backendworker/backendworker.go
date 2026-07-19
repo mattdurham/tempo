@@ -55,7 +55,21 @@ const (
 	// for a single-row UPDATE/transaction against Postgres while still
 	// bounding how long a worker can block on a reporting call gone bad.
 	postgresJobReportTimeout = 10 * time.Second
+
+	// leaseRenewTimeout bounds each individual renewLeasePeriodically tick's
+	// Store.RenewLease call, mirroring postgresJobReportTimeout's own "fresh,
+	// short-lived context" reasoning (issue #520): a renewal call must not be
+	// tied to the job's own (possibly long-running or near-deadline) ctx.
+	leaseRenewTimeout = 10 * time.Second
 )
+
+// leaseRenewInterval is how often dispatchPostgresJob's renewal loop extends a
+// claimed job's lease while it's being processed (issue #520). A package-level
+// var, not a const, so tests can shrink it well below the 30-minute lease TTL
+// (jobstore.claimJobSQL) without a real 30-minute wait. 10 minutes leaves ample
+// margin in production: even a single missed tick still has 20 minutes of
+// slack before the lease actually expires.
+var leaseRenewInterval = 10 * time.Minute
 
 var ringOp = ring.NewOp([]ring.InstanceState{ring.ACTIVE}, nil)
 
@@ -356,6 +370,18 @@ func (w *BackendWorker) tryClaimPostgresJob(ctx context.Context) (*jobstore.Job,
 // claimed jobs, since the scheduler was never the one that handed the job
 // out in this branch.
 func (w *BackendWorker) dispatchPostgresJob(ctx context.Context, job *jobstore.Job) error {
+	// Issue #520: renew job.ID's lease every leaseRenewInterval for as long as
+	// this function is actively processing it, so a job genuinely running
+	// longer than the 30-minute lease TTL is never double-claimed by a second
+	// worker. renewCtx is derived from ctx (not context.Background()) so the
+	// loop also stops if the job's own ctx is canceled/expires independently
+	// of this function returning. defer stopRenew() covers every exit path --
+	// normal return, an error return, and a panic unwinding through this frame
+	// -- so the goroutine below is never leaked running past this call.
+	renewCtx, stopRenew := context.WithCancel(ctx)
+	defer stopRenew()
+	go w.renewLeasePeriodically(renewCtx, job.ID)
+
 	var err error
 	switch job.Type {
 	case jobstore.JobTypeViBackfill:
@@ -368,6 +394,32 @@ func (w *BackendWorker) dispatchPostgresJob(ctx context.Context, job *jobstore.J
 	return w.reportPostgresJobOutcome(job.ID, err)
 }
 
+// renewLeasePeriodically extends jobID's lease every leaseRenewInterval until
+// ctx is done (issue #520). Each renewal call runs on its own short-lived,
+// fresh context (leaseRenewTimeout), not ctx itself -- mirrors
+// reportPostgresJobOutcome's identical "fresh context" reasoning, so a ctx
+// that's already near its own deadline doesn't also starve the renewal call
+// meant to buy the job more time. A failed renewal is logged and NOT
+// otherwise retried before the next scheduled tick: a single missed tick
+// still leaves ample margin (30-minute lease vs 10-minute interval) before
+// the lease could actually expire.
+func (w *BackendWorker) renewLeasePeriodically(ctx context.Context, jobID string) {
+	ticker := time.NewTicker(leaseRenewInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			renewCtx, cancel := context.WithTimeout(context.Background(), leaseRenewTimeout)
+			if err := w.jobStore.RenewLease(renewCtx, jobID); err != nil {
+				level.Warn(log.Logger).Log("msg", "failed to renew backend_jobs lease", "job_id", jobID, "err", err)
+			}
+			cancel()
+		}
+	}
+}
+
 // reportPostgresJobOutcome reports a Postgres-claimed job's execution result
 // directly to w.jobStore (Complete on success, Fail-with-retry on error) --
 // never to w.backendScheduler.UpdateJob, since the scheduler never handed
@@ -378,6 +430,12 @@ func (w *BackendWorker) dispatchPostgresJob(ctx context.Context, job *jobstore.J
 // (2026-07-14 fix): a job that failed because ITS OWN ctx's deadline was
 // exceeded must still be able to successfully record that failure, which is
 // impossible if the reporting call reuses that same already-expired ctx.
+//
+// Issue #518: this function's Complete/Fail-only shape is intentional and
+// unchanged -- it never enqueued a chained continuation job, before or after
+// #518. Chain-enqueue responsibility belongs entirely to the new job-planner
+// component's own poll loop, which decides independently (by re-reading
+// viusage_entries/cube_entries) whether more history remains to backfill.
 func (w *BackendWorker) reportPostgresJobOutcome(jobID string, jobErr error) error {
 	reportCtx, cancel := context.WithTimeout(context.Background(), postgresJobReportTimeout)
 	defer cancel()
@@ -430,11 +488,47 @@ func (w *BackendWorker) processViBackfillJobPostgres(ctx context.Context, job *j
 	// own doc comment for the full history).
 	deps = vblockpack.NewViBackfillDepsWithPgRegistry(deps, w.pgPool, job.Tenant)
 
-	if err := vblockpack.RunViBackfill(ctx, entry, deps); err != nil {
+	// #518: entry above is built fresh from job.Detail's column-identity fields only,
+	// so its Backfill (in particular WatermarkSec, the new AnchorSec source) is always
+	// the zero value -- load the REAL, already-persisted entry so a chained
+	// continuation job anchors to where the last one left off instead of silently
+	// falling back to "anchor to now" every time, exactly the bug this whole feature
+	// exists to fix. Mirrors processCubeBackfillJobPostgres's own blockpack.LoadCubeEntry
+	// call below, which already does this correctly for cube_backfill.
+	if deps.Registry != nil {
+		loaded, ok, loadErr := loadViUsageEntry(ctx, deps.Registry, entry.ColumnHash, entry.ColumnType)
+		if loadErr != nil {
+			return fmt.Errorf("vi backfill: load entry: %w", loadErr)
+		}
+		if ok {
+			entry.Backfill = loaded.Backfill
+		}
+	}
+
+	if err := vblockpack.RunViBackfill(ctx, entry, deps, detail.WindowSeconds); err != nil {
 		return fmt.Errorf("vi backfill failed: %w", err)
 	}
 
 	return nil
+}
+
+// loadViUsageEntry finds the entry matching (colHash, colType) in registry's own
+// tenant (a *blockpack.Registry is bound to exactly one tenant at construction), or
+// (zero-value, false, nil) if no such entry exists yet -- a safe, conservative
+// fallback (AnchorSec stays 0, i.e. "anchor to now") rather than a hard failure,
+// since a genuinely first-ever backfill for a column is expected to have no entry
+// yet the very first time this runs.
+func loadViUsageEntry(ctx context.Context, registry *blockpack.Registry, colHash, colType string) (blockpack.Entry, bool, error) {
+	entries, _, err := registry.Load(ctx)
+	if err != nil {
+		return blockpack.Entry{}, false, err
+	}
+	for _, e := range entries {
+		if e.ColumnHash == colHash && e.ColumnType == colType {
+			return e, true, nil
+		}
+	}
+	return blockpack.Entry{}, false, nil
 }
 
 // processCubeBackfillJobPostgres mirrors processViBackfillJobPostgres's shape
@@ -486,7 +580,12 @@ func (w *BackendWorker) processCubeBackfillJobPostgres(ctx context.Context, job 
 	retentionMinutes := effectiveBlockRetentionMinutes(w.cfg.Compactor.BlockRetention, w.BlockRetentionForTenant(job.Tenant))
 
 	// Run backfill synchronously (the worker goroutine is already async).
-	if err := vblockpack.RunCubeBackfill(ctx, entry, w.s3Cfg, w.pgPool, retentionMinutes); err != nil {
+	// detail.WindowMinutes is the per-job bound (job-planner's chained continuation
+	// jobs, or math.MaxUint32 for the reactive trigger's first job -- cubequerypath.go's
+	// existing literal, unchanged); retentionMinutes remains an outer ceiling a job's
+	// window can never exceed, regardless of what WindowMinutes requests (issue #518,
+	// Correction 1: WindowMinutes was previously write-only dead JSONB).
+	if err := vblockpack.RunCubeBackfill(ctx, entry, w.s3Cfg, w.pgPool, detail.WindowMinutes, retentionMinutes); err != nil {
 		return fmt.Errorf("cube backfill failed: %w", err)
 	}
 

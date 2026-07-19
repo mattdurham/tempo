@@ -84,7 +84,7 @@ func newBackfillVIStore(client *minio.Client, bucket string) valueIndexStore {
 // compactor's configured default).
 func RunCubeBackfill(
 	ctx context.Context, entry blockpack.CubeRegistryEntry, s3cfg *s3backend.Config, pgPool *pgxpool.Pool,
-	retentionMinutes uint32,
+	jobWindowMinutes, retentionMinutes uint32,
 ) error {
 	if s3cfg == nil {
 		return nil
@@ -98,10 +98,10 @@ func RunCubeBackfill(
 	store := &s3ObjectPutter{client: client, bucket: s3cfg.Bucket}
 	cfg := blockpack.CubeBackfillConfig{
 		Workers:       4,
-		WindowMinutes: cubeBackfillWindowMinutes(retentionMinutes),
+		WindowMinutes: min(jobWindowMinutes, cubeBackfillWindowMinutes(retentionMinutes)),
 	}
 	metricCubeBackfillStarted.Inc()
-	err = blockpack.RunCubeBackfill(ctx, entry, viStore, store, pgPool, cfg, 0, defaultValueIndexPref)
+	err = blockpack.RunCubeBackfill(ctx, entry, viStore, store, pgPool, cfg, currentMinuteAnchor(entry), defaultValueIndexPref)
 	if err != nil {
 		// A ctx cancellation/deadline is the caller's own decision, not a genuine backfill
 		// failure -- mirrors this function's pre-#508 posture of not counting that case as
@@ -130,4 +130,22 @@ func cubeBackfillWindowMinutes(retentionMinutes uint32) uint32 {
 		return math.MaxUint32
 	}
 	return retentionMinutes
+}
+
+// currentMinuteAnchor resolves the resume point for a chained cube backfill (issue
+// #518, Correction 1): the oldest minute already confirmed backfilled
+// (Watermarks[CubeRollupL0].MinMinute), or 0 (meaning "anchor to wall-clock now",
+// blockpack's own zero-value convention, cube_backfill_runner.go/backfill.go) for a
+// cube with no L0 watermark yet -- i.e. its first backfill pass.
+//
+// Passing wm.MinMinute directly (not wm.MinMinute-1) is deliberate: Backfiller.Run's
+// window is [currentMinute-1, currentMinute-WindowMinutes], so the NEXT window ends
+// exactly at wm.MinMinute-1, one minute older than the last confirmed minute, with no
+// gap and no redundant reprocessing of an already-covered minute.
+func currentMinuteAnchor(entry blockpack.CubeRegistryEntry) uint32 {
+	wm, ok := entry.Watermarks[blockpack.CubeRollupL0]
+	if !ok {
+		return 0
+	}
+	return wm.MinMinute
 }

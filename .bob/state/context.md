@@ -5,65 +5,65 @@ INVARIANT (blockpack Reader lifetime — foundational to the whole cache archite
 
 > id: 0e1f00d5-b106-46b3-a479-e1e8425ff135
 
+INVARIANT (blockpack lazy-closure cache safety — load-bearing for NOTE-340): a deferred-decode closure may safely CAPTURE AND RETAIN a fetched blob ONLY because every cache tier returns a freshly-allocated caller-owned buffer, never a pooled/shared one. Verified: memcache.go…
+
+> id: 0777dda6-2770-46b7-875d-42a7a6370d5f
+
 INVARIANT (blockpack rw.DataType controls cache eviction priority, NOT just labeling): every Provider.ReadAt / Reader.readRange call passes an rw.DataType, and SharedLRUCache.dataTypeTier maps it to one of 4 eviction tiers (0=hardest to evict … 3=evicted first). Mapping:…
 
 > id: 2445ef14-fa7e-499a-b599-2fd229f69b6d
+
+**Profile first, then restructure—eliminate allocations at their source rather than optimizing their cost.**
+
+> id: 7357b006-9a22-4566-9ee2-3d373f4dc15b
 
 INVARIANT: blockpack reader WantAll() eagerly decodes EVERY column in a block and causes 300MB+ memory spikes per block on the query path — use WantOnly(cols) for query-driven paths (lazy zero-decode for unreferenced columns). WantAll() is reserved for genuinely all-column…
 
 > id: ce1757f9-7f77-4d0f-8d58-e736f360d3dd
 
-**Decompose monolithic problems into independent, swappable optimization layers with graceful fallbacks rather than attempting comprehensive rewrites.**
-
-> id: f2d25742-7a08-4e16-9c10-882565e569b3
-
-**"Defer observable side effects until explicitly requested; keep hot paths unconditionally fast."**
-
-> id: da287611-033b-4f90-81b8-09af528525de
-
 
 ## Relevant Techniques
-Predicate pushdown / index pre-filter pattern: when an index scan has a 'predicate kind X not supported here, fall back to full scan' branch, measure the fallback cost before micro-optimizing it. The fallback often re-fetches and re-decodes the entire wide row group/block for…
+**Core Competency**: Efficiently orchestrating hierarchical, multi-level data compaction across distributed workers while maintaining predictable performance and reliable block consolidation ratios.
 
-> id: c4d80eda-d605-4991-b675-387933d4fce2
+> id: e87570cf-3e5c-4646-b725-cc41d9511d0b
 
-TECHNIQUE: before deleting a 'redundant' dual-storage column on the strength of 'there's already a fallback', audit what EACH fallback actually costs — a fallback can be O(log N) on one read path and O(all_rows whole-file decode) on another. In blockpack a by-VALUE-sorted…
+**Core Pattern**: Create and maintain project-specific state files (`.bob/state/` directories) as a single source of truth for context, planning, and discovery across multiple concurrent worktrees and projects.
 
-> id: aff4d73c-a7cf-4dee-85fd-1f62b678c62d
+> id: 22fc3e10-d562-4e5e-9e05-5b1ca40293d9
 
-TECHNIQUE (the 'return nil cascades to full fallback' trap): in a layered query-pushdown pre-filter, a leaf evaluator that returns 'nil/unevaluable' for an UNSUPPORTED predicate shape often does NOT degrade gracefully — it can propagate all the way up (leaf nil -> node…
+**Core Competency:** Design and operate multi-worker, multi-level block compaction systems that efficiently consolidate fragmented data into optimized storage while maintaining predictable performance at scale.
 
-> id: 4d46a49d-e00f-43b3-8e19-227272a94210
+> id: 954ba452-17d0-4385-acc9-583f5b8ebca7
 
-TECHNIQUE: in a paged columnar store, an equality predicate on a SORTED column is a degenerate range [target,target] — reuse the existing min/max page-pruned range scanner verbatim instead of writing an equality-specific path. Min/max page-skip is exact for sorted data (a page…
+**Core Pattern:** Managing work artifacts (tasks, outputs, memory) distributed across persistent storage (`~/.claude/`), temporary execution directories (`/tmp/`), and multiple project contexts simultaneously.
 
-> id: 48b220a6-ad9d-43cc-bfe7-a2504c871ad4
+> id: 54b045da-43fb-4dfd-aadf-c88071cb86bf
 
-TECHNIQUE: when converting an 'index is a hint, always safe to fall back' contract into an 'index is authoritative' one, audit every ok=false / fallback return and classify each as CORRECTNESS ('the index genuinely cannot answer' — keep, document as an explicit exception) vs…
+**Core pattern**: These memories show repeated instances of initially misdiagnosing performance issues because observed metrics were obscured by intermediate system behavior—then correctly identifying the true bottleneck only after separating measurement noise from root cause.
 
-> id: 133c974e-2cd0-46de-a882-136d2cd48175
+> id: ac12db7d-3dab-4479-8b8b-14d7b91fe40f
 
 
 ## Current Project Context
-The architecture implements a tiered query execution strategy with explicit fallback contracts: when index-only mode is enabled (IndexOnly=true), queries decline with typed sentinel errors (ErrSliceIndexCoverageGap, ErrStructuralIndexCoverageGap) rather than silently falling…
+Compaction jobs are successfully assigned and processed across multiple tenants, with system validation confirming active block compaction rather than retention operations. The system effectively groups blocks into 15-minute time windows with consistent replication to prevent…
 
-> id: d7c208a6-27db-43a4-a4c5-062962e870b0
+> id: a006eb69-57c6-47e7-828f-413ed1575332
 
-The index path was successfully refactored to eliminate full scans by replacing `getTraceByIDFullScan` with a `scanTraceByID` fallback that only applies to WAL blocks lacking a lister, ensuring the index remains authoritative once engaged rather than degrading to sequential…
+A 15-minute job timeout is essential for blockpack compaction, as shorter timeouts would prevent jobs from completing within feasible timeframes, and extending it beyond 15 minutes risks introducing uncontrolled job durations that compromise system stability. Reverting the…
 
-> id: 4f23a570-0f1a-4876-9022-a9870fbddd36
+> id: c61f5615-eb04-424b-b6f1-cf2601f386ab
 
-When index data inconsistency is detected during query execution, the system must fail the query with an explicit error rather than silently falling back to a scan that could produce incorrect results. The test suite distinguishes between authoritative index corruption (which…
+The codebase implements a durable, distributed job queue system using Postgres with atomic claim-based work distribution, exponential backoff retry logic, and optional file catalog tracking across multiple backend job types (vi_backfill, cube_backfill, compaction, retention,…
 
-> id: 95046133-fa7b-4702-927e-8286cb8cdd00
+> id: 126f7044-40b1-4ea6-969f-b84ce2b6887a
 
-When time-slice jobs encounter index coverage gaps, the system must fail the query rather than silently fall back to a full block scan, preventing double-counting and data corruption masking by converting routine index declines into explicit ErrSliceIndexCoverageGap errors.…
+Backfill job scheduling logic was refactored from the scheduler module into the worker module, eliminating separate provider implementations for cube and value-index backfill jobs while consolidating dispatch logic. A new job store abstraction was introduced to persist and…
 
-> id: d8053d93-0251-4a8a-91b4-c02ba192be98
+> id: 891d57d7-c434-41fb-9545-9c564eee63c0
 
-Deliberate sequencing of index removal proved critical: premature deletion of the full-scan fallback after `WriteValueIndexL0` landed would have caused widespread "not found" errors for pre-fix data, so verification must wait until index coverage actually accumulates. A…
+The backend scheduler and worker architecture replaces the legacy compactor by splitting job creation and execution into separate services, allowing horizontal scaling of compaction throughput by adding more stateless workers. Workers connect to a singleton scheduler via gRPC to…
 
-> id: 84cc0fa9-0f0c-4254-8e3a-e9c05ece967a
+> id: 62ef7a08-7590-4ce2-a0eb-8451ff0f8fb5
 
 
 ## Related Context (via graph)
@@ -75,17 +75,17 @@ Deliberate sequencing of index removal proved critical: premature deletion of th
 
 > id: cb9984df-c534-4573-b311-853292409d83
 
-/home/mdurham/source/blockpack_collection/blockpack-worktrees/read-path-modernization/tracemetricoptions.go:35:	// same block. Mirrors the search path's own IndexOnly contract (QueryTraceQLFromIndex's…
+modules/backendscheduler/backendscheduler.go | 27 +-- modules/backendscheduler/backendscheduler_test.go | 35 ++++ modules/backendscheduler/provider/config.go | 11 +- modules/backendscheduler/provider/cubebackfill.go | 173 ----------------…
 
-> id: 489c11af-a28e-4344-a3ee-c902d98f2009
+> id: 95ed29c0-1595-4c0f-aeb4-37f647c8c878
 
-/home/mdurham/source/blockpack_collection/blockpack-worktrees/read-path-modernization/tracemetricoptions.go:// ExecuteMetricsTraceQL returns when TraceMetricOptions.IndexOnly is set and the value index…
+M modules/backendscheduler/backendscheduler.go M modules/backendscheduler/backendscheduler_test.go M modules/backendscheduler/provider/config.go D modules/backendscheduler/provider/cubebackfill.go D modules/backendscheduler/provider/vi_backfill.go D…
 
-> id: acb60870-63a8-4532-ad29-614a0402d683
+> id: 1f0a3e26-47ff-47ce-8e92-582a4dfd0916
 
-/home/mdurham/source/blockpack_collection/blockpack-worktrees/read-path-modernization/tracemetricoptions.go:6:// ExecuteMetricsTraceQL returns when TraceMetricOptions.IndexOnly is set and the value index…
+The default 1-minute job timeout causes compaction jobs to timeout prematurely, leading to excessive retries and a false appearance of job failure despite successful completion. Raising the job_timeout to at least 15 minutes is essential to allow compaction jobs—averaging 4.7…
 
-> id: 53133bc0-9a09-4fc4-a285-68a972a77297
+> id: 207a85ec-aa10-4427-8287-588e6d3b452f
 
 
 ## Memory IDs (for exploration)
@@ -95,30 +95,31 @@ Use these IDs to explore further:
   lth graph ppr --seeds <id,...>  — personalized pagerank from seeds
 
   0e1f00d5-b106-46b3-a479-e1e8425ff135
+  0777dda6-2770-46b7-875d-42a7a6370d5f
   2445ef14-fa7e-499a-b599-2fd229f69b6d
+  7357b006-9a22-4566-9ee2-3d373f4dc15b
   ce1757f9-7f77-4d0f-8d58-e736f360d3dd
-  f2d25742-7a08-4e16-9c10-882565e569b3
-  da287611-033b-4f90-81b8-09af528525de
-  c4d80eda-d605-4991-b675-387933d4fce2
-  aff4d73c-a7cf-4dee-85fd-1f62b678c62d
-  4d46a49d-e00f-43b3-8e19-227272a94210
-  48b220a6-ad9d-43cc-bfe7-a2504c871ad4
-  133c974e-2cd0-46de-a882-136d2cd48175
-  d7c208a6-27db-43a4-a4c5-062962e870b0
-  4f23a570-0f1a-4876-9022-a9870fbddd36
-  95046133-fa7b-4702-927e-8286cb8cdd00
-  d8053d93-0251-4a8a-91b4-c02ba192be98
-  84cc0fa9-0f0c-4254-8e3a-e9c05ece967a
+  e87570cf-3e5c-4646-b725-cc41d9511d0b
+  22fc3e10-d562-4e5e-9e05-5b1ca40293d9
+  954ba452-17d0-4385-acc9-583f5b8ebca7
+  54b045da-43fb-4dfd-aadf-c88071cb86bf
+  ac12db7d-3dab-4479-8b8b-14d7b91fe40f
+  a006eb69-57c6-47e7-828f-413ed1575332
+  c61f5615-eb04-424b-b6f1-cf2601f386ab
+  126f7044-40b1-4ea6-969f-b84ce2b6887a
+  891d57d7-c434-41fb-9545-9c564eee63c0
+  62ef7a08-7590-4ce2-a0eb-8451ff0f8fb5
   c326e175-423b-44f1-9968-ecf3dce7ac44
   cb9984df-c534-4573-b311-853292409d83
-  489c11af-a28e-4344-a3ee-c902d98f2009
-  acb60870-63a8-4532-ad29-614a0402d683
-  53133bc0-9a09-4fc4-a285-68a972a77297
+  95ed29c0-1595-4c0f-aeb4-37f647c8c878
+  1f0a3e26-47ff-47ce-8e92-582a4dfd0916
+  207a85ec-aa10-4427-8287-588e6d3b452f
 
 ## Filter by project
 Memories from these projects are present:
   lth prompt "..." --attr project=github.com/grafana/blockpack
   lth prompt "..." --attr project=grafana/blockpack
+  lth prompt "..." --attr project=mattdurham/lth
   lth prompt "..." --attr project=mattdurham/tempo
   lth projects  — list all tracked projects
   lth chat "..." --attr project=<project> — filtered chat

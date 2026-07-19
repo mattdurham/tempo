@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"math"
 	"testing"
 
 	"github.com/google/uuid"
@@ -142,7 +143,7 @@ func TestRunViBackfillCore_CursorNotAdvancedOnPartialFailure(t *testing.T) {
 	seedRegistryEntry(t, objStore, entry)
 	registry := blockpack.NewRegistry(objStore, entry.Tenant)
 
-	runErr := runViBackfillCore(ctx, entry, fetcher, registry, newFakeViPutter(), defaultValueIndexPref)
+	runErr := runViBackfillCore(ctx, entry, fetcher, registry, newFakeViPutter(), defaultValueIndexPref, math.MaxUint64)
 	require.Error(t, runErr, "the run must fail overall -- block 2 has no data")
 	require.Contains(t, runErr.Error(), "fetch block", "the failure must genuinely occur at FetchBlock, not earlier (e.g. a missing registry entry) -- otherwise this test doesn't exercise the partial-run scenario it claims to")
 

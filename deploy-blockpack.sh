@@ -6,7 +6,7 @@
 #   ./deploy-blockpack.sh                   # auto-increments from current deployed revision
 #
 # Rolls: block-builder (statefulset), backend-worker (statefulset), querier (deployment),
-#        query-frontend (deployment), live-store-zone-a/b (statefulset),
+#        query-frontend (deployment), job-planner (deployment), live-store-zone-a/b (statefulset),
 #        value-index-compactor (statefulset)
 
 set -euo pipefail
@@ -170,6 +170,85 @@ else
     echo "    WARNING: no config file for value-index-compactor at ${vic_compactor_cfg}"
 fi
 
+# job-planner (issue #518) is deployed for the FIRST time by this script -- unlike every
+# other component's tempo-${component} configmap above (patch-only, assumes it already
+# exists from some earlier one-time cluster setup), job-planner has neither a ConfigMap
+# nor a Deployment yet, so both must be created here, not just patched. Special-cased
+# rather than added to the generic patch-only loop above for the same reason
+# value-index-compactor is special-cased: `kubectl create --dry-run=client -o yaml |
+# kubectl apply` is create-or-update in one idempotent step (unlike `kubectl patch`,
+# which errors if the object doesn't exist yet), and re-running it on every future deploy
+# once job-planner exists is a harmless no-op.
+echo "--- Ensuring job-planner ConfigMap + Deployment exist/updated ---"
+job_planner_cfg="${CONFIGS_DIR}/job-planner.yaml"
+if [[ -f "$job_planner_cfg" ]]; then
+    kubectl create configmap tempo-job-planner -n "$NAMESPACE" \
+        --from-file=tempo.yaml="$job_planner_cfg" --dry-run=client -o yaml \
+        | kubectl apply -n "$NAMESPACE" -f -
+    echo "    applied tempo-job-planner configmap"
+else
+    echo "    WARNING: no config file for job-planner at ${job_planner_cfg}"
+fi
+# A Deployment rolls out on ANY podTemplateSpec change (including the image tag) when
+# re-applied -- no separate `kubectl set image` + `rollout restart` needed, unlike
+# querier/query-frontend below (those use set image because they're pre-existing objects
+# this script only ever patches, never re-applies wholesale).
+cat <<DEPLOYEOF | kubectl apply -n "$NAMESPACE" -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: job-planner
+  labels:
+    app: job-planner
+  annotations:
+    kustomize.toolkit.fluxcd.io/reconcile: disabled
+    kustomize.toolkit.fluxcd.io/reconcile-disabled-by: matt.durham@grafana.com
+    kustomize.toolkit.fluxcd.io/reconcile-disabled-reason: blockpack
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: job-planner
+  template:
+    metadata:
+      labels:
+        app: job-planner
+      annotations:
+        profiles.grafana.com/cpu.scrape: "true"
+        profiles.grafana.com/cpu.port: "3100"
+        profiles.grafana.com/cpu.path: /debug/pprof/profile
+        profiles.grafana.com/memory.scrape: "true"
+        profiles.grafana.com/memory.port: "3100"
+        profiles.grafana.com/memory.path: /debug/pprof/heap
+        profiles.grafana.com/goroutine.scrape: "true"
+        profiles.grafana.com/goroutine.port: "3100"
+        profiles.grafana.com/goroutine.path: /debug/pprof/goroutine
+    spec:
+      containers:
+        - name: job-planner
+          image: ${IMAGE}
+          args:
+            - -target=job-planner
+            - -config.file=/etc/tempo/tempo.yaml
+          ports:
+            - name: prom-metrics
+              containerPort: 3100
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/tempo
+      volumes:
+        - name: config
+          configMap:
+            name: tempo-job-planner
+DEPLOYEOF
+
 # Roll components
 echo "--- Updating block-builder ---"
 kubectl set image statefulset/block-builder -n "$NAMESPACE" "block-builder=${IMAGE}"
@@ -241,6 +320,11 @@ kubectl wait --for=condition=Ready pod/block-builder-0 -n "$NAMESPACE" --timeout
 kubectl wait --for=condition=Ready pod/backend-worker-0 -n "$NAMESPACE" --timeout=120s
 kubectl rollout status deployment/querier -n "$NAMESPACE" --timeout=120s
 kubectl rollout status deployment/query-frontend -n "$NAMESPACE" --timeout=120s
+# job-planner is a plain Deployment (no ordinal pods, no sharding) -- rollout status
+# already waits for every replica, unlike a StatefulSet's own pod-0-only wait pattern
+# elsewhere in this section (this project's standing "verify all replicas after deploy"
+# rule).
+kubectl rollout status deployment/job-planner -n "$NAMESPACE" --timeout=120s
 kubectl wait --for=condition=Ready pod/live-store-zone-a-0 -n "$NAMESPACE" --timeout=120s
 kubectl wait --for=condition=Ready pod/live-store-zone-b-0 -n "$NAMESPACE" --timeout=120s
 # value-index-compactor has 20 replicas and is already known to be crash-looping (OOMKilled) --
@@ -255,6 +339,7 @@ echo "    block-builder:        $(kubectl get pod block-builder-0 -n $NAMESPACE 
 echo "    backend-worker:       $(kubectl get pod backend-worker-0 -n $NAMESPACE -o jsonpath='{.spec.containers[0].image}')"
 echo "    querier:              $(kubectl get deployment querier -n $NAMESPACE -o jsonpath='{.spec.template.spec.containers[0].image}')"
 echo "    query-frontend:       $(kubectl get deployment query-frontend -n $NAMESPACE -o jsonpath='{.spec.template.spec.containers[0].image}')"
+echo "    job-planner:          $(kubectl get deployment job-planner -n $NAMESPACE -o jsonpath='{.spec.template.spec.containers[0].image}') ($(kubectl get pods -n $NAMESPACE -l app=job-planner --no-headers 2>/dev/null | grep -c Running || echo '?')/2 Running)"
 echo "    live-store-a:         $(kubectl get pod live-store-zone-a-0 -n $NAMESPACE -o jsonpath='{.spec.containers[0].image}')"
 echo "    live-store-b:         $(kubectl get pod live-store-zone-b-0 -n $NAMESPACE -o jsonpath='{.spec.containers[0].image}')"
 echo "    value-index-compactor: $(kubectl get statefulset value-index-compactor -n $NAMESPACE -o jsonpath='{.spec.template.spec.containers[0].image}') ($(kubectl get pods -n $NAMESPACE -l app=value-index-compactor --no-headers 2>/dev/null | grep -c Running || echo '?')/$(kubectl get statefulset value-index-compactor -n $NAMESPACE -o jsonpath='{.spec.replicas}') Running)"

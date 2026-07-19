@@ -58,6 +58,13 @@ type ViBackfillDetail struct {
 	ColumnHash string `json:"column_hash"`
 	ColumnName string `json:"column_name"`
 	ColumnType string `json:"column_type"`
+	// WindowSeconds bounds how far back from the column's current watermark this
+	// job processes. Zero means unbounded (full remaining history) -- the
+	// reactive first-trigger path (vi_usage_hook.go) still passes zero here,
+	// preserving today's "first backfill does everything" behavior;
+	// job-planner's chained continuation jobs (issue #518) pass a real bounded
+	// value.
+	WindowSeconds uint64 `json:"window_seconds"`
 }
 
 type CubeBackfillDetail struct {
@@ -153,6 +160,32 @@ func (s *Store) Claim(ctx context.Context, jobType JobType, workerID string) (*J
 		return nil, fmt.Errorf("jobstore: claim %s job: %w", jobType, err)
 	}
 	return &Job{ID: id, Type: jobType, Tenant: tenant, Status: StatusClaimed, Detail: detail, Retries: retries}, nil
+}
+
+// renewLeaseSQL extends jobID's lease by another 30 minutes from the CURRENT
+// now(), not the original claim time -- the status guard makes this a no-op
+// once the job has reached a terminal state (issue #520: defense-in-depth
+// against a benign race between the renewal loop's last tick and
+// Complete/Fail, not a condition expected to matter in practice, since the
+// caller only ever renews while it still holds and is actively processing the
+// job).
+const renewLeaseSQL = `
+	UPDATE backend_jobs
+	SET lease_expires_at = now() + interval '30 minutes'
+	WHERE id = $1 AND status IN ('claimed', 'running')`
+
+// RenewLease extends jobID's lease, preventing Claim's expired-lease clause
+// from letting a second worker reclaim it while the original worker is still
+// actively processing it (issue #520: today's lease is set once at claim time
+// and never renewed, so any job genuinely running longer than 30 minutes was
+// silently subject to double-execution). Callers are expected to invoke this
+// periodically (well under the 30-minute lease TTL) for the duration of
+// active processing -- see backend-worker's renewLeasePeriodically.
+func (s *Store) RenewLease(ctx context.Context, jobID string) error {
+	if _, err := s.pool.Exec(ctx, renewLeaseSQL, jobID); err != nil {
+		return fmt.Errorf("jobstore: renew lease %s: %w", jobID, err)
+	}
+	return nil
 }
 
 const completeJobSQL = `UPDATE backend_jobs SET status = 'succeeded', finished_at = now() WHERE id = $1`

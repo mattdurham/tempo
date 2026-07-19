@@ -776,6 +776,7 @@ func (t *App) setupModuleManager() error {
 	mm.RegisterModule(BackendWorker, t.initBackendWorker)
 	mm.RegisterModule(ValueIndexConsumer, t.initValueIndexConsumer)
 	mm.RegisterModule(ValueIndexCompactor, t.initValueIndexCompactor)
+	mm.RegisterModule(JobPlanner, t.initJobPlanner)
 	mm.RegisterModule(LiveStore, t.initLiveStore)
 
 	mm.RegisterModule(SingleBinary, nil)
@@ -820,6 +821,7 @@ func (t *App) setupModuleManager() error {
 		BackendWorker:                 {Common, Store, MemberlistKV},
 		ValueIndexConsumer:            {Store, Server},
 		ValueIndexCompactor:           {Store, Server},
+		JobPlanner:                    {Server},
 		// composite targets
 		SingleBinary: {BackendScheduler, BackendWorker, QueryFrontend, Querier, Distributor, MetricsGenerator, LiveStore},
 	}
@@ -899,4 +901,10 @@ func usageStatsHandler(urCfg usagestats.Config) http.HandlerFunc {
 const (
 	ValueIndexConsumer  string = "value-index-consumer"
 	ValueIndexCompactor string = "value-index-compactor"
+	// JobPlanner is issue #518's poll loop that chain-enqueues bounded-window
+	// vi_backfill/cube_backfill continuation jobs. Deps are {Server} only
+	// (see the deps map above) -- deliberately NOT {Store, Server}, since
+	// Store transitively builds the full S3/GCS/Azure trace storage stack
+	// job-planner never needs.
+	JobPlanner string = "job-planner"
 )

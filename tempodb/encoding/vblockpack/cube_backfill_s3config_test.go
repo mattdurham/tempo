@@ -25,6 +25,7 @@ package vblockpack
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
 
@@ -53,7 +54,7 @@ func TestE2E_RunCubeBackfill_ReturnsErrorOnRegistryFailure(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	err := RunCubeBackfill(ctx, entry, s3cfg, pgPool, 0)
+	err := RunCubeBackfill(ctx, entry, s3cfg, pgPool, math.MaxUint32, 0)
 	require.Error(t, err, "RunCubeBackfill must surface a real registry-persist failure, not swallow it")
 	assert.Contains(t, err.Error(), "not found")
 }
@@ -95,7 +96,7 @@ func TestE2E_RunCubeBackfill_UsesConfigCredentialsNotEnv(t *testing.T) {
 	// (modules/backendworker/backend_jobs_e2e_test.go)'s identical accommodation.
 	boundedCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	_ = RunCubeBackfill(boundedCtx, entry, s3cfg, pgPool, 0)
+	_ = RunCubeBackfill(boundedCtx, entry, s3cfg, pgPool, math.MaxUint32, 0)
 
 	entries, _, loadErr := registry.Load(context.Background())
 	require.NoError(t, loadErr)
