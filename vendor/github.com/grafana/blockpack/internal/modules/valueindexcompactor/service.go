@@ -567,7 +567,12 @@ func (s *Service) mergeLevel(ctx context.Context, colDir string, files []levelFi
 			if merr := s.markFileCorrupted(ctx, f.key, data); merr != nil {
 				// Can't even verify we preserved the file -- fall back to the original,
 				// safer all-or-nothing behavior rather than risk losing track of it.
-				return fmt.Errorf("valueindexcompactor: decode %q: %w (also failed to mark corrupted: %v)", f.key, err, merr)
+				return fmt.Errorf(
+					"valueindexcompactor: decode %q: %w (also failed to mark corrupted: %v)",
+					f.key,
+					err,
+					merr,
+				)
 			}
 			alreadyHandled[f.key] = struct{}{}
 			s.metrics.incFilesCorrupted()
@@ -585,30 +590,40 @@ func (s *Service) mergeLevel(ctx context.Context, colDir string, files []levelFi
 	}
 
 	var written int
-	err := valueindex.StreamCompactBucketFiles(ctx, iterators, 0, s.cfg.MaxOutputBytes, tmpDir, func(outPath string) error {
-		//nolint:gosec // G304: outPath is StreamCompactBucketFiles' own local temp output file, not user input
-		data, err := os.ReadFile(outPath)
-		if err != nil {
-			return fmt.Errorf("valueindexcompactor: read local output %q: %w", outPath, err)
-		}
-		// NOTE-VI-037 (#431): embed the merged file's wall time range in the output
-		// filename so DiscoverIndexFiles/IndexFileCache can prune compacted files by
-		// time exactly as it prunes L0 files. Writing a v1 filename (no range) here
-		// would make the output unparseable by ParseFilenameV2 (the v1 fallback was
-		// removed), so it would be silently skipped by discovery entirely rather than
-		// found. The BucketGroup footer carries file-level min/max time_sec directly.
-		var wallMinSec, wallMaxSec uint64
-		if ft, ferr := valueindex.DecodeBucketFooter(data); ferr == nil {
-			wallMinSec, wallMaxSec = ft.MinTimeSec, ft.MaxTimeSec
-		}
-		key := path.Join(colDir, valueindex.FormatFilenameV2(outputLevel, wallMinSec, wallMaxSec, valueindex.NewID()))
-		if err := s.store.Put(ctx, key, data); err != nil {
-			s.metrics.incError(compactorOpPut)
-			return fmt.Errorf("valueindexcompactor: put %q: %w", key, err)
-		}
-		written++
-		return nil
-	})
+	err := valueindex.StreamCompactBucketFiles(
+		ctx,
+		iterators,
+		0,
+		s.cfg.MaxOutputBytes,
+		tmpDir,
+		func(outPath string) error {
+			//nolint:gosec // G304: outPath is StreamCompactBucketFiles' own local temp output file, not user input
+			data, err := os.ReadFile(outPath)
+			if err != nil {
+				return fmt.Errorf("valueindexcompactor: read local output %q: %w", outPath, err)
+			}
+			// NOTE-VI-037 (#431): embed the merged file's wall time range in the output
+			// filename so DiscoverIndexFiles/IndexFileCache can prune compacted files by
+			// time exactly as it prunes L0 files. Writing a v1 filename (no range) here
+			// would make the output unparseable by ParseFilenameV2 (the v1 fallback was
+			// removed), so it would be silently skipped by discovery entirely rather than
+			// found. The BucketGroup footer carries file-level min/max time_sec directly.
+			var wallMinSec, wallMaxSec uint64
+			if ft, ferr := valueindex.DecodeBucketFooter(data); ferr == nil {
+				wallMinSec, wallMaxSec = ft.MinTimeSec, ft.MaxTimeSec
+			}
+			key := path.Join(
+				colDir,
+				valueindex.FormatFilenameV2(outputLevel, wallMinSec, wallMaxSec, valueindex.NewID()),
+			)
+			if err := s.store.Put(ctx, key, data); err != nil {
+				s.metrics.incError(compactorOpPut)
+				return fmt.Errorf("valueindexcompactor: put %q: %w", key, err)
+			}
+			written++
+			return nil
+		},
+	)
 	if err != nil {
 		return err
 	}
@@ -626,8 +641,13 @@ func (s *Service) mergeLevel(ctx context.Context, colDir string, files []levelFi
 		}
 	}
 	if stats.Corrupt > 0 {
-		slog.Warn("valueindexcompactor: dropped refs with unresolvable SourceID (data corruption, not routine retention)",
-			"colDir", colDir, "corrupt", stats.Corrupt)
+		slog.Warn(
+			"valueindexcompactor: dropped refs with unresolvable SourceID (data corruption, not routine retention)",
+			"colDir",
+			colDir,
+			"corrupt",
+			stats.Corrupt,
+		)
 	}
 
 	// Delete inputs only after all outputs are durably written.

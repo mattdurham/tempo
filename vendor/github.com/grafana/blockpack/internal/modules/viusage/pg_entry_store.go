@@ -159,7 +159,12 @@ func (s *PgEntryStore) UpsertEntry(
 				return Entry{}, loadErr
 			}
 			if !found {
-				return Entry{}, fmt.Errorf("pg viusage entrystore: entry %s/%s/%s vanished after losing insert race", tenant, colHash, colType)
+				return Entry{}, fmt.Errorf(
+					"pg viusage entrystore: entry %s/%s/%s vanished after losing insert race",
+					tenant,
+					colHash,
+					colType,
+				)
 			}
 		}
 	}

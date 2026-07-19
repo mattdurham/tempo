@@ -66,10 +66,13 @@ type BackfillState struct {
 	// worker's lease self-heals once LeaseExpiresAt passes — no manual intervention
 	// needed (see 4.4 lifecycle).
 	BackfillInProgress bool `json:"backfill_in_progress"`
-	// Done is true once the full configured backfill window
-	// [now - WindowSeconds, now] is confirmed complete. Once Done, ordinary
-	// FilesForTimeRange-based discovery is trusted without any watermark gating (R5:
-	// same upkeep as any dedicated column from this point forward).
+	// Done is job-planner's chaining-stop signal ONLY (#519) -- true iff a run's
+	// own window was exhausted AND the resolved floor (minSec) is genuinely 0
+	// (true beginning of time, or an unbounded run). NOT a query-correctness
+	// input: CoversRange never consults Done, only Triggered/WatermarkSec.
+	// Removing Done entirely was considered and rejected (NOTES.md) since
+	// job-planner's chaining query still needs SOME "stop enqueuing" signal,
+	// and this is simpler than pushing a WatermarkSec==0 check to every caller.
 	Done bool `json:"done"`
 	// LastCatalogRowID is the highest file_catalog row_id this column's backfill has
 	// fully processed (tempo's catalog-cursor-based BlockFetcher, 2026-07-11). Zero
@@ -83,16 +86,18 @@ type BackfillState struct {
 // CoversRange reports whether bs's backfill state fully covers [minSec, maxSec] — the
 // R7 query-time coverage-check primitive. Pure, no I/O. This is the ONE function every
 // query-path coverage decision for a non-dedicated, usage-tracked column must call before
-// trusting a non-empty FilesForTimeRange result.
+// trusting a non-empty FilesForTimeRange result. #519: Done is never consulted here — see
+// BackfillState.Done's own doc comment.
 func (bs BackfillState) CoversRange(minSec, maxSec uint64) bool {
-	if bs.Done {
-		return true
-	}
 	if !bs.Triggered {
 		return false // never indexed — no coverage at all, matches today's "zero files" case
 	}
-	// In-progress, newest-to-oldest fill: the covered range is [WatermarkSec, now].
-	// The query's window is covered ONLY if its oldest point (minSec) is not older
-	// than the watermark — any older sub-range is unconfirmed and must decline.
+	// #519: Done is NOT consulted here — it is a job-planner scheduling signal
+	// only (see BackfillState.Done's own doc comment), never a query-correctness
+	// bypass. Coverage is always this range check: [WatermarkSec, now) newest-to-
+	// oldest fill, covered only if the query's oldest point (minSec) is not older
+	// than the watermark. Once WatermarkSec genuinely reaches 0, this check alone
+	// covers any real range with zero special-casing — the same property Done's
+	// new definition depends on.
 	return minSec >= bs.WatermarkSec
 }

@@ -121,17 +121,24 @@ can represent and reject everything else, with no I/O.
 Back-ref: `internal/modules/vibuilder/leaf_indexable_test.go`. Issue #487.
 
 ## TEST-VB-5: `ColumnWatermark`/`BuildSource`'s R7 coverage gate — boundary conditions and both `src.Add` sites (#496)
-*Added: 2026-07-10*
+*Added: 2026-07-10. Updated: 2026-07-18 (issue #519 — `Done` branch removed; test names/assertions corrected).*
 
-**Scenario:** `ColumnWatermark.CoversRange`'s 4 branches (SPEC-VB-4) and `BuildSource`'s
+**Scenario:** `ColumnWatermark.CoversRange`'s branches (SPEC-VB-4) and `BuildSource`'s
 gated `src.AddLeaf` call site (leaf predicates) — an absent watermark entry must behave
-exactly as pre-#496.
+exactly as pre-#496. **[CORRECTED, #519, 2026-07-18]** there is no longer a `Done` branch —
+`Done` is a job-planner chaining signal only, never consulted by `CoversRange`.
 
 **Setup/Assertions:**
-- `TestColumnWatermark_CoversRange_DoneAlwaysTrue`, `_NeverTriggeredAlwaysFalse`,
+- `TestColumnWatermark_CoversRange_DoneNoLongerBypassesRangeCheck` (**[RENAMED, #519,
+  2026-07-18]** — was `TestColumnWatermark_CoversRange_DoneAlwaysTrue`, which pinned the actual
+  #519 bug: `Done: true, WatermarkSec: 1000, minSec: 500` used to incorrectly return `true`; now
+  correctly returns `false`) and `TestColumnWatermark_CoversRange_TrueDoneImpliesZeroWatermarkCovers`
+  (new, #519 — `Done: true` alongside a genuinely-zero `WatermarkSec` still covers any real
+  range, proving the ordinary watermark check alone already recovers this case with no `Done`
+  special-case needed), plus the unchanged `_NeverTriggeredAlwaysFalse`,
   `_InProgressCoversOnlyFromWatermarkForward`, `_InProgressExactlyAtWatermarkBoundaryCovers`
-  (`watermark_test.go`) — direct-call tests covering all 4 branches, including the explicit
-  `minSec == WatermarkSec` boundary-inclusive case.
+  (`watermark_test.go`) — direct-call tests covering the remaining branches, including the
+  explicit `minSec == WatermarkSec` boundary-inclusive case.
 - `TestBuildSource_WatermarkGateSkipsUncoveredColumn` / `_WatermarkCoveredColumnResolves`
   (`builder_watermark_test.go`) — a leaf-predicate column with an uncovered/covered watermark
   is skipped/resolved accordingly.

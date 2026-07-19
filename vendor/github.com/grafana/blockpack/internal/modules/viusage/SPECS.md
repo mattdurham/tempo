@@ -71,9 +71,12 @@ exists only because a use was recorded — the threshold has not yet been crosse
 - `WatermarkSec uint64` — the R7 coverage watermark: the oldest wall-clock unix-second for
   which this column's backfill is confirmed COMPLETE, given a newest-to-oldest fill direction.
   Zero until the first unit of backfill work completes.
-- `Done bool` — true once the full configured backfill window `[now-WindowSeconds, now]` is
-  confirmed complete. Once `Done`, ordinary file-discovery-based coverage is trusted without
-  any watermark gating (R5: same upkeep as any dedicated column from this point forward).
+- `Done bool` — **[REDEFINED, #519, 2026-07-18]** job-planner's chaining-stop signal ONLY;
+  true iff a run's own window was exhausted AND the resolved floor (`minSec`) is genuinely 0
+  (true beginning of time, or an unbounded run). NOT a query-correctness input — `CoversRange`
+  (SPEC-VIUSAGE-2) never consults `Done`, only `Triggered`/`WatermarkSec`. See NOTES.md's
+  #519 entry for why the previous "Done bypasses the range check" definition was a bug, not a
+  design choice.
 - `WindowStartSec`/`WindowEndSec uint64` — the backfill window this entry's watermark is
   scoped to (the config value in effect when the backfill was triggered), so a later config
   change to the default window does not retroactively reinterpret an already-`Done` entry's
@@ -91,17 +94,26 @@ Back-refs: `internal/modules/viusage/entry.go:Entry,BackfillState`.
 no I/O, and is the ONE function every query-path coverage decision for a non-dedicated,
 usage-tracked column must call before trusting a non-empty file-discovery result:
 
-1. `bs.Done` → `true` unconditionally (full window confirmed complete; `maxSec` is not even
-   consulted — a `Done` entry is complete for any range, not merely the range it was
-   triggered for, mirroring dedicated-column semantics from this point forward).
-2. `!bs.Triggered` → `false` unconditionally (never indexed — no coverage at all, matches
+1. `!bs.Triggered` → `false` unconditionally (never indexed — no coverage at all, matches
    today's "zero files discovered" case for a column with no VI data).
-3. Otherwise (in-progress, newest-to-oldest fill: the covered range is
+2. Otherwise (in-progress, newest-to-oldest fill: the covered range is
    `[WatermarkSec, now]`) → `minSec >= bs.WatermarkSec`. The query's window is covered ONLY if
    its OLDEST point (`minSec`) is not older than the watermark; any older sub-range is
    unconfirmed and must decline. `maxSec` is not consulted in this branch either — a
    newest-to-oldest backfill's covered range has no upper bound below "now," so only the
    lower bound can ever be the source of a coverage gap.
+
+**[CORRECTED, #519, 2026-07-18]** `bs.Done` is **never consulted** by `CoversRange` — the
+previous version of this contract had `bs.Done` unconditionally short-circuit to `true`
+before the `Triggered`/`WatermarkSec` check, which was the actual #519 bug: `Done` only ever
+meant "this call's own window iteration finished," not "the full historical range is really
+covered," so a bounded/chained backfill run's final block could falsely claim full coverage
+of a range older than its own window. `Done`'s new definition (SPEC-VIUSAGE-1) makes it a
+job-planner-only scheduling signal; once `WatermarkSec` genuinely reaches 0, branch 2 above
+already returns `true` for any real range with zero special-casing, so no `Done` check is
+needed to recover the "fully covered" case. See NOTES.md's #519 entry for the full rationale,
+including why the narrower "gate `Done` on a retention floor" patch was considered and
+rejected in favor of this decoupling.
 
 **Boundary condition (binding):** `minSec == WatermarkSec` MUST cover (`>=`, not `>`) — a
 query whose oldest point lands exactly on the watermark is asking about data the backfill has
@@ -333,9 +345,15 @@ tracks the minimum block-coverage `MinStart` seen so far across processed blocks
 **independent of whether the target column has any values in that block** — an entirely-empty
 block for the target column still correctly advances the watermark past it, since the
 watermark tracks TIME coverage, not per-column data presence). On the LAST block
-(`i == len(refs)-1`), `WatermarkSec` is forced to `minSec` (the window's own oldest bound) and
-`Done=true` — closing any rounding gap between the last block's own `MinStart` and the
-window's configured edge. **`Run` itself never persists anything** — per R7/R9 (see
+(`i == len(refs)-1`, "`windowExhausted`"), `WatermarkSec` is forced to `minSec` (the window's
+own oldest bound) — closing any rounding gap between the last block's own `MinStart` and the
+window's configured edge. **[CORRECTED, #519, 2026-07-18]** `Done` is reported as
+`windowExhausted && minSec == 0` — window exhaustion ALONE is no longer sufficient; the
+resolved floor must also be genuinely 0 (true beginning of time), since `Done` no longer
+means "confirmed complete," only "job-planner may stop chaining" (SPEC-VIUSAGE-1). Previous
+versions of this spec described `Done=true` as being set on every final block regardless of
+`minSec` — that was the actual #519 bug, not a design fact. **`Run` itself never persists
+anything** — per R7/R9 (see
 `plan.md` Section 1's cube-watermark-gap finding), persisting `BackfillState.WatermarkSec`/
 `Done` to the registry via `Registry.UpdateWatermark` (SPEC-VIUSAGE-4 — the concrete method
 `updateEntryWithRetry`-based persistence uses) is the CALLER's job, invoked from inside
@@ -347,10 +365,21 @@ single, concrete, tested method to call from `progressFn` on every progress upda
 on `Done`, exactly what R9's finding says cube's own wiring omits.
 
 **Empty-range case:** zero blocks in `[minSec, maxSec]` → `progressFn` is called exactly once
-with `{WatermarkSec: minSec, WindowStartSec: minSec, WindowEndSec: maxSec, Done: true}` and
-`Run` returns `nil` — no blocks fetched, nothing written, but the caller still receives a
-terminal `Done` signal so it can mark the column fully backfilled (there was nothing to
-backfill).
+with `{WatermarkSec: minSec, WindowStartSec: minSec, WindowEndSec: maxSec, Done: minSec == 0}`
+(**[CORRECTED, #519, 2026-07-18]** — previously unconditionally `Done: true`; an empty listing
+within a BOUNDED window says nothing about whether history older than `minSec` is covered) and
+`Run` returns `nil` — no blocks fetched, nothing written.
+
+**`HardExcludedColumns` case:** `Run` refuses outright to backfill any hard-excluded column
+(R2) and reports `progressFn` exactly once with
+`{WatermarkSec: 0, WindowStartSec: minSec, WindowEndSec: maxSec, Done: true}`.
+**[CORRECTED, #519, 2026-07-18]** `WatermarkSec` is forced to `0`, not `minSec` — "nothing
+will ever be backfilled for this column" (permanent exclusion) is vacuously "covers
+everything from the beginning of time" under `CoversRange`'s corrected contract
+(SPEC-VIUSAGE-2), which is the actually-intended meaning here, not an artifact of whichever
+window this particular call happened to resolve. `WindowStartSec`/`WindowEndSec` are left as
+the resolved window purely for operator-facing observability — `CoversRange` never reads
+them.
 
 **Package-placement note (2026-07-10, updated after this entry was first written):**
 `BackfillEngine`/`BackfillConfig`/`BlockFetcher`/`BackfillProgress` all live in the ROOT

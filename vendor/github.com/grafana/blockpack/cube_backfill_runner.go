@@ -114,7 +114,10 @@ func decodeCanonicalVI(b []byte, typeName string) string {
 	switch typeName {
 	case "int64":
 		if len(b) == 8 {
-			return strconv.FormatInt(int64(binary.LittleEndian.Uint64(b)), 10) //nolint:gosec // intentional two's complement re-interpretation
+			return strconv.FormatInt(
+				int64(binary.LittleEndian.Uint64(b)),
+				10,
+			) //nolint:gosec // intentional two's complement re-interpretation
 		}
 	case "uint64":
 		if len(b) == 8 {

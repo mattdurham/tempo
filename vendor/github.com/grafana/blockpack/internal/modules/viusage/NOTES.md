@@ -825,3 +825,85 @@ that happens, treat any change to either file as requiring a manual check of the
 `viusage_query_log` remains out of scope for this addendum (Open Decision D2, above — it has no
 blockpack-side schema at all, ported or otherwise). See go-presubmit.md / review.md Issue 2 (#506
 holistic review) for the finding that prompted this addendum.
+
+---
+
+## NOTE-VIUSAGE-15 — `Done` decoupled from `CoversRange` correctness (issue #519)
+
+Date: 2026-07-18
+
+**The bug:** `BackfillState.CoversRange`/`ColumnWatermark.CoversRange` (SPEC-VIUSAGE-2)
+previously let `bs.Done`/`w.Done` unconditionally short-circuit to `true`, bypassing the
+`WatermarkSec` range check entirely. `Done` was set to `true` by `BackfillEngine.Run`/
+`processBlocks` purely because THIS call's own window/listing iteration finished
+(`i == len(refs)-1`), with zero knowledge of whether real history OLDER than the resolved
+window's floor (`minSec`) had ever actually been covered. For every historical production
+run to date this was harmless, because every real caller resolved `minSec == 0` (see
+"Why no migration was needed" below) — but issue #518's job-planner chaining path
+(`ViBackfillDetail.WindowSeconds`, not yet deployed) can produce a genuinely bounded,
+nonzero `minSec`, at which point the bug becomes a real false-positive "covered" claim: a
+query could be told a range is fully backed by VI data when the sub-range below the
+bounded run's own floor was never actually backfilled.
+
+**The fix:** `CoversRange` never consults `Done` at all — coverage is always
+`Triggered && minSec_query >= WatermarkSec_persisted` (SPEC-VIUSAGE-2, corrected). `Done`
+is redefined (SPEC-VIUSAGE-1) to a narrower, decoupled meaning: job-planner's
+"stop chaining more backfill runs for this column" scheduling signal ONLY, true iff
+`windowExhausted && minSec == 0` (this run's own listing finished AND the resolved floor is
+genuinely the true beginning of time). `windowExhausted` (the old `done`/`i==len(refs)-1`
+value) still drives `WatermarkSec` advancement exactly as before — only the semantics of
+what gets PERSISTED as `Done` changed. Applied identically to both `BackfillState.
+CoversRange` (viusage) and `ColumnWatermark.CoversRange` (vibuilder, see `vibuilder/
+NOTES.md`'s mirrored entry) since the two are independently-maintained, parity-tested
+duplicates (NOTE-VIUSAGE-7).
+
+**Why this mirrors cube's architecture rather than tightening a boolean:** cube's own
+`Watermarks`-based coverage check (`internal/modules/cube/router.go`) has no boolean
+"trust forever" flag anywhere — `Route` always falls through to an explicit overlap
+computation against the persisted watermark. The bug here was exactly that missing
+discipline: a second, independently-settable piece of state (`Done`) bypassing an
+already-correct range check, rather than every coverage decision going through the range
+check unconditionally. A narrower patch (e.g. "only set `Done=true` when `minSec==0` OR a
+retention floor is reached," mirroring job-planner's `cubeBackfillWindowMinutes` bound) was
+considered and rejected — it would have kept the "boolean bypasses the range check"
+architecture and only tightened the condition, plus made correctness depend on trusting
+external retention config matching actual bucket contents. `minSec==0` is self-verifying
+and needs no external input.
+
+**Why `Done` still exists (not removed entirely):** job-planner's chaining query
+(`modules/jobplanner/plan_vi.go`'s `viUsagePlanQuery`, tempo-side) uses `done` as its
+"stop enqueuing more chained jobs for this column" signal — a separate concern from
+query-time correctness. Removing `Done` would just push an equivalent `WatermarkSec == 0`
+check to every caller; keeping the field with a corrected, narrower definition is simpler.
+
+**Why no migration of already-persisted registry state was needed:** every production
+caller that has ever run — `vi_usage_hook.go`'s reactive trigger (`windowSeconds: 0` →
+`math.MaxUint64` internally → `minSec` stays `0` for any real `maxSec`) — always resolved
+`minSec == 0`, so every already-persisted `Done: true` entry already satisfies the NEW,
+stricter definition retroactively. Only job-planner's not-yet-deployed bounded-window
+chaining path (#518) can ever produce a `Done` value under the OLD code that would differ
+from the NEW code's answer for the same inputs — and #518's job-planner deployment (task
+#136) is separately gated on user sign-off.
+
+**Also fixed, defense-in-depth (not an observed bug, no live call path exercises it today —
+confirmed by tracing `RecordUseAndMaybeTrigger`/`BuildColumnPolicy`, nothing constructs a
+`Triggered=true` `Entry` for a `HardExcludedColumns` name):** `Run`'s `HardExcludedColumns`
+early-return now reports `WatermarkSec: 0` (not `minSec`) alongside `Done: true` — "nothing
+will ever be backfilled for this column" (R2 permanent exclusion) is vacuously "covers
+everything from the beginning of time" under the corrected contract, matching R2's actual
+intent rather than being an artifact of whatever window this particular call resolved.
+
+**Back-refs:** `internal/modules/viusage/entry.go:BackfillState.Done,BackfillState.
+CoversRange`, `valueindex_backfill.go:BackfillEngine.Run,BackfillEngine.processBlocks,
+BackfillProgress`, `internal/modules/vibuilder/watermark.go:ColumnWatermark.Done,
+ColumnWatermark.CoversRange`. Tests: `coversrange_parity_test.go` (new #519 regression row,
+mutation-tested), `valueindex_backfill_test.go`'s
+`TestBackfillEngine_Run_TrueDoneWhenWindowReachesBeginningOfTime` (new positive
+`minSec==0` case) and its flipped `Done` assertions in
+`TestBackfillEngine_WatermarkValuesAcrossMultiBlockRun`/
+`TestBackfillEngine_ProgressFnCalledPerCompletedUnit`/
+`TestBackfillEngine_OverlappingOutOfOrderBlocksNeverOverstatesCoverage`/
+`TestBackfillEngine_EmptyBlockRangeWritesOnlyMetadata`,
+`internal/modules/vibuilder/watermark_test.go`'s rewritten
+`TestColumnWatermark_CoversRange_DoneNoLongerBypassesRangeCheck`/
+`TestColumnWatermark_CoversRange_TrueDoneImpliesZeroWatermarkCovers`. Issue #519.

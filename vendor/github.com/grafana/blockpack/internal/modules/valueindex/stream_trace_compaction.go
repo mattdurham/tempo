@@ -219,7 +219,12 @@ type traceStreamWriter struct {
 	haveFileTime   bool
 }
 
-func newTraceStreamWriter(bw *bufio.Writer, table *StringTable, groupsPerBlock int, headerLen uint64) *traceStreamWriter {
+func newTraceStreamWriter(
+	bw *bufio.Writer,
+	table *StringTable,
+	groupsPerBlock int,
+	headerLen uint64,
+) *traceStreamWriter {
 	return &traceStreamWriter{
 		bw:             bw,
 		table:          table,

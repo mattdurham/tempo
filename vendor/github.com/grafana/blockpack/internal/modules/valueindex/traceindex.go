@@ -294,7 +294,9 @@ func appendTraceBlockIndex(out []byte, dir []traceBlockDirEntry) []byte {
 // uses the partial, block-pruning helpers in traceindexquery.go instead.
 func DecodeTraceGroups(data []byte) ([]TraceGroup, error) {
 	if !isTraceV2(data) {
-		return nil, fmt.Errorf("valueindex: trace index is not a v2 batched file (legacy v1 flat-blob format is no longer supported)")
+		return nil, fmt.Errorf(
+			"valueindex: trace index is not a v2 batched file (legacy v1 flat-blob format is no longer supported)",
+		)
 	}
 	return decodeTraceV2(data)
 }

@@ -67,6 +67,11 @@ type BackfillConfig struct {
 	IndexPrefix   string
 	WindowSeconds uint64 // default 48h (R4)
 	Workers       int    // default 4, mirrors cube's tempo-side override
+	// AnchorSec, if non-zero, is the window's newest edge (replacing Now()) --
+	// set by a caller resuming a chained backfill from a previously-persisted
+	// watermark. Zero means "anchor to the current wall clock", preserving all
+	// pre-existing callers' behavior unchanged.
+	AnchorSec uint64
 }
 
 // BackfillEngine runs one column's historical backfill.
@@ -101,6 +106,15 @@ func NewBackfillEngine(entry Entry, cfg BackfillConfig) *BackfillEngine {
 // constructs this BackfillEngine and owns persistence per plan.md's Part B) persist the
 // actual window alongside the watermark on its very first progressFn call, instead of
 // duplicating this engine's window-resolution logic in a second repo.
+//
+// #519: Done distinguishes two internally-separate signals that must not be conflated.
+// windowExhausted (this run's own listing finished, i.e. this is the final progressFn
+// call) is what's safe to use to advance WatermarkSec — see processBlocks' doc comment.
+// trueDone (what's actually persisted here as Done) additionally requires the resolved
+// window floor (minSec) to be genuinely 0 — the true beginning of time, or an unbounded
+// run. Done drives ONLY job-planner's "stop chaining more backfill runs for this column"
+// decision; it is never consulted by CoversRange (BackfillState.CoversRange /
+// ColumnWatermark.CoversRange), which ranges-checks WatermarkSec unconditionally.
 type BackfillProgress struct {
 	LastError      error
 	WatermarkSec   uint64
@@ -135,15 +149,25 @@ type BackfillProgress struct {
 // of... usage-triggered backfill status." Reports Done immediately (writing nothing) so a
 // caller doesn't keep re-attempting a backfill that will never do anything.
 func (e *BackfillEngine) Run(ctx context.Context, progressFn func(BackfillProgress) error) error {
-	maxSec := uint64(e.cfg.Now().Unix()) //nolint:gosec // Unix time is non-negative for any real clock
+	maxSec := e.cfg.AnchorSec
+	if maxSec == 0 {
+		maxSec = uint64(e.cfg.Now().Unix()) //nolint:gosec // Unix time is non-negative for any real clock
+	}
 	var minSec uint64
 	if maxSec > e.cfg.WindowSeconds {
 		minSec = maxSec - e.cfg.WindowSeconds
 	}
 
 	if _, excluded := HardExcludedColumns[e.entry.ColumnName]; excluded {
+		// #519: WatermarkSec:0 (not minSec) — "nothing will ever be backfilled for
+		// this column" (R2 permanent exclusion) is vacuously "covers everything
+		// from the beginning of time" under CoversRange's corrected contract, the
+		// actually-intended meaning here, not an artifact of this call's window.
+		// WindowStartSec/WindowEndSec are left as the resolved window purely for
+		// operator-facing observability (informational only — CoversRange never
+		// reads them).
 		return progressFn(BackfillProgress{
-			WatermarkSec:   minSec,
+			WatermarkSec:   0,
 			WindowStartSec: minSec,
 			WindowEndSec:   maxSec,
 			Done:           true,
@@ -166,11 +190,16 @@ func (e *BackfillEngine) Run(ctx context.Context, progressFn func(BackfillProgre
 	}
 
 	if len(refs) == 0 {
+		// #519: this call's own listing is trivially exhausted (there was nothing
+		// to process), but Done must still require minSec==0 — an empty listing
+		// within a BOUNDED window (e.g. no blocks exist in [minSec,maxSec] simply
+		// because nothing was ingested that hour) says nothing about whether
+		// history older than minSec is covered.
 		return progressFn(BackfillProgress{
 			WatermarkSec:   minSec,
 			WindowStartSec: minSec,
 			WindowEndSec:   maxSec,
-			Done:           true,
+			Done:           minSec == 0,
 		})
 	}
 
@@ -197,12 +226,13 @@ func (e *BackfillEngine) Run(ctx context.Context, progressFn func(BackfillProgre
 // beyond the window's boundary is confirmed yet" sentinel (CoversRange requires
 // minSec >= WatermarkSec, which a WatermarkSec of maxSec never satisfies for any real
 // historical query). Only the FINAL call, once every listed block has genuinely been
-// fetched and written, advances WatermarkSec to minSec (Done=true, which independently
-// makes CoversRange always return true regardless of WatermarkSec's exact value — see
-// BackfillState.CoversRange). This still satisfies R9 ("the caller MUST actually call
-// Registry.UpdateWatermark from progressFn," closing cube's own gap) since the call
-// happens on every block — it just does not let intermediate calls make a coverage
-// claim this loop cannot yet prove safe. See
+// fetched and written, advances WatermarkSec to minSec. Done is reported alongside per
+// #519's windowExhausted-AND-minSec==0 contract (see BackfillState.Done) — Done no longer
+// affects CoversRange's answer at all, only job-planner's chaining decision. This still
+// satisfies R9 ("the caller MUST actually call Registry.UpdateWatermark from
+// progressFn," closing cube's own gap) since the call happens on every block — it just
+// does not let intermediate calls make a coverage claim this loop cannot yet prove safe.
+// See
 // TestBackfillEngine_OverlappingOutOfOrderBlocksNeverOverstatesCoverage for the
 // adversarial regression pin, and NOTE-VIUSAGE-11 for the full design rationale
 // (including why extending BlockFetcher with per-block nominal bounds still would not
@@ -229,17 +259,22 @@ func (e *BackfillEngine) processBlocks(
 			return werr
 		}
 
-		done := i == len(refs)-1
+		windowExhausted := i == len(refs)-1
 		watermark := maxSec // unconfirmed sentinel -- see this function's own doc comment
-		if done {
+		if windowExhausted {
 			watermark = minSec
 		}
+		// #519: trueDone additionally requires minSec==0 -- windowExhausted alone
+		// (this run's own listing finished) says nothing about whether history
+		// OLDER than this run's window floor is covered. See BackfillState.Done's
+		// doc comment for the full contract.
+		trueDone := windowExhausted && minSec == 0
 
 		if perr := progressFn(BackfillProgress{
 			WatermarkSec:   watermark,
 			WindowStartSec: minSec,
 			WindowEndSec:   maxSec,
-			Done:           done,
+			Done:           trueDone,
 		}); perr != nil {
 			return perr
 		}

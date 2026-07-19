@@ -111,7 +111,11 @@ func MaterializeTraceGroupMultiFile(
 				return fmt.Errorf("%w: sourceRef %q: %w", ErrStructuralMultiFileCoverageGap, ref, err)
 			}
 			if reader == nil {
-				return fmt.Errorf("%w: sourceRef %q: readerFor returned a nil reader", ErrStructuralMultiFileCoverageGap, ref)
+				return fmt.Errorf(
+					"%w: sourceRef %q: readerFor returned a nil reader",
+					ErrStructuralMultiFileCoverageGap,
+					ref,
+				)
 			}
 			rows, rErr := ResolveTraceGroupSourceRef(reader, group, traceID, ref)
 			if rErr != nil {

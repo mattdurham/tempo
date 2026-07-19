@@ -55,7 +55,9 @@ type CubeQueryPathResult struct {
 //
 //nolint:revive,staticcheck // see the naming-convention rationale above
 //lint:ignore ST1012 deliberately Cube-prefixed, not ErrCube- (see rationale above)
-var CubeErrWarming = errors.New("blockpack: cube not yet backfilled for this shape/window; creation triggered, retry shortly")
+var CubeErrWarming = errors.New(
+	"blockpack: cube not yet backfilled for this shape/window; creation triggered, retry shortly",
+)
 
 // CubeQueryPathConfig configures a CubeQueryPath's caching, creation-cooldown, and
 // backfill-launch behavior. All fields have sane zero-value defaults applied by
@@ -111,7 +113,13 @@ type CubeQueryPath struct {
 // than CubeFileStore.List — see Decision 2 in the #508 implementation plan); vi is
 // the value-index LookupStore used by the creation trigger's VCNT lookups; pgPool
 // may be nil, in which case registry-backed operations decline silently.
-func NewCubeQueryPath(files CubeFileStore, lister Lister, vi LookupStore, pgPool *pgxpool.Pool, cfg CubeQueryPathConfig) *CubeQueryPath {
+func NewCubeQueryPath(
+	files CubeFileStore,
+	lister Lister,
+	vi LookupStore,
+	pgPool *pgxpool.Pool,
+	cfg CubeQueryPathConfig,
+) *CubeQueryPath {
 	if cfg.RegistryCacheTTL <= 0 {
 		cfg.RegistryCacheTTL = 5 * time.Minute
 	}
@@ -182,12 +190,30 @@ func (q *CubeQueryPath) QueryRange(ctx context.Context, req CubeQueryPathRequest
 	}
 
 	router := NewCubeQueryRouter(entries)
-	result, routeErr := router.Route(req.Tenant, req.Dims, req.Filters, req.NeededAttr, req.RequestedResolutionMinutes, req.MinMinute, req.MaxMinute)
+	result, routeErr := router.Route(
+		req.Tenant,
+		req.Dims,
+		req.Filters,
+		req.NeededAttr,
+		req.RequestedResolutionMinutes,
+		req.MinMinute,
+		req.MaxMinute,
+	)
 	if routeErr != nil || !result.Found {
 		// Cube not found, or found but with NO overlap at all with the requested window. Attempt
 		// cube creation on first query. Fire cube creation in a background goroutine so QueryRange
 		// is not blocked.
-		go q.maybeCreateCube(context.Background(), req.Tenant, req.Dims, req.Filters, req.NeededAttr, req.NeededAttrType, req.NeededAttrOK, req.MinTS, req.MaxTS)
+		go q.maybeCreateCube(
+			context.Background(),
+			req.Tenant,
+			req.Dims,
+			req.Filters,
+			req.NeededAttr,
+			req.NeededAttrType,
+			req.NeededAttrOK,
+			req.MinTS,
+			req.MaxTS,
+		)
 		return nil, false, CubeErrWarming
 	}
 
@@ -264,7 +290,11 @@ type cubeFileFetchResult struct {
 // at a time serialized the query's whole latency on round-trip count. Results are collected into
 // a slice indexed by each key's original position and filtered back into inputs in that same
 // order once every fetch has resolved.
-func (q *CubeQueryPath) fetchCubeFileInputs(ctx context.Context, keys []string, entry CubeRegistryEntry) ([]CubeRollupInput, int64, error) {
+func (q *CubeQueryPath) fetchCubeFileInputs(
+	ctx context.Context,
+	keys []string,
+	entry CubeRegistryEntry,
+) ([]CubeRollupInput, int64, error) {
 	results := make([]cubeFileFetchResult, len(keys))
 	var cubeBytesRead int64
 	g, gctx := errgroup.WithContext(ctx)
@@ -312,14 +342,21 @@ func (q *CubeQueryPath) fetchCubeFileInputs(ctx context.Context, keys []string, 
 // — Route's own decision) as CubeRollup's target level, never a hardcoded value. Extracted into
 // its own function so a test can construct a fake CubeRoutingResult and real cube readers and
 // assert CubeRollup was invoked with THAT resolution, independently of QueryRange's I/O wiring.
-func rollupCubeInputs(inputs []CubeRollupInput, result CubeRoutingResult, minMinute, maxMinute uint32) ([]CubeMergedCell, error) {
+func rollupCubeInputs(
+	inputs []CubeRollupInput,
+	result CubeRoutingResult,
+	minMinute, maxMinute uint32,
+) ([]CubeMergedCell, error) {
 	return CubeRollup(inputs, result.Resolution, minMinute, maxMinute)
 }
 
 // cubeCoveredWindow (#217/SPEC-CUBE-028, ruling 4(b) revisit) narrows [reqMinMinute, reqMaxMinute]
 // to result's actual covered sub-range (CoveredMinMinute/CoveredMaxMinute), reporting whether
 // coverage is partial. Pure — no I/O.
-func cubeCoveredWindow(result CubeRoutingResult, reqMinMinute, reqMaxMinute uint32) (minMinute, maxMinute uint32, partial bool) {
+func cubeCoveredWindow(
+	result CubeRoutingResult,
+	reqMinMinute, reqMaxMinute uint32,
+) (minMinute, maxMinute uint32, partial bool) {
 	partial = result.CoveredMinMinute > reqMinMinute || result.CoveredMaxMinute < reqMaxMinute
 	if !partial {
 		return reqMinMinute, reqMaxMinute, false

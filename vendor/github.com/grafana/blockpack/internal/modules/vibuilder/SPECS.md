@@ -165,11 +165,21 @@ NOTE-VI-085. Test: `leaf_indexable_test.go`. Issue #487.
 
 **Contract:** `ColumnWatermark{Triggered bool, Done bool, WatermarkSec uint64}` is the
 query-time-relevant coverage state for one non-dedicated, usage-triggered column mid-backfill
-(#496 R7). `(w ColumnWatermark) CoversRange(minSec, maxSec uint64) bool`: `w.Done` → `true`
-unconditionally; `!w.Triggered` → `false` unconditionally (never indexed, no coverage);
-otherwise → `minSec >= w.WatermarkSec` (in-progress, newest-to-oldest fill: covered range is
-`[WatermarkSec, now]`; only the query's OLDEST bound can create a coverage gap). The boundary
-`minSec == WatermarkSec` covers (inclusive, not a strict `>`).
+(#496 R7). `(w ColumnWatermark) CoversRange(minSec, maxSec uint64) bool`: `!w.Triggered` →
+`false` unconditionally (never indexed, no coverage); otherwise → `minSec >= w.WatermarkSec`
+(in-progress, newest-to-oldest fill: covered range is `[WatermarkSec, now]`; only the query's
+OLDEST bound can create a coverage gap). The boundary `minSec == WatermarkSec` covers
+(inclusive, not a strict `>`).
+
+**[CORRECTED, #519, 2026-07-18]** `w.Done` is **never consulted** by `CoversRange` — the
+previous version of this contract had `w.Done` unconditionally short-circuit to `true`
+before the `Triggered`/`WatermarkSec` check, which was the actual #519 bug (see
+`viusage/SPECS.md` SPEC-VIUSAGE-2 and `viusage/NOTES.md` NOTE-VIUSAGE-15 for the full
+rationale, mirrored here since this is the parity-tested duplicate). `Done`'s new
+definition is a job-planner-only scheduling signal (set by `BackfillEngine.Run`/
+`processBlocks`, `valueindex_backfill.go`); once `WatermarkSec` genuinely reaches 0, the
+`minSec >= w.WatermarkSec` check alone already returns `true` for any real range, so no
+`Done` check is needed to recover the "fully covered" case.
 
 **This logic must stay identical to `viusage.BackfillState.CoversRange`
 (`viusage/SPECS.md` SPEC-VIUSAGE-2)** — both express the same contract for the same underlying

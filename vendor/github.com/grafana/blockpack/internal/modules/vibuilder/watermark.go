@@ -15,9 +15,12 @@ package vibuilder
 // viusage.Entry.BackfillState (duplicated as a tiny value type here rather
 // than imported, per the same import-direction reasoning above -- vibuilder
 // must not depend on internal/modules/viusage either, to keep this package's
-// dependency graph a leaf). Triggered/Done/WatermarkSec together answer
-// exactly one question: does this column's backfill state confirm complete
-// coverage for [minSec, maxSec]?
+// dependency graph a leaf). Triggered/WatermarkSec together answer exactly
+// one question: does this column's backfill state confirm complete coverage
+// for [minSec, maxSec]? Done is a job-planner chaining-stop signal ONLY
+// (#519) -- true iff a run's own window was exhausted AND the resolved floor
+// (minSec) is genuinely 0 (true beginning of time, or an unbounded run). NOT
+// a query-correctness input: CoversRange never consults Done.
 type ColumnWatermark struct {
 	Triggered    bool
 	Done         bool
@@ -32,16 +35,18 @@ type ColumnWatermark struct {
 // (plan.md Section 4.1) since both express the same contract for the same
 // underlying registry state, just via two independent value types (see this
 // file's own doc comment for why they cannot share one type without an
-// import cycle).
+// import cycle). #519: Done is never consulted here -- see this type's own
+// doc comment.
 func (w ColumnWatermark) CoversRange(minSec, maxSec uint64) bool {
-	if w.Done {
-		return true
-	}
 	if !w.Triggered {
 		return false // never indexed -- no coverage at all, matches today's "zero files" case
 	}
-	// In-progress, newest-to-oldest fill: the covered range is [WatermarkSec, now].
-	// The query's window is covered ONLY if its oldest point (minSec) is not older
-	// than the watermark -- any older sub-range is unconfirmed and must decline.
+	// #519: Done is NOT consulted here -- it is a job-planner scheduling signal
+	// only (see this type's own doc comment), never a query-correctness bypass.
+	// Coverage is always this range check: [WatermarkSec, now) newest-to-oldest
+	// fill, covered only if the query's oldest point (minSec) is not older than
+	// the watermark. Once WatermarkSec genuinely reaches 0, this check alone
+	// covers any real range with zero special-casing -- the same property Done's
+	// new definition depends on.
 	return minSec >= w.WatermarkSec
 }

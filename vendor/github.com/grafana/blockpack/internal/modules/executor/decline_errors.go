@@ -39,7 +39,9 @@ var ErrMetricsNoCoverage = errors.New("executor: metrics query has no value-inde
 // time bucket is unknown and the span cannot be safely placed. Per-block-data-driven (not
 // query-shape-driven): heterogeneous across blocks written before vs. after per-span
 // timestamps were introduced. There is no full-block-scan fallback. Use errors.Is to detect it.
-var ErrMetricsLegacyTimeSecZero = errors.New("executor: metrics query matched a legacy block with no per-span timestamps")
+var ErrMetricsLegacyTimeSecZero = errors.New(
+	"executor: metrics query matched a legacy block with no per-span timestamps",
+)
 
 // ErrMetricsValueIndexDisabled (issue #481 part 3, team-lead ruling R8) is returned when
 // ExecuteMetricsTraceQL is called with no ValueIndexSource supplied at all (opts.ValueIndex ==

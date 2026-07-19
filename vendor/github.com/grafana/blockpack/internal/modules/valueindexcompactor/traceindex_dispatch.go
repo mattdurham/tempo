@@ -143,27 +143,37 @@ func (s *Service) mergeTraceLevel(ctx context.Context, colDir string, files []le
 	}
 
 	var written int
-	err := valueindex.StreamCompactTraceGroups(ctx, iterators, 0, s.cfg.MaxOutputBytes, tmpDir, func(outPath string) error {
-		//nolint:gosec // G304: outPath is StreamCompactTraceGroups' own local temp output file, not user input
-		data, rerr := os.ReadFile(outPath)
-		if rerr != nil {
-			return fmt.Errorf("valueindexcompactor: read local output %q: %w", outPath, rerr)
-		}
-		// Footer-only decode for the wall-clock time range -- mirrors mergeLevel's
-		// NOTE-VI-037 use of the BucketGroup footer, avoiding a second full decode of the
-		// just-written output.
-		var wallMinSec, wallMaxSec uint64
-		if ft, ferr := valueindex.DecodeTraceFooter(data); ferr == nil {
-			wallMinSec, wallMaxSec = ft.MinTimeSec, ft.MaxTimeSec
-		}
-		key := path.Join(colDir, valueindex.FormatFilenameV2(outputLevel, wallMinSec, wallMaxSec, valueindex.NewID()))
-		if perr := s.store.Put(ctx, key, data); perr != nil {
-			s.metrics.incError(compactorOpPut)
-			return fmt.Errorf("valueindexcompactor: put %q: %w", key, perr)
-		}
-		written++
-		return nil
-	})
+	err := valueindex.StreamCompactTraceGroups(
+		ctx,
+		iterators,
+		0,
+		s.cfg.MaxOutputBytes,
+		tmpDir,
+		func(outPath string) error {
+			//nolint:gosec // G304: outPath is StreamCompactTraceGroups' own local temp output file, not user input
+			data, rerr := os.ReadFile(outPath)
+			if rerr != nil {
+				return fmt.Errorf("valueindexcompactor: read local output %q: %w", outPath, rerr)
+			}
+			// Footer-only decode for the wall-clock time range -- mirrors mergeLevel's
+			// NOTE-VI-037 use of the BucketGroup footer, avoiding a second full decode of the
+			// just-written output.
+			var wallMinSec, wallMaxSec uint64
+			if ft, ferr := valueindex.DecodeTraceFooter(data); ferr == nil {
+				wallMinSec, wallMaxSec = ft.MinTimeSec, ft.MaxTimeSec
+			}
+			key := path.Join(
+				colDir,
+				valueindex.FormatFilenameV2(outputLevel, wallMinSec, wallMaxSec, valueindex.NewID()),
+			)
+			if perr := s.store.Put(ctx, key, data); perr != nil {
+				s.metrics.incError(compactorOpPut)
+				return fmt.Errorf("valueindexcompactor: put %q: %w", key, perr)
+			}
+			written++
+			return nil
+		},
+	)
 	if err != nil {
 		return fmt.Errorf("valueindexcompactor: merge trace groups %q: %w", colDir, err)
 	}
@@ -181,8 +191,13 @@ func (s *Service) mergeTraceLevel(ctx context.Context, colDir string, files []le
 		}
 	}
 	if stats.Corrupt > 0 {
-		slog.Warn("valueindexcompactor: dropped refs with unresolvable SourceID (data corruption, not routine retention)",
-			"colDir", colDir, "corrupt", stats.Corrupt)
+		slog.Warn(
+			"valueindexcompactor: dropped refs with unresolvable SourceID (data corruption, not routine retention)",
+			"colDir",
+			colDir,
+			"corrupt",
+			stats.Corrupt,
+		)
 	}
 
 	// Delete only the inputs that were successfully decoded and incorporated

@@ -699,3 +699,34 @@ Back-ref: `internal/modules/vibuilder/builder.go:BuildSource` (the `anyLeafAdded
 See `SPECS.md` SPEC-VB-4's own binding paragraph on this exact contract, and
 `internal/modules/viusage/TESTS.md`'s R7 adversarial-test entry (cross-references this note
 for the confirmed mutation-check outcome).
+
+## NOTE-VI-121 — `Done` decoupled from `ColumnWatermark.CoversRange` correctness (issue #519, mirrors `viusage/NOTES.md` NOTE-VIUSAGE-15)
+
+Date: 2026-07-18
+
+`ColumnWatermark.CoversRange` (`watermark.go`, SPEC-VB-4) previously let `w.Done`
+unconditionally short-circuit to `true`, bypassing the `WatermarkSec` range check —
+the actual #519 bug: `Done` only ever meant "this `BackfillEngine.Run` call's own window
+iteration finished" (`valueindex_backfill.go`, root package), not "the full historical
+range is really covered." Fixed identically to `viusage.BackfillState.CoversRange` (the
+parity-tested duplicate, NOTE-VI-103) — `CoversRange` never consults `Done` at all;
+coverage is always `Triggered && minSec_query >= WatermarkSec`. `Done` is redefined to a
+narrower, decoupled meaning owned by the root package's `BackfillEngine`: job-planner's
+"stop chaining more backfill runs for this column" signal only, true iff this run's own
+window was exhausted AND the resolved floor (`minSec`) is genuinely 0.
+
+Full rationale (why this mirrors cube's architecture rather than tightening a boolean, why
+`Done` still exists, why no migration of already-persisted state was needed) lives in
+`viusage/NOTES.md` NOTE-VIUSAGE-15 — not duplicated here since both `CoversRange`
+implementations must stay logically identical by construction (NOTE-VI-103); this entry
+exists so a reader of this file's own history doesn't have to guess that a design
+change landed here too, just because the fuller writeup happens to live in the sibling
+package's NOTES.md.
+
+**Back-refs:** `internal/modules/vibuilder/watermark.go:ColumnWatermark.Done,
+ColumnWatermark.CoversRange`, `valueindex_backfill.go:BackfillEngine.Run,
+BackfillEngine.processBlocks` (root package). Tests: `watermark_test.go`'s rewritten
+`TestColumnWatermark_CoversRange_DoneNoLongerBypassesRangeCheck`/
+`TestColumnWatermark_CoversRange_TrueDoneImpliesZeroWatermarkCovers`,
+`internal/modules/viusage/coversrange_parity_test.go` (parity gate covering both
+implementations). Issue #519.

@@ -18,49 +18,69 @@ and never reused or renumbered.
 
 
 ## TEST-VIUSAGE-1 through 4: `BackfillState.CoversRange` / `ColumnWatermark.CoversRange` boundary conditions, plus their cross-implementation parity test
-*Added: 2026-07-10. Updated: 2026-07-10 (task #117 landed the parity test flagged below as a recommended follow-up; the gap is now resolved.)*
+*Added: 2026-07-10. Updated: 2026-07-10 (task #117 landed the parity test flagged below as a
+recommended follow-up; the gap is now resolved.) Updated: 2026-07-18 (issue #519 — `Done` no
+longer bypasses the range check; see NOTE-VIUSAGE-15/NOTE-VI-121 for the design change, this
+entry only for the test-shape update).*
 
-**Scenario:** the R7 coverage-check primitive's 4 branches (SPEC-VIUSAGE-2 /
-`vibuilder/SPECS.md` SPEC-VB-4): `Done` always covers; never-`Triggered` never covers;
-in-progress covers only from the watermark forward; the exact `minSec == WatermarkSec`
-boundary covers (not a strict `>`). Because `viusage.BackfillState.CoversRange` and
-`vibuilder.ColumnWatermark.CoversRange` are two independently-maintained copies of the
-identical logic (NOTE-VIUSAGE-7), the real risk is not merely "does each copy pass its own
-tests" but "can the two copies silently diverge from each other" — task #117 added a
-dedicated parity test for exactly this risk, resolving the gap this entry originally flagged.
+**Scenario:** the R7 coverage-check primitive's branches (SPEC-VIUSAGE-2 / `vibuilder/
+SPECS.md` SPEC-VB-4, both corrected under #519): never-`Triggered` never covers; in-progress
+covers only from the watermark forward; the exact `minSec == WatermarkSec` boundary covers
+(not a strict `>`); `Done` is never consulted (the degenerate `Done:true, Triggered:false`
+combination now correctly declines, exactly like the never-triggered case; the actually
+reachable `Done:true, Triggered:true, WatermarkSec:0` combination still covers, but through
+the ordinary watermark check, not a `Done` special-case). Because `viusage.BackfillState.
+CoversRange` and `vibuilder.ColumnWatermark.CoversRange` are two independently-maintained
+copies of the identical logic (NOTE-VIUSAGE-7), the real risk is not merely "does each copy
+pass its own tests" but "can the two copies silently diverge from each other" — task #117
+added a dedicated parity test for exactly this risk; #519 both fixed a real divergence-risk
+bug in the shared logic AND found that the parity table's own `Done`-related rows had been
+pinning the pre-#519 bypass behavior (not merely under-covering it — actively asserting the
+wrong answer), so those rows needed correcting, not just extending.
 
 **Setup/Assertions:**
-- `TestColumnWatermark_CoversRange_DoneAlwaysTrue`, `_NeverTriggeredAlwaysFalse`,
-  `_InProgressCoversOnlyFromWatermarkForward`, `_InProgressExactlyAtWatermarkBoundaryCovers` —
-  direct-call tests against `vibuilder.ColumnWatermark.CoversRange` covering all 4 branches,
-  including the explicit boundary-inclusive case.
+- `TestColumnWatermark_CoversRange_DoneNoLongerBypassesRangeCheck` (renamed/rewritten from
+  the pre-#519 `_DoneAlwaysTrue`, which pinned the actual bug) and
+  `TestColumnWatermark_CoversRange_TrueDoneImpliesZeroWatermarkCovers` (new, #519) —
+  direct-call tests against `vibuilder.ColumnWatermark.CoversRange` pinning the corrected
+  `Done` contract, plus `_NeverTriggeredAlwaysFalse`, `_InProgressCoversOnlyFromWatermarkForward`,
+  `_InProgressExactlyAtWatermarkBoundaryCovers` for the unchanged branches.
 - `TestCoversRange_Parity_BackfillStateAndColumnWatermark` (`viusage/coversrange_parity_test.go`,
-  task #117) — a 9-case table test that constructs BOTH `viusage.BackfillState` and
+  task #117, corrected #519) — a table test that constructs BOTH `viusage.BackfillState` and
   `vibuilder.ColumnWatermark` from the SAME `{watermarkSec, minSec, maxSec, done, triggered}`
   input for each case, asserts BOTH match the case's expected `want` value, AND asserts the two
   implementations' own results equal each OTHER (`assert.Equal(t, gotBS, gotWM, ...)`) —
   catching a divergence even in the hypothetical case where both copies agreed with each other
-  but disagreed with the intended contract in the same wrong way (an ordinary equality-to-`want`
-  check alone would not catch that). Cases cover all 4 SPEC-VIUSAGE-2/SPEC-VB-4 branches plus
-  additional boundary variations (one second before/after the watermark, a degenerate
-  zero-width range, a wide `Done` range) beyond the 4 `vibuilder`-only tests above.
+  but disagreed with the intended contract in the same wrong way. #519 corrected the two
+  pre-existing "done always covers" rows (which paired `Done:true` with `Triggered:false` and
+  expected `true` — the exact bypass bug, present in the parity table under a different case
+  name than the `vibuilder`-only test) to expect `false`, added two new rows for the
+  genuinely-reachable `Done:true, Triggered:true, WatermarkSec:0` case (expect `true`), and
+  added the dedicated #519 mutation-test-gate row: `Done:true, WatermarkSec:1000, minSec:500,
+  maxSec:1500, Triggered:true` → `false` (this exact shape — a bounded run's final block
+  setting `Done:true` while `WatermarkSec` is a real nonzero historical boundary — is what the
+  old bypass got wrong).
 
 **Resolution of the originally-flagged coverage gap:** this entry originally noted
 `viusage.BackfillState.CoversRange` had no DIRECT dedicated boundary test of its own (only
 `vibuilder.ColumnWatermark.CoversRange` did) and recommended a follow-up parity/mirror test.
 Task #117's `TestCoversRange_Parity_BackfillStateAndColumnWatermark` satisfies that
-recommendation directly — it exercises `viusage.BackfillState.CoversRange` on every one of its
-9 cases, not merely as an indirect side effect of `trigger_test.go`/`backfill_test.go`'s
-scenarios as before. The asymmetry is resolved: both copies now have direct, dedicated
+recommendation directly. The asymmetry is resolved: both copies have direct, dedicated
 boundary-condition coverage, plus a cross-check that they agree with each other.
 
-**Spec invariants tested:** SPEC-VIUSAGE-2, `vibuilder/SPECS.md` SPEC-VB-4 (both copies, plus
-their mutual agreement).
+**#519 mutation-test gate (Phase 4, TASK #140):** revert ONLY the `CoversRange` edits in
+`entry.go` and `watermark.go` (restore `if bs.Done { return true }` / `if w.Done { return
+true }`), confirm the mutation-test-gate row above fails (old bypass produces `true`, row
+expects `false`), restore, confirm it passes again.
+
+**Spec invariants tested:** SPEC-VIUSAGE-1 (`Done`'s redefinition), SPEC-VIUSAGE-2,
+`vibuilder/SPECS.md` SPEC-VB-4 (both copies, plus their mutual agreement, all corrected #519).
 
 Back-refs: `internal/modules/vibuilder/watermark_test.go:TestColumnWatermark_CoversRange_
-DoneAlwaysTrue,_NeverTriggeredAlwaysFalse,_InProgressCoversOnlyFromWatermarkForward,
+DoneNoLongerBypassesRangeCheck,_TrueDoneImpliesZeroWatermarkCovers,
+_NeverTriggeredAlwaysFalse,_InProgressCoversOnlyFromWatermarkForward,
 _InProgressExactlyAtWatermarkBoundaryCovers`; `internal/modules/viusage/
-coversrange_parity_test.go:TestCoversRange_Parity_BackfillStateAndColumnWatermark`.
+coversrange_parity_test.go:TestCoversRange_Parity_BackfillStateAndColumnWatermark`. Issue #519.
 
 ---
 
@@ -140,7 +160,7 @@ store shape, independently written per R1).
 ---
 
 ## TEST-VIUSAGE-19 through 30: `BackfillEngine`/`Run` — ordering, allowlist scoping, file-layout parity, watermark progression across blocks, progress/cancellation, real-write-path round trip
-*Added: 2026-07-10. Updated: 2026-07-10 (test now lives in root `blockpack` alongside `BackfillEngine` itself, per SPEC-VIUSAGE-5's package-placement note; task #116 added `TestBackfillEngine_WatermarkValuesAcrossMultiBlockRun`, extending this range from 19-29 to 19-30.)*
+*Added: 2026-07-10. Updated: 2026-07-10 (test now lives in root `blockpack` alongside `BackfillEngine` itself, per SPEC-VIUSAGE-5's package-placement note; task #116 added `TestBackfillEngine_WatermarkValuesAcrossMultiBlockRun`, extending this range from 19-29 to 19-30.) Updated: 2026-07-18 (issue #519 — `Done`'s contract changed from "window exhausted" to "window exhausted AND minSec==0"; every `Done` assertion below using the default/fixed 48h window (nonzero `minSec`) flipped from `true` to `false`; one new positive test added for the `minSec==0` case).*
 
 **Scenario:** SPEC-VIUSAGE-5's full contract: newest-first processing, column-scoped
 extraction (proving `ExtractValueIndexEntriesForColumns` is genuinely used, not a full
@@ -165,23 +185,49 @@ methods.
   `valueindexcompactor`'s own file-discovery parsing would silently miss these files — this
   assertion is the entire proof behind R6's "zero special-casing" claim, not decorative.
 - `TestBackfillEngine_ProgressFnCalledPerCompletedUnit` — `progressFn` is called once per
-  fetched block (never batched).
+  fetched block (never batched). **[#519, 2026-07-18]** the final block's `Done` assertion
+  flipped from `true` to `false` — this test uses the default 48h window with real
+  `time.Now()`, so `minSec` is a real nonzero boundary, not the true beginning of time; window
+  exhaustion alone is no longer sufficient to claim `Done`.
 - `TestBackfillEngine_WatermarkValuesAcrossMultiBlockRun` (task #116) — the EXACT-VALUE
   companion to the test above: 3 real blocks (T3/T2/T1, each 1h/2h/3h old respectively, each
   with exactly one span so `blockCoverageRangeSec` collapses to that span's own second),
   fetched newest-first. Asserts the running-minimum watermark advances correctly block-by-block
   (`progress[0].WatermarkSec == T3's own second`, `progress[1].WatermarkSec == T2's own
   second` — the OLDER of the two, proving the running-minimum, not running-maximum or
-  last-seen, semantics) AND that the FINAL block's `Done=true` call forces `WatermarkSec` to
-  the full window's start (`nowSec - 48h`), NOT merely T1's own second — proving the
-  window-closing behavior SPEC-VIUSAGE-5 describes ("closing any rounding gap between the last
-  block's own MinStart and the window's configured edge") with real numbers, not just a
-  boolean `Done` check. Also asserts every progress call's `WindowStartSec`/`WindowEndSec`
-  stay constant across all 3 calls (the window itself does not drift mid-run).
+  last-seen, semantics) AND that the FINAL block's call forces `WatermarkSec` to the full
+  window's start (`nowSec - 48h`), NOT merely T1's own second — proving the window-closing
+  behavior SPEC-VIUSAGE-5 describes ("closing any rounding gap between the last block's own
+  MinStart and the window's configured edge") with real numbers. **[#519, 2026-07-18]** the
+  final block's `Done` assertion flipped from `true` to `false`, with a comment explaining why
+  this is a deliberate, reasoned contract change and not a weakening: a bounded (default 48h)
+  window's own exhaustion no longer implies `Done`, since `windowStartSec` here is a real,
+  nonzero historical boundary, not the true beginning of time — `WatermarkSec` still correctly
+  advances (unchanged), only `Done`'s semantics changed. Also asserts every progress call's
+  `WindowStartSec`/`WindowEndSec` stay constant across all 3 calls (the window itself does not
+  drift mid-run).
+- `TestBackfillEngine_Run_TrueDoneWhenWindowReachesBeginningOfTime` (new, #519,
+  2026-07-18) — the positive regression case the suite was missing before #519: a real
+  (non-empty-refs), single-block run with `WindowSeconds >= AnchorSec` so `minSec` floors at 0
+  (the true beginning of time) rather than going negative. Asserts `WatermarkSec == 0` and
+  `Done == true` — the ONLY case in the suite where a real block-processing loop produces a
+  true `Done`.
+- `TestBackfillEngine_OverlappingOutOfOrderBlocksNeverOverstatesCoverage` — **[#519,
+  2026-07-18]** the final block's `Done` assertion flipped from `true` to `false` for the same
+  reason as the two tests above (fixed-but-nonzero-`minSec` 48h window, not the true beginning
+  of time); `WatermarkSec` still correctly advances on the final block.
 - `TestBackfillEngine_StopsOnCtxCancel` — a canceled `ctx` stops processing before the next
   block fetch; `Run` returns `ctx.Err()`.
-- `TestBackfillEngine_EmptyBlockRangeWritesNothingReturnsNil` — zero blocks in range →
-  `progressFn` called exactly once with `Done=true`, `Run` returns `nil`, nothing written.
+- `TestBackfillEngine_EmptyBlockRangeWritesOnlyMetadata` — zero blocks in range → `progressFn`
+  called exactly once, `Run` returns `nil`, nothing written but `writeColumnMetadata` still
+  runs. **[#519, 2026-07-18]** `Done` assertion flipped from `true` to `false` — this test uses
+  real `time.Now()` (no override), so `minSec` is a real nonzero window floor, not the true
+  beginning of time; `Done` is now `minSec == 0`.
+- `TestBackfillEngine_HardExcludedColumnWritesNothing` — **[#519, 2026-07-18]** extended with
+  `assert.Zero(t, got[0].WatermarkSec)`: R2 permanent exclusion now reports `WatermarkSec: 0`
+  (not the resolved window's `minSec`), since "nothing will ever be backfilled for this
+  column" is vacuously "covers everything from the beginning of time" under the corrected
+  contract.
 - `TestBackfillEngine_FiltersToEntryColumnType` — a column observed under a DIFFERENT
   `ColumnType` than `entry.ColumnType` in a fetched block is excluded from output — proves the
   type-filter half of SPEC-VIUSAGE-5's "belongs to a distinct Entry/key" rule, distinct from
