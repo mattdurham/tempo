@@ -46,6 +46,10 @@ type queryRangeSharder struct {
 	// real #487 QueryPlan at RoundTrip's backendRequests call site. See asyncSearchSharder's
 	// identical field for the full rationale.
 	rawR backend.RawReader
+
+	// compactedChecker (issue #522 #157) backs fetchVCNTSection's mandatory compacted-key
+	// exclusion filter. See asyncSearchSharder's identical field for the full rationale.
+	compactedChecker compactedKeyChecker
 }
 
 type QueryRangeSharderConfig struct {
@@ -66,6 +70,12 @@ func newAsyncQueryRangeSharder(reader tempodb.Reader, o overrides.Interface, cfg
 	if rrp, ok := reader.(tempodb.RawReaderProvider); ok {
 		rawR = rrp.RawReader()
 	}
+	var compactedChecker compactedKeyChecker
+	if ppp, ok := reader.(tempodb.PgPoolProvider); ok {
+		if pool := ppp.PgPool(); pool != nil {
+			compactedChecker = blockpack.NewFileCatalogStore(pool)
+		}
+	}
 	return pipeline.AsyncMiddlewareFunc[combiner.PipelineResponse](func(next pipeline.AsyncRoundTripper[combiner.PipelineResponse]) pipeline.AsyncRoundTripper[combiner.PipelineResponse] {
 		return queryRangeSharder{
 			next:                   next,
@@ -77,7 +87,8 @@ func newAsyncQueryRangeSharder(reader tempodb.Reader, o overrides.Interface, cfg
 			logger:                 logger,
 			jobsPerQuery:           jobsPerQuery,
 
-			rawR: rawR,
+			rawR:             rawR,
+			compactedChecker: compactedChecker,
 		}
 	})
 }
@@ -177,7 +188,7 @@ func (s queryRangeSharder) RoundTrip(pipelineRequest pipeline.Request) (pipeline
 		dedicated := s.overrides.DedicatedColumns(tenantID)
 		var planErr error
 		var vcntBytesRead int64
-		plan, vcntBytesRead, planErr = buildMetricsQueryPlan(ctx, s.rawR, tenantID, dedicated, req.Query, req.Start/uint64(time.Second), req.End/uint64(time.Second), s.cfg.ConcurrentRequests)
+		plan, vcntBytesRead, planErr = buildMetricsQueryPlan(ctx, s.rawR, tenantID, dedicated, req.Query, req.Start/uint64(time.Second), req.End/uint64(time.Second), s.cfg.ConcurrentRequests, s.compactedChecker)
 		if planErr != nil {
 			// F-6 (issue #481 parts 2/3, R6): a resolvable-but-low-selectivity metrics query has
 			// no safe answer (R2: metrics is never bounded-served) — fail HERE, at plan time,

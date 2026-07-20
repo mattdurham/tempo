@@ -32,6 +32,16 @@ type Config struct {
 	// direct Postgres claim for vi_backfill/cube_backfill before falling back
 	// to the existing gRPC Next() path.
 	Postgres *postgres.Config `yaml:"postgres"`
+
+	// ValueIndexPrefix is the object-storage key prefix under which VI files
+	// live for a tenant (issue #522's catalog_reconcile "vi" branch,
+	// catalog_reconcile.go). Must match whatever value is actually configured
+	// on the value-index-compactor target
+	// (valueindexcompactor.Config.IndexPrefix) in this deployment -- it is
+	// genuinely per-deployment configurable there, defaulting to "indexes",
+	// so this field is NOT hardcoded to that default either. Defaults to
+	// "indexes" here only when left empty.
+	ValueIndexPrefix string `yaml:"value_index_prefix"`
 }
 
 func (cfg *Config) RegisterFlagsAndApplyDefaults(prefix string, f *flag.FlagSet) {
@@ -50,6 +60,10 @@ func (cfg *Config) RegisterFlagsAndApplyDefaults(prefix string, f *flag.FlagSet)
 	flagext.DefaultValues(&cfg.Ring)
 	cfg.Ring.KVStore.Store = "" // by default worker is not sharded
 	cfg.OverrideRingKey = backendWorkerRingKey
+
+	if cfg.ValueIndexPrefix == "" {
+		cfg.ValueIndexPrefix = "indexes"
+	}
 }
 
 func ValidateConfig(cfg *Config) error {

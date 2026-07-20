@@ -333,7 +333,7 @@ func (rw *readerWriter) CompactWithConfig(ctx context.Context, blockMetas []*bac
 	}
 
 	// mark old blocks compacted, so they don't show up in polling
-	if err := markCompacted(rw, tenantID, blockMetas, newCompactedBlocks); err != nil {
+	if err := markCompacted(ctx, rw, tenantID, blockMetas, newCompactedBlocks); err != nil {
 		return nil, err
 	}
 
@@ -369,7 +369,7 @@ func (rw *readerWriter) MarkBlocklistCompacted(tenantID string, oldBlocks, newBl
 	return nil
 }
 
-func markCompacted(rw *readerWriter, tenantID string, oldBlocks, newBlocks []*backend.BlockMeta) error {
+func markCompacted(ctx context.Context, rw *readerWriter, tenantID string, oldBlocks, newBlocks []*backend.BlockMeta) error {
 	// Check if we have any errors, but continue marking the blocks as compacted
 	var errCount int
 	for _, meta := range oldBlocks {
@@ -392,6 +392,11 @@ func markCompacted(rw *readerWriter, tenantID string, oldBlocks, newBlocks []*ba
 
 	// Update blocklist in memory
 	rw.blocklist.Update(tenantID, newBlocks, oldBlocks, newCompactions, nil)
+
+	// Direct-write-primary mirror into file_catalog (issue #522 #159) -- in addition to, not
+	// instead of, the filesystem-level MarkBlockCompacted calls above. No-op unless this
+	// deployment has both Postgres configured and Block.Version == "vblockpack".
+	rw.writeCompactionToFileCatalog(ctx, tenantID, oldBlocks, newBlocks)
 
 	if errCount > 0 {
 		return fmt.Errorf("unable to mark %d blocks compacted", errCount)

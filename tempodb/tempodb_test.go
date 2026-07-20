@@ -1071,6 +1071,37 @@ func TestReaderExposesRawReader(t *testing.T) {
 	require.Equal(t, content, got)
 }
 
+// TestReaderExposesPgPool pins the #522 #157 PgPoolProvider capability's "opt-in, nil when
+// cfg.Postgres is nil" contract, mirroring TestReaderExposesRawReader's own precedent -- a
+// Reader built by New() with no Postgres config must implement PgPoolProvider (so callers can
+// always type-assert for it) and must return a nil pool (so callers know to skip the compacted-
+// key exclusion filter rather than treating a missing pool as an error), exactly like every
+// other pgPool consumer in this file already treats it.
+func TestReaderExposesPgPool(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := &Config{
+		Backend: backend.Local,
+		Local:   &local.Config{Path: path.Join(tempDir, "traces")},
+		Block: &common.BlockConfig{
+			BloomFP:             .01,
+			BloomShardSizeBytes: 100_000,
+			Version:             encoding.DefaultEncoding().Version(),
+		},
+		WAL:           &wal.Config{Filepath: path.Join(tempDir, "wal")},
+		BlocklistPoll: 0,
+		Search: &SearchConfig{
+			ChunkSizeBytes:  1_000_000,
+			ReadBufferCount: 8, ReadBufferSizeBytes: 4 * 1024 * 1024,
+		},
+	}
+	r, _, _, err := New(cfg, nil, log.NewNopLogger())
+	require.NoError(t, err)
+
+	ppp, ok := r.(PgPoolProvider)
+	require.True(t, ok, "Reader built by New() must implement PgPoolProvider")
+	require.Nil(t, ppp.PgPool(), "cfg.Postgres is nil, so the exposed pool must be nil too")
+}
+
 // TestValueIndexQueryWiring_NoExplicitConfigStillInstalled is a regression test for a real
 // live gap (2026-07-11): a target whose own YAML never mentions `value_index_query` or
 // `vi_usage` at all (e.g. query-frontend's own configmap, historically) got NO

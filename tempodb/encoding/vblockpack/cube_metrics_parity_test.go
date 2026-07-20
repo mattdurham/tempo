@@ -25,6 +25,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 
 	blockpack "github.com/grafana/blockpack"
@@ -34,6 +35,38 @@ import (
 	tracepbv1 "github.com/grafana/tempo/pkg/tempopb/trace/v1"
 	"github.com/grafana/tempo/pkg/traceql"
 )
+
+// fakeSchedObjectStore is a minimal blockpack.CubeObjectStore fake backing the registry,
+// mirroring the conditional-PUT-with-etag discipline the real Registry.UpdateWatermarks
+// retries against. Originally defined in cube_scheduler_test.go (deleted, issue #522 #163 --
+// its boundary-gated compaction driver was superseded by compaction-planner/compaction-worker),
+// moved here since this file is now its only remaining consumer.
+type fakeSchedObjectStore struct {
+	mu   sync.Mutex
+	data []byte
+	etag string
+}
+
+func (s *fakeSchedObjectStore) Get(_ context.Context, _ string) ([]byte, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cp := make([]byte, len(s.data))
+	copy(cp, s.data)
+	return cp, s.etag, nil
+}
+
+func (s *fakeSchedObjectStore) ConditionalPut(_ context.Context, _ string, data []byte, etag string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.etag != etag {
+		return blockpack.CubeErrConflict
+	}
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	s.data = cp
+	s.etag = etag + "x"
+	return nil
+}
 
 // floatAttrColumn is the Float64-typed second aggAttr the "float-attr" fixtures exercise,
 // alongside the mandatory duration attribute (ruling 3).

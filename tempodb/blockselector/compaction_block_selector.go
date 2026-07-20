@@ -15,9 +15,12 @@ type CompactionBlockSelector interface {
 }
 
 const (
-	activeWindowDuration      = 24 * time.Hour
+	activeWindowDuration = 24 * time.Hour
+	// DefaultMinInputBlocks/DefaultMaxInputBlocks are both 2 (#522 Phase 4a):
+	// compaction is now strictly pairwise everywhere, mirroring VI/VCNT/cube's
+	// merge-execution shape, instead of the old 2-4 block stripes.
 	DefaultMinInputBlocks     = 2
-	DefaultMaxInputBlocks     = 4
+	DefaultMaxInputBlocks     = 2
 	DefaultMaxCompactionLevel = 0
 )
 
@@ -74,6 +77,15 @@ func NewTimeWindowBlockSelector(blocklist []*backend.BlockMeta, maxCompactionRan
 
 		if twbs.MaxCompactionLevel != 0 && b.CompactionLevel >= twbs.MaxCompactionLevel {
 			// skip blocks that are already at max compaction level
+			continue
+		}
+
+		// Terminal-leaf filter (#522 Phase 4b): a block that has already
+		// crossed MaxBlockBytes on its own is permanently excluded from
+		// future candidate selection -- growing it further via another merge
+		// would only ever violate the global size cutoff, and re-checking it
+		// on every pass would be wasted work.
+		if twbs.MaxBlockBytes != 0 && b.Size_ >= twbs.MaxBlockBytes {
 			continue
 		}
 

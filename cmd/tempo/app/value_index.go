@@ -13,25 +13,19 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/go-kit/log/level"
 	"github.com/grafana/dskit/services"
 	"github.com/grafana/tempo/modules/postgres"
-	"github.com/grafana/tempo/pkg/util/log"
 	s3cfg "github.com/grafana/tempo/tempodb/backend/s3"
 	common "github.com/grafana/tempo/tempodb/encoding/common"
-	"github.com/jackc/pgx/v5/pgxpool"
 	minio "github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/prometheus/client_golang/prometheus"
 
 	blockpack "github.com/grafana/blockpack"
 	"github.com/grafana/blockpack/blockevents"
-	vcntcompactor "github.com/grafana/blockpack/valuecountscompactor"
-	viccompactor "github.com/grafana/blockpack/valueindexcompactor"
 	vicconsumer "github.com/grafana/blockpack/valueindexconsumer"
 	vblockpack "github.com/grafana/tempo/tempodb/encoding/vblockpack"
 )
@@ -83,78 +77,6 @@ func toVICConsumerCfg(cfg common.ValueIndexConsumerConfig, ms manifestStore) vic
 		ClaimIdleThreshold: cfg.ClaimIdleThreshold,
 		BatchSize:          cfg.BatchSize,
 	}
-}
-
-// toVICCompactorCfg converts the Tempo config struct to the blockpack compactor config.
-func toVICCompactorCfg(cfg common.ValueIndexCompactorConfig) viccompactor.Config {
-	out := viccompactor.Config{
-		Enabled:               cfg.Enabled,
-		IndexPrefix:           cfg.IndexPrefix,
-		Tenants:               cfg.Tenants,
-		CompactInterval:       cfg.CompactInterval,
-		CompactThresholdFiles: cfg.CompactThresholdFiles,
-		MaxOutputBytes:        cfg.MaxOutputBytes,
-		ShardCount:            cfg.ShardCount,
-		ShardIndex:            cfg.ShardIndex,
-		CompactBatchBytes:     cfg.CompactBatchBytes,
-		CompactConcurrency:    cfg.CompactConcurrency,
-		CompactMaxInputFiles:  cfg.CompactMaxInputFiles,
-	}
-	// Allow SHARD_COUNT env var (set on the Deployment) to enable sharding.
-	if v, err := strconv.Atoi(os.Getenv("SHARD_COUNT")); err == nil && v > 0 {
-		out.ShardCount = v
-	}
-	// SHARD_INDEX can be set explicitly, or derived from POD_NAME (injected via
-	// the Kubernetes Downward API) so every pod in a Deployment gets a stable,
-	// unique shard assignment without needing a StatefulSet.
-	if v, err := strconv.Atoi(os.Getenv("SHARD_INDEX")); err == nil && v >= 0 {
-		out.ShardIndex = v
-	} else if out.ShardCount > 1 {
-		// StatefulSet pods are named <name>-<ordinal> (e.g. value-index-compactor-3).
-		// Parse the ordinal suffix as the shard index — guaranteed unique 0..N-1.
-		if name := os.Getenv("POD_NAME"); name != "" {
-			if idx := strings.LastIndex(name, "-"); idx >= 0 {
-				if v, err := strconv.Atoi(name[idx+1:]); err == nil && v >= 0 {
-					out.ShardIndex = v % out.ShardCount
-				}
-			}
-		}
-	}
-	return out
-}
-
-// toVCNTCompactorCfg converts the Tempo config struct to the blockpack VCNT compactor config.
-// manifestStore is nil when no manifest recording is configured (see initValueIndexCompactor).
-func toVCNTCompactorCfg(cfg common.ValueCountCompactorConfig, ms manifestStore) vcntcompactor.Config {
-	out := vcntcompactor.Config{
-		Enabled:               cfg.Enabled,
-		ManifestStore:         ms,
-		Tenants:               cfg.Tenants,
-		CompactInterval:       cfg.CompactInterval,
-		CompactThresholdFiles: cfg.CompactThresholdFiles,
-		CompactBatchBytes:     cfg.CompactBatchBytes,
-		MaxRecordsPerMerge:    cfg.MaxRecordsPerMerge,
-		ShardCount:            cfg.ShardCount,
-		ShardIndex:            cfg.ShardIndex,
-	}
-	// Same SHARD_COUNT/SHARD_INDEX env var convention as toVICCompactorCfg, so a VCNT
-	// column and a VI column with the same name land on the same shard index when both
-	// compactors share ShardCount/ShardIndex (byte-identical ColHash construction).
-	if v, err := strconv.Atoi(os.Getenv("SHARD_COUNT")); err == nil && v > 0 {
-		out.ShardCount = v
-	}
-	if v, err := strconv.Atoi(os.Getenv("SHARD_INDEX")); err == nil && v >= 0 {
-		out.ShardIndex = v
-	} else if out.ShardCount > 1 {
-		if name := os.Getenv("POD_NAME"); name != "" {
-			if idx := strings.LastIndex(name, "-"); idx >= 0 {
-				if v, err := strconv.Atoi(name[idx+1:]); err == nil && v >= 0 {
-					out.ShardIndex = v % out.ShardCount
-				}
-			}
-		}
-	}
-	return out
 }
 
 // ── value-index consumer ──────────────────────────────────────────────────────
@@ -234,120 +156,25 @@ func (t *App) initValueIndexConsumer() (services.Service, error) {
 
 // ── value-index compactor ─────────────────────────────────────────────────────
 
+// initValueIndexCompactor is now a permanent no-op (-target=value-index-compactor).
+// It used to bundle three self-driven ticker loops: VI's own compaction
+// (viccompactor.Service.Run, retired #162), VCNT's own compaction
+// (vcntcompactor.Service.Run, retired #162), and the cube scheduler
+// (vblockpack.ConfigureCubeScheduler's boundary-gated rollup ladder, retired
+// #163). All three are superseded system-wide by blockpack's own
+// compaction-planner/compaction-worker -- any one of these self-driven loops
+// still running here would double-process the same blockpack_file_catalog
+// rows compaction-worker's Postgres-claim-based concurrency now owns.
+//
+// The module target registration itself is deliberately kept (not removed
+// from modules.go) purely so the currently-deployed StatefulSet's
+// `-target=value-index-compactor` flag doesn't crash the process on its next
+// routine image rollout, before an operator has a chance to update the
+// deploy config. Actually retiring the StatefulSet (and, once that's done,
+// this now-permanently-idle module registration too) is a separate,
+// deliberately deferred live-infra decision (issue #522), not a code change.
 func (t *App) initValueIndexCompactor() (services.Service, error) {
-	bp := t.cfg.StorageConfig.Trace.Block.Blockpack
-	vccCfg := toVICCompactorCfg(bp.ValueIndexCompactor)
-
-	if !vccCfg.Enabled && !bp.CubeCompactorEnabled && !bp.ValueCountCompactor.Enabled {
-		return services.NewIdleService(nil, nil), nil
-	}
-
-	// Postgres is a hard requirement (2026-07-15) for both the cube scheduler's registry
-	// (issue #504) and the VCNT compactor's column-manifest recording (issue #507) -- there is
-	// no longer a blob-backed fallback for either. This check exists because, unlike
-	// block-builder/backend-worker/querier, this target never calls tempodb.New()/
-	// validateConfig at all (it's a standalone module with no "store" dependency), so nothing
-	// else catches a missing Postgres config before it silently degrades. VI compactor alone
-	// (vccCfg.Enabled, no cube/VCNT) doesn't need Postgres.
-	needsPostgres := (bp.CubeCompactorEnabled && len(bp.CubeTenants) > 0) || bp.ValueCountCompactor.Enabled
-	pgCfg := t.cfg.StorageConfig.Trace.Postgres
-	if needsPostgres && pgCfg == nil {
-		return nil, errors.New("value-index-compactor: postgres is not configured; required for the cube scheduler and/or value-count compactor's manifest recording")
-	}
-
-	s3Client, err := newMinioFromS3Cfg(t.cfg.StorageConfig.Trace.S3)
-	if err != nil {
-		return nil, fmt.Errorf("value-index-compactor: create S3 client: %w", err)
-	}
-
-	bucket := t.cfg.StorageConfig.Trace.S3.Bucket
-	store := &tempoVCCStore{client: s3Client, bucket: bucket}
-	exister := &tempoVCCExister{client: s3Client, bucket: bucket}
-	vcntStore := &tempoVCNTStore{store: store}
-
-	// pgPool backs the cube scheduler's registry and the VCNT compactor's column-manifest store.
-	// Constructed whenever cfg.Postgres is configured (not just when needsPostgres is true above)
-	// so it's also available if an operator configures Postgres for a deployment that doesn't
-	// strictly require it yet. This is a SEPARATE pgxpool.Pool from the one tempodb.New's
-	// readerWriter owns internally (that field is unexported, and this module has no reference to
-	// the concrete *readerWriter, only the Reader/Writer/Compactor interfaces) -- mirrors
-	// modules/backendworker's own identical cfg.Postgres != nil -> postgres.NewPool pattern.
-	var pgPool *pgxpool.Pool
-	if pgCfg != nil {
-		pgPool, err = postgres.NewPool(context.Background(), pgCfg)
-		if err != nil {
-			return nil, fmt.Errorf("value-index-compactor: create postgres pool: %w", err)
-		}
-		if err := blockpack.ApplyColumnManifestSchema(context.Background(), pgPool); err != nil {
-			pgPool.Close()
-			return nil, fmt.Errorf("value-index-compactor: apply column manifest schema: %w", err)
-		}
-	}
-
-	// Column-manifest recording (colhashmanifest, task #216). The VI compactor
-	// (viccompactor.Config) has no ManifestStore field; only the VCNT compactor
-	// (vcntcompactor.Config) records manifest entries, and needsPostgres above already
-	// guarantees pgPool is non-nil whenever bp.ValueCountCompactor.Enabled is true.
-	var manStore manifestStore
-	if bp.ValueCountCompactor.Enabled {
-		manStore = blockpack.NewPgColumnManifestStore(pgPool)
-	}
-	vcntCfg := toVCNTCompactorCfg(bp.ValueCountCompactor, manStore)
-
-	return services.NewIdleService(
-		func(ctx context.Context) error {
-			// VI index compactor loop.
-			if vccCfg.Enabled {
-				vccCfg.Registerer = prometheus.DefaultRegisterer
-				viSvc, viErr := viccompactor.NewService(vccCfg, store, exister)
-				if viErr != nil {
-					return fmt.Errorf("value-index-compactor: %w", viErr)
-				}
-				go func() {
-					if err := viSvc.Run(ctx); err != nil && err != context.Canceled {
-						level.Error(log.Logger).Log("msg", "value-index-compactor exited", "err", err)
-					}
-				}()
-			}
-			// Cube scheduler loop — runs inside the same service. Implements the full
-			// L0-merge / boundary-gated L0->L1 hourly / L1->L2 daily rollup ladder plus L0
-			// eviction as a single driver (#491, E-12b — replaces the former
-			// CubeCompactorService, whose L1-rollup step had no boundary-completeness gate).
-			if bp.CubeCompactorEnabled && len(bp.CubeTenants) > 0 {
-				cubeScheduler := vblockpack.ConfigureCubeScheduler(
-					s3Client, bucket, bp.CubeTenants,
-					vblockpack.CubeSchedulerConfig{TickInterval: bp.CubeCompactorInterval},
-					pgPool,
-				)
-				go cubeScheduler.Run(ctx)
-			}
-			// VCNT (value-counts) compactor loop — bundled the same way as cube above,
-			// no dedicated StatefulSet. See blockpack valuecountscompactor NOTE-VC-005/009
-			// for why this has no SourceExister (retention is Compact's own net-sum rule)
-			// and why delete failures are retried with a dedicated metric rather than
-			// treated as fully safe (Compact sums by key, unlike VI's identity-deduped merge).
-			if vcntCfg.Enabled {
-				vcntCfg.Registerer = prometheus.DefaultRegisterer
-				vcntSvc, vcntErr := vcntcompactor.NewService(vcntCfg, vcntStore)
-				if vcntErr != nil {
-					return fmt.Errorf("value-count-compactor: %w", vcntErr)
-				}
-				go func() {
-					if err := vcntSvc.Run(ctx); err != nil && err != context.Canceled {
-						level.Error(log.Logger).Log("msg", "value-count-compactor exited", "err", err)
-					}
-				}()
-			}
-			<-ctx.Done()
-			return nil
-		},
-		func(_ error) error {
-			if pgPool != nil {
-				pgPool.Close()
-			}
-			return nil
-		},
-	), nil
+	return services.NewIdleService(nil, nil), nil
 }
 
 // ── S3 extractor for consumer ─────────────────────────────────────────────────
@@ -461,144 +288,6 @@ func (p *tempoVICPutter) Put(key string, data []byte) error {
 		minio.PutObjectOptions{ContentType: "application/octet-stream"},
 	)
 	return err
-}
-
-// ── S3 IndexStore for compactor ───────────────────────────────────────────────
-
-type tempoVCCStore struct {
-	client *minio.Client
-	bucket string
-}
-
-func (s *tempoVCCStore) Peek(ctx context.Context, key string, n int) ([]byte, error) {
-	opts := minio.GetObjectOptions{}
-	_ = opts.SetRange(0, int64(n)-1)
-	obj, err := s.client.GetObject(ctx, s.bucket, key, opts)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = obj.Close() }()
-	buf := make([]byte, n)
-	nr, err := io.ReadFull(obj, buf)
-	if err != nil && err != io.ErrUnexpectedEOF {
-		return nil, err
-	}
-	return buf[:nr], nil
-}
-
-func (s *tempoVCCStore) List(ctx context.Context, prefix string) ([]viccompactor.IndexObject, error) {
-	var objs []viccompactor.IndexObject
-	for o := range s.client.ListObjects(ctx, s.bucket,
-		minio.ListObjectsOptions{Prefix: prefix, Recursive: true}) {
-		if o.Err != nil {
-			return nil, o.Err
-		}
-		objs = append(objs, viccompactor.IndexObject{Key: o.Key, Size: o.Size})
-	}
-	return objs, nil
-}
-
-// ListDirs returns the immediate child "directory" prefixes one level below
-// prefix using a non-recursive S3 list with delimiter "/". This avoids
-// loading millions of file keys when only the directory names are needed.
-func (s *tempoVCCStore) ListDirs(ctx context.Context, prefix string) ([]string, error) {
-	var dirs []string
-	for obj := range s.client.ListObjects(ctx, s.bucket,
-		minio.ListObjectsOptions{Prefix: prefix, Recursive: false}) {
-		if obj.Err != nil {
-			return nil, obj.Err
-		}
-		// With Recursive: false minio returns common prefixes in obj.Key with a
-		// trailing "/" and obj.Size == 0; actual objects have non-zero size.
-		if strings.HasSuffix(obj.Key, "/") {
-			dirs = append(dirs, obj.Key)
-		}
-	}
-	return dirs, nil
-}
-
-func (s *tempoVCCStore) Get(ctx context.Context, key string) ([]byte, error) {
-	obj, err := s.client.GetObject(ctx, s.bucket, key, minio.GetObjectOptions{})
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = obj.Close() }()
-	return io.ReadAll(obj)
-}
-
-func (s *tempoVCCStore) Put(ctx context.Context, key string, data []byte) error {
-	_, err := s.client.PutObject(ctx, s.bucket, key,
-		bytes.NewReader(data), int64(len(data)),
-		minio.PutObjectOptions{ContentType: "application/octet-stream"},
-	)
-	return err
-}
-
-func (s *tempoVCCStore) Delete(ctx context.Context, key string) error {
-	return s.client.RemoveObject(ctx, s.bucket, key, minio.RemoveObjectOptions{})
-}
-
-// ── S3 Store adapter for VCNT compactor ──────────────────────────────────────
-
-// tempoVCNTStore adapts tempoVCCStore to valuecountscompactor.Store. It cannot embed
-// tempoVCCStore directly and rely on Go's structural typing to satisfy the interface for
-// free: tempoVCCStore.List returns []viccompactor.IndexObject, but Store.List requires
-// []valuecountscompactor.Object — two distinct named struct types with identical fields
-// (blockpack NOTE-VC-005/SPEC-VC-1, from today's earlier value-index-compactor fix #33,
-// which found the same "these look structurally identical but Go doesn't treat named
-// types that way" mistake in blockpack's own doc comments). Get/Put/Delete/ListDirs have
-// plain string/[]byte/error signatures with no divergent named type, so those are reused
-// directly from the embedded *tempoVCCStore; only List needs a converting wrapper.
-type tempoVCNTStore struct {
-	store *tempoVCCStore
-}
-
-func (s *tempoVCNTStore) List(ctx context.Context, prefix string) ([]vcntcompactor.Object, error) {
-	objs, err := s.store.List(ctx, prefix)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]vcntcompactor.Object, 0, len(objs))
-	for _, o := range objs {
-		out = append(out, vcntcompactor.Object{Key: o.Key, Size: o.Size})
-	}
-	return out, nil
-}
-
-func (s *tempoVCNTStore) ListDirs(ctx context.Context, prefix string) ([]string, error) {
-	return s.store.ListDirs(ctx, prefix)
-}
-
-func (s *tempoVCNTStore) Get(ctx context.Context, key string) ([]byte, error) {
-	return s.store.Get(ctx, key)
-}
-
-func (s *tempoVCNTStore) Put(ctx context.Context, key string, data []byte) error {
-	return s.store.Put(ctx, key, data)
-}
-
-func (s *tempoVCNTStore) Delete(ctx context.Context, key string) error {
-	return s.store.Delete(ctx, key)
-}
-
-// ── S3 SourceExister for compactor ───────────────────────────────────────────
-
-type tempoVCCExister struct {
-	client *minio.Client
-	bucket string
-}
-
-func (e *tempoVCCExister) Exists(ctx context.Context, sourceRef string) (bool, error) {
-	key := bareKey(sourceRef)
-	_, err := e.client.StatObject(ctx, e.bucket, key, minio.StatObjectOptions{})
-	if err != nil {
-		resp := minio.ToErrorResponse(err)
-		if resp.Code == "NoSuchKey" || resp.StatusCode == 404 {
-			return false, nil
-		}
-		return false, fmt.Errorf("stat %s: %w", key, err)
-	}
-	return true, nil
 }
 
 // ── utilities ─────────────────────────────────────────────────────────────────

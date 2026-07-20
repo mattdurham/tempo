@@ -17,7 +17,7 @@ import (
 // canceled, without a real Postgres connection (pollFn is overridden with a
 // no-op).
 func TestService_Run_StopsOnContextCancel(t *testing.T) {
-	s := &Service{cfg: common.JobPlannerConfig{Enabled: true, PollInterval: time.Millisecond}}
+	s := &Service{cfg: common.JobPlannerConfig{Enabled: true, PollInterval: time.Millisecond, CatalogPollInterval: time.Hour}}
 	s.pollFn = func(context.Context) error { return nil }
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -53,7 +53,7 @@ func TestService_Run_DisabledBlocksUntilContextDone(t *testing.T) {
 // again -- mirrors backendscheduler's "one bad tick doesn't kill the poller"
 // posture.
 func TestService_PollOnce_ErrorDoesNotAbortLoop(t *testing.T) {
-	s := &Service{cfg: common.JobPlannerConfig{Enabled: true, PollInterval: time.Millisecond}}
+	s := &Service{cfg: common.JobPlannerConfig{Enabled: true, PollInterval: time.Millisecond, CatalogPollInterval: time.Hour}}
 	var calls atomic.Int32
 	s.pollFn = func(context.Context) error {
 		n := calls.Add(1)
@@ -68,4 +68,48 @@ func TestService_PollOnce_ErrorDoesNotAbortLoop(t *testing.T) {
 	_ = s.Run(ctx)
 
 	assert.GreaterOrEqual(t, calls.Load(), int32(2), "Run must keep ticking after pollFn returns an error")
+}
+
+// TestService_Run_TicksCatalogPollFnOnItsOwnInterval proves catalogPollFn
+// fires independently of pollFn, on its own (potentially different) ticker --
+// issue #522's catalog-maintenance poll must not depend on PollInterval.
+func TestService_Run_TicksCatalogPollFnOnItsOwnInterval(t *testing.T) {
+	s := &Service{cfg: common.JobPlannerConfig{Enabled: true, PollInterval: time.Hour, CatalogPollInterval: time.Millisecond}}
+	s.pollFn = func(context.Context) error {
+		t.Fatal("pollFn must not fire within this test's short window given a 1h PollInterval")
+		return nil
+	}
+	var catalogCalls atomic.Int32
+	s.catalogPollFn = func(context.Context) error {
+		catalogCalls.Add(1)
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_ = s.Run(ctx)
+
+	assert.GreaterOrEqual(t, catalogCalls.Load(), int32(1), "Run must tick catalogPollFn on its own CatalogPollInterval")
+}
+
+// TestService_CatalogPollOnce_ErrorDoesNotAbortLoop mirrors
+// TestService_PollOnce_ErrorDoesNotAbortLoop for the catalog-maintenance
+// ticker: a tick's error is recorded but never stops Run from ticking again.
+func TestService_CatalogPollOnce_ErrorDoesNotAbortLoop(t *testing.T) {
+	s := &Service{cfg: common.JobPlannerConfig{Enabled: true, PollInterval: time.Hour, CatalogPollInterval: time.Millisecond}}
+	s.pollFn = func(context.Context) error { return nil }
+	var calls atomic.Int32
+	s.catalogPollFn = func(context.Context) error {
+		n := calls.Add(1)
+		if n == 1 {
+			return errors.New("simulated transient failure")
+		}
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_ = s.Run(ctx)
+
+	assert.GreaterOrEqual(t, calls.Load(), int32(2), "Run must keep ticking catalogPollFn after it returns an error")
 }

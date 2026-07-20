@@ -11,6 +11,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -23,6 +25,23 @@ type JobType string
 const (
 	JobTypeViBackfill   JobType = "vi_backfill"
 	JobTypeCubeBackfill JobType = "cube_backfill"
+
+	// JobTypeCatalogReconcile is issue #522's catalog-maintenance job type,
+	// trace/span-only as of #154 (per revision note pivot #4 -- vi/vcnt/cube
+	// catalog-sync/reap moved entirely to blockpack's own compaction-planner/
+	// compaction-worker): job-planner enumerates candidates Postgres-only (no
+	// storage.Store dependency, see plan.md Section C) and inserts one job
+	// per candidate; backend-worker claims and executes each.
+	JobTypeCatalogReconcile JobType = "catalog_reconcile"
+
+	// JobTypeTraceCompaction is issue #522 Phase 4c/#158's pairwise trace/span
+	// compaction job type, staged alongside the existing gRPC
+	// backendScheduler.Next() CompactionProvider path (backend-worker's
+	// processJobs tries a Postgres claim first, falls back to the gRPC path
+	// only if none is available -- already proven for vi_backfill/
+	// cube_backfill). vblockpack-encoded tenants only; vparquet/standard
+	// tenants stay on the gRPC path forever.
+	JobTypeTraceCompaction JobType = "trace_compaction"
 )
 
 type Status string
@@ -72,6 +91,27 @@ type CubeBackfillDetail struct {
 	WindowMinutes uint32 `json:"window_minutes"`
 }
 
+// CatalogReconcileDetail identifies which (subsystem, tenant) pair
+// backend-worker's processCatalogReconcileJobPostgres handler reconciles.
+// Trace/span-only now (#154, per revision note pivot #4): "trace" compares
+// tempodb's own BlockMetas against file_catalog. "vi"/"vcnt"/"cube"
+// reconciliation against blockpack_file_catalog moved entirely to
+// blockpack's own compaction-worker (plan.md Section G.4) -- any other
+// Subsystem value is rejected by the handler.
+type CatalogReconcileDetail struct {
+	Subsystem string `json:"subsystem"` // "trace"
+	Tenant    string `json:"tenant"`
+}
+
+// TraceCompactionDetail identifies the exactly-2 same-level trace/span block IDs
+// backend-worker's processTraceCompactionJobPostgres handler merges (issue #522
+// #158): pairwise only (#151's DefaultMinInputBlocks=DefaultMaxInputBlocks=2),
+// vblockpack-encoded tenants only (plan.md Phase 4c scoping -- vparquet/
+// standard tenants stay on the existing gRPC CompactionProvider path forever).
+type TraceCompactionDetail struct {
+	InputBlockIDs []string `json:"input_block_ids"`
+}
+
 // Store is the Postgres-backed backend_jobs implementation.
 type Store struct{ pool *pgxpool.Pool }
 
@@ -115,6 +155,43 @@ func (s *Store) InsertCubeBackfill(ctx context.Context, tenant string, d CubeBac
 	}
 	if _, err := s.pool.Exec(ctx, insertJobSQL, uuid.NewString(), string(JobTypeCubeBackfill), tenant, detail, dedupKey); err != nil {
 		return fmt.Errorf("jobstore: insert cube_backfill job: %w", err)
+	}
+	return nil
+}
+
+// InsertCatalogReconcile inserts a pending catalog_reconcile job, deduped on
+// job_type+subsystem+tenant (plan.md Section C's "catalog_reconcile|subsystem|tenant"
+// dedup key) -- job-planner's own catalog-maintenance poll re-enumerates the
+// same (subsystem, tenant) pairs every tick, so a still-pending or
+// still-running reconcile job for the same pair must be a silent no-op, not a
+// duplicate.
+func (s *Store) InsertCatalogReconcile(ctx context.Context, subsystem, tenant string) error {
+	dedupKey := string(JobTypeCatalogReconcile) + "|" + subsystem + "|" + tenant
+	detail, err := json.Marshal(CatalogReconcileDetail{Subsystem: subsystem, Tenant: tenant})
+	if err != nil {
+		return fmt.Errorf("jobstore: marshal catalog_reconcile detail: %w", err)
+	}
+	if _, err := s.pool.Exec(ctx, insertJobSQL, uuid.NewString(), string(JobTypeCatalogReconcile), tenant, detail, dedupKey); err != nil {
+		return fmt.Errorf("jobstore: insert catalog_reconcile job: %w", err)
+	}
+	return nil
+}
+
+// InsertTraceCompaction inserts a pending trace_compaction job, deduped on
+// job_type+tenant+sorted-input-block-IDs (sorting first means the same 2
+// input blocks in either order always produce the identical dedup key --
+// mirrors the now-relocated InsertViCompaction's own convention). A
+// still-pending or still-running job for the same 2 inputs is a silent no-op.
+func (s *Store) InsertTraceCompaction(ctx context.Context, tenant string, d TraceCompactionDetail) error {
+	sortedIDs := append([]string(nil), d.InputBlockIDs...)
+	sort.Strings(sortedIDs)
+	dedupKey := string(JobTypeTraceCompaction) + "|" + tenant + "|" + strings.Join(sortedIDs, ",")
+	detail, err := json.Marshal(d)
+	if err != nil {
+		return fmt.Errorf("jobstore: marshal trace_compaction detail: %w", err)
+	}
+	if _, err := s.pool.Exec(ctx, insertJobSQL, uuid.NewString(), string(JobTypeTraceCompaction), tenant, detail, dedupKey); err != nil {
+		return fmt.Errorf("jobstore: insert trace_compaction job: %w", err)
 	}
 	return nil
 }

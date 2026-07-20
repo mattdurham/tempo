@@ -126,6 +126,9 @@ func (rw *readerWriter) retainTenant(ctx context.Context, tenantID string, compa
 					metricDeleted.Inc()
 					rw.removeCachedBlock(ctx, tenantID, (uuid.UUID)(b.BlockID), int(b.BloomShardCount))
 					rw.blocklist.Update(tenantID, nil, nil, nil, []*backend.CompactedBlockMeta{b})
+					// Direct-write-primary mirror into file_catalog (issue #522 #159) -- in
+					// addition to, not instead of, the filesystem-level ClearBlock call above.
+					rw.markFileCatalogDeleted(ctx, tenantID, b.BlockID)
 				}
 			}
 		}

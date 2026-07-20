@@ -151,7 +151,7 @@ func (cfg *CompactorConfig) RegisterFlagsAndApplyDefaults(prefix string, f *flag
 
 	f.DurationVar(&cfg.BlockRetention, util.PrefixConfig(prefix, "block-retention"), 14*24*time.Hour, "Duration to keep blocks/traces.")
 	f.IntVar(&cfg.MaxCompactionObjects, util.PrefixConfig(prefix, "max-objects-per-block"), 6000000, "Maximum number of traces in a compacted block.")
-	f.Uint64Var(&cfg.MaxBlockBytes, util.PrefixConfig(prefix, "max-block-bytes"), 100*1024*1024*1024 /* 100GB */, "Maximum size of a compacted block.")
+	f.Uint64Var(&cfg.MaxBlockBytes, util.PrefixConfig(prefix, "max-block-bytes"), 1*1024*1024*1024 /* 1GiB, #522 Phase 4b terminal-leaf cutoff */, "Maximum size of a compacted block.")
 	f.DurationVar(&cfg.MaxCompactionRange, util.PrefixConfig(prefix, "compaction-window"), time.Hour, "Maximum time window across which to compact blocks.")
 }
 
@@ -197,7 +197,8 @@ func validateConfig(cfg *Config) error {
 	// issue #504: the cube registry is Postgres-only now (no blob/index.json fallback), so
 	// enabling cube ingest for any tenant without a configured Postgres pool is a broken
 	// config, not a silently-degraded one -- fail fast at startup rather than let
-	// vblockpack.ConfigureCubeManager/ConfigureCubeScheduler/ConfigureCubeQueryPath panic or
+	// vblockpack.ConfigureCubeManager/ConfigureCubeQueryPath (or, on the compaction side,
+	// compaction-planner/compaction-worker's own cube handlers, issue #522 #163) panic or
 	// silently no-op the first time they actually try to touch the registry.
 	if len(cfg.Block.Blockpack.CubeTenants) > 0 && cfg.Postgres == nil {
 		return errors.New("blockpack.cube_tenants is non-empty but postgres is not configured: the cube registry requires postgres (issue #504)")

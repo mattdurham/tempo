@@ -64,6 +64,14 @@ type asyncSearchSharder struct {
 	// this field today (no race: it is set once and never mutated, so concurrent RoundTrip
 	// calls are safe).
 	rawR backend.RawReader
+
+	// compactedChecker (issue #522 #157) backs fetchVCNTSection's mandatory compacted-key
+	// exclusion filter, mirroring rawR's own derivation: from reader via the optional
+	// tempodb.PgPoolProvider capability, nil whenever reader doesn't implement it or its pool
+	// is nil (Postgres not configured on this deployment) — buildQueryPlan/fetchVCNTSection
+	// treat nil exactly like buildVCNTSection's own nil-checker convention (filtering skipped,
+	// never a hard error).
+	compactedChecker compactedKeyChecker
 }
 
 // newAsyncSearchSharder creates a sharding middleware for search
@@ -71,6 +79,12 @@ func newAsyncSearchSharder(reader tempodb.Reader, o overrides.Interface, cfg Sea
 	var rawR backend.RawReader
 	if rrp, ok := reader.(tempodb.RawReaderProvider); ok {
 		rawR = rrp.RawReader()
+	}
+	var compactedChecker compactedKeyChecker
+	if ppp, ok := reader.(tempodb.PgPoolProvider); ok {
+		if pool := ppp.PgPool(); pool != nil {
+			compactedChecker = blockpack.NewFileCatalogStore(pool)
+		}
 	}
 	return pipeline.AsyncMiddlewareFunc[combiner.PipelineResponse](func(next pipeline.AsyncRoundTripper[combiner.PipelineResponse]) pipeline.AsyncRoundTripper[combiner.PipelineResponse] {
 		return asyncSearchSharder{
@@ -83,7 +97,8 @@ func newAsyncSearchSharder(reader tempodb.Reader, o overrides.Interface, cfg Sea
 			logger:                 logger,
 			jobsPerQuery:           jobsPerQuery,
 
-			rawR: rawR,
+			rawR:             rawR,
+			compactedChecker: compactedChecker,
 		}
 	})
 }
@@ -164,12 +179,12 @@ func (s asyncSearchSharder) RoundTrip(pipelineRequest pipeline.Request) (pipelin
 		dedicated := s.overrides.DedicatedColumns(tenantID)
 		var planErr error
 		var vcntBytesRead int64
-		plan, vcntBytesRead, planErr = buildQueryPlan(ctx, s.rawR, tenantID, dedicated, searchReq.Query, uint64(searchReq.Start), uint64(searchReq.End), s.cfg.ConcurrentRequests, hasLimit)
+		plan, vcntBytesRead, planErr = buildQueryPlan(ctx, s.rawR, tenantID, dedicated, searchReq.Query, uint64(searchReq.Start), uint64(searchReq.End), s.cfg.ConcurrentRequests, hasLimit, s.compactedChecker)
 		if planErr != nil {
 			return pipeline.NewBadRequest(planErr), nil
 		}
 		if plan == nil {
-			plan, vcntBytesRead, planErr = buildStructuralQueryPlan(ctx, s.rawR, tenantID, dedicated, searchReq.Query, uint64(searchReq.Start), uint64(searchReq.End), s.cfg.ConcurrentRequests, hasLimit)
+			plan, vcntBytesRead, planErr = buildStructuralQueryPlan(ctx, s.rawR, tenantID, dedicated, searchReq.Query, uint64(searchReq.Start), uint64(searchReq.End), s.cfg.ConcurrentRequests, hasLimit, s.compactedChecker)
 			if planErr != nil {
 				return pipeline.NewBadRequest(planErr), nil
 			}

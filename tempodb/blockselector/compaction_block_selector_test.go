@@ -927,3 +927,37 @@ func TestTimeWindowBlockSelectorBlocksToCompact(t *testing.T) {
 		})
 	}
 }
+
+// TestTimeWindowBlockSelector_TerminalLeafFilter (#522 Phase 4b): a block
+// whose own size already meets/exceeds MaxBlockBytes is permanently excluded
+// from candidate selection, even when paired with a zero-byte block that
+// would otherwise keep the *stripe's total* within MaxBlockBytes -- the
+// generic totalSize(stripe) <= MaxBlockBytes check alone does not catch this
+// case, since maxBlockBytes + 0 <= maxBlockBytes. The terminal-leaf filter
+// must reject the block on its own size, independent of what it's paired with.
+func TestTimeWindowBlockSelector_TerminalLeafFilter(t *testing.T) {
+	now := time.Now()
+	const maxBlockBytes = uint64(1024 * 1024 * 1024) // 1GiB
+
+	oversized := &backend.BlockMeta{
+		BlockID: backend.MustParse("00000000-0000-0000-0000-000000000000"),
+		EndTime: now,
+		Size_:   maxBlockBytes, // already at the cutoff
+		Version: encoding.DefaultEncoding().Version(),
+	}
+	zeroByte := &backend.BlockMeta{
+		BlockID: backend.MustParse("00000000-0000-0000-0000-000000000001"),
+		EndTime: now,
+		Size_:   0, // stripe total with oversized would still satisfy totalSize <= maxBlockBytes
+		Version: encoding.DefaultEncoding().Version(),
+	}
+
+	selector := NewTimeWindowBlockSelector(
+		[]*backend.BlockMeta{oversized, zeroByte},
+		time.Second, 100, maxBlockBytes,
+		DefaultMinInputBlocks, DefaultMaxInputBlocks, DefaultMaxCompactionLevel,
+	)
+
+	actual, _ := selector.BlocksToCompact()
+	assert.Nil(t, actual, "oversized block must never be selected, even paired with a zero-byte block that keeps the stripe's total size within the cutoff")
+}

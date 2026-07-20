@@ -92,6 +92,20 @@ type BackendWorker struct {
 	jobStore *jobstore.Store
 	pgPool   *pgxpool.Pool
 
+	// fileCatalogStore is nil under the exact same condition as jobStore
+	// (cfg.Postgres == nil) -- issue #522's blockpack_file_catalog Postgres
+	// store, used by every VI/VCNT/cube compaction handler's write path.
+	fileCatalogStore *blockpack.FileCatalogStore
+
+	// catalogObjectStore is nil when w.s3Cfg is nil (mirrors every other
+	// S3-only Postgres-job handler's "if w.s3Cfg == nil, fail" convention --
+	// processViBackfillJobPostgres/processCubeBackfillJobPostgres are
+	// S3-only today too). Used by the VI/VCNT/cube compaction write path
+	// (issue #522 Phase 0.4) to fetch merge inputs. A field (not a per-call
+	// construction) so tests can override it with a fake, mirroring
+	// jobStore's own override-in-tests convention.
+	catalogObjectStore vblockpack.CatalogObjectStore
+
 	// Ring used for sharding tenant index writing.
 	ringLifecycler *ring.BasicLifecycler
 	Ring           *ring.Ring
@@ -142,6 +156,16 @@ func New(cfg Config, schedulerClientCfg backendscheduler_client.Config, s3cfg *s
 		} else {
 			w.pgPool = pool
 			w.jobStore = jobstore.New(pool)
+			w.fileCatalogStore = blockpack.NewFileCatalogStore(pool)
+		}
+	}
+
+	if s3cfg != nil {
+		catalogObjectStore, cerr := vblockpack.NewCatalogObjectStoreS3(s3cfg)
+		if cerr != nil {
+			level.Warn(log.Logger).Log("msg", "catalog object store disabled -- client init failed", "err", cerr)
+		} else {
+			w.catalogObjectStore = catalogObjectStore
 		}
 	}
 
@@ -344,24 +368,42 @@ func (w *BackendWorker) processJobs(ctx context.Context) error {
 	}
 }
 
-// tryClaimPostgresJob tries JOB_TYPE_VI_BACKFILL then JOB_TYPE_CUBE_BACKFILL
-// (arbitrary priority order, revisit if real production data shows one
-// starving the other -- no evidence either way today). Returns (nil, nil) if
-// neither has claimable work.
-func (w *BackendWorker) tryClaimPostgresJob(ctx context.Context) (*jobstore.Job, error) {
-	job, err := w.jobStore.Claim(ctx, jobstore.JobTypeViBackfill, w.workerID)
-	if err != nil {
-		return nil, fmt.Errorf("claim vi_backfill: %w", err)
-	}
-	if job != nil {
-		return job, nil
-	}
+// postgresJobClaimPriority is the order tryClaimPostgresJob tries each
+// Postgres job type in -- arbitrary priority (revisit if real production
+// data shows one starving another -- no evidence either way today).
+// catalog_reconcile (issue #522, trace/span-only per #154) is tried last:
+// it isn't latency-sensitive the way vi_backfill/cube_backfill chaining is.
+// catalog_reap was removed outright by #154: it processed only vi/vcnt/cube
+// rows against blockpack_file_catalog, which now belongs entirely to
+// blockpack's own compaction-worker (plan.md Section G.4) -- keeping it here
+// too would race the same rows into two independent delete pipelines.
+// vi_compaction was removed by #155: candidate-selection and execution both
+// moved into blockpack's own compaction-planner/compaction-worker, so this
+// job type no longer exists in tempo's jobstore at all.
+// trace_compaction (issue #522 #158, staged rollout) is tried right after the
+// existing backfill chaining and before catalog_reconcile -- pairwise
+// trace/span compaction for vblockpack-encoded tenants, alongside (not yet
+// replacing) the legacy gRPC CompactionProvider path.
+var postgresJobClaimPriority = []jobstore.JobType{
+	jobstore.JobTypeViBackfill,
+	jobstore.JobTypeCubeBackfill,
+	jobstore.JobTypeTraceCompaction,
+	jobstore.JobTypeCatalogReconcile,
+}
 
-	job, err = w.jobStore.Claim(ctx, jobstore.JobTypeCubeBackfill, w.workerID)
-	if err != nil {
-		return nil, fmt.Errorf("claim cube_backfill: %w", err)
+// tryClaimPostgresJob tries each of postgresJobClaimPriority in order.
+// Returns (nil, nil) if none has claimable work.
+func (w *BackendWorker) tryClaimPostgresJob(ctx context.Context) (*jobstore.Job, error) {
+	for _, jobType := range postgresJobClaimPriority {
+		job, err := w.jobStore.Claim(ctx, jobType, w.workerID)
+		if err != nil {
+			return nil, fmt.Errorf("claim %s: %w", jobType, err)
+		}
+		if job != nil {
+			return job, nil
+		}
 	}
-	return job, nil
+	return nil, nil
 }
 
 // dispatchPostgresJob runs job to completion and reports the result back to
@@ -388,6 +430,10 @@ func (w *BackendWorker) dispatchPostgresJob(ctx context.Context, job *jobstore.J
 		err = w.processViBackfillJobPostgres(ctx, job)
 	case jobstore.JobTypeCubeBackfill:
 		err = w.processCubeBackfillJobPostgres(ctx, job)
+	case jobstore.JobTypeTraceCompaction:
+		err = w.processTraceCompactionJobPostgres(ctx, job)
+	case jobstore.JobTypeCatalogReconcile:
+		err = w.processCatalogReconcileJobPostgres(ctx, job)
 	default:
 		err = fmt.Errorf("unknown postgres job type: %s", job.Type)
 	}

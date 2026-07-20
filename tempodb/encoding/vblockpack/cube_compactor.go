@@ -1,13 +1,17 @@
 package vblockpack
 
-// cube_compactor.go — cubeFileStore: the blockpack.CubeFileStore implementation over minio,
-// shared by cube_scheduler.go (the only cube compaction driver — see that file's doc comment for
-// history: this file used to also own a periodic CubeCompactorService, which had a real,
-// currently-live correctness bug — its L1-rollup loop had no boundary-completeness gate, so it
-// rolled up any hour with >=2 L0 files regardless of whether the hour had finished, permanently
-// undercounting that hour's L1 data. It was deleted in favor of cube_scheduler.go's single,
-// boundary-gated ladder implementation rather than patched in place, to avoid two independent
-// cube-compaction drivers racing over the same files).
+// cube_compactor.go — cubeFileStore: the blockpack.CubeFileStore implementation over minio.
+// Its Get/Put/Delete methods are used directly by cubequerypath.go's query-path
+// wiring (ConfigureCubeQueryPath); List/readFileInfo/cubeTimedFileRe/cubeTierToLevel
+// (the filename-parsing-based lister) exist solely to satisfy blockpack.CubeFileStore's
+// interface contract -- cubequerypath.go deliberately uses a separate, non-parsing
+// lister instead (see its own #508 Decision 2 comment), and Compactor.Evict (the only
+// method that still calls FileStore.List) is currently unwired to any production driver
+// (issue #522 #163: the boundary-gated compaction driver that used to own this file,
+// cube_scheduler.go, was superseded by compaction-planner/compaction-worker and deleted
+// outright; NewCubeFileStoreS3, that driver's own construction entry point, went with
+// it -- List's implementation stays only because Go's interface satisfaction requires
+// every method on the type, not because anything currently calls it as such).
 
 import (
 	"bytes"
@@ -20,6 +24,17 @@ import (
 
 	blockpack "github.com/grafana/blockpack"
 	minio "github.com/minio/minio-go/v7"
+)
+
+// cubeLevelL0/L1/L2 alias blockpack's canonical rollup-level constants (#491 Phase E fix
+// pass, go-presubmit.md #3) rather than independently duplicating the same three literal
+// values. Previously defined in cube_scheduler.go (deleted, issue #522 #163 -- its
+// boundary-gated compaction driver was superseded by compaction-planner/compaction-worker),
+// moved here since cubeTierToLevel is now this file's only remaining consumer.
+const (
+	cubeLevelL0 = blockpack.CubeRollupL0
+	cubeLevelL1 = blockpack.CubeRollupL1
+	cubeLevelL2 = blockpack.CubeRollupL2
 )
 
 // cubeFileStore implements blockpack.CubeFileStore over minio.

@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -36,9 +37,16 @@ func overridesConfigForTest(t *testing.T) overrides.Config {
 	return limitCfg
 }
 
+// fileCatalogSchemaPath is tempo's own file_catalog.sql (NOT
+// blockpack_file_catalog -- see newTestFileCatalogPool in
+// catalog_write_helper_test.go for that one) -- needed by
+// TestProcessCatalogReconcileJobPostgres_Trace_*'s "trace" subsystem tests.
+const fileCatalogSchemaPath = "../../tempodb/encoding/vblockpack/schema/file_catalog.sql"
+
 // newTestPostgresPool starts an ephemeral Postgres container, applies
-// backend_jobs.sql via migrate.Apply, and returns a connected pool. Skips
-// the calling test (does not fail the suite) if Docker is unavailable.
+// backend_jobs.sql via migrate.Apply plus tempo's own file_catalog.sql, and
+// returns a connected pool. Skips the calling test (does not fail the suite)
+// if Docker is unavailable.
 func newTestPostgresPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	ctx := context.Background()
@@ -75,8 +83,39 @@ func newTestPostgresPool(t *testing.T) *pgxpool.Pool {
 	if err := migrate.Apply(ctx, pool); err != nil {
 		t.Fatalf("applying backend_jobs migration: %v", err)
 	}
+	applySchemaFile(ctx, t, pool, fileCatalogSchemaPath)
 
 	return pool
+}
+
+// applySchemaFile executes path's SQL statements verbatim against pool, split
+// on bare top-level semicolons after stripping `--` line comments first
+// (mirrors modules/backendscheduler/filecatalog's identical helper).
+func applySchemaFile(ctx context.Context, t *testing.T, pool *pgxpool.Pool, path string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading schema file %s: %v", path, err)
+	}
+	for _, stmt := range strings.Split(stripSQLLineComments(string(data)), ";") {
+		stmt = strings.TrimSpace(stmt)
+		if stmt == "" {
+			continue
+		}
+		if _, err := pool.Exec(ctx, stmt); err != nil {
+			t.Fatalf("applying schema statement from %s: %v\nstatement: %s", path, err, stmt)
+		}
+	}
+}
+
+func stripSQLLineComments(sql string) string {
+	lines := strings.Split(sql, "\n")
+	for i, line := range lines {
+		if idx := strings.Index(line, "--"); idx != -1 {
+			lines[i] = line[:idx]
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func isDockerUnavailable(err error) bool {

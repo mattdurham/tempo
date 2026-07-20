@@ -46,6 +46,15 @@ var ErrPlanTimeLowSelectivityNoLimit = errors.New(
 		"a full per-block scan would be required to answer it correctly, which is not attempted",
 )
 
+// compactedKeyChecker is the minimal seam fetchVCNTSection needs to exclude
+// already-compacted-but-not-yet-reaped VCNT object keys before downloading them (issue #522
+// #157) — lets unit tests exercise the exclusion logic against a fake, without a real Postgres
+// connection. *blockpack.FileCatalogStore (a type alias for pgcatalog.Store) satisfies this
+// structurally; ListCompactedKeys is exported specifically for this purpose (SPEC-PGCATALOG-7).
+type compactedKeyChecker interface {
+	ListCompactedKeys(ctx context.Context, keys []string) (map[string]struct{}, error)
+}
+
 // fetchVCNTSection lists and downloads the .vcnt files covering each of dims (candidate
 // leaf column names) for tenant, using rawR's generic Find+Read. It merges them into one
 // consolidated VCNT section via blockpack.VCNTBuildSectionFromObjects — the same shape
@@ -71,15 +80,32 @@ var ErrPlanTimeLowSelectivityNoLimit = errors.New(
 // object's len(data)), now returned so the caller can attach them to the "frontend.vcntFetch"
 // child span it wraps this call in, without this function needing any tracing awareness of its
 // own.
+//
+// compactedChecker (issue #522 #157, mandatory, mirrors vblockpack.buildVCNTSection's #149
+// fix): every candidate key surviving the time-range filter below is checked against it BEFORE
+// being downloaded and merged — any key already marked compacted is excluded, closing the same
+// NOTE-VC-009-class double-counting window this call path was newly exposed to once VCNT
+// compaction moved from immediate-delete to mark-compacted+30-minute-grace-window (#149). A
+// compactedChecker error fails the WHOLE call closed (nil/empty section, "no VCNT signal"),
+// never falls through to an unfiltered fetch — mirrors buildVCNTSection's own "unverifiable
+// exclusion is treated exactly like absent coverage" contract. nil disables the filter (matches
+// this function's own rawR-nil-tolerance convention) — the caller is expected to pass nil only
+// when tempodb.PgPoolProvider's pool itself is nil (Postgres not configured on this
+// deployment).
 func fetchVCNTSection(
 	ctx context.Context, rawR backend.RawReader, tenant string, dims []string,
-	minTS, maxTS uint64,
+	minTS, maxTS uint64, compactedChecker compactedKeyChecker,
 ) (data []byte, dir []blockpack.VCNTChunkDirEntry, filesCount int, bytesRead int64) {
 	if rawR == nil || len(dims) == 0 {
 		return nil, nil, 0, 0
 	}
 
-	var objects [][]byte
+	type candidate struct {
+		key     string
+		keypath backend.KeyPath
+		name    string
+	}
+	var candidates []candidate
 	for _, dim := range dims {
 		colHash := blockpack.VCNTColHash(dim)
 		prefix := backend.KeyPath{tenant, "value_counts", colHash}
@@ -98,19 +124,43 @@ func fetchVCNTSection(
 			if !vblockpack.VCNTFileOverlapsRange(name, minTS, maxTS) {
 				continue
 			}
-			rc, _, err := rawR.Read(ctx, name, keypath, nil)
-			if err != nil {
-				continue
-			}
-			objData, readErr := io.ReadAll(rc)
-			_ = rc.Close()
-			if readErr != nil || len(objData) == 0 {
-				continue
-			}
-			objects = append(objects, objData)
-			filesCount++
-			bytesRead += int64(len(objData))
+			candidates = append(candidates, candidate{key: k, keypath: keypath, name: name})
 		}
+	}
+	if len(candidates) == 0 {
+		return nil, nil, 0, 0
+	}
+
+	var compacted map[string]struct{}
+	if compactedChecker != nil {
+		candidateKeys := make([]string, len(candidates))
+		for i, c := range candidates {
+			candidateKeys[i] = c.key
+		}
+		var checkErr error
+		compacted, checkErr = compactedChecker.ListCompactedKeys(ctx, candidateKeys)
+		if checkErr != nil {
+			return nil, nil, 0, 0
+		}
+	}
+
+	var objects [][]byte
+	for _, c := range candidates {
+		if _, isCompacted := compacted[c.key]; isCompacted {
+			continue
+		}
+		rc, _, err := rawR.Read(ctx, c.name, c.keypath, nil)
+		if err != nil {
+			continue
+		}
+		objData, readErr := io.ReadAll(rc)
+		_ = rc.Close()
+		if readErr != nil || len(objData) == 0 {
+			continue
+		}
+		objects = append(objects, objData)
+		filesCount++
+		bytesRead += int64(len(objData))
 	}
 	if len(objects) == 0 {
 		return nil, nil, filesCount, bytesRead
@@ -154,7 +204,7 @@ func splitObjectKey(fullKey string) (backend.KeyPath, string) {
 // and is unreachable from this block-independent plan-time call site).
 func buildQueryPlan(
 	ctx context.Context, rawR backend.RawReader, tenant string, dedicated backend.DedicatedColumns, query string,
-	minTS, maxTS uint64, concurrentRequests int, hasLimit bool,
+	minTS, maxTS uint64, concurrentRequests int, hasLimit bool, compactedChecker compactedKeyChecker,
 ) (*blockpack.QueryPlan, int64, error) {
 	if rawR == nil || query == "" {
 		return nil, 0, nil
@@ -163,7 +213,9 @@ func buildQueryPlan(
 	if err != nil || prog == nil {
 		return nil, 0, nil
 	}
-	return buildQueryPlanFromProgram(ctx, rawR, tenant, dedicated, prog, minTS, maxTS, concurrentRequests, true, hasLimit)
+	return buildQueryPlanFromProgram(
+		ctx, rawR, tenant, dedicated, prog, minTS, maxTS, concurrentRequests, true, hasLimit, compactedChecker,
+	)
 }
 
 // buildMetricsQueryPlan is buildQueryPlan's metrics sibling (holistic-review Issue 2/B): a real
@@ -188,7 +240,7 @@ func buildQueryPlan(
 // depending on a typed error the user would otherwise see.
 func buildMetricsQueryPlan(
 	ctx context.Context, rawR backend.RawReader, tenant string, dedicated backend.DedicatedColumns, query string,
-	minTS, maxTS uint64, concurrentRequests int,
+	minTS, maxTS uint64, concurrentRequests int, compactedChecker compactedKeyChecker,
 ) (*blockpack.QueryPlan, int64, error) {
 	if rawR == nil || query == "" {
 		return nil, 0, nil
@@ -199,7 +251,9 @@ func buildMetricsQueryPlan(
 	}
 	// boundedEligible=false (R2: metrics is never bounded-served); hasLimit is irrelevant on
 	// this path and unused by buildQueryPlanFromProgram's boundedEligible=false branch.
-	return buildQueryPlanFromProgram(ctx, rawR, tenant, dedicated, prog, minTS, maxTS, concurrentRequests, false, false)
+	return buildQueryPlanFromProgram(
+		ctx, rawR, tenant, dedicated, prog, minTS, maxTS, concurrentRequests, false, false, compactedChecker,
+	)
 }
 
 // buildQueryPlanFromProgram is the shared tail buildQueryPlan/buildStructuralQueryPlan (search,
@@ -229,6 +283,7 @@ func buildMetricsQueryPlan(
 func buildQueryPlanFromProgram(
 	ctx context.Context, rawR backend.RawReader, tenant string, dedicated backend.DedicatedColumns,
 	prog *blockpack.Program, minTS, maxTS uint64, concurrentRequests int, boundedEligible, hasLimit bool,
+	compactedChecker compactedKeyChecker,
 ) (*blockpack.QueryPlan, int64, error) {
 	// issue #493 Task 4a/4b: attach qualification/plan attributes to whatever span is already
 	// active on ctx — this function has no span of its own; ctx is the SAME ctx
@@ -292,7 +347,7 @@ func buildQueryPlanFromProgram(
 	// reuse of blockpack.query) — a distinct I/O phase (S3 Find+Read fan-out) worth timing on
 	// its own, not routine attribute promotion onto an existing span.
 	vcntCtx, vcntSpan := tracer.Start(ctx, "frontend.vcntFetch")
-	data, dir, filesCount, bytesRead := fetchVCNTSection(vcntCtx, rawR, tenant, dims, minTS, maxTS)
+	data, dir, filesCount, bytesRead := fetchVCNTSection(vcntCtx, rawR, tenant, dims, minTS, maxTS, compactedChecker)
 	if vcntSpan.IsRecording() {
 		vcntSpan.SetAttributes(
 			attribute.Int("files.count", filesCount),

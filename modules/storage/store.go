@@ -5,6 +5,7 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/grafana/dskit/services"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/grafana/tempo/pkg/cache"
 	"github.com/grafana/tempo/pkg/usagestats"
@@ -36,6 +37,11 @@ type store struct {
 	tempodb.Compactor
 }
 
+var (
+	_ tempodb.RawReaderProvider = (*store)(nil)
+	_ tempodb.PgPoolProvider    = (*store)(nil)
+)
+
 // NewStore creates a new Tempo Store using configuration supplied.
 func NewStore(cfg Config, cacheProvider cache.Provider, logger log.Logger) (Store, error) {
 	statCache.Set(cfg.Trace.Cache)
@@ -66,6 +72,21 @@ func NewStore(cfg Config, cacheProvider cache.Provider, logger log.Logger) (Stor
 func (s *store) RawReader() backend.RawReader {
 	if rrp, ok := s.Reader.(tempodb.RawReaderProvider); ok {
 		return rrp.RawReader()
+	}
+	return nil
+}
+
+// PgPool implements tempodb.PgPoolProvider (issue #522 #157/#161), forwarding to the
+// underlying Reader's own capability -- the exact same embedded-interface method-promotion gap
+// RawReader immediately above already exists to close, for the same reason: embedding
+// tempodb.Reader here as an interface-typed field does not promote PgPool(), even though the
+// concrete *readerWriter tempodb.New returns implements it. Without this, every
+// reader.(tempodb.PgPoolProvider) assertion against a *store (frontend search/metrics sharders'
+// compactedKeyChecker derivation for fetchVCNTSection) silently fails and #157's mandatory VCNT
+// compacted-key exclusion filter never engages in production.
+func (s *store) PgPool() *pgxpool.Pool {
+	if ppp, ok := s.Reader.(tempodb.PgPoolProvider); ok {
+		return ppp.PgPool()
 	}
 	return nil
 }

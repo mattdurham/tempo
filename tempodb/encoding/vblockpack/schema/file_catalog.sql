@@ -25,3 +25,27 @@ CREATE TABLE IF NOT EXISTS file_catalog (
 CREATE INDEX IF NOT EXISTS idx_file_catalog_tenant_rowid_live
     ON file_catalog (tenant, row_id)
     WHERE deleted_at IS NULL;
+
+-- compaction_level/compacted_at (#522 Phase 0.2): added so file_catalog can
+-- become the primary source for vblockpack-encoded tenants' compaction
+-- candidate selection (Phase 4c), mirroring blockpack_file_catalog's
+-- level/compacted_at columns. deleted_at keeps its existing "vanished from
+-- filesystem/blocklist" meaning; compacted_at is distinct -- set the moment a
+-- row is superseded by a pairwise merge output, while the row (and its
+-- object) is still physically present during the reaper's grace window.
+ALTER TABLE file_catalog ADD COLUMN IF NOT EXISTS compaction_level INT NOT NULL DEFAULT 0;
+ALTER TABLE file_catalog ADD COLUMN IF NOT EXISTS compacted_at TIMESTAMPTZ NULL;
+
+-- tenant_redaction_state (#522 Phase 0.2/4c): mirrors backend-scheduler's
+-- existing in-memory work.Interface TenantPending state into Postgres, so
+-- job-planner's trace-compaction candidate query (which has no access to
+-- that in-memory state) can exclude any tenant with a redaction batch in
+-- flight via a simple anti-join, without job-planner gaining a dependency on
+-- backend-scheduler's work-queue internals.
+CREATE TABLE IF NOT EXISTS tenant_redaction_state (
+    tenant      TEXT PRIMARY KEY,
+    pending     BOOLEAN NOT NULL DEFAULT FALSE,
+    batch_id    TEXT NULL,
+    started_at  TIMESTAMPTZ NULL,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);

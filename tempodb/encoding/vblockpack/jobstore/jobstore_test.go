@@ -182,6 +182,143 @@ func TestStore_InsertCubeBackfill_NewRowAllowedAfterPriorTerminal(t *testing.T) 
 	}
 }
 
+func TestStore_InsertCatalogReconcile_CreatesPendingRow(t *testing.T) {
+	pool := newTestPostgresPool(t)
+	store := New(pool)
+	ctx := context.Background()
+
+	if err := store.InsertCatalogReconcile(ctx, "vi", "tenant-a"); err != nil {
+		t.Fatalf("InsertCatalogReconcile: %v", err)
+	}
+
+	var status, jobType, tenant string
+	row := pool.QueryRow(ctx, `SELECT status, job_type, tenant FROM backend_jobs WHERE dedup_key = $1`, "catalog_reconcile|vi|tenant-a")
+	if err := row.Scan(&status, &jobType, &tenant); err != nil {
+		t.Fatalf("querying inserted row: %v", err)
+	}
+	if status != string(StatusPending) {
+		t.Fatalf("expected status=pending, got %q", status)
+	}
+	if jobType != string(JobTypeCatalogReconcile) {
+		t.Fatalf("expected job_type=catalog_reconcile, got %q", jobType)
+	}
+	if tenant != "tenant-a" {
+		t.Fatalf("expected tenant=tenant-a, got %q", tenant)
+	}
+}
+
+func TestStore_InsertCatalogReconcile_DuplicateDedupKeyIsNoOp(t *testing.T) {
+	pool := newTestPostgresPool(t)
+	store := New(pool)
+	ctx := context.Background()
+
+	if err := store.InsertCatalogReconcile(ctx, "vi", "tenant-a"); err != nil {
+		t.Fatalf("InsertCatalogReconcile (first): %v", err)
+	}
+	if err := store.InsertCatalogReconcile(ctx, "vi", "tenant-a"); err != nil {
+		t.Fatalf("InsertCatalogReconcile (duplicate): %v", err)
+	}
+
+	var count int
+	row := pool.QueryRow(ctx, `SELECT count(*) FROM backend_jobs WHERE dedup_key = $1`, "catalog_reconcile|vi|tenant-a")
+	if err := row.Scan(&count); err != nil {
+		t.Fatalf("counting rows: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 row after duplicate insert, got %d", count)
+	}
+}
+
+func TestStore_InsertTraceCompaction_CreatesPendingRow(t *testing.T) {
+	pool := newTestPostgresPool(t)
+	store := New(pool)
+	ctx := context.Background()
+
+	detail := TraceCompactionDetail{InputBlockIDs: []string{"block-b", "block-a"}}
+	if err := store.InsertTraceCompaction(ctx, "tenant-a", detail); err != nil {
+		t.Fatalf("InsertTraceCompaction: %v", err)
+	}
+
+	var status, jobType, tenant string
+	var gotDetail []byte
+	row := pool.QueryRow(
+		ctx, `SELECT status, job_type, tenant, detail FROM backend_jobs WHERE dedup_key = $1`,
+		"trace_compaction|tenant-a|block-a,block-b",
+	)
+	if err := row.Scan(&status, &jobType, &tenant, &gotDetail); err != nil {
+		t.Fatalf("querying inserted row: %v", err)
+	}
+	if status != string(StatusPending) {
+		t.Fatalf("expected status=pending, got %q", status)
+	}
+	if jobType != string(JobTypeTraceCompaction) {
+		t.Fatalf("expected job_type=trace_compaction, got %q", jobType)
+	}
+	if tenant != "tenant-a" {
+		t.Fatalf("expected tenant=tenant-a, got %q", tenant)
+	}
+	var decoded TraceCompactionDetail
+	if err := json.Unmarshal(gotDetail, &decoded); err != nil {
+		t.Fatalf("unmarshal detail: %v", err)
+	}
+	if len(decoded.InputBlockIDs) != 2 || decoded.InputBlockIDs[0] != "block-b" || decoded.InputBlockIDs[1] != "block-a" {
+		t.Fatalf("expected detail's InputBlockIDs to round-trip in original (unsorted) order, got %+v", decoded.InputBlockIDs)
+	}
+}
+
+// TestStore_InsertTraceCompaction_DedupKeyIgnoresInputOrder proves the same 2
+// input blocks in either order produce the identical dedup key -- job-planner's
+// candidate query has no reason to always emit them in a stable order, so the
+// sort inside InsertTraceCompaction must make that a non-load-bearing detail.
+func TestStore_InsertTraceCompaction_DedupKeyIgnoresInputOrder(t *testing.T) {
+	pool := newTestPostgresPool(t)
+	store := New(pool)
+	ctx := context.Background()
+
+	if err := store.InsertTraceCompaction(ctx, "tenant-a", TraceCompactionDetail{InputBlockIDs: []string{"block-a", "block-b"}}); err != nil {
+		t.Fatalf("InsertTraceCompaction (first): %v", err)
+	}
+	if err := store.InsertTraceCompaction(ctx, "tenant-a", TraceCompactionDetail{InputBlockIDs: []string{"block-b", "block-a"}}); err != nil {
+		t.Fatalf("InsertTraceCompaction (reversed order): %v", err)
+	}
+
+	var count int
+	row := pool.QueryRow(ctx, `SELECT count(*) FROM backend_jobs WHERE dedup_key = $1`, "trace_compaction|tenant-a|block-a,block-b")
+	if err := row.Scan(&count); err != nil {
+		t.Fatalf("counting rows: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 row regardless of input order, got %d", count)
+	}
+}
+
+// TestStore_InsertCatalogReconcile_DistinctSubsystemsSameTenant_BothRowsSurvive
+// proves subsystem is part of the dedup key -- job-planner's catalog poll
+// enumerates (subsystem, tenant) pairs independently per subsystem
+// (plan.md Section C), so "vi"/tenant-a and "vcnt"/tenant-a must both get
+// their own reconcile job, never absorbed as duplicates of each other.
+func TestStore_InsertCatalogReconcile_DistinctSubsystemsSameTenant_BothRowsSurvive(t *testing.T) {
+	pool := newTestPostgresPool(t)
+	store := New(pool)
+	ctx := context.Background()
+
+	if err := store.InsertCatalogReconcile(ctx, "vi", "tenant-a"); err != nil {
+		t.Fatalf("InsertCatalogReconcile (vi): %v", err)
+	}
+	if err := store.InsertCatalogReconcile(ctx, "vcnt", "tenant-a"); err != nil {
+		t.Fatalf("InsertCatalogReconcile (vcnt): %v", err)
+	}
+
+	var count int
+	row := pool.QueryRow(ctx, `SELECT count(*) FROM backend_jobs WHERE job_type = $1 AND tenant = $2`, "catalog_reconcile", "tenant-a")
+	if err := row.Scan(&count); err != nil {
+		t.Fatalf("counting rows: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("expected 2 distinct reconcile rows (one per subsystem), got %d", count)
+	}
+}
+
 // TestStore_InsertViBackfillAndCubeBackfill_SameRawDedupComponents_BothRowsSurvive
 // proves the job_type prefix added to dedup_key (defense-in-depth against a future
 // vi_backfill/cube_backfill ID-format collision, even though today's real ID formats

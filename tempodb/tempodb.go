@@ -42,6 +42,7 @@ import (
 	"github.com/grafana/tempo/tempodb/encoding"
 	"github.com/grafana/tempo/tempodb/encoding/common"
 	"github.com/grafana/tempo/tempodb/encoding/vblockpack"
+	"github.com/grafana/tempo/tempodb/encoding/vblockpack/schema"
 	"github.com/grafana/tempo/tempodb/pool"
 	"github.com/grafana/tempo/tempodb/wal"
 )
@@ -139,6 +140,20 @@ type RawReaderProvider interface {
 	RawReader() backend.RawReader
 }
 
+// PgPoolProvider is an OPTIONAL capability a Reader implementation may satisfy, exposing the
+// *pgxpool.Pool tempodb already builds and holds internally when cfg.Postgres is configured
+// (issue #522 #157). Mirrors RawReaderProvider's exact shape/rationale: a separate interface
+// from Reader, not a new Reader method, so existing Reader implementations/fakes/mocks are
+// unaffected. Callers that need the mandatory VCNT compacted-key exclusion filter (the
+// frontend's fetchVCNTSection, closing the same NOTE-VC-009-class double-counting exposure
+// vblockpack.buildVCNTSection's #149 fix closes on the querier side) type-assert for this
+// capability rather than requiring every Reader to support it. Nil pool (Postgres not
+// configured on this deployment) is a valid, expected value -- callers must treat it exactly
+// like buildVCNTSection's own nil-checker convention: filtering is skipped, never a hard error.
+type PgPoolProvider interface {
+	PgPool() *pgxpool.Pool
+}
+
 type Compactor interface {
 	EnableCompaction(ctx context.Context, cfg *CompactorConfig, sharder CompactorSharder, overrides CompactorOverrides) error
 	MarkBlockCompacted(tenantID string, blockID backend.UUID) error
@@ -171,6 +186,7 @@ type WriteableBlock interface {
 var (
 	_ Reader            = (*readerWriter)(nil)
 	_ RawReaderProvider = (*readerWriter)(nil)
+	_ PgPoolProvider    = (*readerWriter)(nil)
 )
 
 type readerWriter struct {
@@ -290,6 +306,17 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 		if err := blockpack.ApplyCubeSchema(context.Background(), pgPool); err != nil {
 			pgPool.Close()
 			return nil, nil, nil, fmt.Errorf("applying cube postgres schema: %w", err)
+		}
+		// file_catalog schema (issue #522 #159): markCompacted/ClearBlock's direct writes
+		// (file_catalog_write.go) need this table to exist regardless of process start order --
+		// backend-scheduler's own migration (modules/backendscheduler/backendscheduler.go)
+		// happens to also apply it, but relying on that one process having started first
+		// against a shared Postgres instance would be fragile. Idempotent (IF NOT EXISTS/ADD
+		// COLUMN IF NOT EXISTS throughout), safe to call redundantly from every tempo process
+		// that configures cfg.Postgres.
+		if err := schema.ApplyFileCatalog(context.Background(), pgPool); err != nil {
+			pgPool.Close()
+			return nil, nil, nil, fmt.Errorf("applying file_catalog postgres schema: %w", err)
 		}
 	}
 
@@ -869,6 +896,13 @@ func (rw *readerWriter) RawReader() backend.RawReader {
 	return rw.rawR
 }
 
+// PgPool implements PgPoolProvider: it returns the *pgxpool.Pool this readerWriter was built
+// with (issue #522 #157), nil when cfg.Postgres is nil -- the exact same nil-means-disabled
+// convention rw.pgPool already carries everywhere else in this file.
+func (rw *readerWriter) PgPool() *pgxpool.Pool {
+	return rw.pgPool
+}
+
 // EnableCompaction activates the compaction/retention loops
 func (rw *readerWriter) EnableCompaction(ctx context.Context, cfg *CompactorConfig, c CompactorSharder, overrides CompactorOverrides) error {
 	// If compactor configuration is not as expected, no need to go any further
@@ -1041,6 +1075,15 @@ func (rw *readerWriter) EnablePolling(ctx context.Context, sharder blocklist.Job
 		EmptyTenantDeletionEnabled: rw.cfg.EmptyTenantDeletionEnabled,
 		SkipNoCompactBlocks:        skipNoCompactBlocks,
 	}, sharder, rw.r, rw.c, rw.w, rw.logger)
+
+	// Poller flip (issue #522 #159): file_catalog as the primary block-discovery source,
+	// avoiding a real backend LIST call, for vblockpack-encoded deployments with Postgres
+	// configured. Every other deployment's polling behavior is completely unchanged --
+	// blocklistPoller.fileCatalogLister stays nil and pollTenantBlocks falls back to
+	// reader.Blocks exactly as it always has.
+	if rw.fileCatalogWriteEnabled() {
+		blocklistPoller.SetFileCatalogLister(newFileCatalogBlockLister(rw.pgPool))
+	}
 
 	rw.blocklistPoller = blocklistPoller
 	rw.pollerShutdownCh = make(chan struct{})

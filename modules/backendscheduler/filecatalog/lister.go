@@ -44,11 +44,11 @@ import (
 )
 
 const upsertLiveBlocksSQL = `
-	INSERT INTO file_catalog (tenant, block_id, block_ref, start_sec, end_sec, size_bytes, deleted_at)
-	SELECT $1, t.block_id, t.block_ref, t.start_sec, t.end_sec, t.size_bytes, NULL
-	FROM unnest($2::text[], $3::text[], $4::bigint[], $5::bigint[], $6::bigint[])
-		AS t(block_id, block_ref, start_sec, end_sec, size_bytes)
-	ON CONFLICT (tenant, block_id) DO UPDATE SET deleted_at = NULL`
+	INSERT INTO file_catalog (tenant, block_id, block_ref, start_sec, end_sec, size_bytes, compaction_level, deleted_at)
+	SELECT $1, t.block_id, t.block_ref, t.start_sec, t.end_sec, t.size_bytes, t.compaction_level, NULL
+	FROM unnest($2::text[], $3::text[], $4::bigint[], $5::bigint[], $6::bigint[], $7::int[])
+		AS t(block_id, block_ref, start_sec, end_sec, size_bytes, compaction_level)
+	ON CONFLICT (tenant, block_id) DO UPDATE SET deleted_at = NULL, compaction_level = EXCLUDED.compaction_level`
 
 const softDeleteVanishedBlocksSQL = `
 	UPDATE file_catalog
@@ -99,14 +99,52 @@ func (l *Lister) RunOnce(ctx context.Context) error {
 	return nil
 }
 
+// vblockpackVersion is the exact backend.BlockMeta.Version string vblockpack-encoded blocks
+// carry -- mirrors tempodb/blockselector/compaction_block_selector.go's own
+// `meta.Version == "vblockpack"` check, the established convention for this comparison
+// elsewhere in the codebase.
+const vblockpackVersion = "vblockpack"
+
 func (l *Lister) reconcileTenant(ctx context.Context, tenant string) error {
-	metas := l.blockMetas(tenant)
+	allMetas := l.blockMetas(tenant)
+
+	// Filter to vblockpack-encoded blocks only (issue #522 #158 fix): file_catalog's
+	// block_ref column is hardcoded below to the vblockpack ".../data.blockpack" object-key
+	// shape -- reconciling a vparquet/standard block here would fabricate a wrong block_ref
+	// for it (that block's real object key never matches). This also gives file_catalog a
+	// reliable "vblockpack-encoded tenants only" scoping property BY CONSTRUCTION, with no
+	// new schema column needed: #158's job-planner candidate query (plan_trace_compaction.go)
+	// depends on file_catalog never containing a non-vblockpack row at all, per plan.md Phase
+	// 4c's "vparquet/standard tenants' compaction is completely untouched, forever" scoping.
+	metas := make([]*backend.BlockMeta, 0, len(allMetas))
+	var nonVblockpackCount int
+	for _, m := range allMetas {
+		if m.Version == vblockpackVersion {
+			metas = append(metas, m)
+			continue
+		}
+		nonVblockpackCount++
+	}
+	// Cheap safety-net sanity check (issue #522 #159): the poller flip's deployment-level gate
+	// assumes no tenant ever mixes vblockpack and non-vblockpack blocks -- confirmed true for
+	// this deployment, but a future violation of that assumption would otherwise silently make
+	// these blocks invisible once the poller stops calling the real backend LIST for this
+	// tenant. Zero extra I/O: allMetas is already fetched above for the filter itself.
+	if nonVblockpackCount > 0 {
+		metricUnexpectedNonVblockpackBlocks.WithLabelValues(tenant).Add(float64(nonVblockpackCount))
+		level.Warn(log.Logger).Log(
+			"msg", "filecatalog: tenant has non-vblockpack-encoded blocks that will never be reconciled into file_catalog -- "+
+				"if this tenant's poller has flipped to file_catalog-primary, these blocks may be invisible to it",
+			"tenant", tenant, "count", nonVblockpackCount,
+		)
+	}
 
 	blockIDs := make([]string, len(metas))
 	blockRefs := make([]string, len(metas))
 	startSecs := make([]int64, len(metas))
 	endSecs := make([]int64, len(metas))
 	sizeBytes := make([]int64, len(metas))
+	compactionLevels := make([]int32, len(metas))
 	for i, m := range metas {
 		id := m.BlockID.String()
 		blockIDs[i] = id
@@ -117,10 +155,17 @@ func (l *Lister) reconcileTenant(ctx context.Context, tenant string) error {
 		// module than tempodb/encoding/vblockpack, and this package's own test
 		// infra already accepts a small, deliberate duplication across that
 		// module boundary rather than introducing a cross-layer dependency.
+		// Safe now that metas is filtered to vblockpack-encoded blocks only.
 		blockRefs[i] = tenant + "/" + id + "/data.blockpack"
 		startSecs[i] = m.StartTime.Unix()
 		endSecs[i] = m.EndTime.Unix()
 		sizeBytes[i] = int64(m.Size_) //nolint:gosec // block sizes never approach int64 overflow
+		// compaction_level (issue #522 #159): the real merge-depth, closing #158's "nothing
+		// ever writes a real level" gap for the reconciliation path specifically (compaction's
+		// own direct write, tempodb/file_catalog_write.go, closes it for the compaction-time
+		// path; this covers every OTHER way a block becomes visible here, e.g. this Lister's
+		// own periodic catch-up reconciliation for a block compaction never directly wrote).
+		compactionLevels[i] = int32(m.CompactionLevel) //nolint:gosec // compaction levels never approach int32 overflow
 	}
 
 	tx, err := l.pool.Begin(ctx)
@@ -130,7 +175,7 @@ func (l *Lister) reconcileTenant(ctx context.Context, tenant string) error {
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	if len(metas) > 0 {
-		if _, err := tx.Exec(ctx, upsertLiveBlocksSQL, tenant, blockIDs, blockRefs, startSecs, endSecs, sizeBytes); err != nil {
+		if _, err := tx.Exec(ctx, upsertLiveBlocksSQL, tenant, blockIDs, blockRefs, startSecs, endSecs, sizeBytes, compactionLevels); err != nil {
 			return fmt.Errorf("upsert live blocks: %w", err)
 		}
 	}

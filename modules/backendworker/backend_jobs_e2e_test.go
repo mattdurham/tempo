@@ -181,6 +181,19 @@ func newTestPostgresPoolAndDSN(t *testing.T) (*pgxpool.Pool, string) {
 	// production once NewViBackfillDepsWithPgRegistry makes backend-worker's own RunViBackfill
 	// call site use the SAME Postgres-backed registry the querier-side trigger already does.
 	require.NoError(t, blockpack.ApplyViUsageSchema(ctx, pool))
+	// issue #522: blockpack_file_catalog, needed by catalog_reconcile/catalog_reap
+	// coverage in this package's own test files (VI/VCNT/cube catalog-sync moved
+	// entirely to blockpack's own compaction-planner/compaction-worker per #154/#155,
+	// but this table remains the shared metadata source of truth those subsystems
+	// still write to, and trace/span's own catalog_reconcile still reads it here).
+	require.NoError(t, blockpack.ApplyFileCatalogSchema(ctx, pool))
+	// issue #522 #158: tempo's OWN file_catalog.sql (a different table from
+	// blockpack_file_catalog above) -- jobplanner.Service.PollOnce now also runs
+	// planTraceCompaction on every tick, which queries file_catalog/tenant_redaction_state
+	// unconditionally, so any test driving PollOnce against this pool (e.g.
+	// jobplanner_chained_progress_e2e_test.go) needs this schema present even though its
+	// own assertions are about VI/cube chaining, not trace compaction.
+	applySchemaFile(ctx, t, pool, fileCatalogSchemaPath)
 	return pool, dsn
 }
 

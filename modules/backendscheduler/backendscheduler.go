@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/grafana/dskit/services"
 	"github.com/grafana/dskit/user"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/grafana/tempo/modules/backendscheduler/filecatalog"
 	"github.com/grafana/tempo/modules/backendscheduler/provider"
 	"github.com/grafana/tempo/modules/backendscheduler/work"
@@ -29,6 +30,7 @@ import (
 	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
 	"github.com/grafana/tempo/tempodb/blocklist"
 	"github.com/grafana/tempo/tempodb/encoding/vblockpack/migrate"
+	"github.com/grafana/tempo/tempodb/encoding/vblockpack/schema"
 	"github.com/jedib0t/go-pretty/v6/table"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -65,6 +67,14 @@ type BackendScheduler struct {
 	// nil) -- the same nil-means-disabled convention used everywhere else in
 	// this plan. Non-nil means running() ticks it on cfg.CatalogListInterval.
 	catalogLister *filecatalog.Lister
+
+	// pgPool is nil under the exact same condition as catalogLister
+	// (cfg.Postgres == nil). Backs the direct-write-primary mirror of a
+	// redaction batch's start/finish into tenant_redaction_state (issue #522
+	// #152/Phase 4c) -- SubmitRedaction/cleanupBatchIfDone write to it
+	// directly, on the SAME pool catalogLister/the backend_jobs migration
+	// already share, rather than opening a second connection.
+	pgPool *pgxpool.Pool
 }
 
 // ListJobs returns all jobs in the work cache
@@ -147,7 +157,19 @@ func New(cfg Config, s3cfg *s3backend.Config, store storage.Store, overrides ove
 			if merr := migrate.Apply(context.Background(), pool); merr != nil {
 				level.Warn(log.Logger).Log("msg", "backend_jobs schema migration failed", "err", merr)
 			}
+			// file_catalog migration (issue #522 #152): same idempotent,
+			// apply-on-every-startup posture as backend_jobs above -- closes a
+			// pre-existing gap where file_catalog.sql (including
+			// tenant_redaction_state, #143) was never actually applied by any
+			// production code path, only by test infra's os.ReadFile-based
+			// helpers. Needed now that markTenantRedactionPending/
+			// clearTenantRedactionPending (redaction_state.go) depend on
+			// tenant_redaction_state genuinely existing.
+			if merr := schema.ApplyFileCatalog(context.Background(), pool); merr != nil {
+				level.Warn(log.Logger).Log("msg", "file_catalog schema migration failed", "err", merr)
+			}
 			s.catalogLister = filecatalog.NewLister(pool, s.store.BlockMetas, s.store.Tenants)
+			s.pgPool = pool
 		}
 	}
 
@@ -584,6 +606,11 @@ func (s *BackendScheduler) SubmitRedaction(ctx context.Context, req *tempopb.Sub
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
+	// Mirror the now-durably-in-memory batch into tenant_redaction_state (issue #522 #152) --
+	// placed after both AddBatch/AddPendingJobs succeed so this Postgres-side mirror never needs
+	// its own rollback on the in-memory rollback path just above.
+	s.markTenantRedactionPending(ctx, tenant, batchID)
+
 	// Persist batch manifest and affected shards. Both are best-effort here;
 	// the data is safely in memory and will be flushed again on shutdown.
 	if err := s.work.FlushBatchesToLocal(ctx, s.cfg.LocalWorkPath); err != nil {
@@ -636,6 +663,8 @@ func (s *BackendScheduler) cleanupBatchIfDone(ctx context.Context, tenantID stri
 		return
 	}
 	s.work.RemoveBatch(tenantID)
+	// Mirror the now-completed batch's cleanup into tenant_redaction_state (issue #522 #152).
+	s.clearTenantRedactionPending(ctx, tenantID)
 	if err := s.work.FlushBatchesToLocal(ctx, s.cfg.LocalWorkPath); err != nil {
 		level.Warn(log.Logger).Log("msg", "failed to flush batch manifest after cleanup", "tenant", tenantID, "err", err)
 	}

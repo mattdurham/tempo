@@ -81,7 +81,7 @@ func newLocalRawReadWriter(t *testing.T) (backend.RawReader, backend.RawWriter) 
 func TestFetchVCNTSection_NilRawReaderReturnsNil(t *testing.T) {
 	// A real, deliberately chosen window (not a leftover placeholder) — irrelevant here since
 	// a nil rawR short-circuits before the prune check is ever reached.
-	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), nil, "tenant-a", []string{"resource.service.name"}, 0, 200)
+	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), nil, "tenant-a", []string{"resource.service.name"}, 0, 200, nil)
 	require.Nil(t, data)
 	require.Nil(t, dir)
 	require.Zero(t, filesCount)
@@ -92,7 +92,7 @@ func TestFetchVCNTSection_NoDimsReturnsNil(t *testing.T) {
 	rawR, _ := newLocalRawReadWriter(t)
 	// A real, deliberately chosen window (not a leftover placeholder) — irrelevant here since
 	// no dims means the per-file loop never runs.
-	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), rawR, "tenant-a", nil, 0, 200)
+	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), rawR, "tenant-a", nil, 0, 200, nil)
 	require.Nil(t, data)
 	require.Nil(t, dir)
 	require.Zero(t, filesCount)
@@ -115,7 +115,7 @@ func TestFetchVCNTSection_MergesObjectsForRequestedDims(t *testing.T) {
 
 	// This test's fixtures are v1-shaped (writeVCNTObject), so the window below is inert by
 	// design — the new TestFetchVCNTSection_* pruning tests below are what actually exercises it.
-	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), rawR, tenant, []string{"resource.service.name"}, 0, 200)
+	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), rawR, tenant, []string{"resource.service.name"}, 0, 200, nil)
 	require.NotNil(t, data)
 	require.NotEmpty(t, dir)
 	// filesCount/bytesRead (issue #493 Task 4c): exactly the 2 resource.service.name objects
@@ -138,29 +138,139 @@ func TestFetchVCNTSection_MissingDimYieldsNoCoverageNotError(t *testing.T) {
 	rawR, _ := newLocalRawReadWriter(t)
 	// A real, deliberately chosen window (not a leftover placeholder) — irrelevant here since
 	// there is no coverage for this dim at all.
-	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), rawR, "tenant-a", []string{"resource.service.name"}, 0, 200)
+	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), rawR, "tenant-a", []string{"resource.service.name"}, 0, 200, nil)
 	require.Nil(t, data)
 	require.Nil(t, dir)
 	require.Zero(t, filesCount)
 	require.Zero(t, bytesRead)
 }
 
+// fakeCompactedKeyChecker is an in-memory compactedKeyChecker for issue #522 #157's mandatory
+// read-path filter tests, mirroring blockpack's own fakeCompactedKeyChecker fixture
+// (cube_backfill_runner_internal_test.go) used to prove the querier-side buildVCNTSection fix.
+type fakeCompactedKeyChecker struct {
+	compacted map[string]struct{}
+	err       error
+}
+
+func (f *fakeCompactedKeyChecker) ListCompactedKeys(_ context.Context, keys []string) (map[string]struct{}, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	out := make(map[string]struct{})
+	for _, k := range keys {
+		if _, ok := f.compacted[k]; ok {
+			out[k] = struct{}{}
+		}
+	}
+	return out, nil
+}
+
+// vcntSourceKey computes the exact key fetchVCNTSection's rawR.Find will report for a file
+// written via writeVCNTObjectV2WithID below -- tenant/value_counts/<colHash>/<filename>,
+// matching splitObjectKey's own inverse (KeyPath segments + name joined by "/").
+func vcntSourceKey(tenant, column string, wallMinSec, wallMaxSec uint64, id string) string {
+	colHash := blockpack.VCNTColHash(column)
+	name := blockpack.VCNTFormatFilenameV2(0, wallMinSec, wallMaxSec, id)
+	return tenant + "/value_counts/" + colHash + "/" + name
+}
+
+// writeVCNTObjectV2WithID mirrors writeVCNTObjectV2 but with a caller-chosen id (instead of a
+// random blockpack.VCNTNewID()) so the test can compute the exact resulting key up front via
+// vcntSourceKey, deterministically, rather than needing to discover it after the fact.
+func writeVCNTObjectV2WithID(t *testing.T, rawW backend.RawWriter, column string, data []byte, wallMinSec, wallMaxSec uint64, id string) {
+	t.Helper()
+	colHash := blockpack.VCNTColHash(column)
+	name := blockpack.VCNTFormatFilenameV2(0, wallMinSec, wallMaxSec, id)
+	keypath := backend.KeyPath{"tenant-a", "value_counts", colHash}
+	require.NoError(t, rawW.Write(t.Context(), name, keypath, bytes.NewReader(data), int64(len(data)), nil))
+}
+
+// TestFetchVCNTSection_ExcludesCompactedSourcesFromSummation is issue #522 #157's mandatory
+// read-path filter test (closes the same NOTE-VC-009-class double-counting exposure #149's
+// buildVCNTSection fix closes on the querier side, newly created in THIS call path by #149's own
+// deletion-model change): a compacted-but-undeleted source file coexisting with its merged
+// replacement for up to the reaper's 30-minute grace window must not be summed twice.
+func TestFetchVCNTSection_ExcludesCompactedSourcesFromSummation(t *testing.T) {
+	const tenant = "tenant-a"
+	const dim = "service.name"
+	rawR, rawW := newLocalRawReadWriter(t)
+
+	sourceKey := vcntSourceKey(tenant, dim, 0, 120, "source")
+	writeVCNTObjectV2WithID(t, rawW, dim, vcntObj(t, dim, 60, map[string]int64{"svc-a": 5}), 0, 120, "source")
+	writeVCNTObjectV2WithID(t, rawW, dim, vcntObj(t, dim, 60, map[string]int64{"svc-a": 5}), 0, 120, "merged")
+
+	checker := &fakeCompactedKeyChecker{compacted: map[string]struct{}{sourceKey: {}}}
+	data, dir, filesCount, _ := fetchVCNTSection(context.Background(), rawR, tenant, []string{dim}, 0, 120, checker)
+	require.Equal(t, 1, filesCount, "the compacted source must never be downloaded, only the merged replacement")
+
+	est, err := blockpack.VCNTSelectivityInRange(data, dir, dim, []byte("svc-a"), 0, 120)
+	require.NoError(t, err)
+	require.True(t, est.Covered)
+	require.Equal(
+		t, int64(5), est.Count,
+		"Count = %d, want 5 (compacted source excluded, only its merged replacement counted -- "+
+			"10 here would mean the mandatory filter regressed and both were double-counted)",
+		est.Count,
+	)
+}
+
+// TestFetchVCNTSection_NilCompactedChecker_SkipsFilterAsDocumentedFallback pins the
+// nil-tolerance fallback (mirrors blockpack's own buildVCNTSection nil-checker convention): with
+// no compactedKeyChecker configured (e.g. tempodb.PgPoolProvider's pool is nil -- Postgres not
+// configured on this deployment), every listed, in-range file is summed.
+func TestFetchVCNTSection_NilCompactedChecker_SkipsFilterAsDocumentedFallback(t *testing.T) {
+	const tenant = "tenant-a"
+	const dim = "service.name"
+	rawR, rawW := newLocalRawReadWriter(t)
+
+	writeVCNTObjectV2WithID(t, rawW, dim, vcntObj(t, dim, 60, map[string]int64{"svc-a": 5}), 0, 120, "source")
+	writeVCNTObjectV2WithID(t, rawW, dim, vcntObj(t, dim, 60, map[string]int64{"svc-a": 5}), 0, 120, "merged")
+
+	data, dir, filesCount, _ := fetchVCNTSection(context.Background(), rawR, tenant, []string{dim}, 0, 120, nil)
+	require.Equal(t, 2, filesCount)
+
+	est, err := blockpack.VCNTSelectivityInRange(data, dir, dim, []byte("svc-a"), 0, 120)
+	require.NoError(t, err)
+	require.True(t, est.Covered)
+	require.Equal(t, int64(10), est.Count, "nil checker means no exclusion filtering, both files summed")
+}
+
+// TestFetchVCNTSection_CompactedCheckerError_FailsClosedToEmptySection proves a
+// compactedKeyChecker query failure never falls through to an unfiltered fetch -- the whole call
+// returns a nil/empty section (the same "no VCNT signal" contract as absent coverage) rather
+// than risk double-counting an unverifiable exclusion.
+func TestFetchVCNTSection_CompactedCheckerError_FailsClosedToEmptySection(t *testing.T) {
+	const tenant = "tenant-a"
+	const dim = "service.name"
+	rawR, rawW := newLocalRawReadWriter(t)
+
+	writeVCNTObjectV2WithID(t, rawW, dim, vcntObj(t, dim, 60, map[string]int64{"svc-a": 5}), 0, 120, "source")
+
+	checker := &fakeCompactedKeyChecker{err: errors.New("postgres unavailable")}
+	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), rawR, tenant, []string{dim}, 0, 120, checker)
+	require.Nil(t, data)
+	require.Nil(t, dir)
+	require.Zero(t, filesCount, "no file must be downloaded once the checker call itself fails")
+	require.Zero(t, bytesRead)
+}
+
 func TestBuildQueryPlan_NilRawReaderReturnsNilPlan(t *testing.T) {
-	plan, _, err := buildQueryPlan(context.Background(), nil, "tenant-a", nil, `{ span.http.method = "GET" }`, 0, 200, 1000, false)
+	plan, _, err := buildQueryPlan(context.Background(), nil, "tenant-a", nil, `{ span.http.method = "GET" }`, 0, 200, 1000, false, nil)
 	require.NoError(t, err)
 	require.Nil(t, plan)
 }
 
 func TestBuildQueryPlan_CompileFailureReturnsNilPlan(t *testing.T) {
 	rawR, _ := newLocalRawReadWriter(t)
-	plan, _, err := buildQueryPlan(context.Background(), rawR, "tenant-a", nil, `{ not a valid traceql`, 0, 200, 1000, false)
+	plan, _, err := buildQueryPlan(context.Background(), rawR, "tenant-a", nil, `{ not a valid traceql`, 0, 200, 1000, false, nil)
 	require.NoError(t, err)
 	require.Nil(t, plan)
 }
 
 func TestBuildQueryPlan_EmptyQueryReturnsNilPlan(t *testing.T) {
 	rawR, _ := newLocalRawReadWriter(t)
-	plan, _, err := buildQueryPlan(context.Background(), rawR, "tenant-a", nil, "", 0, 200, 1000, false)
+	plan, _, err := buildQueryPlan(context.Background(), rawR, "tenant-a", nil, "", 0, 200, 1000, false, nil)
 	require.NoError(t, err)
 	require.Nil(t, plan)
 }
@@ -180,7 +290,7 @@ func TestBuildQueryPlan_UnresolvableQueryReturnsNilPlanWithoutFetching(t *testin
 		vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 9}))
 
 	counting := &countingRawReader{RawReader: rawR}
-	plan, _, err := buildQueryPlan(context.Background(), counting, tenant, nil, `{ span.http.method = "GET" }`, 0, 200, 1000, false)
+	plan, _, err := buildQueryPlan(context.Background(), counting, tenant, nil, `{ span.http.method = "GET" }`, 0, 200, 1000, false, nil)
 	require.NoError(t, err)
 	require.Nil(t, plan, "an unresolvable query (no value-index reader configured) must short-circuit to a nil plan")
 	require.Equal(t, 0, counting.findCalls, "CheckIndexCoverage must be checked before any VCNT fetch I/O — zero Find calls expected")
@@ -198,7 +308,7 @@ func TestFetchVCNTSection_OutOfRangeV2FileNeverFetched(t *testing.T) {
 		vcntObj(t, "span.http.method", 500, map[string]int64{"GET": 1}), 500, 600)
 
 	counting := &countingRawReader{RawReader: rawR}
-	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), counting, tenant, []string{"span.http.method"}, 0, 100)
+	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), counting, tenant, []string{"span.http.method"}, 0, 100, nil)
 	require.Nil(t, data)
 	require.Nil(t, dir)
 	require.Zero(t, filesCount)
@@ -215,7 +325,7 @@ func TestFetchVCNTSection_InRangeV2FileStillFetched(t *testing.T) {
 		vcntObj(t, "span.http.method", 500, map[string]int64{"GET": 1}), 500, 600)
 
 	counting := &countingRawReader{RawReader: rawR}
-	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), counting, tenant, []string{"span.http.method"}, 100, 700)
+	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), counting, tenant, []string{"span.http.method"}, 100, 700, nil)
 	require.NotNil(t, data)
 	require.NotEmpty(t, dir)
 	require.Equal(t, 1, filesCount)
@@ -232,7 +342,7 @@ func TestFetchVCNTSection_V1ShapedFileStillFetchedRegardlessOfWindow(t *testing.
 		vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 1}))
 
 	counting := &countingRawReader{RawReader: rawR}
-	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), counting, tenant, []string{"span.http.method"}, 900, 1000)
+	data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), counting, tenant, []string{"span.http.method"}, 900, 1000, nil)
 	require.NotNil(t, data)
 	require.NotEmpty(t, dir)
 	require.Equal(t, 1, filesCount)
@@ -254,7 +364,7 @@ func TestFetchVCNTSection_BoundaryTouchingWindowsIncluded(t *testing.T) {
 			vcntObj(t, "span.http.method", 100, map[string]int64{"GET": 1}), 100, 200)
 
 		counting := &countingRawReader{RawReader: rawR}
-		data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), counting, tenant, []string{"span.http.method"}, window.minTS, window.maxTS)
+		data, dir, filesCount, bytesRead := fetchVCNTSection(context.Background(), counting, tenant, []string{"span.http.method"}, window.minTS, window.maxTS, nil)
 		require.NotNil(t, data, "window [%d,%d]: expected boundary-touching file to be fetched", window.minTS, window.maxTS)
 		require.NotEmpty(t, dir)
 		require.Equal(t, 1, filesCount)
@@ -312,7 +422,7 @@ func TestBuildQueryPlanFromProgram_LowSelectivityWithLimit_FallsThroughToResolva
 		vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 900, "POST": 100}))
 
 	plan, _, err := buildQueryPlan(context.Background(), rawR, tenant, nil,
-		`{ span.http.method = "GET" }`, 0, 200, 1000, true /* hasLimit */)
+		`{ span.http.method = "GET" }`, 0, 200, 1000, true /* hasLimit */, nil)
 	require.NoError(t, err, "LowSelectivity+hasLimit no longer plan-time-declines -- a limit alone never forces a decline")
 	require.NotNil(t, plan)
 	require.Equal(t, blockpack.DispatchTimeSliced, plan.Strategy)
@@ -333,7 +443,7 @@ func TestBuildMetricsQueryPlanFromProgram_LowSelectivityWithoutLimit_NeverBounde
 		vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 900, "POST": 100}))
 
 	plan, _, err := buildMetricsQueryPlan(context.Background(), rawR, tenant, nil,
-		`{ span.http.method = "GET" } | rate()`, 0, 200, 1000)
+		`{ span.http.method = "GET" } | rate()`, 0, 200, 1000, nil)
 	require.Error(t, err, "a resolvable, LowSelectivity metrics query must plan-time-decline, not dispatch")
 	require.True(t, errors.Is(err, ErrPlanTimeLowSelectivityNoLimit))
 	require.Nil(t, plan, "no plan must be returned alongside a plan-time decline error")
@@ -354,7 +464,7 @@ func TestBuildQueryPlanFromProgram_UnknownSelectivity_WithLimit_FallsThroughToRe
 	// No VCNT object written at all for this column — ClassifyProgramVCNT must read UnknownSelectivity.
 
 	plan, _, err := buildQueryPlan(context.Background(), rawR, tenant, nil,
-		`{ span.http.method = "GET" }`, 0, 200, 1000, true /* hasLimit */)
+		`{ span.http.method = "GET" }`, 0, 200, 1000, true /* hasLimit */, nil)
 	require.NoError(t, err)
 	require.NotNil(t, plan)
 	require.Equal(t, blockpack.DispatchTimeSliced, plan.Strategy)
@@ -374,7 +484,7 @@ func TestBuildQueryPlanFromProgram_UnknownSelectivity_HasLimitNoLongerAffectsOut
 	tenant := "tenant-a"
 
 	plan, _, err := buildQueryPlan(context.Background(), rawR, tenant, nil,
-		`{ span.http.method = "GET" }`, 0, 200, 1000, false /* hasLimit */)
+		`{ span.http.method = "GET" }`, 0, 200, 1000, false /* hasLimit */, nil)
 	require.NoError(t, err)
 	require.NotNil(t, plan)
 	require.Equal(t, blockpack.DispatchTimeSliced, plan.Strategy,
@@ -446,7 +556,7 @@ func TestBuildQueryPlanFromProgram_AttachesQualificationOutcome(t *testing.T) {
 		writeVCNTObject(t, rawW, "span.http.method", vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 9}))
 
 		span := runWithSpan(t, func(ctx context.Context) {
-			plan, _, err := buildQueryPlan(ctx, rawR, "tenant-a", nil, `{ span.http.method = "GET" }`, 0, 200, 1000, false)
+			plan, _, err := buildQueryPlan(ctx, rawR, "tenant-a", nil, `{ span.http.method = "GET" }`, 0, 200, 1000, false, nil)
 			require.NoError(t, err)
 			require.Nil(t, plan)
 		})
@@ -462,7 +572,7 @@ func TestBuildQueryPlanFromProgram_AttachesQualificationOutcome(t *testing.T) {
 		writeVCNTObject(t, rawW, "span.http.method", vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 900, "POST": 100}))
 
 		span := runWithSpan(t, func(ctx context.Context) {
-			plan, _, err := buildQueryPlan(ctx, rawR, "tenant-a", nil, `{ span.http.method = "GET" }`, 0, 200, 1000, false)
+			plan, _, err := buildQueryPlan(ctx, rawR, "tenant-a", nil, `{ span.http.method = "GET" }`, 0, 200, 1000, false, nil)
 			require.Error(t, err)
 			require.Nil(t, plan)
 		})
@@ -478,7 +588,7 @@ func TestBuildQueryPlanFromProgram_AttachesQualificationOutcome(t *testing.T) {
 		writeVCNTObject(t, rawW, "span.http.method", vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 900, "POST": 100}))
 
 		span := runWithSpan(t, func(ctx context.Context) {
-			plan, _, err := buildMetricsQueryPlan(ctx, rawR, "tenant-a", nil, `{ span.http.method = "GET" } | rate()`, 0, 200, 1000)
+			plan, _, err := buildMetricsQueryPlan(ctx, rawR, "tenant-a", nil, `{ span.http.method = "GET" } | rate()`, 0, 200, 1000, nil)
 			require.Error(t, err)
 			require.Nil(t, plan)
 		})
@@ -497,7 +607,7 @@ func TestBuildQueryPlanFromProgram_AttachesQualificationOutcome(t *testing.T) {
 
 		var capturedPlan *blockpack.QueryPlan
 		span := runWithSpan(t, func(ctx context.Context) {
-			plan, _, err := buildQueryPlan(ctx, rawR, "tenant-a", nil, `{ span.http.method = "POST" }`, 0, 200, 1000, false)
+			plan, _, err := buildQueryPlan(ctx, rawR, "tenant-a", nil, `{ span.http.method = "POST" }`, 0, 200, 1000, false, nil)
 			require.NoError(t, err)
 			require.NotNil(t, plan)
 			capturedPlan = plan
@@ -536,7 +646,7 @@ func TestBuildQueryPlanFromProgram_AttachesLeadDetail(t *testing.T) {
 	writeVCNTObject(t, rawW, "span.http.method", vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 900, "POST": 100}))
 
 	ctx, span := tracer.Start(context.Background(), "test.caller")
-	plan, _, err := buildQueryPlan(ctx, rawR, "tenant-a", nil, `{ span.http.method = "GET" }`, 0, 200, 1000, true)
+	plan, _, err := buildQueryPlan(ctx, rawR, "tenant-a", nil, `{ span.http.method = "GET" }`, 0, 200, 1000, true, nil)
 	require.NoError(t, err)
 	require.NotNil(t, plan)
 	span.End()
@@ -587,7 +697,7 @@ func TestBuildQueryPlanFromProgram_DimsWideningReachesDurationHistogramClassific
 		durationHistogramVCNTObj(t, 60, map[uint64]int64{2: 900, 0: 100}))
 
 	ctx, span := tracer.Start(context.Background(), "test.caller")
-	plan, _, err := buildQueryPlan(ctx, rawR, "tenant-a", nil, `{ duration >= 1ms }`, 0, 200, 1000, true /* hasLimit */)
+	plan, _, err := buildQueryPlan(ctx, rawR, "tenant-a", nil, `{ duration >= 1ms }`, 0, 200, 1000, true /* hasLimit */, nil)
 	require.NoError(t, err)
 	require.NotNil(t, plan)
 	span.End()
@@ -625,7 +735,7 @@ func TestBuildQueryPlanFromProgram_DimsWideningDoesNotReachNonDurationHistogramD
 		vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 9, "POST": 1}))
 
 	counting := &countingRawReader{RawReader: rawR}
-	plan, _, err := buildQueryPlan(context.Background(), counting, "tenant-a", nil, `{ span.http.method = "GET" }`, 0, 200, 1000, true)
+	plan, _, err := buildQueryPlan(context.Background(), counting, "tenant-a", nil, `{ span.http.method = "GET" }`, 0, 200, 1000, true, nil)
 	require.NoError(t, err)
 	require.NotNil(t, plan)
 
@@ -665,7 +775,7 @@ func TestFetchVCNTFetch_EmitsChildSpanWithFileStats(t *testing.T) {
 	writeVCNTObject(t, rawW, "span.http.method",
 		vcntObj(t, "span.http.method", 120, map[string]int64{"GET": 2}))
 
-	plan, _, err := buildQueryPlan(context.Background(), rawR, "tenant-a", nil, `{ span.http.method = "POST" }`, 0, 200, 1000, false)
+	plan, _, err := buildQueryPlan(context.Background(), rawR, "tenant-a", nil, `{ span.http.method = "POST" }`, 0, 200, 1000, false, nil)
 	require.NoError(t, err)
 	require.NotNil(t, plan)
 
@@ -738,7 +848,7 @@ func TestBuildQueryPlanFromProgram_RecordsUsageForUncoveredNonDedicatedColumn(t 
 	defer restore()
 
 	rawR, _ := newLocalRawReadWriter(t)
-	_, _, err := buildQueryPlan(context.Background(), rawR, "tenant-a", nil, `{ span.never.indexed.rec1 = "x" }`, 0, 200, 1000, false)
+	_, _, err := buildQueryPlan(context.Background(), rawR, "tenant-a", nil, `{ span.never.indexed.rec1 = "x" }`, 0, 200, 1000, false, nil)
 	require.NoError(t, err)
 
 	assert.Equal(t, []string{"span.never.indexed.rec1"}, rec.columns())
@@ -756,7 +866,7 @@ func TestBuildQueryPlanFromProgram_DedicatedColumnNeverRecorded(t *testing.T) {
 
 	rawR, _ := newLocalRawReadWriter(t)
 	dedicated := backend.DedicatedColumns{{Scope: backend.DedicatedColumnScopeSpan, Name: "never.indexed.rec2"}}
-	_, _, err := buildQueryPlan(context.Background(), rawR, "tenant-a", dedicated, `{ span.never.indexed.rec2 = "x" }`, 0, 200, 1000, false)
+	_, _, err := buildQueryPlan(context.Background(), rawR, "tenant-a", dedicated, `{ span.never.indexed.rec2 = "x" }`, 0, 200, 1000, false, nil)
 	require.NoError(t, err)
 
 	assert.Empty(t, rec.columns())
@@ -786,7 +896,7 @@ func TestBuildQueryPlanFromProgram_UsageRecordingNeverDownloadsContent(t *testin
 	defer restore()
 
 	rawR, _ := newLocalRawReadWriter(t)
-	_, _, _ = buildQueryPlan(context.Background(), rawR, "tenant-a", nil, `{ span.never.indexed.rec3 = "x" }`, 0, 200, 1000, false)
+	_, _, _ = buildQueryPlan(context.Background(), rawR, "tenant-a", nil, `{ span.never.indexed.rec3 = "x" }`, 0, 200, 1000, false, nil)
 
 	assert.Equal(t, 0, counting.sizeCalls, "must never download a value-index file's content")
 	assert.Equal(t, 0, counting.readAtCalls, "must never download a value-index file's content")
@@ -808,7 +918,7 @@ func TestBuildQueryPlanFromProgram_RunsIndependentlyOfCheckIndexCoverageOutcome(
 
 	rawR, _ := newLocalRawReadWriter(t)
 	plan, _, err := buildQueryPlan(context.Background(), rawR, "tenant-a", nil,
-		`{ span.custom.attr != "x" && span.never.indexed.rec4 = "y" }`, 0, 200, 1000, false)
+		`{ span.custom.attr != "x" && span.never.indexed.rec4 = "y" }`, 0, 200, 1000, false, nil)
 	require.NoError(t, err)
 	require.Nil(t, plan, "CheckIndexCoverage must decline this mixed unindexable/indexable query")
 
@@ -892,7 +1002,7 @@ func TestBuildQueryPlanFromProgram_DurationLowSelectivityNoLimit_DeclinesBeforeD
 		durationHistogramVCNTObj(t, 60, map[uint64]int64{2: 900, 0: 100}))
 
 	plan, _, err := buildQueryPlan(context.Background(), rawR, tenant, nil,
-		`{ duration >= 1ms }`, 0, 200, 1000, false /* hasLimit */)
+		`{ duration >= 1ms }`, 0, 200, 1000, false /* hasLimit */, nil)
 	require.Error(t, err, "a resolvable, LowSelectivity duration predicate with no limit must plan-time-decline")
 	require.True(t, errors.Is(err, ErrPlanTimeLowSelectivityNoLimit))
 	require.Nil(t, plan, "the returned plan must be nil -- zero block jobs constructed, the literal zero-io_ops proof")
@@ -922,7 +1032,7 @@ func TestBuildQueryPlan_HalfWindowBackfill_NowDispatchesTimeSlicedInsteadOfDecli
 		vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 900, "POST": 100}))
 
 	plan, _, err := buildQueryPlan(context.Background(), rawR, tenant, nil,
-		`{ span.http.method = "GET" }`, 0, 200, 1000, true /* hasLimit */)
+		`{ span.http.method = "GET" }`, 0, 200, 1000, true /* hasLimit */, nil)
 	require.NoError(t, err)
 	require.NotNil(t, plan, "a half-window backfill watermark must no longer decline the whole query")
 	require.Equal(t, blockpack.DispatchTimeSliced, plan.Strategy)

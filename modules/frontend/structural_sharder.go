@@ -35,7 +35,7 @@ import (
 // "every trace" from the search index without defeating the point of the index-driven path.
 func buildStructuralQueryPlan(
 	ctx context.Context, rawR backend.RawReader, tenant string, dedicated backend.DedicatedColumns, query string,
-	minTS, maxTS uint64, concurrentRequests int, hasLimit bool,
+	minTS, maxTS uint64, concurrentRequests int, hasLimit bool, compactedChecker compactedKeyChecker,
 ) (*blockpack.QueryPlan, int64, error) {
 	if rawR == nil || query == "" {
 		return nil, 0, nil
@@ -51,7 +51,9 @@ func buildStructuralQueryPlan(
 	// bounded path querier-side, with or without a limit (Phase 6's asymmetry finding, made
 	// permanent by Phase 7's removal of the #481-part-2 bounded-scan mechanism) — this
 	// classification's only remaining effect on a structural query is the plan-time decline gate.
-	return buildQueryPlanFromProgram(ctx, rawR, tenant, dedicated, leftProg, minTS, maxTS, concurrentRequests, true, hasLimit)
+	return buildQueryPlanFromProgram(
+		ctx, rawR, tenant, dedicated, leftProg, minTS, maxTS, concurrentRequests, true, hasLimit, compactedChecker,
+	)
 }
 
 // structuralTimeSlicedJobsFunc is timeSlicedJobsFunc's structural-query sibling (issue #489,

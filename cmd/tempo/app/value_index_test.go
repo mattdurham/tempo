@@ -10,8 +10,8 @@ import (
 )
 
 // fakeManifestStore is a minimal in-memory manifestStore for tests -- it satisfies the
-// exact Get/Put shape colhashmanifest.Store requires (and which toVICConsumerCfg /
-// toVCNTCompactorCfg's ms parameter accepts), mirroring blockpack's own
+// exact Get/Put shape colhashmanifest.Store requires (and which toVICConsumerCfg's ms
+// parameter accepts), mirroring blockpack's own
 // internal/modules/{valueindexconsumer,valuecountscompactor} manifest_hook_test.go fakes.
 type fakeManifestStore struct {
 	objects map[string][]byte
@@ -43,24 +43,6 @@ func TestToVICConsumerCfg_ManifestStore(t *testing.T) {
 
 	t.Run("nil manifest store stays nil", func(t *testing.T) {
 		out := toVICConsumerCfg(cfg, nil)
-		assert.Nil(t, out.ManifestStore)
-	})
-}
-
-// TestToVCNTCompactorCfg_ManifestStore is the VCNT-compactor counterpart of
-// TestToVICConsumerCfg_ManifestStore (issue #507).
-func TestToVCNTCompactorCfg_ManifestStore(t *testing.T) {
-	cfg := common.ValueCountCompactorConfig{Enabled: true}
-
-	t.Run("non-nil manifest store is wired through", func(t *testing.T) {
-		ms := &fakeManifestStore{objects: map[string][]byte{}}
-		out := toVCNTCompactorCfg(cfg, ms)
-		assert.NotNil(t, out.ManifestStore)
-		assert.Same(t, ms, out.ManifestStore)
-	})
-
-	t.Run("nil manifest store stays nil", func(t *testing.T) {
-		out := toVCNTCompactorCfg(cfg, nil)
 		assert.Nil(t, out.ManifestStore)
 	})
 }

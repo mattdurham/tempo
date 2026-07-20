@@ -31,8 +31,7 @@ func (t *App) initJobPlanner() (services.Service, error) {
 		return services.NewIdleService(nil, nil), nil
 	}
 
-	// job-planner has no purpose without Postgres -- unlike value-index-compactor,
-	// which can run VI-compaction-only without it, job-planner's entire job is
+	// job-planner has no purpose without Postgres -- its entire job is
 	// reading/writing Postgres rows (viusage_entries/cube_entries/backend_jobs).
 	pgCfg := t.cfg.StorageConfig.Trace.Postgres
 	if pgCfg == nil {
