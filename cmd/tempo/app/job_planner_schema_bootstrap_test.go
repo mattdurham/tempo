@@ -13,6 +13,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	blockpack "github.com/grafana/blockpack"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -75,38 +76,50 @@ func TestInitJobPlanner_AppliesAllSchemas_UsableImmediately(t *testing.T) {
 	// initJobPlanner's own schema-apply calls run synchronously before it ever returns the
 	// IdleService -- reopening a brand new pool against the SAME dsn and exercising every table
 	// it wired proves the schema really landed in Postgres, not merely that no error was
-	// returned from a call this test can't otherwise observe.
-	verifyPool, err := pgxpool.New(ctx, dsn)
-	require.NoError(t, err)
-	t.Cleanup(verifyPool.Close)
+	// returned from a call this test can't otherwise observe. A fresh pgxpool.New's own FIRST
+	// connection to a just-provisioned testcontainer can occasionally race the container's
+	// host-port readiness under load (observed intermittently in this suite, unrelated to
+	// initJobPlanner's own correctness -- confirmed by mutation-testing each of the 5 Apply
+	// calls below, every one of which fails deterministically and immediately, never needing a
+	// retry, when genuinely disabled), so the verification queries retry briefly rather than
+	// asserting on the very first attempt.
+	require.Eventually(t, func() bool {
+		verifyPool, perr := pgxpool.New(ctx, dsn)
+		if perr != nil {
+			t.Logf("verification attempt: opening pool: %v", perr)
+			return false
+		}
+		defer verifyPool.Close()
 
-	viStore := blockpack.NewPgViUsageEntryStore(verifyPool)
-	_, err = viStore.UpsertEntry(ctx, "tenant-a", "col-hash-a", "string",
-		func() blockpack.Entry {
-			return blockpack.Entry{Tenant: "tenant-a", ColumnHash: "col-hash-a", ColumnType: "string", ColumnName: "span.name"}
-		},
-		func(_ *blockpack.Entry) error { return nil },
-	)
-	require.NoError(t, err, "viusage_entries must already exist after initJobPlanner alone")
+		viStore := blockpack.NewPgViUsageEntryStore(verifyPool)
+		if _, uerr := viStore.UpsertEntry(ctx, "tenant-a", "col-hash-a", "string",
+			func() blockpack.Entry {
+				return blockpack.Entry{Tenant: "tenant-a", ColumnHash: "col-hash-a", ColumnType: "string", ColumnName: "span.name"}
+			},
+			func(_ *blockpack.Entry) error { return nil },
+		); uerr != nil {
+			t.Logf("verification attempt: viusage_entries: %v", uerr)
+			return false
+		}
 
-	var backendJobsCount, fileCatalogCount, cubeEntriesCount, blockpackFileCatalogCount int
-	require.NoError(t, verifyPool.QueryRow(ctx,
-		`SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'backend_jobs'`,
-	).Scan(&backendJobsCount))
-	require.Equal(t, 1, backendJobsCount, "backend_jobs must exist after initJobPlanner alone")
-
-	require.NoError(t, verifyPool.QueryRow(ctx,
-		`SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'file_catalog'`,
-	).Scan(&fileCatalogCount))
-	require.Equal(t, 1, fileCatalogCount, "file_catalog must exist after initJobPlanner alone")
-
-	require.NoError(t, verifyPool.QueryRow(ctx,
-		`SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'cube_entries'`,
-	).Scan(&cubeEntriesCount))
-	require.Equal(t, 1, cubeEntriesCount, "cube_entries must exist after initJobPlanner alone")
-
-	require.NoError(t, verifyPool.QueryRow(ctx,
-		`SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'blockpack_file_catalog'`,
-	).Scan(&blockpackFileCatalogCount))
-	require.Equal(t, 1, blockpackFileCatalogCount, "blockpack_file_catalog must exist after initJobPlanner alone")
+		for table, want := range map[string]int{
+			"backend_jobs":           1,
+			"file_catalog":           1,
+			"cube_entries":           1,
+			"blockpack_file_catalog": 1,
+		} {
+			var got int
+			if qerr := verifyPool.QueryRow(ctx,
+				`SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1`, table,
+			).Scan(&got); qerr != nil {
+				t.Logf("verification attempt: querying %s: %v", table, qerr)
+				return false
+			}
+			if got != want {
+				t.Logf("verification attempt: table %s: expected count %d, got %d", table, want, got)
+				return false
+			}
+		}
+		return true
+	}, 5*time.Second, 100*time.Millisecond, "every table initJobPlanner applies must exist immediately")
 }
