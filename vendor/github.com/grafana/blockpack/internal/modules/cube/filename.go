@@ -1,19 +1,21 @@
 package cube
 
-// filename.go — issue #522 Phase 3.1/3.2: filename format/parse for cube's new pairwise
-// compaction-worker merge outputs, mirroring valuecounts.FormatFilenameV2/ParseFilenameV2's
-// established L<level>-<min>-<max>-<id> shape exactly (minutes instead of seconds, matching
+// filename.go — issue #522 Phase 3.1/3.2: filename format/parse for cube's L<level>-<min>-<max>-
+// <id>.cube "timed" shape, ported from tempo's cube_compactor.go (cubeTimedFileRe/
+// cubeTierToLevel) before that file is deleted per plan.md Phase 3.3 -- compaction-worker can't
+// import it either way (tempo-side, minio-specific, wrong dependency direction). Mirrors
+// valuecounts.FormatFilenameV2/ParseFilenameV2's shape (minutes instead of seconds, matching
 // cube's own MinMinute/MaxMinute convention; .cube suffix instead of .vcnt).
 //
-// Deliberately NOT understood by tempo's cube_compactor.go's legacy cubeTierToLevel mapping
-// (tier 0/1/2 -> Level 1/60/1440 only, everything else silently skipped) -- this is safe, not a
-// gap: level here is always >= 10000 (plan.md Phase 3.0 point 4's confirmed offset, guaranteeing
-// no collision with legacy 1/60/1440 values), and neither of the two real consumers of this
-// filename shape depends on that legacy classifier at all. cube_query_path.go's QueryRange lists
-// via the narrower Lister (raw key strings, Decision 2) and fetches every key regardless of any
-// tier classification; compaction-planner/compaction-worker are Postgres-driven and never call
-// cubeFileStore.List either. A level>=10000 file being invisible to the OLD scheduler's own
-// listing is a feature (it can never be re-selected as an old-model merge candidate), not a bug.
+// legacyTierToLevel's default case is the ONE deliberate correctness fix relative to tempo's
+// original (planner-522, issue #522 Phase 3.1/3.2 review): tempo's cubeTierToLevel REJECTS
+// (returns ok=false) any digit outside {0,1,2}, since every real tempo-written filename's leading
+// digit was always a human-readable tier code needing translation, never the real Level. That
+// assumption breaks for the new pairwise compaction-worker's own merge outputs, whose Level is
+// always >= 10000 (plan.md Phase 3.0 point 4) and is ALREADY the real value, not a tier code
+// needing translation. Rejecting it here (porting tempo's original default verbatim) would make
+// every new-model merge output silently invisible to candidate-selection/reconcile forever.
+// Passing it through unchanged is the fix -- see legacyTierToLevel's own doc comment.
 
 import (
 	"fmt"
@@ -44,10 +46,12 @@ type FileMeta struct {
 	MaxMinute uint32
 }
 
-// ParseFilename parses a cube filename produced by FormatFilename into its components. Returns
-// an error for any other shape (including legacy L0/L1/L2-tier filenames written by the old
-// scheduler/accumulator, or an accumulator-written untimed "L0-<xid>.cube" flush file) --
-// callers must treat those identically to any other unparseable input (skip, don't guess).
+// ParseFilename parses any "timed" cube filename -- L<levelOrTier>-<minMinute>-<maxMinute>-
+// <id>.cube -- into its components, translating a legacy tier digit (0/1/2) to its real Level
+// (1/60/1440) via legacyTierToLevel; any other digit (a new-model merge output, always >= 10000)
+// passes through unchanged. Returns an error for any other shape, notably an accumulator-written
+// untimed "L0-<xid>.cube" raw flush file (no embedded range at all) -- callers must fall back to
+// reading the file's own header (cube.DecodeHeader) for that shape instead of guessing.
 func ParseFilename(name string) (FileMeta, error) {
 	base := strings.TrimSuffix(name, ".cube")
 	if base == name {
@@ -67,6 +71,8 @@ func ParseFilename(name string) (FileMeta, error) {
 	if err != nil {
 		return FileMeta{}, fmt.Errorf("cube: filename %q level not an integer: %w", name, err)
 	}
+	//nolint:gosec // G115: lv parsed with ParseUint(..., 32) above, never exceeds uint32 range
+	level := legacyTierToLevel(uint32(lv))
 	minMinute, err := strconv.ParseUint(parts[1], 10, 32)
 	if err != nil {
 		return FileMeta{}, fmt.Errorf("cube: filename %q minMinute not an integer: %w", name, err)
@@ -81,10 +87,31 @@ func ParseFilename(name string) (FileMeta, error) {
 	if minMinute > maxMinute {
 		return FileMeta{}, fmt.Errorf("cube: filename %q has minMinute %d > maxMinute %d", name, minMinute, maxMinute)
 	}
+	//nolint:gosec // G115: parsed from this package's own filenames, never exceeds uint32 range
 	return FileMeta{
 		Filename: name, ID: parts[3],
-		Level: uint32(lv), MinMinute: uint32(minMinute), MaxMinute: uint32(maxMinute), //nolint:gosec // G115: parsed from this package's own filenames, never exceeds uint32 range
+		Level: level, MinMinute: uint32(minMinute), MaxMinute: uint32(maxMinute),
 	}, nil
+}
+
+// legacyTierToLevel maps a legacy human-readable tier digit (0/1/2, from a pre-#522 "L0"/"L1"/
+// "L2" merge/rollup filename) to its real Level value (1/60/1440, RollupL0/RollupL1/RollupL2).
+// Any OTHER value is not a tier code at all -- it IS the real Level already (a new-model
+// pairwise compaction-worker merge output, always >= 10000 per plan.md Phase 3.0 point 4) --
+// passed through unchanged. See this file's own doc comment for why getting this backwards
+// (rejecting anything outside {0,1,2}, tempo's original cubeTierToLevel behavior) would be a
+// real bug for the new model, not just a missed optimization.
+func legacyTierToLevel(tier uint32) uint32 {
+	switch tier {
+	case 0:
+		return uint32(RollupL0)
+	case 1:
+		return uint32(RollupL1)
+	case 2:
+		return uint32(RollupL2)
+	default:
+		return tier
+	}
 }
 
 // IsInTimeRange reports whether the file covers any part of [queryMinMinute, queryMaxMinute].

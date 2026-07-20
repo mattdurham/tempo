@@ -28,6 +28,15 @@ func (r *Reader) BytesRead() int64 { return r.bytesRead }
 // ValidateFileMatchesRegistry (APPENDIX 3's registry-vs-file consistency check).
 func (r *Reader) NumAggAttrs() uint8 { return r.header.NumAggAttrs }
 
+// MinMinute returns this file's earliest cell minute, from its header (issue #522 Phase 3.2) --
+// compaction-worker's cube_compaction handler needs this to compute RollupToWriter's inclusive
+// merge window from its already-opened input Readers, without a second, separate header decode.
+func (r *Reader) MinMinute() uint32 { return r.header.MinMinute }
+
+// MaxMinute returns this file's latest cell minute, from its header (issue #522 Phase 3.2). See
+// MinMinute's own doc comment.
+func (r *Reader) MaxMinute() uint32 { return r.header.MaxMinute }
+
 // OpenReader opens a cube file for reading.
 func OpenReader(path string) (*Reader, error) {
 	data, err := os.ReadFile(path) //nolint:gosec // path is an internal, trusted cube file location

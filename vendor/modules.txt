@@ -809,7 +809,7 @@ github.com/googleapis/gax-go/v2/iterator
 # github.com/gorilla/mux v1.8.1
 ## explicit; go 1.20
 github.com/gorilla/mux
-# github.com/grafana/blockpack v0.0.0-20260717103544-c45592db => ../blockpack
+# github.com/grafana/blockpack v0.0.0-20260720132026-86b69675 => ../blockpack
 ## explicit; go 1.26.0
 github.com/grafana/blockpack
 github.com/grafana/blockpack/blockevents
@@ -832,9 +832,7 @@ github.com/grafana/blockpack/internal/modules/rw
 github.com/grafana/blockpack/internal/modules/sectioncache
 github.com/grafana/blockpack/internal/modules/tieredcache
 github.com/grafana/blockpack/internal/modules/valuecounts
-github.com/grafana/blockpack/internal/modules/valuecountscompactor
 github.com/grafana/blockpack/internal/modules/valueindex
-github.com/grafana/blockpack/internal/modules/valueindexcompactor
 github.com/grafana/blockpack/internal/modules/valueindexconsumer
 github.com/grafana/blockpack/internal/modules/vibuilder
 github.com/grafana/blockpack/internal/modules/viusage
@@ -842,8 +840,6 @@ github.com/grafana/blockpack/internal/pgschema
 github.com/grafana/blockpack/internal/s3provider
 github.com/grafana/blockpack/internal/traceqlparser
 github.com/grafana/blockpack/internal/vm
-github.com/grafana/blockpack/valuecountscompactor
-github.com/grafana/blockpack/valueindexcompactor
 github.com/grafana/blockpack/valueindexconsumer
 # github.com/grafana/dskit v0.0.0-20260427162712-0457a92dacc3
 ## explicit; go 1.25.8

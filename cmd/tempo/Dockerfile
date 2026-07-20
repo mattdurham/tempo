@@ -13,7 +13,8 @@ FROM gcr.io/distroless/static-debian12@sha256:20bc6c0bc4d625a22a8fde3e55f6515709
 ARG TARGETARCH
 COPY bin/linux/tempo-${TARGETARCH} /tempo
 COPY --chmod=0755 bin/linux/value-index-consumer-${TARGETARCH} /value-index-consumer
-COPY --chmod=0755 bin/linux/value-index-compactor-${TARGETARCH} /value-index-compactor
+COPY --chmod=0755 bin/linux/compaction-planner-${TARGETARCH} /compaction-planner
+COPY --chmod=0755 bin/linux/compaction-worker-${TARGETARCH} /compaction-worker
 COPY --from=ca-certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=tempo-setup /etc/passwd /etc/passwd
 COPY --from=tempo-setup /etc/group /etc/group

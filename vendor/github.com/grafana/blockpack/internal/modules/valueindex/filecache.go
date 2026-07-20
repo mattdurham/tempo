@@ -51,12 +51,24 @@ type colEntry struct {
 // refreshed in the background. It wraps DiscoverIndexFiles' Lister and replaces
 // the live-per-query S3 LIST with a cached, periodically refreshed listing.
 type IndexFileCache struct {
-	lister      Lister
-	entries     map[colKey]*colEntry
-	tenant      string
-	indexPrefix string
-	ttl         time.Duration
-	mu          sync.Mutex
+	lister           Lister
+	entries          map[colKey]*colEntry
+	compactedChecker CompactedKeyChecker // nil-tolerant, see SetCompactedChecker's own doc comment
+	tenant           string
+	indexPrefix      string
+	ttl              time.Duration
+	mu               sync.Mutex
+}
+
+// SetCompactedChecker opts this cache into excluding already-compacted keys from every listing
+// it performs (cold miss and background refresh alike), issue #522 Phase 1.5's milder read-path
+// filter. Not a constructor parameter (NewIndexFileCache's signature is left unchanged for every
+// existing caller) -- call this once, before the cache serves its first query, if the caller has
+// a *pgcatalog.Store to wire in. nil (the default, if never called) disables the filter entirely.
+func (c *IndexFileCache) SetCompactedChecker(checker CompactedKeyChecker) {
+	c.mu.Lock()
+	c.compactedChecker = checker
+	c.mu.Unlock()
 }
 
 // NewIndexFileCache builds an IndexFileCache over lister for a single tenant and
@@ -263,13 +275,19 @@ func (c *IndexFileCache) refreshAccessed(ctx context.Context) {
 // listColumn performs a live LIST of one column directory and returns its parsed
 // FileMetas with full keys, sorted by SortFileMetas. Malformed keys are skipped
 // (same policy as DiscoverIndexFiles). Returns nil when the directory is empty.
+//
+// issue #522 Phase 1.5: when SetCompactedChecker has wired a non-nil checker, any key it
+// reports as already compacted is excluded here, before it ever enters the cache -- applied at
+// listColumn (both the cold-miss path and the background refresh sweep call it), not at
+// FilesForTimeRange's filter step, so a compacted key never lingers in a warm cache hit between
+// refreshes either.
 func (c *IndexFileCache) listColumn(ctx context.Context, colHash, colTypeName string) ([]FileMeta, error) {
 	prefix := path.Join(c.tenant, c.indexPrefix, colHash, colTypeName) + "/"
 	keys, err := c.lister.List(ctx, prefix)
 	if err != nil {
 		return nil, err
 	}
-	metas := make([]FileMeta, 0, len(keys))
+	candidates := make([]FileMeta, 0, len(keys))
 	for _, key := range keys {
 		meta, parseErr := ParseFilenameV2(path.Base(key))
 		if parseErr != nil {
@@ -277,11 +295,40 @@ func (c *IndexFileCache) listColumn(ctx context.Context, colHash, colTypeName st
 		}
 		// Preserve the full key so callers can Get/Download directly.
 		meta.Filename = key
-		metas = append(metas, meta)
+		candidates = append(candidates, meta)
 	}
-	if len(metas) == 0 {
+	if len(candidates) == 0 {
 		return nil, nil
 	}
+
+	c.mu.Lock()
+	checker := c.compactedChecker
+	c.mu.Unlock()
+
+	metas := candidates
+	if checker != nil {
+		candidateKeys := make([]string, len(candidates))
+		for i, m := range candidates {
+			candidateKeys[i] = m.Filename
+		}
+		compacted, checkErr := checker.ListCompactedKeys(ctx, candidateKeys)
+		if checkErr != nil {
+			// Fail closed like discoverIndexFiles' own filtered path -- never fall
+			// through to an unfiltered listing on a catalog query failure.
+			return nil, checkErr
+		}
+		metas = make([]FileMeta, 0, len(candidates))
+		for _, m := range candidates {
+			if _, isCompacted := compacted[m.Filename]; isCompacted {
+				continue
+			}
+			metas = append(metas, m)
+		}
+		if len(metas) == 0 {
+			return nil, nil
+		}
+	}
+
 	SortFileMetas(metas)
 	return metas, nil
 }

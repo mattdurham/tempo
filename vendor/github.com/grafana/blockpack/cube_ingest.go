@@ -236,22 +236,9 @@ type CubeFileInfo = cube.FileInfo
 // CubeFileStore is the minimal S3-compatible interface the compactor needs.
 type CubeFileStore = cube.FileStore
 
-// CubeCompactionPlan describes one planned merge.
-type CubeCompactionPlan = cube.CompactionPlan
-
 // NewCubeCompactor creates a cube compactor.
 func NewCubeCompactor(store CubeFileStore, registry *CubeRegistry, cfg CubeCompactorConfig) *CubeCompactor {
 	return cube.NewCompactor(store, registry, cfg)
-}
-
-// PlanCubeL0Merge returns compaction plans for L0 files covering a complete hour.
-func PlanCubeL0Merge(files []CubeFileInfo, threshold int, tenant, cubeID string) []CubeCompactionPlan {
-	return cube.PlanL0Merge(files, threshold, tenant, cubeID)
-}
-
-// PlanCubeL1Rollup returns input keys to roll up one hour of L0 files into an L1 file.
-func PlanCubeL1Rollup(files []CubeFileInfo, hourStart uint32, tenant, cubeID string) ([]string, bool) {
-	return cube.PlanL1Rollup(files, hourStart, tenant, cubeID)
 }
 
 // CubeBackfiller processes historical backfill for one cube from the value index.

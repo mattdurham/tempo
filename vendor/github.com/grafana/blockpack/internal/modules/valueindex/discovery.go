@@ -23,6 +23,19 @@ type Lister interface {
 	List(ctx context.Context, prefix string) ([]string, error)
 }
 
+// CompactedKeyChecker reports which of a candidate set of object keys are already marked
+// compacted in blockpack_file_catalog (issue #522 Phase 1.5). VI's residual risk from a
+// compacted-but-undeleted source is milder than VCNT's/cube's (identity-based dedup in
+// StreamCompactBucketFiles already prevents double-counting) -- staleness/precedence, not
+// double-counting -- so unlike buildVCNTSection's mandatory filter, this stays nil-tolerant:
+// nil disables the filter entirely, preserving every existing caller's exact current behavior.
+// *pgcatalog.Store satisfies this structurally; kept as a local interface (mirroring
+// IndexStore/SourceExister's own shape) so this low-level, backend-agnostic package never gains a
+// direct Postgres dependency.
+type CompactedKeyChecker interface {
+	ListCompactedKeys(ctx context.Context, keys []string) (map[string]struct{}, error)
+}
+
 // DiscoverIndexFiles lists all value-index files for a single
 // (tenant, colHash, colTypeName) that overlap the query time window
 // [queryMinSec, queryMaxSec]. Keys are returned sorted by
@@ -49,6 +62,33 @@ func DiscoverIndexFiles(
 		queryMinSec,
 		queryMaxSec,
 		SortFileMetas,
+		nil,
+	)
+}
+
+// DiscoverIndexFilesFiltered mirrors DiscoverIndexFiles but additionally excludes any key
+// checker reports as already compacted (issue #522 Phase 1.5) -- a new, opt-in sibling function,
+// not a modification of DiscoverIndexFiles itself, mirroring this file's own established
+// DiscoverIndexFilesNewestFirst precedent (every existing caller's behavior must stay byte-for-
+// byte unchanged). checker may be nil, disabling the filter (identical to DiscoverIndexFiles).
+func DiscoverIndexFilesFiltered(
+	ctx context.Context,
+	lister Lister,
+	tenant, indexPrefix, colHash, colTypeName string,
+	queryMinSec, queryMaxSec uint64,
+	checker CompactedKeyChecker,
+) ([]string, error) {
+	return discoverIndexFiles(
+		ctx,
+		lister,
+		tenant,
+		indexPrefix,
+		colHash,
+		colTypeName,
+		queryMinSec,
+		queryMaxSec,
+		SortFileMetas,
+		checker,
 	)
 }
 
@@ -73,18 +113,21 @@ func DiscoverIndexFilesNewestFirst(
 		queryMinSec,
 		queryMaxSec,
 		SortFileMetasNewestFirst,
+		nil,
 	)
 }
 
-// discoverIndexFiles is the shared implementation behind DiscoverIndexFiles and
-// DiscoverIndexFilesNewestFirst -- identical List/parse/filter logic, differing only in which
-// sort function orders the final key list.
+// discoverIndexFiles is the shared implementation behind DiscoverIndexFiles/
+// DiscoverIndexFilesFiltered and DiscoverIndexFilesNewestFirst -- identical List/parse/filter
+// logic, differing only in which sort function orders the final key list and whether checker
+// (nil-tolerant, issue #522 Phase 1.5) excludes already-compacted keys before download.
 func discoverIndexFiles(
 	ctx context.Context,
 	lister Lister,
 	tenant, indexPrefix, colHash, colTypeName string,
 	queryMinSec, queryMaxSec uint64,
 	sortFunc func([]FileMeta),
+	checker CompactedKeyChecker,
 ) ([]string, error) {
 	prefix := path.Join(tenant, indexPrefix, colHash, colTypeName) + "/"
 	keys, err := lister.List(ctx, prefix)
@@ -92,7 +135,7 @@ func discoverIndexFiles(
 		return nil, err
 	}
 
-	matches := make([]FileMeta, 0, len(keys))
+	candidates := make([]FileMeta, 0, len(keys))
 	for _, key := range keys {
 		meta, parseErr := ParseFilenameV2(path.Base(key))
 		if parseErr != nil {
@@ -106,9 +149,33 @@ func discoverIndexFiles(
 		// Preserve the full key so the caller can Get/Download it directly;
 		// FileMeta only carries the leaf name from ParseFilenameV2.
 		meta.Filename = key
-		matches = append(matches, meta)
+		candidates = append(candidates, meta)
+	}
+	if len(candidates) == 0 {
+		return nil, nil
 	}
 
+	matches := candidates
+	if checker != nil {
+		candidateKeys := make([]string, len(candidates))
+		for i, m := range candidates {
+			candidateKeys[i] = m.Filename
+		}
+		compacted, checkErr := checker.ListCompactedKeys(ctx, candidateKeys)
+		if checkErr != nil {
+			// A catalog query failure must not silently defeat the filter by falling
+			// through to an unfiltered result -- fail closed like buildVCNTSection's
+			// own mandatory-filter contract, even though this filter is only "milder".
+			return nil, checkErr
+		}
+		matches = make([]FileMeta, 0, len(candidates))
+		for _, m := range candidates {
+			if _, isCompacted := compacted[m.Filename]; isCompacted {
+				continue
+			}
+			matches = append(matches, m)
+		}
+	}
 	if len(matches) == 0 {
 		return nil, nil
 	}
