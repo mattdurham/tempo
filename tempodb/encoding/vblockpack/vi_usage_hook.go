@@ -97,7 +97,7 @@ func (r *realUsageRecorder) registryFor(tenant string) *blockpack.Registry {
 	}
 	var reg *blockpack.Registry
 	if r.pgPool != nil {
-		reg = blockpack.NewRegistryFromEntryStore(newPgViUsageEntryStore(r.pgPool), tenant)
+		reg = blockpack.NewRegistryFromEntryStore(blockpack.NewPgViUsageEntryStore(r.pgPool), tenant)
 	} else {
 		reg = blockpack.NewRegistry(r.store, tenant)
 	}

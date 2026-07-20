@@ -1,22 +1,25 @@
 package vblockpack
 
 // pg_testutil_test.go — shared ephemeral-Postgres test infrastructure for this
-// package's pg_entrystore_test.go and vi_backfill_catalog_test.go (2026-07-11), and
-// (2026-07-15, issue #504) every cube test that now needs a real Postgres-backed
-// cube registry.
+// package's vi_backfill_catalog_test.go (2026-07-11), and (2026-07-15, issue #504) every cube
+// test that now needs a real Postgres-backed cube registry.
 //
 // newTestPostgresPool starts a real, throwaway PostgreSQL container per test run
 // (spun up and torn down via t.Cleanup, never a persistent or shared instance --
 // this is exactly the "team's own ephemeral testcontainers-go test infra"
 // exception carved out by the standing infrastructure checkpoint, not a
-// violation of it) and applies schema/registries.sql + schema/file_catalog.sql
-// verbatim -- this is the test that proves those schema files are actually
-// valid, executable SQL, not just reviewed prose. It also applies blockpack's OWN
-// cube schema (blockpack.ApplyCubeSchema) -- cube's Postgres-backed registry moved
-// to blockpack's native implementation (issue #506), which owns the cube_entries
-// table definition now; schema/registries.sql's own cube_entries section was
-// removed (issue #504) once tempo's local pgCubeEntryStore was deleted, so this is
-// the only remaining source of that table for tests in this package.
+// violation of it) and applies schema/file_catalog.sql verbatim -- this is the test that proves
+// that schema file is actually valid, executable SQL, not just reviewed prose. It also applies
+// blockpack's own cube, viusage, and blockpack_file_catalog schemas (blockpack.ApplyCubeSchema/
+// ApplyViUsageSchema/ApplyFileCatalogSchema) -- both cube's AND viusage's Postgres-backed
+// registries moved to blockpack's native implementation (issue #506): cube's move (and its own
+// schema/registries.sql cube_entries section removal) happened first (issue #504); viusage's
+// production call sites (vi_usage_hook.go/vi_backfill.go) were only swapped over to
+// blockpack.NewPgViUsageEntryStore in issue #522's own bootstrap-ordering fix -- tempo's local
+// pg_entrystore.go/schema/registries.sql (viusage_entries section) are deleted entirely now,
+// this test infra applies blockpack's native schema instead. viusage_query_log is deliberately
+// NOT created anywhere anymore (matches blockpack's own schema.sql, which excludes it for the
+// same reason: no production code writes to it, tempo's own grep-confirmed zero writers either).
 
 import (
 	"context"
@@ -79,10 +82,18 @@ func newTestPostgresPool(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 
-	applySchema(ctx, t, pool, "schema/registries.sql")
 	applySchema(ctx, t, pool, "schema/file_catalog.sql")
 	if err := blockpack.ApplyCubeSchema(ctx, pool); err != nil {
 		t.Fatalf("applying blockpack cube schema: %v", err)
+	}
+	if err := blockpack.ApplyViUsageSchema(ctx, pool); err != nil {
+		t.Fatalf("applying blockpack viusage schema: %v", err)
+	}
+	// blockpack_file_catalog schema (issue #522): cube_query_path.go's mandatory
+	// Phase 3.4 compacted-exclusion filter (pgcatalog.NewStore(q.pgPool).ListCompactedKeys)
+	// depends on this table existing, mirroring the same gap fixed in tempodb.go's New().
+	if err := blockpack.ApplyFileCatalogSchema(ctx, pool); err != nil {
+		t.Fatalf("applying blockpack_file_catalog schema: %v", err)
 	}
 
 	return pool
@@ -116,22 +127,23 @@ func applySchema(ctx context.Context, t *testing.T, pool *pgxpool.Pool, path str
 func TestNewTestPostgresPool_SmokeTest(t *testing.T) {
 	pool := newTestPostgresPool(t)
 
-	// cube_entries is now created by blockpack.ApplyCubeSchema (issue #504/#506), not by
-	// this package's own schema/registries.sql -- tempo's local pgCubeEntryStore/cube_entries
-	// definition was deleted once cube moved to blockpack's own native Postgres-backed
-	// registry (blockpack.NewPgCubeRegistry, which owns this table's schema entirely now).
-	// newTestPostgresPool applies both, so it's still expected to exist here.
+	// cube_entries and viusage_entries are both now created by blockpack's own native schema
+	// (blockpack.ApplyCubeSchema/ApplyViUsageSchema, issue #504/#506/#522) -- tempo's local
+	// pgCubeEntryStore/pgViUsageEntryStore and their schema/registries.sql definitions were both
+	// deleted once their registries moved to blockpack's own native Postgres-backed
+	// implementations. viusage_query_log is deliberately excluded, matching blockpack's own
+	// schema.sql (no production writer anywhere, tempo-side or blockpack-side).
 	var tableCount int
 	err := pool.QueryRow(context.Background(), `
 		SELECT count(*) FROM information_schema.tables
 		WHERE table_schema = 'public'
-		AND table_name IN ('viusage_entries', 'viusage_query_log', 'file_catalog', 'cube_entries')
+		AND table_name IN ('viusage_entries', 'file_catalog', 'cube_entries')
 	`).Scan(&tableCount)
 	if err != nil {
 		t.Fatalf("querying information_schema: %v", err)
 	}
-	if tableCount != 4 {
-		t.Fatalf("expected all 4 schema tables to exist after applySchema, found %d", tableCount)
+	if tableCount != 3 {
+		t.Fatalf("expected all 3 schema tables to exist after applySchema, found %d", tableCount)
 	}
 }
 

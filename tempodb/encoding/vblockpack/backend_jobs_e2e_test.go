@@ -100,7 +100,7 @@ func TestE2E_ViRecordUse_RealTrigger_InsertsPendingJobAndBackfillCompletes(t *te
 	// not a hand-built Entry, and not merely a metric increment divorced from actual
 	// registry state. Because pgPool is configured here, rec.registryFor(tenant)
 	// (vi_usage_hook.go's registryFor) uses the POSTGRES-backed registry
-	// (NewRegistryFromEntryStore(newPgViUsageEntryStore(pgPool), tenant)), not the
+	// (NewRegistryFromEntryStore(blockpack.NewPgViUsageEntryStore(pgPool), tenant)), not the
 	// S3-backed one -- confirmed live (a direct fake-S3 object dump during this test's
 	// development showed only the VI Putter's own output file, never a
 	// tenant/viusage/index.json, proving the registry write really goes to Postgres
@@ -114,7 +114,7 @@ func TestE2E_ViRecordUse_RealTrigger_InsertsPendingJobAndBackfillCompletes(t *te
 		return testutil.ToFloat64(metricViBackfillCompleted) > before
 	}, 10*time.Second, 20*time.Millisecond, "the real in-process backfill goroutine must complete")
 
-	registry := blockpack.NewRegistryFromEntryStore(newPgViUsageEntryStore(pool), tenant)
+	registry := blockpack.NewRegistryFromEntryStore(blockpack.NewPgViUsageEntryStore(pool), tenant)
 	entries, _, loadErr := registry.Load(context.Background())
 	require.NoError(t, loadErr)
 	require.Len(t, entries, 1)

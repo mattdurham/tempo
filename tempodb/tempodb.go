@@ -307,6 +307,17 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 			pgPool.Close()
 			return nil, nil, nil, fmt.Errorf("applying cube postgres schema: %w", err)
 		}
+		// viusage schema (issue #522): the SAME bootstrap-ordering gap ApplyCubeSchema above
+		// closed for cube, but for viusage_entries -- ConfigureViUsage below (vi_usage_hook.go)
+		// and vi_backfill.go's NewViBackfillDepsWithPgRegistry both construct
+		// blockpack.NewPgViUsageEntryStore(pgPool) against this same pool, which needs
+		// viusage_entries to already exist. Completes the migration tempo's own local
+		// pg_entrystore.go started (2026-07-11) but never finished switching production code
+		// over to blockpack's native implementation until now.
+		if err := blockpack.ApplyViUsageSchema(context.Background(), pgPool); err != nil {
+			pgPool.Close()
+			return nil, nil, nil, fmt.Errorf("applying viusage postgres schema: %w", err)
+		}
 		// file_catalog schema (issue #522 #159): markCompacted/ClearBlock's direct writes
 		// (file_catalog_write.go) need this table to exist regardless of process start order --
 		// backend-scheduler's own migration (modules/backendscheduler/backendscheduler.go)
@@ -317,6 +328,16 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 		if err := schema.ApplyFileCatalog(context.Background(), pgPool); err != nil {
 			pgPool.Close()
 			return nil, nil, nil, fmt.Errorf("applying file_catalog postgres schema: %w", err)
+		}
+		// blockpack_file_catalog schema (issue #522): cube_query_path.go's mandatory
+		// Phase 3.4 compacted-exclusion filter (pgcatalog.NewStore(q.pgPool).ListCompactedKeys)
+		// depends on this table existing. Without this call, a fresh Postgres instance only
+		// gets the table once some OTHER process (compaction-planner/compaction-worker) happens
+		// to have started against it first -- the exact bootstrap-ordering fragility the
+		// file_catalog call above already guards against, just missed for this table.
+		if err := blockpack.ApplyFileCatalogSchema(context.Background(), pgPool); err != nil {
+			pgPool.Close()
+			return nil, nil, nil, fmt.Errorf("applying blockpack_file_catalog postgres schema: %w", err)
 		}
 	}
 

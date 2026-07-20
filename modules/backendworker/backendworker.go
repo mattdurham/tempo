@@ -157,6 +157,15 @@ func New(cfg Config, schedulerClientCfg backendscheduler_client.Config, s3cfg *s
 			w.pgPool = pool
 			w.jobStore = jobstore.New(pool)
 			w.fileCatalogStore = blockpack.NewFileCatalogStore(pool)
+			// viusage schema (issue #522): unlike backend_jobs.sql above, this worker IS the
+			// migration owner here -- w.pgPool is passed to NewViBackfillDepsWithPgRegistry
+			// (processViBackfillJobPostgres), which constructs blockpack.NewPgViUsageEntryStore
+			// against this exact pool and needs viusage_entries to already exist. Idempotent,
+			// safe to call redundantly alongside tempodb.go's/job-planner's own identical calls
+			// against a shared Postgres instance.
+			if aerr := blockpack.ApplyViUsageSchema(context.Background(), pool); aerr != nil {
+				level.Warn(log.Logger).Log("msg", "viusage postgres schema migration failed", "err", aerr)
+			}
 		}
 	}
 

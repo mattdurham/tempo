@@ -16,7 +16,7 @@ var backendJobsSchema string
 // `--` line comments first so a comment containing an ordinary English
 // semicolon is never mistaken for a statement boundary. Extracted from
 // ../pg_testutil_test.go's original applySchema/stripSQLLineComments, which
-// this package's schema files and registries.sql/file_catalog.sql all rely on.
+// this package's schema files and file_catalog.sql both rely on.
 func SplitStatements(sql string) []string {
 	var stmts []string
 	for _, stmt := range strings.Split(stripSQLLineComments(sql), ";") {
@@ -41,8 +41,8 @@ func stripSQLLineComments(sql string) string {
 
 // ApplyStatements executes every statement in sql (as produced by
 // SplitStatements) against pool, in order. Shared by Apply (backend_jobs.sql)
-// and by this repo's own test infra for registries.sql/file_catalog.sql,
-// which need the identical comment/semicolon splitting behavior.
+// and by this repo's own test infra for file_catalog.sql, which needs the
+// identical comment/semicolon splitting behavior.
 func ApplyStatements(ctx context.Context, pool *pgxpool.Pool, sql string) error {
 	for _, stmt := range SplitStatements(sql) {
 		if _, err := pool.Exec(ctx, stmt); err != nil {

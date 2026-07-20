@@ -700,7 +700,7 @@ func TestRealUsageRecorder_DifferentTenantsUseSeparateRegistries_PostgresBacked(
 	regB := rec.registryFor("tenant-b")
 	assert.NotSame(t, regA, regB, "registryFor must construct a SEPARATE Registry per tenant, never one baked in for all tenants")
 
-	store := newPgViUsageEntryStore(pool)
+	store := blockpack.NewPgViUsageEntryStore(pool)
 	entriesA, err := store.Load(context.Background(), "tenant-a")
 	require.NoError(t, err)
 	require.Len(t, entriesA, 1, "tenant-a's own row set must contain exactly its own entry")

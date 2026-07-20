@@ -100,6 +100,18 @@ func (cmd *importViusageCmd) Run(g *globalOptions) error {
 	}
 	defer pool.Close()
 
+	// Schema (issue #522): this importer writes raw INSERTs directly against viusage_entries/
+	// cube_entries, bypassing blockpack's own EntryStore -- unlike every other production entry
+	// point, it has no other startup path that would have already applied these, so it must apply
+	// both itself before writing. Idempotent, safe even if the target Postgres instance already
+	// has them (the intended case for most real invocations).
+	if err := blockpack.ApplyViUsageSchema(ctx, pool); err != nil {
+		return fmt.Errorf("applying viusage postgres schema: %w", err)
+	}
+	if err := blockpack.ApplyCubeSchema(ctx, pool); err != nil {
+		return fmt.Errorf("applying cube postgres schema: %w", err)
+	}
+
 	imported, err := importUsageEntries(ctx, pool, usageEntries)
 	if err != nil {
 		return fmt.Errorf("importing viusage entries: %w", err)

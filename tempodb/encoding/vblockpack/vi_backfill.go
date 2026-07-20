@@ -363,19 +363,19 @@ func NewViBackfillDepsCatalogOverride(
 // NewViBackfillDepsWithPgRegistry (2026-07-17 follow-up to the 2026-07-11 live-bug fix
 // documented on RunViBackfillDeps.Registry's own doc comment) takes an ALREADY-BUILT deps and
 // returns a copy with .Registry set to the SAME Postgres-backed registry construction
-// realUsageRecorder.registryFor uses (blockpack.NewRegistryFromEntryStore(newPgViUsageEntryStore
-// (pool), tenant)) -- closing the exact gap that comment flagged as "not yet threaded": backend-
-// worker's own RunViBackfill call site (processViBackfillJobPostgres) used to always fall back
-// to RunViBackfill's zero-value-Registry branch, which builds a FRESH blob-backed registry that
-// has never heard of an entry the Postgres-backed registry already created -- every
-// watermark-persist call then fails with "entry ... not found," aborting on the very first
-// progress callback. A nil pool is a safe no-op (returns deps unchanged), matching every other
-// *Postgres-optional construction in this file.
+// realUsageRecorder.registryFor uses (blockpack.NewRegistryFromEntryStore(blockpack.
+// NewPgViUsageEntryStore(pool), tenant)) -- closing the exact gap that comment flagged as "not
+// yet threaded": backend-worker's own RunViBackfill call site (processViBackfillJobPostgres)
+// used to always fall back to RunViBackfill's zero-value-Registry branch, which builds a FRESH
+// blob-backed registry that has never heard of an entry the Postgres-backed registry already
+// created -- every watermark-persist call then fails with "entry ... not found," aborting on the
+// very first progress callback. A nil pool is a safe no-op (returns deps unchanged), matching
+// every other *Postgres-optional construction in this file.
 func NewViBackfillDepsWithPgRegistry(deps RunViBackfillDeps, pool *pgxpool.Pool, tenant string) RunViBackfillDeps {
 	if pool == nil {
 		return deps
 	}
-	deps.Registry = blockpack.NewRegistryFromEntryStore(newPgViUsageEntryStore(pool), tenant)
+	deps.Registry = blockpack.NewRegistryFromEntryStore(blockpack.NewPgViUsageEntryStore(pool), tenant)
 	return deps
 }
 
