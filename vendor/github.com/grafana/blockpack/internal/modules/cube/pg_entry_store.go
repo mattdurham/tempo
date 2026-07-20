@@ -119,12 +119,7 @@ func (s *PgEntryStore) AddEntry(ctx context.Context, tenant string, entry Regist
 	}
 
 	var alreadyPresent bool
-	row := tx.QueryRow(
-		ctx,
-		`SELECT EXISTS(SELECT 1 FROM cube_entries WHERE tenant = $1 AND cube_id = $2)`,
-		tenant,
-		entry.CubeID,
-	)
+	row := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM cube_entries WHERE tenant = $1 AND cube_id = $2)`, tenant, entry.CubeID)
 	if scanErr := row.Scan(&alreadyPresent); scanErr != nil {
 		return fmt.Errorf("pg cube entrystore: exists check: %w", scanErr)
 	}
@@ -179,11 +174,7 @@ func (s *PgEntryStore) RemoveEntry(ctx context.Context, tenant, cubeID string) e
 // blobEntryStore.updateWatermarksEntry's exact contract. Errors if cubeID is
 // not found. SELECT ... FOR UPDATE provides the same read-modify-write
 // atomicity viusage's UpsertEntry relies on.
-func (s *PgEntryStore) UpdateWatermarksEntry(
-	ctx context.Context,
-	tenant, cubeID string,
-	level, minMinute, maxMinute uint32,
-) error {
+func (s *PgEntryStore) UpdateWatermarksEntry(ctx context.Context, tenant, cubeID string, level, minMinute, maxMinute uint32) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("pg cube entrystore: begin: %w", err)
@@ -191,12 +182,7 @@ func (s *PgEntryStore) UpdateWatermarksEntry(
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	var watermarksRaw []byte
-	row := tx.QueryRow(
-		ctx,
-		`SELECT watermarks FROM cube_entries WHERE tenant = $1 AND cube_id = $2 FOR UPDATE`,
-		tenant,
-		cubeID,
-	)
+	row := tx.QueryRow(ctx, `SELECT watermarks FROM cube_entries WHERE tenant = $1 AND cube_id = $2 FOR UPDATE`, tenant, cubeID)
 	if scanErr := row.Scan(&watermarksRaw); scanErr != nil {
 		if errors.Is(scanErr, pgx.ErrNoRows) {
 			return fmt.Errorf("pg cube entrystore: update watermarks: cube %q not found", cubeID)

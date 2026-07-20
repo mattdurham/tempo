@@ -1,6 +1,10 @@
 package valuecountscompactor
 
-import "context"
+import (
+	"context"
+
+	"github.com/grafana/blockpack/internal/modules/pgcatalog"
+)
 
 // NOTE: see internal/modules/valuecountscompactor/NOTES.md.
 // Any changes to this file must be reflected there.
@@ -34,4 +38,21 @@ type Store interface {
 	Put(ctx context.Context, key string, data []byte) error
 	// Delete removes the object at key.
 	Delete(ctx context.Context, key string) error
+}
+
+// CatalogStore is the blockpack_file_catalog capability mergeLevel needs
+// (issue #522 Phase 2.2, mirrors valueindexcompactor.CatalogStore's identical
+// shape and nil-tolerance convention): record a merge output row, and mark
+// the 2+ input rows compacted. *pgcatalog.Store satisfies this structurally.
+//
+// SPEC-VC (issue #522 Phase 2.1's own mandatory read-path filter is a
+// SEPARATE mechanism from this write-path one -- this interface only covers
+// mergeLevel's write side): when Config.CatalogStore is nil, mergeLevel falls
+// back to its pre-#522 delete-input behavior unchanged, exactly like
+// valueindexcompactor's own NOTE-VI-122 fallback -- a deliberate, documented
+// choice so this package's existing, catalog-unrelated tests never need a
+// fake catalog store they don't care about.
+type CatalogStore interface {
+	Insert(ctx context.Context, row pgcatalog.Row) error
+	MarkCompacted(ctx context.Context, objectKeys []string) error
 }

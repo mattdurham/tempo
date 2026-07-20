@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/grafana/blockpack/internal/modules/colhashmanifest"
+	"github.com/grafana/blockpack/internal/modules/pgcatalog"
 	"github.com/grafana/blockpack/internal/modules/valuecounts"
 )
 
@@ -44,6 +45,7 @@ type Service struct {
 	// known-recorded -- Run/RunOnce drive compaction sequentially with no concurrent goroutines
 	// touching Service state, so no locking is needed.
 	manifestSeen map[string]struct{}
+	catalogStore CatalogStore      // nil-tolerant, see CatalogStore's own doc comment (store.go)
 	metrics      *compactorMetrics // nil when Config.Registerer is nil (no-op)
 	now          func() time.Time
 	cfg          Config
@@ -63,6 +65,7 @@ func NewService(cfg Config, store Store) (*Service, error) {
 		store:        store,
 		cfg:          cfg,
 		manifestSeen: make(map[string]struct{}),
+		catalogStore: cfg.CatalogStore,
 		metrics:      newCompactorMetrics(cfg.Registerer),
 		now:          time.Now,
 	}, nil
@@ -312,24 +315,26 @@ func (s *Service) capBatchBytes(files []levelFile) []levelFile {
 // decodes each via valuecounts.DecodeVCNTObject (the self-describing EncodeVCNTFile format —
 // the only format written since #490 A-3/A-Tempo-1), accumulates their records, merges/sums/nets them via
 // valuecounts.Compact, writes the result at level+1 using the self-describing EncodeVCNTFile
-// format, then deletes only the inputs actually processed. Write-then-delete: inputs are only
-// removed after the merged output's Put succeeds. Files left unprocessed because the record
-// ceiling was hit are deferred to the next pass, not deleted or otherwise touched.
+// format, then retires only the inputs actually processed. Write-then-retire: inputs are only
+// touched after the merged output's Put (and, when a CatalogStore is configured, its catalog
+// row Insert) succeeds. Files left unprocessed because the record ceiling was hit are deferred
+// to the next pass, not deleted or otherwise touched.
 //
 // Output filenames are v2-format (valuecounts.FormatFilenameV2, issue #494), embedding the
 // genuine [minSec,maxSec] range returned by valuecounts.TimeRange(merged) — a full scan of the
 // merged records, never a copy of one input's range or the last-sorted record's TimeEnd. See
 // SPEC-VC-3/SPEC-VC-7.
 //
-// NOTE-VC-009 (known, documented residual risk — not eliminated by the retry mitigation
-// below): unlike valueindexcompactor, valuecounts.Compact SUMS Count per merge key rather than
-// deduping by identity (Record carries no identity field). A *partial* Delete failure within one
-// batch (some inputs deleted, one or more not, while the merged output Put already succeeded) can
-// leave a surviving input that gets summed a second time by a later merge, permanently
-// double-counting that value. deleteWithRetry (below) retries each failed Delete a few times to
-// close the window for transient failures, and any exhausted-retry failure is surfaced via both
-// the returned error and a dedicated metric — but a sufficiently persistent storage outage can
-// still exceed the retry budget. This is a documented limitation, not a design guarantee.
+// NOTE-VC-009 (issue #522 Phase 2.1/2.2, FINAL resolution): unlike valueindexcompactor,
+// valuecounts.Compact SUMS Count per merge key rather than deduping by identity (Record carries
+// no identity field), so any surviving duplicate of an already-merged input risks permanent
+// double-counting. The uniform catalog deletion model closes this at its root instead of
+// mitigating the old immediate-Delete race: when Config.CatalogStore is configured, inputs are
+// never deleted here at all -- they are marked compacted (SPEC-VI-10-equivalent), and the
+// mandatory read-path filter (buildVCNTSection, cube_backfill_runner.go) excludes every
+// compacted-but-undeleted source from being read and summed again, for the entire grace window
+// until the reaper physically deletes it. See CatalogStore's own doc comment (store.go) for the
+// pre-#522 delete-input fallback this replaces when CatalogStore is nil.
 //
 // SPEC-VC-1 (valuecountscompactor): inputs are decoded one at a time and the raw compressed
 // bytes go out of scope immediately after decode — this function never holds all inputs' raw
@@ -394,27 +399,62 @@ func (s *Service) mergeLevel(ctx context.Context, colDir string, files []levelFi
 			return fmt.Errorf("valuecountscompactor: put %q: %w", key, err)
 		}
 		written = 1
+		// SPEC-VC (issue #522 Phase 2.2): insert the output's catalog row right after its
+		// Put succeeds, before any input is touched -- a crash after this point but before
+		// MarkCompacted below leaves the catalog in a recoverable state (the output row
+		// already exists live; the inputs are still live too, simply not yet marked
+		// compacted), never a lost or double-counted file.
+		if s.catalogStore != nil {
+			tenant := tenantFromColDir(colDir)
+			colHash := path.Base(colDir)
+			if err := s.catalogStore.Insert(ctx, pgcatalog.Row{
+				Subsystem: "vcnt", Tenant: tenant, ResourceID: colHash,
+				ObjectKey: key, Level: outputLevel, MinSec: int64(minSec), MaxSec: int64(maxSec), //nolint:gosec // G115: wall-clock seconds never approach int64 overflow
+				SizeBytes: int64(len(data)),
+			}); err != nil {
+				return fmt.Errorf("valuecountscompactor: insert catalog row for %q: %w", key, err)
+			}
+		}
 		s.recordManifestEntry(ctx, colDir, merged[0].ColumnName)
 	}
 
 	var firstErr error
 	var deleted int
+	inputKeys := make([]string, 0, len(processed))
 	for _, f := range processed {
-		// NOTE-VC-009: retry a failed Delete a few times before giving up on this key — see
-		// deleteWithRetry's doc comment for why this matters more here than it would for
-		// valueindexcompactor's identity-deduped equivalent.
-		if err := s.deleteWithRetry(ctx, f.key); err != nil {
-			s.metrics.incError(compactorOpDelete)
-			s.metrics.incDeleteFailedAfterRetry()
-			if firstErr == nil {
-				firstErr = fmt.Errorf(
-					"valuecountscompactor: delete %q failed after %d attempts: %w",
-					f.key, deleteMaxAttempts, err,
-				)
-			}
-			continue
+		inputKeys = append(inputKeys, f.key)
+	}
+	if s.catalogStore != nil {
+		// NOTE-VC-009 (final resolution, issue #522 Phase 2.1/2.2): inputs are marked
+		// compacted, never deleted here -- the reaper physically deletes them later, after
+		// a grace window, and the mandatory read-path filter excludes them from being
+		// summed again in the meantime. See mergeLevel's own doc comment above.
+		if err := s.catalogStore.MarkCompacted(ctx, inputKeys); err != nil {
+			firstErr = fmt.Errorf("valuecountscompactor: mark inputs compacted: %w", err)
+		} else {
+			deleted = len(inputKeys) // metrics field name predates #522; still "inputs retired this merge"
 		}
-		deleted++
+	} else {
+		// Pre-#522 behavior, unchanged: delete inputs only after the output is durably
+		// written. See CatalogStore's own doc comment for why this fallback exists.
+		for _, key := range inputKeys {
+			// NOTE-VC-009 (pre-#522 mitigation, still active in this fallback path only):
+			// retry a failed Delete a few times before giving up on this key — see
+			// deleteWithRetry's doc comment for why this matters more here than it would
+			// for valueindexcompactor's identity-deduped equivalent.
+			if err := s.deleteWithRetry(ctx, key); err != nil {
+				s.metrics.incError(compactorOpDelete)
+				s.metrics.incDeleteFailedAfterRetry()
+				if firstErr == nil {
+					firstErr = fmt.Errorf(
+						"valuecountscompactor: delete %q failed after %d attempts: %w",
+						key, deleteMaxAttempts, err,
+					)
+				}
+				continue
+			}
+			deleted++
+		}
 	}
 
 	s.metrics.observeMerge(s.now().Sub(mergeStart))

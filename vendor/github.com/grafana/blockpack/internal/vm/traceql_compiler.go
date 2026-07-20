@@ -402,13 +402,9 @@ func (c *traceqlCompiler) compileColumnPredicateComparison(expr *traceqlparser.B
 			if a := AnalyzeRegex(strVal); a != nil {
 				if kind := regexFastPathKind(a); kind != RegexFastNone {
 					prefixes := a.Prefixes // pre-lowercased only when CaseInsensitive
-					return unscopedOrScoped(
-						fieldExpr,
-						attrName,
-						func(p ColumnDataProvider, name string) (RowSet, error) {
-							return scanColumnRegexFast(p, name, nil, prefixes, kind, notMatch)
-						},
-					), nil
+					return unscopedOrScoped(fieldExpr, attrName, func(p ColumnDataProvider, name string) (RowSet, error) {
+						return scanColumnRegexFast(p, name, nil, prefixes, kind, notMatch)
+					}), nil
 				}
 			}
 			re, err := regexp.Compile(strVal)

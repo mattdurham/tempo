@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/grafana/blockpack/internal/modules/pgcatalog"
 	"github.com/grafana/blockpack/internal/modules/valueindex"
 	"golang.org/x/sync/errgroup"
 )
@@ -27,11 +28,12 @@ import (
 // files into fewer, larger files, dropping entries whose source blockpack has
 // been deleted by retention.
 type Service struct {
-	store   IndexStore
-	exister SourceExister
-	metrics *compactorMetrics // nil when Config.Registerer is nil (no-op)
-	now     func() time.Time
-	cfg     Config
+	store        IndexStore
+	exister      SourceExister
+	catalogStore CatalogStore      // nil-tolerant, see CatalogStore's own doc comment (store.go)
+	metrics      *compactorMetrics // nil when Config.Registerer is nil (no-op)
+	now          func() time.Time
+	cfg          Config
 }
 
 // NewService builds a compactor service. cfg.Tenants must be non-empty and the
@@ -55,11 +57,12 @@ func NewService(cfg Config, store IndexStore, exister SourceExister) (*Service, 
 		return nil, errors.New("valueindexcompactor: store is required")
 	}
 	s := &Service{
-		store:   store,
-		exister: exister,
-		cfg:     cfg,
-		metrics: newCompactorMetrics(cfg.Registerer),
-		now:     time.Now,
+		store:        store,
+		exister:      exister,
+		catalogStore: cfg.CatalogStore,
+		cfg:          cfg,
+		metrics:      newCompactorMetrics(cfg.Registerer),
+		now:          time.Now,
 	}
 	if _, err := valueindex.SweepOrphanedMergeTempFiles(); err != nil {
 		s.metrics.incError(compactorOpSweep)
@@ -293,6 +296,32 @@ func (s *Service) resolveTenants(ctx context.Context) ([]string, error) {
 	return tenants, nil
 }
 
+// splitColDir extracts (tenant, colHash, colType) from a colDir of the shape
+// "<tenant>/<indexPrefix>/<colHash>/<colType>" (buildWorkList's own
+// construction: tenantPrefix := path.Join(tenant, s.cfg.IndexPrefix), then one
+// more ListDirs level for colHash, one more for colType). tenant is always
+// colDir's first path segment; colHash/colType are always its last two,
+// regardless of how many segments IndexPrefix itself contributes in between --
+// this matches the SAME resource_id shape (colHash+"|"+colType) backend-worker's
+// catalog_reconcile self-heal already uses for VI (issue #522, modules/
+// backendworker/catalog_reconcile.go), which any pre-#146 self-healed row and
+// any post-#146 compaction-written row for the same real column must agree on
+// to ever group together.
+func splitColDir(colDir string) (tenant, colHash, colType string) {
+	parts := strings.Split(colDir, "/")
+	if len(parts) == 0 {
+		return "", "", ""
+	}
+	tenant = parts[0]
+	if len(parts) >= 2 {
+		colType = parts[len(parts)-1]
+	}
+	if len(parts) >= 3 {
+		colHash = parts[len(parts)-2]
+	}
+	return tenant, colHash, colType
+}
+
 // levelFile pairs a key with its parsed compaction level and object size.
 type levelFile struct {
 	key   string
@@ -505,6 +534,13 @@ func (s *Service) mergeLevel(ctx context.Context, colDir string, files []levelFi
 
 	outputLevel := files[0].level + 1
 
+	// tenant/colHash/colType are derived from colDir (tenant/indexPrefix/colHash/colType,
+	// see buildWorkList) rather than threaded as new mergeLevel parameters -- colDir
+	// already carries everything Insert's Row needs (issue #522 Phase 1.1), so this keeps
+	// mergeLevel's signature, and every existing direct-call test site's call shape,
+	// unchanged.
+	tenant, colHash, colType := splitColDir(colDir)
+
 	// tmpDir is the single source of truth for where this merge stages local files (mirrors
 	// traceindex_dispatch.go's own convention), threaded into both the input-side
 	// writeLocalTempInput calls below AND the output-side StreamCompactBucketFiles call
@@ -621,6 +657,20 @@ func (s *Service) mergeLevel(ctx context.Context, colDir string, files []levelFi
 				return fmt.Errorf("valueindexcompactor: put %q: %w", key, err)
 			}
 			written++
+			// SPEC-VI-10 (issue #522 Phase 1.1): insert the output's catalog row right
+			// after its Put succeeds, before any input is touched -- a crash after this
+			// point but before MarkCompacted below leaves the catalog in a recoverable
+			// state (the output row already exists live; the inputs are still live too,
+			// simply not yet marked compacted), never a lost or double-counted file.
+			if s.catalogStore != nil {
+				if err := s.catalogStore.Insert(ctx, pgcatalog.Row{
+					Subsystem: "vi", Tenant: tenant, ResourceID: colHash + "|" + colType,
+					ObjectKey: key, Level: outputLevel, MinSec: int64(wallMinSec), MaxSec: int64(wallMaxSec),
+					SizeBytes: int64(len(data)),
+				}); err != nil {
+					return fmt.Errorf("valueindexcompactor: insert catalog row for %q: %w", key, err)
+				}
+			}
 			return nil
 		},
 	)
@@ -650,21 +700,43 @@ func (s *Service) mergeLevel(ctx context.Context, colDir string, files []levelFi
 		)
 	}
 
-	// Delete inputs only after all outputs are durably written.
-	var firstErr error
-	var deleted int
+	// inputKeys excludes anything markFileCorrupted already handled (renamed to
+	// "<key>.corrupted", never a live input either way) -- shared by both branches
+	// below.
+	inputKeys := make([]string, 0, len(files))
 	for _, f := range files {
 		if _, handled := alreadyHandled[f.key]; handled {
 			continue
 		}
-		if err := s.store.Delete(ctx, f.key); err != nil {
-			s.metrics.incError(compactorOpDelete)
-			if firstErr == nil {
-				firstErr = fmt.Errorf("valueindexcompactor: delete %q: %w", f.key, err)
-			}
-			continue
+		inputKeys = append(inputKeys, f.key)
+	}
+
+	var firstErr error
+	var deleted int
+	if s.catalogStore != nil {
+		// SPEC-VI-10 (issue #522 Phase 1.1): inputs are marked compacted, never
+		// deleted here -- the reaper (backend-worker's catalog_reap handler)
+		// physically deletes them later, after a grace window, once job-planner
+		// confirms nothing still needs to read them.
+		if err := s.catalogStore.MarkCompacted(ctx, inputKeys); err != nil {
+			firstErr = fmt.Errorf("valueindexcompactor: mark inputs compacted: %w", err)
+		} else {
+			deleted = len(inputKeys) // metrics field name predates #522; still "inputs retired this merge"
 		}
-		deleted++
+	} else {
+		// Pre-#522 behavior, unchanged: delete inputs only after all outputs are
+		// durably written. See CatalogStore's own doc comment for why this
+		// fallback exists (NOTE-VI-122).
+		for _, key := range inputKeys {
+			if err := s.store.Delete(ctx, key); err != nil {
+				s.metrics.incError(compactorOpDelete)
+				if firstErr == nil {
+					firstErr = fmt.Errorf("valueindexcompactor: delete %q: %w", key, err)
+				}
+				continue
+			}
+			deleted++
+		}
 	}
 
 	s.metrics.observeMerge(s.now().Sub(mergeStart))

@@ -15,7 +15,7 @@ from `internal/modules/valueindex/SPECS.md`'s own independent `SPEC-VI-N` sequen
 module's SPECS.md numbers from 1). IDs are assigned in ascending order and never reused or
 renumbered; superseded entries are marked `[SUPERSEDED by SPEC-VI-N]` rather than deleted.
 
-Next free ID: **SPEC-VI-10**.
+Next free ID: **SPEC-VI-11**.
 
 ---
 
@@ -405,3 +405,43 @@ project's own `no-emptyDir` convention).
 
 Back-ref: `internal/modules/valueindexcompactor/service.go:mergeLevel`. See
 `valueindex/SPECS.md` SPEC-VI-18, `NOTES.md` (this file, new entry). Issue #503.
+
+## SPEC-VI-10: `mergeLevel` catalog wiring — `blockpack_file_catalog` Insert/MarkCompacted, nil-tolerant fallback to pre-#522 delete (issue #522 Phase 1.1)
+
+*Added: 2026-07-20*
+
+**Contract:** When `Config.CatalogStore` is non-nil, `mergeLevel` (`service.go`):
+
+1. After each merged output object's `Put` succeeds, calls `CatalogStore.Insert` with a
+   `pgcatalog.Row{Subsystem: "vi", Tenant, ResourceID: colHash+"|"+colType, ObjectKey, Level:
+   outputLevel, MinSec, MaxSec, SizeBytes}` — `Tenant`/`colHash`/`colType` are derived from
+   `colDir` via `splitColDir` (colDir's own shape: `<tenant>/<indexPrefix>/<colHash>/<colType>`,
+   unchanged from `buildWorkList`'s existing construction), never threaded as new `mergeLevel`
+   parameters.
+2. After every output has been written and inserted, calls `CatalogStore.MarkCompacted` once
+   with every input's object key (excluding any `markFileCorrupted`-handled key, per the
+   existing `alreadyHandled` set) — **inputs are never deleted from storage in this branch.**
+   Physical deletion becomes the reaper's job (backend-worker's `catalog_reap` handler, issue
+   #522 Phase 0.4/1.3), after a grace window.
+
+**Fallback:** When `Config.CatalogStore` is nil, `mergeLevel`'s pre-#522 behavior is completely
+unchanged — outputs are written, then every input is deleted directly via `s.store.Delete`, same
+as before this issue. See `store.go`'s `CatalogStore` doc comment and NOTES.md NOTE-VI-122 for
+why this fallback exists (an explicit, deliberate choice to avoid forcing every one of this
+package's ~50 existing, catalog-unrelated test call sites to thread through a fake catalog
+store) rather than being a temporary migration shim.
+
+**resource_id shape is load-bearing across repos:** `colHash+"|"+colType` MUST match exactly
+what tempo's `modules/backendworker/catalog_reconcile.go`'s VI self-heal path uses for the same
+column, or a self-healed row and a compaction-written row for the identical real column would
+never group together in `ListCandidates`/job-planner's candidate-selection query
+(`SPEC-PGCATALOG-4`).
+
+**TDD:** `TestMergeLevel_WritesOutputRowAndMarksInputsCompacted` (exactly one `Insert`, one
+`MarkCompacted`, zero `store.Delete` calls against either input) and
+`TestMergeLevel_NilCatalogStore_PreservesPreExistingDeleteBehavior` (`catalog_wiring_test.go`).
+
+Back-ref: `internal/modules/valueindexcompactor/service.go:mergeLevel,splitColDir`,
+`internal/modules/valueindexcompactor/store.go:CatalogStore`,
+`internal/modules/valueindexcompactor/config.go:Config.CatalogStore`. See NOTES.md NOTE-VI-122.
+Issue #522.

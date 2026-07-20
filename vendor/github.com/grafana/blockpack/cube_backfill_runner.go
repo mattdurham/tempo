@@ -114,10 +114,7 @@ func decodeCanonicalVI(b []byte, typeName string) string {
 	switch typeName {
 	case "int64":
 		if len(b) == 8 {
-			return strconv.FormatInt(
-				int64(binary.LittleEndian.Uint64(b)),
-				10,
-			) //nolint:gosec // intentional two's complement re-interpretation
+			return strconv.FormatInt(int64(binary.LittleEndian.Uint64(b)), 10) //nolint:gosec // intentional two's complement re-interpretation
 		}
 	case "uint64":
 		if len(b) == 8 {
@@ -138,6 +135,20 @@ func decodeCanonicalVI(b []byte, typeName string) string {
 	return string(b) // string type, or a short/malformed numeric payload -- raw passthrough
 }
 
+// CompactedKeyChecker reports which of a candidate set of object keys are
+// already marked compacted in blockpack_file_catalog (issue #522 Phase 2.1)
+// -- the mandatory VCNT read-path fix for NOTE-VC-009: valuecounts.Compact
+// sums per key with no source-identity dedup, so a compacted-but-undeleted
+// source coexisting with its merged replacement for up to the reaper's
+// 30-minute grace window would otherwise be double-counted. nil disables the
+// filter (matches this package's LookupStore/vi nil-tolerance convention) --
+// buildVCNTSection's one production caller (cube_query_path.go) always wires
+// a real *pgcatalog.Store, since it already requires a non-nil pgPool to
+// reach this call at all. *pgcatalog.Store satisfies this structurally.
+type CompactedKeyChecker interface {
+	ListCompactedKeys(ctx context.Context, keys []string) (map[string]struct{}, error)
+}
+
 // buildVCNTSection lists and downloads the .vcnt files covering each dim and merges them into
 // one consolidated section (data + dir) via VCNTBuildSectionFromObjects -- the shape the
 // cardinality gate consumes. Ported from tempo's cube_backfill.go (the store-agnostic core of
@@ -146,14 +157,22 @@ func decodeCanonicalVI(b []byte, typeName string) string {
 // convention in cube_query_path.go). On any error or absent coverage this returns a nil/empty
 // section, which the cardinality gate treats as "no coverage" and passes by default -- a VCNT
 // read failure must never block cube creation, only inform it when data is present.
+//
+// SPEC-PGCATALOG-7 (issue #522 Phase 2.1, MANDATORY, final resolution of NOTE-VC-009): every
+// candidate key surviving the ext/time-range filters below is checked against
+// compactedChecker BEFORE being downloaded and summed -- any key already marked compacted is
+// excluded. A compactedChecker error fails the WHOLE call closed (nil/empty section, "no VCNT
+// signal"), never falls through to an unfiltered fetch: an unverifiable exclusion is treated
+// exactly like absent coverage, never as a green light to risk double-counting.
 func buildVCNTSection(
 	ctx context.Context,
 	store LookupStore,
 	tenant string,
 	dims []string,
 	minSec, maxSec uint64,
+	compactedChecker CompactedKeyChecker,
 ) ([]byte, []VCNTChunkDirEntry) {
-	var objects [][]byte
+	var candidateKeys []string
 	for _, dim := range dims {
 		colHash := VCNTColHash(dim)
 		prefix := path.Join(tenant, "value_counts", colHash) + "/"
@@ -168,12 +187,32 @@ func buildVCNTSection(
 			if !VCNTFileOverlapsRange(path.Base(k), minSec, maxSec) {
 				continue
 			}
-			data, getErr := store.Get(ctx, k)
-			if getErr != nil || len(data) == 0 {
-				continue
-			}
-			objects = append(objects, data)
+			candidateKeys = append(candidateKeys, k)
 		}
+	}
+	if len(candidateKeys) == 0 {
+		return nil, nil
+	}
+
+	var compacted map[string]struct{}
+	if compactedChecker != nil {
+		var checkErr error
+		compacted, checkErr = compactedChecker.ListCompactedKeys(ctx, candidateKeys)
+		if checkErr != nil {
+			return nil, nil
+		}
+	}
+
+	var objects [][]byte
+	for _, k := range candidateKeys {
+		if _, isCompacted := compacted[k]; isCompacted {
+			continue
+		}
+		data, getErr := store.Get(ctx, k)
+		if getErr != nil || len(data) == 0 {
+			continue
+		}
+		objects = append(objects, data)
 	}
 	if len(objects) == 0 {
 		return nil, nil

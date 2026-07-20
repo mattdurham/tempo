@@ -810,3 +810,43 @@ See NOTE-VI-066, NOTE-VI-109, NOTE-VI-118 (`entriesCorrupt`, the sibling metric)
 `valueindex/NOTES.md` NOTE-VI-119 (the pipeline-wide incident/reconciliation writeup). See
 `SPECS.md` SPEC-VI-7, SPEC-VI-8 (both updated in place for this fix). `TESTS.md` TEST-VI-5,
 TEST-VI-21, TEST-VI-22, TEST-VI-23. Incident: tempo-dev-test-03, 2026-07-15.
+
+## NOTE-VI-122 — `mergeLevel` catalog wiring is nil-tolerant, not required (issue #522 Phase 1.1)
+
+Date: 2026-07-20
+
+**Decision:** `Config.CatalogStore` (new field, `store.go`'s `CatalogStore` interface) is
+nil-tolerant, not a hard-required dependency like `IndexStore` itself. When set, `mergeLevel`
+inserts a `blockpack_file_catalog` row for its merge output and marks its inputs compacted
+(never deletes them) instead of deleting them directly. When nil, `mergeLevel`'s behavior is
+completely unchanged from before this issue.
+
+**Why nil-tolerant rather than required, despite this project's standing "no backwards
+compat ever" policy:** `NewService(cfg, store, exister)`'s existing 3-arg constructor shape has
+~50 real call sites across this package's own test suite (corruption handling, disk staging,
+memory bounds, concurrency, metrics -- none of them testing catalog behavior at all). Adding
+`CatalogStore` as a 4th required positional constructor argument, or making a required
+`Config.CatalogStore` field a hard NewService validation error, would force every one of those
+~50 unrelated call sites to thread through a fake catalog store purely to keep compiling --
+real, avoidable churn across tests that have nothing to do with issue #522, for a capability
+that (per plan.md's own framing) is explicitly a "recommended first subsystem" / "proven" rollout,
+not an atomic flag-day cutover. `Registerer prometheus.Registerer` (this same `Config` struct)
+already establishes the identical "optional capability via a nil-tolerant Config field, embedder
+injects it programmatically, YAML never sets it" pattern for exactly this kind of orthogonal,
+incrementally-adoptable concern -- `CatalogStore` follows it exactly rather than inventing a new
+shape. This is a scoped, justified exception to "no backwards compat ever," not a routine one:
+the policy exists to prevent preserving genuinely obsolete/broken behavior, not to force an
+unrelated mechanical migration of ~50 test call sites for an additive, nil-safe capability.
+
+**Consequence once Phase 1.4 (#147) decommissions the old ticker-driven `Service.Run` path:**
+once every real (non-test) `NewService` call site is confirmed to inject a real `CatalogStore`,
+the pre-#522 delete-branch in `mergeLevel` becomes dead in production, but is deliberately left
+in place rather than removed at that time UNLESS a follow-up task also updates all ~50 test call
+sites to inject a fake `CatalogStore` -- tracked here as a flag for whoever picks up #147/#148,
+not resolved by this entry.
+
+Back-refs: `internal/modules/valueindexcompactor/store.go:CatalogStore`,
+`internal/modules/valueindexcompactor/config.go:Config.CatalogStore`,
+`internal/modules/valueindexcompactor/service.go:mergeLevel,splitColDir`,
+`internal/modules/valueindexcompactor/catalog_wiring_test.go`. See SPECS.md SPEC-VI-10. Issue
+#522.

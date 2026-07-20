@@ -57,6 +57,13 @@ type Config struct {
 	// embedder (tempo) injects it programmatically. Store already satisfies this interface
 	// structurally, so most callers can simply pass the same store used for NewService.
 	ManifestStore ManifestStore `yaml:"-"`
+	// CatalogStore is the blockpack_file_catalog store mergeLevel records its
+	// output row and marks its inputs compacted through (issue #522 Phase
+	// 2.2). Not settable from YAML; the embedder injects it programmatically,
+	// mirroring Registerer/ManifestStore. When nil, mergeLevel falls back to
+	// its pre-#522 delete-input behavior unchanged -- see CatalogStore's own
+	// doc comment (store.go).
+	CatalogStore CatalogStore `yaml:"-"`
 	// Tenants is the explicit list of tenant IDs to compact. A single entry of
 	// "*" means all tenants (discovered by listing the prefix). Must be
 	// non-empty.

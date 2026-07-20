@@ -57,6 +57,14 @@ type Config struct {
 	// registration occurs. It is not settable from YAML; the embedder (tempo)
 	// injects it programmatically.
 	Registerer prometheus.Registerer `yaml:"-"`
+	// CatalogStore is the blockpack_file_catalog store mergeLevel records its
+	// output row and marks its inputs compacted through (issue #522 Phase
+	// 1.1). Not settable from YAML; the embedder injects it programmatically,
+	// mirroring Registerer. When nil, mergeLevel falls back to its pre-#522
+	// delete-input behavior unchanged -- see CatalogStore's own doc comment
+	// (store.go) and NOTES.md NOTE-VI-122 for why this is nil-tolerant rather
+	// than required.
+	CatalogStore CatalogStore `yaml:"-"`
 	// IndexPrefix is the object-storage key prefix for value index files.
 	// Defaults to DefaultIndexPrefix when empty. Must match the consumer.
 	IndexPrefix string `yaml:"index_prefix"`

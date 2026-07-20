@@ -19,6 +19,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/grafana/blockpack/internal/modules/pgcatalog"
 )
 
 // CubeQueryPathRequest describes a single cube query, with TraceQL-string
@@ -248,6 +250,31 @@ func (q *CubeQueryPath) QueryRange(ctx context.Context, req CubeQueryPathRequest
 		return nil, false, nil //nolint:nilerr // intentional: a list failure/empty listing silently falls back to VI/scan, not self-healing
 	}
 
+	// issue #522 Phase 3.4 (MANDATORY, confirmed via direct verification of this exact call
+	// site): CubeRollup's mergeAggAttrInto (internal/modules/cube/rollup.go) sums Count/Sum/
+	// SampleCount/Buckets across inputs with no source-identity dedup, exactly like VCNT's
+	// NOTE-VC-009 -- a compacted-but-undeleted source coexisting with its merged replacement
+	// under this same prefix for up to the reaper's 30-minute grace window would otherwise be
+	// summed twice. q.pgPool is guaranteed non-nil here (loadEntries above already required
+	// it). A ListCompactedKeys error fails this request closed (falls back to VI/scan) rather
+	// than risk an unfiltered, possibly double-counted fetch.
+	compacted, compactErr := pgcatalog.NewStore(q.pgPool).ListCompactedKeys(ctx, keys)
+	if compactErr != nil {
+		return nil, false, nil //nolint:nilerr // intentional: an unverifiable exclusion falls back to VI/scan, never risks double-counting
+	}
+	if len(compacted) > 0 {
+		liveKeys := make([]string, 0, len(keys))
+		for _, k := range keys {
+			if _, isCompacted := compacted[k]; !isCompacted {
+				liveKeys = append(liveKeys, k)
+			}
+		}
+		keys = liveKeys
+	}
+	if len(keys) == 0 {
+		return nil, false, nil
+	}
+
 	inputs, cubeBytesRead, fanOutErr := q.fetchCubeFileInputs(ctx, keys, result.Entry)
 	if fanOutErr != nil {
 		// A goroutine panicked -- treat as no cube coverage rather than propagating, so a single
@@ -460,7 +487,10 @@ func (q *CubeQueryPath) maybeCreateCube(
 	var vcntData []byte
 	var vcntDir []VCNTChunkDirEntry
 	if q.vi != nil {
-		vcntData, vcntDir = buildVCNTSection(ctx, q.vi, tenant, dims, minTS, maxTS)
+		// issue #522 Phase 2.1: q.pgPool is guaranteed non-nil here (checked at this
+		// function's own top), so the mandatory compacted-exclusion filter is always
+		// wired at this, buildVCNTSection's one production call site.
+		vcntData, vcntDir = buildVCNTSection(ctx, q.vi, tenant, dims, minTS, maxTS, pgcatalog.NewStore(q.pgPool))
 	}
 	// Every v2 cube always materializes duration; the triggering query's own attribute (if any)
 	// joins the set so the cube this query creates can immediately answer it.

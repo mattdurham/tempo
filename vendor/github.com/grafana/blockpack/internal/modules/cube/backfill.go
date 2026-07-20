@@ -262,11 +262,7 @@ func (b *Backfiller) publishMinute(
 		}
 	}
 	return progressFn(BackfillProgress{
-		Watermark: BackfillWatermark{
-			CubeID:          b.entry.CubeID,
-			WatermarkMinute: res.minute,
-			Done:            res.minute == endMinute,
-		},
+		Watermark: BackfillWatermark{CubeID: b.entry.CubeID, WatermarkMinute: res.minute, Done: res.minute == endMinute},
 	})
 }
 
@@ -448,12 +444,7 @@ func (b *Backfiller) processMinute(ctx context.Context, minute uint32) (*Accumul
 		}
 		dim2Entries, dim2Err := b.src.LookupColumn(ctx, b.tenant, b.entry.Dimensions[1], minSec, maxSec)
 		if dim2Err != nil {
-			return nil, fmt.Errorf(
-				"cube backfill: lookup dim2 %q minute %d: %w",
-				b.entry.Dimensions[1],
-				minute,
-				dim2Err,
-			)
+			return nil, fmt.Errorf("cube backfill: lookup dim2 %q minute %d: %w", b.entry.Dimensions[1], minute, dim2Err)
 		}
 		for _, e2 := range dim2Entries {
 			key := viEntryKey(e2.TraceID, e2.SpanID)

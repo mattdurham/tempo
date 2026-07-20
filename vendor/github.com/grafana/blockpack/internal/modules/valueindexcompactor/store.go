@@ -3,6 +3,8 @@ package valueindexcompactor
 import (
 	"context"
 	"sync"
+
+	"github.com/grafana/blockpack/internal/modules/pgcatalog"
 )
 
 // NOTE-VI-017: see internal/modules/valueindexcompactor/NOTES.md.
@@ -42,6 +44,26 @@ type IndexStore interface {
 	Put(ctx context.Context, key string, data []byte) error
 	// Delete removes the object at key.
 	Delete(ctx context.Context, key string) error
+}
+
+// CatalogStore is the blockpack_file_catalog capability mergeLevel needs
+// (issue #522 Phase 1.1): record a merge output row, and mark the 2+ input
+// rows compacted. *pgcatalog.Store satisfies this structurally -- exported
+// as a local interface (mirroring IndexStore/SourceExister's own shape)
+// rather than importing the concrete type directly at every call site, so
+// tests unrelated to catalog wiring never need a real Postgres connection.
+//
+// SPEC-VI-10 / NOTE-VI-122: when Config.CatalogStore is nil, mergeLevel
+// falls back to its pre-#522 delete-input behavior unchanged (mirrors
+// SourceExister's own nil-tolerance convention immediately below) -- a
+// deliberate, documented choice to keep issue #522's Phase 1.1 rollout
+// additive/optional rather than forcing every one of this package's
+// existing, catalog-unrelated tests (corruption handling, disk staging,
+// memory bounds, concurrency, metrics) to thread through a fake catalog
+// store they don't care about. See NOTES.md NOTE-VI-122.
+type CatalogStore interface {
+	Insert(ctx context.Context, row pgcatalog.Row) error
+	MarkCompacted(ctx context.Context, objectKeys []string) error
 }
 
 // SourceExister reports whether a source blockpack object still exists in object

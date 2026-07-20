@@ -46,7 +46,14 @@ type FileInfo struct {
 	Key       string // S3 object key
 	MinMinute uint32
 	MaxMinute uint32
-	Level     uint32 // 1=L0, 60=L1, 1440=L2
+	Level     uint32 // 1=L0, 60=L1, 1440=L2 (legacy); >= 10000 = new pairwise merge-depth (issue #522 Phase 3)
+	// Size is the file's byte size in object storage (issue #522 Phase 3.1) -- needed by
+	// compaction-planner's candidate-selection query (the global 1GiB size-cutoff filter,
+	// mirroring VI/VCNT's own size_bytes column) once a lister populates blockpack_file_catalog
+	// for cube. Zero-valued by any caller that doesn't have it readily available (e.g. a
+	// filename-only parse with no object-storage round trip) -- callers that need an accurate
+	// size must populate it themselves from their own List/Stat result.
+	Size int64
 }
 
 // FileStore is the minimal object-storage interface the compactor needs.
