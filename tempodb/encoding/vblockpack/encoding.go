@@ -88,9 +88,19 @@ func (e Encoding) MigrateBlock(_ context.Context, _, _ *backend.BlockMeta, _ bac
 	return fmt.Errorf("not implemented")
 }
 
-// CompactionSupported returns true if compaction is supported for blockpack
+// CompactionSupported returns false: vblockpack blocks are compacted exclusively by
+// blockpack's own standalone compaction-planner/compaction-worker pipeline (Postgres
+// compaction_jobs, trace_compaction job type -- issue #522), never by the classic
+// Tempo compactor (backend-scheduler's CompactionProvider / backend-worker's
+// processCompactionJob). This was left as true from vblockpack's original encoding
+// skeleton, before that pipeline existed, and never revisited -- the classic compactor
+// was blindly selecting and merging the same source blocks blockpack's own compactor
+// was already handling, uncoordinated. compaction_block_selector.go already skips any
+// block whose encoding returns false here, and tempodb/compactor.go's own defensive
+// guard rejects a compact job for an unsupported encoding -- neither retention/deletion
+// nor any other block lifecycle path depends on this.
 func (e Encoding) CompactionSupported() bool {
-	return true
+	return false
 }
 
 // WritesSupported returns true if writes are supported for blockpack
