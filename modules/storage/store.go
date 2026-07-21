@@ -5,8 +5,8 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/grafana/dskit/services"
-	"github.com/jackc/pgx/v5/pgxpool"
 
+	blockpack "github.com/grafana/blockpack"
 	"github.com/grafana/tempo/pkg/cache"
 	"github.com/grafana/tempo/pkg/usagestats"
 	"github.com/grafana/tempo/tempodb"
@@ -84,7 +84,7 @@ func (s *store) RawReader() backend.RawReader {
 // reader.(tempodb.PgPoolProvider) assertion against a *store (frontend search/metrics sharders'
 // compactedKeyChecker derivation for fetchVCNTSection) silently fails and #157's mandatory VCNT
 // compacted-key exclusion filter never engages in production.
-func (s *store) PgPool() *pgxpool.Pool {
+func (s *store) PgPool() *blockpack.Postgres {
 	if ppp, ok := s.Reader.(tempodb.PgPoolProvider); ok {
 		return ppp.PgPool()
 	}

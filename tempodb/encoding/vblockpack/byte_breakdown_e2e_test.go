@@ -231,7 +231,7 @@ func TestE2E_QueryRange_CubeAnswered_ReportsCubeBytesRead_OtherFieldsZero(t *tes
 	// fixture entry must be seeded into a real (ephemeral testcontainers) Postgres instance,
 	// not the old fake blob objStore.
 	pgPool := newTestPostgresPool(t)
-	reg := blockpack.NewPgCubeRegistry(pgPool, tenant)
+	reg := blockpack.NewPostgresFromPool(pgPool).CubeRegistry(tenant)
 	require.NoError(t, reg.Add(context.Background(), entry))
 
 	// Real cube L0 file, served through a real *minio.Client hitting a local fake S3 endpoint
@@ -251,7 +251,7 @@ func TestE2E_QueryRange_CubeAnswered_ReportsCubeBytesRead_OtherFieldsZero(t *tes
 	cqp := &cubeQueryPath{
 		client: fakeClient,
 		bucket: "test-bucket",
-		pgPool: pgPool,
+		pg:     blockpack.NewPostgresFromPool(pgPool),
 		qp:     qp,
 	}
 	withCubeQueryPath(t, cqp)

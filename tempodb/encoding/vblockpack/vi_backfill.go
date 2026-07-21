@@ -375,7 +375,7 @@ func NewViBackfillDepsWithPgRegistry(deps RunViBackfillDeps, pool *pgxpool.Pool,
 	if pool == nil {
 		return deps
 	}
-	deps.Registry = blockpack.NewRegistryFromEntryStore(blockpack.NewPgViUsageEntryStore(pool), tenant)
+	deps.Registry = blockpack.NewPostgresFromPool(pool).ViUsageRegistry(tenant)
 	return deps
 }
 

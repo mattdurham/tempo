@@ -809,7 +809,7 @@ github.com/googleapis/gax-go/v2/iterator
 # github.com/gorilla/mux v1.8.1
 ## explicit; go 1.20
 github.com/gorilla/mux
-# github.com/grafana/blockpack v0.0.0-20260721080338-e94294c6 => ../blockpack
+# github.com/grafana/blockpack v0.0.0-20260721102420-1c4e1f76 => ../blockpack
 ## explicit; go 1.26.0
 github.com/grafana/blockpack
 github.com/grafana/blockpack/blockevents
@@ -826,6 +826,7 @@ github.com/grafana/blockpack/internal/modules/executor
 github.com/grafana/blockpack/internal/modules/filecache
 github.com/grafana/blockpack/internal/modules/memcache
 github.com/grafana/blockpack/internal/modules/pgcatalog
+github.com/grafana/blockpack/internal/modules/pgqueue
 github.com/grafana/blockpack/internal/modules/queryplan
 github.com/grafana/blockpack/internal/modules/queryplanner
 github.com/grafana/blockpack/internal/modules/rw

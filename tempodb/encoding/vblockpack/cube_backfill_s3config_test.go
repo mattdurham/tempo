@@ -87,7 +87,7 @@ func TestE2E_RunCubeBackfill_UsesConfigCredentialsNotEnv(t *testing.T) {
 		Resolution: 1,
 	}
 
-	registry := blockpack.NewPgCubeRegistry(pgPool, tenant)
+	registry := blockpack.NewPostgresFromPool(pgPool).CubeRegistry(tenant)
 	require.NoError(t, registry.Add(context.Background(), entry))
 
 	// RunCubeBackfill's own window is unbounded (math.MaxUint32 minutes), so this never

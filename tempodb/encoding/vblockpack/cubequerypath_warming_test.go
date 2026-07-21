@@ -59,7 +59,7 @@ func newEmptyTestCubeQueryPath(t *testing.T) *cubeQueryPath {
 	t.Helper()
 	pool := newTestPostgresPool(t)
 	qp := blockpack.NewCubeQueryPath(nil, nil, nil, pool, blockpack.CubeQueryPathConfig{})
-	return &cubeQueryPath{pgPool: pool, qp: qp}
+	return &cubeQueryPath{pg: blockpack.NewPostgresFromPool(pool), qp: qp}
 }
 
 // TestTryQueryFromCube_NoGroupByDims_NowReachesQueryRange is #508's Zero-Dimension Cube Support

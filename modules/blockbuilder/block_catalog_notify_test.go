@@ -11,7 +11,6 @@ import (
 	"github.com/stretchr/testify/require"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
-	blockpack "github.com/grafana/blockpack"
 	"github.com/grafana/tempo/modules/postgres"
 	"github.com/grafana/tempo/tempodb"
 	"github.com/grafana/tempo/tempodb/backend"
@@ -79,13 +78,13 @@ func TestNotifyBlockpackFileCatalog_VblockpackWithPostgres_InsertsRow(t *testing
 	w := newTestWriter(t, true)
 	provider, ok := w.(tempodb.PgPoolProvider)
 	require.True(t, ok, "test writer must implement PgPoolProvider")
-	pool := provider.PgPool()
-	require.NotNil(t, pool)
+	pg := provider.PgPool()
+	require.NotNil(t, pg)
 
 	meta := testBlockMeta("tenant-a", vblockpack.VersionString)
 	notifyBlockpackFileCatalog(context.Background(), log.NewNopLogger(), w, meta)
 
-	rows, err := blockpack.NewFileCatalogStore(pool).ListLiveKeys(context.Background(), "trace", "tenant-a")
+	rows, err := pg.FileCatalogStore().ListLiveKeys(context.Background(), "trace", "tenant-a")
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
 	require.Equal(t, "tenant-a/"+meta.BlockID.String()+"/data.blockpack", rows[0].ObjectKey)
@@ -101,12 +100,12 @@ func TestNotifyBlockpackFileCatalog_NonVblockpackVersion_DoesNothing(t *testing.
 	w := newTestWriter(t, true)
 	provider, ok := w.(tempodb.PgPoolProvider)
 	require.True(t, ok)
-	pool := provider.PgPool()
+	pg := provider.PgPool()
 
 	meta := testBlockMeta("tenant-a", "vParquet4")
 	notifyBlockpackFileCatalog(context.Background(), log.NewNopLogger(), w, meta)
 
-	rows, err := blockpack.NewFileCatalogStore(pool).ListLiveKeys(context.Background(), "trace", "tenant-a")
+	rows, err := pg.FileCatalogStore().ListLiveKeys(context.Background(), "trace", "tenant-a")
 	require.NoError(t, err)
 	require.Empty(t, rows, "a non-vblockpack block must never be cataloged")
 }

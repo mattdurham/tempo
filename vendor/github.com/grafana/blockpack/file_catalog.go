@@ -16,10 +16,6 @@ package blockpack
 // reasoning for issue #506.
 
 import (
-	"context"
-
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"github.com/grafana/blockpack/internal/modules/pgcatalog"
 )
 
@@ -28,15 +24,3 @@ type FileCatalogRow = pgcatalog.Row
 
 // FileCatalogStore is the Postgres-backed blockpack_file_catalog store.
 type FileCatalogStore = pgcatalog.Store
-
-// NewFileCatalogStore constructs a FileCatalogStore over pool.
-func NewFileCatalogStore(pool *pgxpool.Pool) *FileCatalogStore {
-	return pgcatalog.NewStore(pool)
-}
-
-// ApplyFileCatalogSchema applies blockpack_file_catalog's schema against
-// pool. Exported, never called automatically by any constructor — the
-// embedding application calls it once at its own startup.
-func ApplyFileCatalogSchema(ctx context.Context, pool *pgxpool.Pool) error {
-	return pgcatalog.ApplyFileCatalogSchema(ctx, pool)
-}

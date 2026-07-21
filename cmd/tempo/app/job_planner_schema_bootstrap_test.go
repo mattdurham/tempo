@@ -91,7 +91,7 @@ func TestInitJobPlanner_AppliesAllSchemas_UsableImmediately(t *testing.T) {
 		}
 		defer verifyPool.Close()
 
-		viStore := blockpack.NewPgViUsageEntryStore(verifyPool)
+		viStore := blockpack.NewPostgresFromPool(verifyPool).ViUsageEntryStore()
 		if _, uerr := viStore.UpsertEntry(ctx, "tenant-a", "col-hash-a", "string",
 			func() blockpack.Entry {
 				return blockpack.Entry{Tenant: "tenant-a", ColumnHash: "col-hash-a", ColumnType: "string", ColumnName: "span.name"}

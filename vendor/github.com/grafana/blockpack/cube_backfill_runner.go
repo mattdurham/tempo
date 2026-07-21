@@ -22,6 +22,8 @@ import (
 	"strconv"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/grafana/blockpack/internal/modules/cube"
 )
 
 // cubeVIBackfillSource implements CubeValueIndexSource over a LookupStore. LookupColumn lists
@@ -247,7 +249,7 @@ func runCubeBackfillCore(
 	cfg CubeBackfillConfig,
 	currentMinute uint32,
 ) error {
-	registry := NewPgCubeRegistry(pgPool, entry.Tenant)
+	registry := cube.NewPgRegistry(pgPool, entry.Tenant)
 	bf := NewCubeBackfiller(entry, src, cfg)
 	var consecutiveFailures int
 	return bf.Run(ctx, currentMinute, func(prog CubeBackfillProgress) error {
@@ -320,7 +322,7 @@ func LoadCubeEntry(ctx context.Context, pgPool *pgxpool.Pool, tenant, cubeID str
 	if pgPool == nil {
 		return CubeRegistryEntry{}, errors.New("cube registry: postgres not configured")
 	}
-	reg := NewPgCubeRegistry(pgPool, tenant)
+	reg := cube.NewPgRegistry(pgPool, tenant)
 	entries, _, loadErr := reg.Load(ctx)
 	if loadErr != nil {
 		return CubeRegistryEntry{}, fmt.Errorf("cube registry: load: %w", loadErr)

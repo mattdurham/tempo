@@ -168,7 +168,7 @@ func TestQueryRange_CubePartialCoverage_DefersToVIScan_FallsBackWhenVIDeclines(t
 		CreatedAt:  1000,
 	}
 	pgPool := newTestPostgresPool(t)
-	reg := blockpack.NewPgCubeRegistry(pgPool, tenant)
+	reg := blockpack.NewPostgresFromPool(pgPool).CubeRegistry(tenant)
 	require.NoError(t, reg.Add(context.Background(), entry))
 
 	// Real cube L0 file with a cell inside the covered sub-range, served through a real
@@ -188,7 +188,7 @@ func TestQueryRange_CubePartialCoverage_DefersToVIScan_FallsBackWhenVIDeclines(t
 	cqp := &cubeQueryPath{
 		client: fakeClient,
 		bucket: "test-bucket",
-		pgPool: pgPool,
+		pg:     blockpack.NewPostgresFromPool(pgPool),
 		qp:     qp,
 	}
 	withCubeQueryPath(t, cqp)

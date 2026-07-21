@@ -35,7 +35,7 @@ func TestJobPlanner_PollOnce_ChainsViBackfillWhenNotDone(t *testing.T) {
 	ctx := context.Background()
 	tenant := "e2e-vi-chain-tenant"
 
-	registry := blockpack.NewPgViUsageRegistry(pool, tenant)
+	registry := blockpack.NewPostgresFromPool(pool).ViUsageRegistry(tenant)
 	triggerResult, err := blockpack.RecordUseAndMaybeTrigger(
 		ctx, registry, tenant, "span.custom.attr", "string", time.Now(),
 		blockpack.TriggerConfig{LeaseTTLSeconds: 1800},
@@ -67,7 +67,7 @@ func TestJobPlanner_PollOnce_SkipsWhenDone(t *testing.T) {
 	ctx := context.Background()
 	tenant := "e2e-vi-done-tenant"
 
-	registry := blockpack.NewPgViUsageRegistry(pool, tenant)
+	registry := blockpack.NewPostgresFromPool(pool).ViUsageRegistry(tenant)
 	triggerResult, err := blockpack.RecordUseAndMaybeTrigger(
 		ctx, registry, tenant, "span.custom.attr", "string", time.Now(),
 		blockpack.TriggerConfig{LeaseTTLSeconds: 1800},
@@ -93,7 +93,7 @@ func TestJobPlanner_PollOnce_SkipsWhenNonTerminalJobAlreadyExists(t *testing.T) 
 	ctx := context.Background()
 	tenant := "e2e-vi-existing-tenant"
 
-	registry := blockpack.NewPgViUsageRegistry(pool, tenant)
+	registry := blockpack.NewPostgresFromPool(pool).ViUsageRegistry(tenant)
 	triggerResult, err := blockpack.RecordUseAndMaybeTrigger(
 		ctx, registry, tenant, "span.custom.attr", "string", time.Now(),
 		blockpack.TriggerConfig{LeaseTTLSeconds: 1800},
@@ -127,7 +127,7 @@ func TestJobPlanner_PollOnce_ChainsCubeBackfillFromExistingWatermark(t *testing.
 	tenant := "e2e-cube-chain-tenant"
 	cubeID := "cube-with-l0-watermark"
 
-	cubeRegistry := blockpack.NewPgCubeRegistry(pool, tenant)
+	cubeRegistry := blockpack.NewPostgresFromPool(pool).CubeRegistry(tenant)
 	require.NoError(t, cubeRegistry.Add(ctx, blockpack.CubeRegistryEntry{
 		CubeID: cubeID, Tenant: tenant, Dimensions: []string{"resource.service.name"},
 	}))
@@ -155,7 +155,7 @@ func TestJobPlanner_PollOnce_SkipsCubeWithNoL0WatermarkYet(t *testing.T) {
 	tenant := "e2e-cube-nowm-tenant"
 	cubeID := "cube-without-l0-watermark"
 
-	cubeRegistry := blockpack.NewPgCubeRegistry(pool, tenant)
+	cubeRegistry := blockpack.NewPostgresFromPool(pool).CubeRegistry(tenant)
 	require.NoError(t, cubeRegistry.Add(ctx, blockpack.CubeRegistryEntry{
 		CubeID: cubeID, Tenant: tenant, Dimensions: []string{"resource.service.name"},
 	}))

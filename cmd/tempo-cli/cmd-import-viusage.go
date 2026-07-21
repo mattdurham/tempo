@@ -105,11 +105,8 @@ func (cmd *importViusageCmd) Run(g *globalOptions) error {
 	// point, it has no other startup path that would have already applied these, so it must apply
 	// both itself before writing. Idempotent, safe even if the target Postgres instance already
 	// has them (the intended case for most real invocations).
-	if err := blockpack.ApplyViUsageSchema(ctx, pool); err != nil {
-		return fmt.Errorf("applying viusage postgres schema: %w", err)
-	}
-	if err := blockpack.ApplyCubeSchema(ctx, pool); err != nil {
-		return fmt.Errorf("applying cube postgres schema: %w", err)
+	if err := blockpack.NewPostgresFromPool(pool).ApplySchemas(ctx); err != nil {
+		return fmt.Errorf("applying blockpack postgres schemas: %w", err)
 	}
 
 	imported, err := importUsageEntries(ctx, pool, usageEntries)

@@ -686,7 +686,7 @@ func TestRealUsageRecorder_DifferentTenantsUseSeparateRegistries(t *testing.T) {
 func TestRealUsageRecorder_DifferentTenantsUseSeparateRegistries_PostgresBacked(t *testing.T) {
 	pool := newTestPostgresPool(t)
 	rec := &realUsageRecorder{
-		pgPool:     pool,
+		pg:         blockpack.NewPostgresFromPool(pool),
 		usageCfg:   blockpack.Config{DedicatedColumnsEnabled: true},
 		triggerCfg: blockpack.TriggerConfig{LeaseTTLSeconds: 1800},
 	}
@@ -700,7 +700,7 @@ func TestRealUsageRecorder_DifferentTenantsUseSeparateRegistries_PostgresBacked(
 	regB := rec.registryFor("tenant-b")
 	assert.NotSame(t, regA, regB, "registryFor must construct a SEPARATE Registry per tenant, never one baked in for all tenants")
 
-	store := blockpack.NewPgViUsageEntryStore(pool)
+	store := blockpack.NewPostgresFromPool(pool).ViUsageEntryStore()
 	entriesA, err := store.Load(context.Background(), "tenant-a")
 	require.NoError(t, err)
 	require.Len(t, entriesA, 1, "tenant-a's own row set must contain exactly its own entry")

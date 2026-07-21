@@ -69,7 +69,7 @@ func TestE2E_ViBackfill_ClaimedAndExecuted_WhileRingDegraded(t *testing.T) {
 	s3cfg := newFakeS3Config(t, "e2e-worker-vi-ring-degraded-bucket")
 
 	tenant := "e2e-worker-vi-ring-degraded-tenant"
-	registry := blockpack.NewPgViUsageRegistry(pool, tenant)
+	registry := blockpack.NewPostgresFromPool(pool).ViUsageRegistry(tenant)
 	triggerResult, err := blockpack.RecordUseAndMaybeTrigger(
 		ctx, registry, tenant, "span.custom.attr", "string", time.Now(),
 		blockpack.TriggerConfig{LeaseTTLSeconds: 1800},
@@ -171,22 +171,13 @@ func newTestPostgresPoolAndDSN(t *testing.T) (*pgxpool.Pool, string) {
 	t.Cleanup(pool.Close)
 
 	require.NoError(t, migrate.Apply(ctx, pool))
-	// Issue #504: cube's registry is Postgres-only now (no blob/index.json fallback) --
-	// blockpack.ApplyCubeSchema creates cube_entries, needed by this file's
-	// TestE2E_CubeBackfill_* tests, which seed real registry fixtures via
-	// blockpack.NewPgCubeRegistry against this same pool.
-	require.NoError(t, blockpack.ApplyCubeSchema(ctx, pool))
-	// 2026-07-17: viusage_entries, needed by this file's TestE2E_ViBackfill_* tests once they
-	// seed/verify fixtures via blockpack.NewPgViUsageRegistry against this same pool -- matches
-	// production once NewViBackfillDepsWithPgRegistry makes backend-worker's own RunViBackfill
-	// call site use the SAME Postgres-backed registry the querier-side trigger already does.
-	require.NoError(t, blockpack.ApplyViUsageSchema(ctx, pool))
-	// issue #522: blockpack_file_catalog, needed by catalog_reconcile/catalog_reap
-	// coverage in this package's own test files (VI/VCNT/cube catalog-sync moved
-	// entirely to blockpack's own compaction-planner/compaction-worker per #154/#155,
-	// but this table remains the shared metadata source of truth those subsystems
-	// still write to, and trace/span's own catalog_reconcile still reads it here).
-	require.NoError(t, blockpack.ApplyFileCatalogSchema(ctx, pool))
+	// blockpack.Postgres.ApplySchemas covers cube_entries (TestE2E_CubeBackfill_* fixtures via
+	// NewPgCubeRegistry-equivalent), viusage_entries (TestE2E_ViBackfill_* fixtures), and
+	// blockpack_file_catalog (catalog_reconcile/catalog_reap coverage in this package's own
+	// test files -- VI/VCNT/cube catalog-sync moved entirely to blockpack's own
+	// compaction-planner/compaction-worker per #154/#155, but this table remains the shared
+	// metadata source of truth those subsystems still write to) in one call.
+	require.NoError(t, blockpack.NewPostgresFromPool(pool).ApplySchemas(ctx))
 	// issue #522 #158: tempo's OWN file_catalog.sql (a different table from
 	// blockpack_file_catalog above) -- trace/span compaction planning moved out of
 	// jobplanner entirely (it now lives in blockpack's own compaction-planner, reading
@@ -219,7 +210,7 @@ func TestE2E_ViBackfill_WorkerClaimsAndExecutesWithoutGRPC(t *testing.T) {
 	s3cfg := newFakeS3Config(t, "e2e-worker-vi-bucket")
 
 	tenant := "e2e-worker-vi-tenant"
-	registry := blockpack.NewPgViUsageRegistry(pool, tenant)
+	registry := blockpack.NewPostgresFromPool(pool).ViUsageRegistry(tenant)
 	triggerResult, err := blockpack.RecordUseAndMaybeTrigger(
 		ctx, registry, tenant, "span.custom.attr", "string", time.Now(),
 		blockpack.TriggerConfig{LeaseTTLSeconds: 1800},
@@ -333,7 +324,7 @@ func TestE2E_ViBackfill_FailureThenReclaimSucceeds(t *testing.T) {
 	// Seed the real registry entry for real, in between attempts -- the second attempt
 	// must be able to genuinely succeed, not just be reclaimable. Postgres-backed (2026-07-17),
 	// matching what RunViBackfill now actually looks up (see this test's own doc comment).
-	registry := blockpack.NewPgViUsageRegistry(pool, tenant)
+	registry := blockpack.NewPostgresFromPool(pool).ViUsageRegistry(tenant)
 	triggerResult, err := blockpack.RecordUseAndMaybeTrigger(
 		ctx, registry, tenant, "span.custom.attr", "string", time.Now(),
 		blockpack.TriggerConfig{LeaseTTLSeconds: 1800},
@@ -394,7 +385,7 @@ func TestE2E_ViBackfill_ChainedJobAnchorsToPersistedWatermarkNotNow(t *testing.T
 	s3cfg := newFakeS3Config(t, "e2e-worker-vi-anchor-bucket")
 
 	tenant := "e2e-worker-vi-anchor-tenant"
-	registry := blockpack.NewPgViUsageRegistry(pool, tenant)
+	registry := blockpack.NewPostgresFromPool(pool).ViUsageRegistry(tenant)
 	triggerResult, err := blockpack.RecordUseAndMaybeTrigger(
 		ctx, registry, tenant, "span.custom.attr", "string", time.Now(),
 		blockpack.TriggerConfig{LeaseTTLSeconds: 1800},
@@ -485,7 +476,7 @@ func TestE2E_CubeBackfill_BoundedRetention_ReachesFullCompletion(t *testing.T) {
 		AggAttrs:   []string{blockpack.CubeDurationColumn},
 		Resolution: 1,
 	}
-	cubeRegistry := blockpack.NewPgCubeRegistry(pool, tenant)
+	cubeRegistry := blockpack.NewPostgresFromPool(pool).CubeRegistry(tenant)
 	require.NoError(t, cubeRegistry.Add(ctx, entry))
 
 	store := jobstore.New(pool)
@@ -567,7 +558,7 @@ func TestE2E_CubeBackfill_WindowMinutesIsLoadBearingAndChainsFromExistingWaterma
 		AggAttrs:   []string{blockpack.CubeDurationColumn},
 		Resolution: 1,
 	}
-	cubeRegistry := blockpack.NewPgCubeRegistry(pool, tenant)
+	cubeRegistry := blockpack.NewPostgresFromPool(pool).CubeRegistry(tenant)
 	require.NoError(t, cubeRegistry.Add(ctx, entry))
 
 	// Seed an existing L0 watermark far in the past, decoupled from wall-clock now, so
@@ -667,7 +658,7 @@ func TestE2E_CubeBackfill_PerTenantRetentionOverride_BoundsWindow(t *testing.T) 
 		AggAttrs:   []string{blockpack.CubeDurationColumn},
 		Resolution: 1,
 	}
-	cubeRegistry := blockpack.NewPgCubeRegistry(pool, tenant)
+	cubeRegistry := blockpack.NewPostgresFromPool(pool).CubeRegistry(tenant)
 	require.NoError(t, cubeRegistry.Add(ctx, entry))
 
 	store := jobstore.New(pool)
@@ -746,7 +737,7 @@ func TestE2E_CubeBackfill_TwoDimensions_BoundedRetention_ReachesFullCompletion(t
 		AggAttrs:   []string{blockpack.CubeDurationColumn},
 		Resolution: 1,
 	}
-	cubeRegistry := blockpack.NewPgCubeRegistry(pool, tenant)
+	cubeRegistry := blockpack.NewPostgresFromPool(pool).CubeRegistry(tenant)
 	require.NoError(t, cubeRegistry.Add(ctx, entry))
 
 	store := jobstore.New(pool)
@@ -804,7 +795,7 @@ func TestE2E_CubeBackfill_WorkerClaimsAndExecutesWithoutGRPC(t *testing.T) {
 		AggAttrs:   []string{blockpack.CubeDurationColumn},
 		Resolution: 1,
 	}
-	cubeRegistry := blockpack.NewPgCubeRegistry(pool, tenant)
+	cubeRegistry := blockpack.NewPostgresFromPool(pool).CubeRegistry(tenant)
 	require.NoError(t, cubeRegistry.Add(ctx, entry))
 
 	store := jobstore.New(pool)
@@ -876,7 +867,7 @@ func TestE2E_CubeBackfill_FailureThenReclaimSucceeds(t *testing.T) {
 		// AggAttrs deliberately omitted -- see doc comment above.
 		Resolution: 1,
 	}
-	cubeRegistry := blockpack.NewPgCubeRegistry(pool, tenant)
+	cubeRegistry := blockpack.NewPostgresFromPool(pool).CubeRegistry(tenant)
 	require.NoError(t, cubeRegistry.Add(ctx, entry))
 
 	store := jobstore.New(pool)

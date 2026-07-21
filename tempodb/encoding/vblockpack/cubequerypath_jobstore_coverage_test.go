@@ -63,10 +63,10 @@ func TestMaybeCreateCube_AlreadyExists_NoL0Watermark_InsertsRetryJob(t *testing.
 	tenant := "tenant-cube-nowatermark"
 	dims := []string{"resource.service.name"}
 	entry := existingCubeEntry(tenant, dims, nil) // no watermarks at all -> no L0 entry
-	require.NoError(t, blockpack.NewPgCubeRegistry(pool, tenant).Add(context.Background(), entry))
+	require.NoError(t, blockpack.NewPostgresFromPool(pool).CubeRegistry(tenant).Add(context.Background(), entry))
 
 	resetCubeQueryPathSingleton(t)
-	ConfigureCubeQueryPath(true, newFakeS3Config(t, "e2e-nowatermark-bucket"), pool)
+	ConfigureCubeQueryPath(true, newFakeS3Config(t, "e2e-nowatermark-bucket"), blockpack.NewPostgresFromPool(pool))
 	cqp := getCubeQueryPath()
 	require.NotNil(t, cqp)
 
@@ -106,10 +106,10 @@ func TestMaybeCreateCube_AlreadyExists_HasL0Watermark_NoInsert(t *testing.T) {
 		blockpack.CubeRollupL0: {MinMinute: 100, MaxMinute: 200},
 	}
 	entry := existingCubeEntry(tenant, dims, watermarks)
-	require.NoError(t, blockpack.NewPgCubeRegistry(pool, tenant).Add(context.Background(), entry))
+	require.NoError(t, blockpack.NewPostgresFromPool(pool).CubeRegistry(tenant).Add(context.Background(), entry))
 
 	resetCubeQueryPathSingleton(t)
-	ConfigureCubeQueryPath(true, newFakeS3Config(t, "e2e-haswatermark-bucket"), pool)
+	ConfigureCubeQueryPath(true, newFakeS3Config(t, "e2e-haswatermark-bucket"), blockpack.NewPostgresFromPool(pool))
 	cqp := getCubeQueryPath()
 	require.NotNil(t, cqp)
 
@@ -144,10 +144,10 @@ func TestMaybeCreateCube_AlreadyExists_NoL0Watermark_ExistingPendingJobIsNotDupl
 	tenant := "tenant-cube-dup"
 	dims := []string{"resource.service.name"}
 	entry := existingCubeEntry(tenant, dims, nil)
-	require.NoError(t, blockpack.NewPgCubeRegistry(pool, tenant).Add(context.Background(), entry))
+	require.NoError(t, blockpack.NewPostgresFromPool(pool).CubeRegistry(tenant).Add(context.Background(), entry))
 
 	resetCubeQueryPathSingleton(t)
-	ConfigureCubeQueryPath(true, newFakeS3Config(t, "e2e-dup-bucket"), pool)
+	ConfigureCubeQueryPath(true, newFakeS3Config(t, "e2e-dup-bucket"), blockpack.NewPostgresFromPool(pool))
 	cqp := getCubeQueryPath()
 	require.NotNil(t, cqp)
 	require.NotNil(t, cqp.jobStore)
@@ -188,7 +188,7 @@ func TestOnCreateAttempt_CreatedBranch_RecordsCubeColumnUsage(t *testing.T) {
 	require.NoError(t, migrate.Apply(context.Background(), pool))
 
 	resetCubeQueryPathSingleton(t)
-	ConfigureCubeQueryPath(true, newFakeS3Config(t, "e2e-oncreate-usage-bucket"), pool)
+	ConfigureCubeQueryPath(true, newFakeS3Config(t, "e2e-oncreate-usage-bucket"), blockpack.NewPostgresFromPool(pool))
 	cqp := getCubeQueryPath()
 	require.NotNil(t, cqp)
 
@@ -235,10 +235,10 @@ func TestOnCreateAttempt_ReEvaluationBranch_RecordsCubeColumnUsage(t *testing.T)
 	tenant := "tenant-reeval-usage"
 	dims := []string{"resource.service.name"}
 	entry := existingCubeEntry(tenant, dims, nil) // no watermarks at all -> no L0 entry
-	require.NoError(t, blockpack.NewPgCubeRegistry(pool, tenant).Add(context.Background(), entry))
+	require.NoError(t, blockpack.NewPostgresFromPool(pool).CubeRegistry(tenant).Add(context.Background(), entry))
 
 	resetCubeQueryPathSingleton(t)
-	ConfigureCubeQueryPath(true, newFakeS3Config(t, "e2e-reeval-usage-bucket"), pool)
+	ConfigureCubeQueryPath(true, newFakeS3Config(t, "e2e-reeval-usage-bucket"), blockpack.NewPostgresFromPool(pool))
 	cqp := getCubeQueryPath()
 	require.NotNil(t, cqp)
 

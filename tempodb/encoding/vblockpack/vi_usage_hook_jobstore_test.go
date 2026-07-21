@@ -33,7 +33,7 @@ func TestConfigureViUsage_OnShouldBackfill_InsertsPendingJobWhenPgPoolConfigured
 	usageCfg := blockpack.Config{DedicatedColumnsEnabled: true}
 	triggerCfg := blockpack.TriggerConfig{LeaseTTLSeconds: 1800}
 
-	err := ConfigureViUsage(nil, rawR, rawW, usageCfg, triggerCfg, pool)
+	err := ConfigureViUsage(nil, rawR, rawW, usageCfg, triggerCfg, blockpack.NewPostgresFromPool(pool))
 	require.NoError(t, err)
 
 	before := testutil.ToFloat64(metricViBackfillStarted)
@@ -86,7 +86,7 @@ func TestConfigureViUsage_OnShouldBackfill_CrossTypeSameNameColumns_EachGetsOwnR
 	usageCfg := blockpack.Config{DedicatedColumnsEnabled: true}
 	triggerCfg := blockpack.TriggerConfig{LeaseTTLSeconds: 1800}
 
-	err := ConfigureViUsage(nil, rawR, rawW, usageCfg, triggerCfg, pool)
+	err := ConfigureViUsage(nil, rawR, rawW, usageCfg, triggerCfg, blockpack.NewPostgresFromPool(pool))
 	require.NoError(t, err)
 
 	rec := getViUsageRecorder()

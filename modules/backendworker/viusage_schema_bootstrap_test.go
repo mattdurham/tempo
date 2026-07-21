@@ -5,7 +5,7 @@ package backendworker
 // Mirrors tempodb/viusage_schema_bootstrap_test.go's exact shape: a genuinely fresh Postgres
 // testcontainer with NO separate schema-apply step, constructed via the real production path
 // (New(), not a test helper that pre-applies schema), proving New() alone leaves
-// blockpack.NewPgViUsageEntryStore(w.pgPool) -- the exact construction
+// blockpack.NewPostgresFromPool(w.pgPool).ViUsageEntryStore() -- the exact construction
 // NewViBackfillDepsWithPgRegistry (vi_backfill.go) uses against this same pool -- usable
 // immediately.
 
@@ -52,7 +52,7 @@ func TestNew_AppliesViUsageSchema_PgViUsageEntryStoreUsableImmediately(t *testin
 	require.NotNil(t, w)
 	require.NotNil(t, w.pgPool, "New() must have configured pgPool given a non-nil cfg.Postgres")
 
-	entryStore := blockpack.NewPgViUsageEntryStore(w.pgPool)
+	entryStore := blockpack.NewPostgresFromPool(w.pgPool).ViUsageEntryStore()
 	entry, err := entryStore.UpsertEntry(ctx, "tenant-a", "col-hash-a", "string",
 		func() blockpack.Entry {
 			return blockpack.Entry{Tenant: "tenant-a", ColumnHash: "col-hash-a", ColumnType: "string", ColumnName: "span.name"}

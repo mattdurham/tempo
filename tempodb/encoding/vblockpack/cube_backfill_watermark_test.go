@@ -69,7 +69,7 @@ func TestRunCubeBackfill_CtxAlreadyCancelled_ReturnsErrorWithoutIncrementingFail
 		Dimensions: []string{"service.name"}, AggAttrs: []string{blockpack.CubeDurationColumn}, Resolution: 1,
 	}
 	pool := newTestPostgresPool(t)
-	registry := blockpack.NewPgCubeRegistry(pool, entry.Tenant)
+	registry := blockpack.NewPostgresFromPool(pool).CubeRegistry(entry.Tenant)
 	require.NoError(t, registry.Add(context.Background(), entry))
 
 	s3cfg := newFakeS3Config(t, "e2e-ctx-cancel-bucket")

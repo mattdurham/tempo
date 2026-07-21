@@ -82,8 +82,8 @@ func newAsyncSearchSharder(reader tempodb.Reader, o overrides.Interface, cfg Sea
 	}
 	var compactedChecker compactedKeyChecker
 	if ppp, ok := reader.(tempodb.PgPoolProvider); ok {
-		if pool := ppp.PgPool(); pool != nil {
-			compactedChecker = blockpack.NewFileCatalogStore(pool)
+		if pg := ppp.PgPool(); pg != nil {
+			compactedChecker = pg.FileCatalogStore()
 		}
 	}
 	return pipeline.AsyncMiddlewareFunc[combiner.PipelineResponse](func(next pipeline.AsyncRoundTripper[combiner.PipelineResponse]) pipeline.AsyncRoundTripper[combiner.PipelineResponse] {

@@ -51,11 +51,11 @@ type cubeQueryPath struct {
 	// configured. Inserted from qp's OnCreateAttempt callback below; purely additive (does
 	// NOT replace launchBackfill, both run).
 	jobStore *jobstore.Store
-	// pgPool backs the cube registry (issue #504: Postgres is now the only supported cube
+	// pg backs the cube registry (issue #504: Postgres is now the only supported cube
 	// registry backend, no blob/index.json fallback) -- also used by cube_backfill.go's
 	// launchBackfill (which reads it off the shared *cubeQueryPath singleton via
 	// getCubeQueryPath()).
-	pgPool *pgxpool.Pool
+	pg *blockpack.Postgres
 	// qp owns the registry cache, routing, fan-out fetch/rollup, and creation-trigger
 	// orchestration (#508) -- see blockpack.CubeQueryPath's own doc comment.
 	qp *blockpack.CubeQueryPath
@@ -68,10 +68,10 @@ var (
 )
 
 // ConfigureCubeQueryPath sets up the cube query path on the querier at startup.
-// pgPool is the opt-in Postgres backend for the durable backend_jobs queue
+// pg is the opt-in Postgres backend for the durable backend_jobs queue
 // (#181) -- nil means "not configured," mirroring ConfigureCubeManager/
-// ConfigureViUsage's own pgPool convention.
-func ConfigureCubeQueryPath(enabled bool, s3cfg *s3backend.Config, pgPool *pgxpool.Pool) {
+// ConfigureViUsage's own pg convention.
+func ConfigureCubeQueryPath(enabled bool, s3cfg *s3backend.Config, pg *blockpack.Postgres) {
 	if !enabled || s3cfg == nil {
 		return
 	}
@@ -82,7 +82,9 @@ func ConfigureCubeQueryPath(enabled bool, s3cfg *s3backend.Config, pgPool *pgxpo
 			return
 		}
 		var jobStore *jobstore.Store
-		if pgPool != nil {
+		var pgPool *pgxpool.Pool
+		if pg != nil {
+			pgPool = pg.Pool()
 			jobStore = jobstore.New(pgPool)
 		}
 		bucket := s3cfg.Bucket
@@ -192,7 +194,7 @@ func ConfigureCubeQueryPath(enabled bool, s3cfg *s3backend.Config, pgPool *pgxpo
 			client:   client,
 			bucket:   bucket,
 			jobStore: jobStore,
-			pgPool:   pgPool,
+			pg:       pg,
 			qp:       qp,
 		}
 		processCubeQueryPathMu.Unlock()

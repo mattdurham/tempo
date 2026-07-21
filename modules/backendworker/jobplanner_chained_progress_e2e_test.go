@@ -50,7 +50,7 @@ func TestJobPlanner_ChainedViJobsMakeGenuineBackwardProgress(t *testing.T) {
 	s3cfg := newFakeS3Config(t, "e2e-jobplanner-vi-chain-bucket")
 
 	tenant := "e2e-jobplanner-vi-chain-tenant"
-	registry := blockpack.NewPgViUsageRegistry(pool, tenant)
+	registry := blockpack.NewPostgresFromPool(pool).ViUsageRegistry(tenant)
 	triggerResult, err := blockpack.RecordUseAndMaybeTrigger(
 		ctx, registry, tenant, "span.custom.attr", "string", time.Now(),
 		blockpack.TriggerConfig{LeaseTTLSeconds: 1800},
@@ -109,7 +109,7 @@ func TestJobPlanner_ChainedCubeJobsMakeGenuineBackwardProgress(t *testing.T) {
 
 	tenant := "e2e-jobplanner-cube-chain-tenant"
 	cubeID := "e2e-jobplanner-cube-chain-1"
-	cubeRegistry := blockpack.NewPgCubeRegistry(pool, tenant)
+	cubeRegistry := blockpack.NewPostgresFromPool(pool).CubeRegistry(tenant)
 	require.NoError(t, cubeRegistry.Add(ctx, blockpack.CubeRegistryEntry{
 		CubeID: cubeID, Tenant: tenant, Dimensions: []string{"resource.service.name"},
 		AggAttrs: []string{blockpack.CubeDurationColumn}, Resolution: 1,

@@ -28,8 +28,6 @@ import (
 	"context"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"github.com/grafana/blockpack/internal/modules/valueindex"
 	"github.com/grafana/blockpack/internal/modules/viusage"
 )
@@ -109,26 +107,6 @@ func NewRegistryFromEntryStore(store EntryStore, tenant string) *Registry {
 }
 
 var _ EntryStore = (*viusage.PgEntryStore)(nil)
-
-// NewPgViUsageEntryStore constructs a native Postgres-backed EntryStore over
-// pool (issue #506).
-func NewPgViUsageEntryStore(pool *pgxpool.Pool) EntryStore {
-	return viusage.NewPgEntryStore(pool)
-}
-
-// NewPgViUsageRegistry is a one-call convenience constructor for the common
-// case of wanting a Postgres-backed Registry without caring about the
-// EntryStore seam directly.
-func NewPgViUsageRegistry(pool *pgxpool.Pool, tenant string) *Registry {
-	return viusage.NewPgRegistry(pool, tenant)
-}
-
-// ApplyViUsageSchema applies viusage's Postgres schema (viusage_entries)
-// against pool. Never called automatically by any constructor — the
-// embedding application calls it once at its own startup.
-func ApplyViUsageSchema(ctx context.Context, pool *pgxpool.Pool) error {
-	return viusage.ApplySchema(ctx, pool)
-}
 
 // RecordUseAndMaybeTrigger appends one usage timestamp for (tenant, colName, colType)
 // and, in the same conditional-PUT retry pass, evaluates R4's repeated-use threshold

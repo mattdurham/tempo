@@ -50,11 +50,11 @@ func (t *App) initJobPlanner() (services.Service, error) {
 	// job-planner runs as its own standalone module target (-target=job-planner), with its own
 	// independent pgPool -- NOT the same pool tempodb.go/backendscheduler.go migrate, so it can't
 	// rely on either of those processes having started first against a shared Postgres instance.
-	// job-planner reads/writes backend_jobs (jobstore), file_catalog/tenant_redaction_state
-	// (plan_trace_compaction.go/plan_catalog_reconcile.go), viusage_entries (plan_vi.go),
-	// cube_entries (plan_cube.go), and blockpack_file_catalog (fileCatalogStore, catalogPollOnce)
-	// directly, so it must apply all five schemas itself, idempotently, mirroring backend-
-	// scheduler's own posture exactly.
+	// job-planner reads/writes backend_jobs (jobstore), file_catalog (tenant_redaction_state's
+	// schema file), viusage_entries (plan_vi.go), and cube_entries (plan_cube.go) directly, so it
+	// must apply every schema itself, idempotently, mirroring backend-scheduler's own posture
+	// exactly. blockpack.Postgres.ApplySchemas covers viusage/cube/file_catalog/compaction_jobs/
+	// column_manifest in one call.
 	if err := migrate.Apply(context.Background(), pgPool); err != nil {
 		pgPool.Close()
 		return nil, fmt.Errorf("job-planner: applying backend_jobs postgres schema: %w", err)
@@ -63,17 +63,9 @@ func (t *App) initJobPlanner() (services.Service, error) {
 		pgPool.Close()
 		return nil, fmt.Errorf("job-planner: applying file_catalog postgres schema: %w", err)
 	}
-	if err := blockpack.ApplyCubeSchema(context.Background(), pgPool); err != nil {
+	if err := blockpack.NewPostgresFromPool(pgPool).ApplySchemas(context.Background()); err != nil {
 		pgPool.Close()
-		return nil, fmt.Errorf("job-planner: applying cube postgres schema: %w", err)
-	}
-	if err := blockpack.ApplyViUsageSchema(context.Background(), pgPool); err != nil {
-		pgPool.Close()
-		return nil, fmt.Errorf("job-planner: applying viusage postgres schema: %w", err)
-	}
-	if err := blockpack.ApplyFileCatalogSchema(context.Background(), pgPool); err != nil {
-		pgPool.Close()
-		return nil, fmt.Errorf("job-planner: applying blockpack_file_catalog postgres schema: %w", err)
+		return nil, fmt.Errorf("job-planner: applying blockpack postgres schemas: %w", err)
 	}
 
 	svc := jobplanner.New(pgPool, cfg)

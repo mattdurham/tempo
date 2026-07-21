@@ -110,11 +110,12 @@ func (t *App) initValueIndexConsumer() (services.Service, error) {
 	if err != nil {
 		return nil, fmt.Errorf("value-index-consumer: create postgres pool for column manifest: %w", err)
 	}
-	if err := blockpack.ApplyColumnManifestSchema(context.Background(), pgPool); err != nil {
+	pg := blockpack.NewPostgresFromPool(pgPool)
+	if err := pg.ApplySchemas(context.Background()); err != nil {
 		pgPool.Close()
-		return nil, fmt.Errorf("value-index-consumer: apply column manifest schema: %w", err)
+		return nil, fmt.Errorf("value-index-consumer: apply blockpack postgres schemas: %w", err)
 	}
-	manStore := blockpack.NewPgColumnManifestStore(pgPool)
+	manStore := pg.ColumnManifestStore()
 
 	vicCfg := toVICConsumerCfg(bp.ValueIndexConsumer, manStore)
 	// Expose consumer pipeline metrics on the default registry.

@@ -61,12 +61,13 @@ func TestE2E_ViRecordUse_RealTrigger_InsertsPendingJobAndBackfillCompletes(t *te
 
 	pool := newTestPostgresPool(t)
 	require.NoError(t, migrate.Apply(context.Background(), pool))
+	pg := blockpack.NewPostgresFromPool(pool)
 
 	s3cfg := newFakeS3Config(t, "e2e-vi-bucket")
 
 	usageCfg := blockpack.Config{DedicatedColumnsEnabled: true}
 	triggerCfg := blockpack.TriggerConfig{LeaseTTLSeconds: 1800}
-	require.NoError(t, ConfigureViUsage(s3cfg, nil, nil, usageCfg, triggerCfg, pool))
+	require.NoError(t, ConfigureViUsage(s3cfg, nil, nil, usageCfg, triggerCfg, pg))
 
 	rec := getViUsageRecorder()
 	require.NotNil(t, rec)
@@ -114,7 +115,7 @@ func TestE2E_ViRecordUse_RealTrigger_InsertsPendingJobAndBackfillCompletes(t *te
 		return testutil.ToFloat64(metricViBackfillCompleted) > before
 	}, 10*time.Second, 20*time.Millisecond, "the real in-process backfill goroutine must complete")
 
-	registry := blockpack.NewRegistryFromEntryStore(blockpack.NewPgViUsageEntryStore(pool), tenant)
+	registry := pg.ViUsageRegistry(tenant)
 	entries, _, loadErr := registry.Load(context.Background())
 	require.NoError(t, loadErr)
 	require.Len(t, entries, 1)
@@ -160,7 +161,7 @@ func TestE2E_MaybeCreateCube_RealTrigger_InsertsPendingJob(t *testing.T) {
 	})
 
 	s3cfg := newFakeS3Config(t, "e2e-cube-bucket")
-	ConfigureCubeQueryPath(true, s3cfg, pool)
+	ConfigureCubeQueryPath(true, s3cfg, blockpack.NewPostgresFromPool(pool))
 	cqp := getCubeQueryPath()
 	require.NotNil(t, cqp, "ConfigureCubeQueryPath must install the process-level query path")
 

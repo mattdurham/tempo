@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/grafana/blockpack/internal/modules/cube"
 	"github.com/grafana/blockpack/internal/modules/pgcatalog"
 )
 
@@ -161,7 +162,7 @@ func (q *CubeQueryPath) loadEntries(ctx context.Context, tenant string) ([]CubeR
 	}
 	q.mu.Unlock()
 
-	reg := NewPgCubeRegistry(q.pgPool, tenant)
+	reg := cube.NewPgRegistry(q.pgPool, tenant)
 	entries, _, err := reg.Load(ctx)
 	if err != nil {
 		return nil, err
@@ -475,7 +476,7 @@ func (q *CubeQueryPath) maybeCreateCube(
 	q.createSeen[key] = time.Now()
 	q.mu.Unlock()
 
-	reg := NewPgCubeRegistry(q.pgPool, tenant)
+	reg := cube.NewPgRegistry(q.pgPool, tenant)
 	trigger := NewCubeCreationTrigger(reg, q.cfg.TriggerConfig)
 	// Fetch real VCNT data for the proposed dimensions over the query window so the cardinality
 	// gate runs against actual per-dimension distinct-value counts instead of nil. If no VCNT

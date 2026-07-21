@@ -17,7 +17,6 @@ import (
 	"github.com/go-kit/log/level"
 	"github.com/google/uuid"
 	blockpack "github.com/grafana/blockpack"
-	"github.com/jackc/pgx/v5/pgxpool"
 	minio "github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/prometheus/client_golang/prometheus"
@@ -141,17 +140,17 @@ type RawReaderProvider interface {
 }
 
 // PgPoolProvider is an OPTIONAL capability a Reader implementation may satisfy, exposing the
-// *pgxpool.Pool tempodb already builds and holds internally when cfg.Postgres is configured
-// (issue #522 #157). Mirrors RawReaderProvider's exact shape/rationale: a separate interface
-// from Reader, not a new Reader method, so existing Reader implementations/fakes/mocks are
-// unaffected. Callers that need the mandatory VCNT compacted-key exclusion filter (the
+// *blockpack.Postgres handle tempodb already builds and holds internally when cfg.Postgres is
+// configured (issue #522 #157). Mirrors RawReaderProvider's exact shape/rationale: a separate
+// interface from Reader, not a new Reader method, so existing Reader implementations/fakes/mocks
+// are unaffected. Callers that need the mandatory VCNT compacted-key exclusion filter (the
 // frontend's fetchVCNTSection, closing the same NOTE-VC-009-class double-counting exposure
 // vblockpack.buildVCNTSection's #149 fix closes on the querier side) type-assert for this
-// capability rather than requiring every Reader to support it. Nil pool (Postgres not
-// configured on this deployment) is a valid, expected value -- callers must treat it exactly
-// like buildVCNTSection's own nil-checker convention: filtering is skipped, never a hard error.
+// capability rather than requiring every Reader to support it. Nil (Postgres not configured on
+// this deployment) is a valid, expected value -- callers must treat it exactly like
+// buildVCNTSection's own nil-checker convention: filtering is skipped, never a hard error.
 type PgPoolProvider interface {
-	PgPool() *pgxpool.Pool
+	PgPool() *blockpack.Postgres
 }
 
 type Compactor interface {
@@ -200,11 +199,11 @@ type readerWriter struct {
 	wal  *wal.WAL
 	pool *pool.Pool
 
-	// pgPool is the opt-in Postgres connection pool backing the viusage/cube
-	// registries and file catalog (2026-07-11). Nil when cfg.Postgres is nil.
-	// Owned here: constructed in New(), closed in Shutdown() -- never leaks
-	// past process shutdown.
-	pgPool *pgxpool.Pool
+	// pg is the opt-in Postgres handle backing the viusage/cube registries and
+	// file catalog (2026-07-11). Nil when cfg.Postgres is nil. Owned here:
+	// constructed in New(), closed in Shutdown() -- never leaks past process
+	// shutdown.
+	pg *blockpack.Postgres
 
 	logger gkLog.Logger
 	cfg    *Config
@@ -287,57 +286,40 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 		}
 	}
 
-	// pgPool backs the opt-in Postgres viusage/cube registries and file catalog
-	// (2026-07-11). Nil when cfg.Postgres is nil -- every consumer of this pool
-	// treats nil identically to "Postgres backend not configured."
-	var pgPool *pgxpool.Pool
+	// pg backs the opt-in Postgres viusage/cube registries and file catalog
+	// (2026-07-11). Nil when cfg.Postgres is nil -- every consumer of this
+	// handle treats nil identically to "Postgres backend not configured."
+	// The pool itself is still constructed via postgres.NewPool (not
+	// blockpack.ConnectPostgres) to preserve tempo's own connection tuning
+	// (cfg.Postgres.MaxConns/ConnectTimeout), then wrapped and schema'd via
+	// blockpack.Postgres -- ApplySchemas applies every schema blockpack owns
+	// (file_catalog, viusage, cube, compaction_jobs, column_manifest) in one
+	// call, closing a real bootstrap-ordering gap: cube's registry
+	// (blockpack.NewPgCubeRegistry, wired below via ConfigureCubeManager/
+	// ConfigureCubeQueryPath) has required Postgres since issue #504, but
+	// nothing in production called its schema-apply until #522 added this.
+	var pg *blockpack.Postgres
 	if cfg.Postgres != nil {
-		pgPool, err = postgres.NewPool(context.Background(), cfg.Postgres)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("creating postgres pool: %w", err)
+		pgPool, perr := postgres.NewPool(context.Background(), cfg.Postgres)
+		if perr != nil {
+			return nil, nil, nil, fmt.Errorf("creating postgres pool: %w", perr)
 		}
-		// Cube's registry (blockpack.NewPgCubeRegistry, wired below via
-		// ConfigureCubeManager/ConfigureCubeQueryPath) has required Postgres since
-		// issue #504, but nothing in production ever called ApplyCubeSchema for it --
-		// cmd/tempo/app/value_index.go's colhashmanifest wiring (#507) applies its own
-		// schema at pool-construction time, and cube's registry needs the same
-		// treatment or every query/write against a fresh Postgres instance fails with
-		// "relation does not exist" instead of a clear startup error.
-		if err := blockpack.ApplyCubeSchema(context.Background(), pgPool); err != nil {
+		pg = blockpack.NewPostgresFromPool(pgPool)
+		if err := pg.ApplySchemas(context.Background()); err != nil {
 			pgPool.Close()
-			return nil, nil, nil, fmt.Errorf("applying cube postgres schema: %w", err)
+			return nil, nil, nil, fmt.Errorf("applying blockpack postgres schemas: %w", err)
 		}
-		// viusage schema (issue #522): the SAME bootstrap-ordering gap ApplyCubeSchema above
-		// closed for cube, but for viusage_entries -- ConfigureViUsage below (vi_usage_hook.go)
-		// and vi_backfill.go's NewViBackfillDepsWithPgRegistry both construct
-		// blockpack.NewPgViUsageEntryStore(pgPool) against this same pool, which needs
-		// viusage_entries to already exist. Completes the migration tempo's own local
-		// pg_entrystore.go started (2026-07-11) but never finished switching production code
-		// over to blockpack's native implementation until now.
-		if err := blockpack.ApplyViUsageSchema(context.Background(), pgPool); err != nil {
-			pgPool.Close()
-			return nil, nil, nil, fmt.Errorf("applying viusage postgres schema: %w", err)
-		}
-		// file_catalog schema (issue #522 #159): markCompacted/ClearBlock's direct writes
-		// (file_catalog_write.go) need this table to exist regardless of process start order --
-		// backend-scheduler's own migration (modules/backendscheduler/backendscheduler.go)
-		// happens to also apply it, but relying on that one process having started first
-		// against a shared Postgres instance would be fragile. Idempotent (IF NOT EXISTS/ADD
-		// COLUMN IF NOT EXISTS throughout), safe to call redundantly from every tempo process
-		// that configures cfg.Postgres.
+		// file_catalog schema (issue #522 #159, tempo's OWN table, unrelated to anything
+		// blockpack owns): markCompacted/ClearBlock's direct writes (file_catalog_write.go)
+		// need this table to exist regardless of process start order -- backend-scheduler's
+		// own migration (modules/backendscheduler/backendscheduler.go) happens to also apply
+		// it, but relying on that one process having started first against a shared Postgres
+		// instance would be fragile. Idempotent (IF NOT EXISTS/ADD COLUMN IF NOT EXISTS
+		// throughout), safe to call redundantly from every tempo process that configures
+		// cfg.Postgres.
 		if err := schema.ApplyFileCatalog(context.Background(), pgPool); err != nil {
 			pgPool.Close()
 			return nil, nil, nil, fmt.Errorf("applying file_catalog postgres schema: %w", err)
-		}
-		// blockpack_file_catalog schema (issue #522): cube_query_path.go's mandatory
-		// Phase 3.4 compacted-exclusion filter (pgcatalog.NewStore(q.pgPool).ListCompactedKeys)
-		// depends on this table existing. Without this call, a fresh Postgres instance only
-		// gets the table once some OTHER process (compaction-planner/compaction-worker) happens
-		// to have started against it first -- the exact bootstrap-ordering fragility the
-		// file_catalog call above already guards against, just missed for this table.
-		if err := blockpack.ApplyFileCatalogSchema(context.Background(), pgPool); err != nil {
-			pgPool.Close()
-			return nil, nil, nil, fmt.Errorf("applying blockpack_file_catalog postgres schema: %w", err)
 		}
 	}
 
@@ -352,7 +334,7 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 		cfg:                     cfg,
 		logger:                  logger,
 		pool:                    pool.NewPool(cfg.Pool),
-		pgPool:                  pgPool,
+		pg:                      pg,
 		blocklist:               blocklist.New(),
 		pollerNotificationFuncs: make([]func(), 0),
 	}
@@ -399,14 +381,14 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 		// The manager loads the cube registry at startup and accumulates per-minute
 		// span counts for every active cube definition.
 		for _, tenantID := range cfg.Block.Blockpack.CubeTenants {
-			vblockpack.ConfigureCubeManager(true, s3cfg, rawRUncached, rawWUncached, tenantID, pgPool)
+			vblockpack.ConfigureCubeManager(true, s3cfg, rawRUncached, rawWUncached, tenantID, pg)
 		}
 		// Cube query path (querier-side reads + historical backfill sourcing) stays
 		// S3-only -- a deliberate scope cut (plan.md §4): neither is required by
 		// RecordUsageIfNoIndexCoverage, and generalizing them would double scope for
 		// zero benefit to the stated goal. Do NOT generalize this call.
 		if cfg.Backend == backend.S3 {
-			vblockpack.ConfigureCubeQueryPath(true, cfg.S3, pgPool)
+			vblockpack.ConfigureCubeQueryPath(true, cfg.S3, pg)
 		}
 		// #496 Fix B (go-presubmit.md/review.md CRITICAL Issue 2): the write-path
 		// targets (block-builder, backend-worker compactor) need the SAME watermark
@@ -456,7 +438,7 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 	triggerCfg := blockpack.TriggerConfig{
 		LeaseTTLSeconds: uint64(vu.LeaseTTL.Seconds()),
 	}
-	if uerr := vblockpack.ConfigureViUsage(s3cfg, rawRUncached, rawWUncached, usageCfg, triggerCfg, pgPool); uerr != nil {
+	if uerr := vblockpack.ConfigureViUsage(s3cfg, rawRUncached, rawWUncached, usageCfg, triggerCfg, pg); uerr != nil {
 		level.Warn(logger).Log("msg", "vi usage: failed to configure; usage-recording hook disabled", "err", uerr)
 	}
 	// #496 B3 fix (go-presubmit.md CRITICAL finding): the R7 watermark gate is
@@ -904,9 +886,7 @@ func (rw *readerWriter) Shutdown() {
 	}
 	rw.pool.Shutdown()
 	rw.r.Shutdown()
-	if rw.pgPool != nil {
-		rw.pgPool.Close()
-	}
+	rw.pg.Close()
 }
 
 // RawReader implements RawReaderProvider: it returns the backend.RawReader this
@@ -917,11 +897,11 @@ func (rw *readerWriter) RawReader() backend.RawReader {
 	return rw.rawR
 }
 
-// PgPool implements PgPoolProvider: it returns the *pgxpool.Pool this readerWriter was built
-// with (issue #522 #157), nil when cfg.Postgres is nil -- the exact same nil-means-disabled
-// convention rw.pgPool already carries everywhere else in this file.
-func (rw *readerWriter) PgPool() *pgxpool.Pool {
-	return rw.pgPool
+// PgPool implements PgPoolProvider: it returns the *blockpack.Postgres handle this readerWriter
+// was built with (issue #522 #157), nil when cfg.Postgres is nil -- the exact same
+// nil-means-disabled convention rw.pg already carries everywhere else in this file.
+func (rw *readerWriter) PgPool() *blockpack.Postgres {
+	return rw.pg
 }
 
 // EnableCompaction activates the compaction/retention loops

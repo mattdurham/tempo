@@ -92,11 +92,6 @@ type BackendWorker struct {
 	jobStore *jobstore.Store
 	pgPool   *pgxpool.Pool
 
-	// fileCatalogStore is nil under the exact same condition as jobStore
-	// (cfg.Postgres == nil) -- issue #522's blockpack_file_catalog Postgres
-	// store, used by every VI/VCNT/cube compaction handler's write path.
-	fileCatalogStore *blockpack.FileCatalogStore
-
 	// catalogObjectStore is nil when w.s3Cfg is nil (mirrors every other
 	// S3-only Postgres-job handler's "if w.s3Cfg == nil, fail" convention --
 	// processViBackfillJobPostgres/processCubeBackfillJobPostgres are
@@ -156,15 +151,15 @@ func New(cfg Config, schedulerClientCfg backendscheduler_client.Config, s3cfg *s
 		} else {
 			w.pgPool = pool
 			w.jobStore = jobstore.New(pool)
-			w.fileCatalogStore = blockpack.NewFileCatalogStore(pool)
 			// viusage schema (issue #522): unlike backend_jobs.sql above, this worker IS the
 			// migration owner here -- w.pgPool is passed to NewViBackfillDepsWithPgRegistry
-			// (processViBackfillJobPostgres), which constructs blockpack.NewPgViUsageEntryStore
-			// against this exact pool and needs viusage_entries to already exist. Idempotent,
-			// safe to call redundantly alongside tempodb.go's/job-planner's own identical calls
-			// against a shared Postgres instance.
-			if aerr := blockpack.ApplyViUsageSchema(context.Background(), pool); aerr != nil {
-				level.Warn(log.Logger).Log("msg", "viusage postgres schema migration failed", "err", aerr)
+			// (processViBackfillJobPostgres), which constructs a Postgres-backed registry
+			// against this exact pool and needs viusage_entries to already exist.
+			// blockpack.Postgres.ApplySchemas applies every schema blockpack owns (not just
+			// viusage) -- idempotent, safe to call redundantly alongside tempodb.go's/
+			// job-planner's own identical calls against a shared Postgres instance.
+			if aerr := blockpack.NewPostgresFromPool(pool).ApplySchemas(context.Background()); aerr != nil {
+				level.Warn(log.Logger).Log("msg", "blockpack postgres schema migration failed", "err", aerr)
 			}
 		}
 	}

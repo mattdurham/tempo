@@ -83,17 +83,13 @@ func newTestPostgresPool(t *testing.T) *pgxpool.Pool {
 	t.Cleanup(pool.Close)
 
 	applySchema(ctx, t, pool, "schema/file_catalog.sql")
-	if err := blockpack.ApplyCubeSchema(ctx, pool); err != nil {
-		t.Fatalf("applying blockpack cube schema: %v", err)
-	}
-	if err := blockpack.ApplyViUsageSchema(ctx, pool); err != nil {
-		t.Fatalf("applying blockpack viusage schema: %v", err)
-	}
-	// blockpack_file_catalog schema (issue #522): cube_query_path.go's mandatory
+	// blockpack.Postgres.ApplySchemas covers cube/viusage/blockpack_file_catalog/
+	// compaction_jobs/column_manifest in one call -- cube_query_path.go's mandatory
 	// Phase 3.4 compacted-exclusion filter (pgcatalog.NewStore(q.pgPool).ListCompactedKeys)
-	// depends on this table existing, mirroring the same gap fixed in tempodb.go's New().
-	if err := blockpack.ApplyFileCatalogSchema(ctx, pool); err != nil {
-		t.Fatalf("applying blockpack_file_catalog schema: %v", err)
+	// depends on blockpack_file_catalog existing, mirroring the same gap fixed in
+	// tempodb.go's New().
+	if err := blockpack.NewPostgresFromPool(pool).ApplySchemas(ctx); err != nil {
+		t.Fatalf("applying blockpack postgres schemas: %v", err)
 	}
 
 	return pool

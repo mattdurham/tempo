@@ -40,8 +40,8 @@ func notifyBlockpackFileCatalog(ctx context.Context, logger log.Logger, w tempod
 	if !ok {
 		return
 	}
-	pool := provider.PgPool()
-	if pool == nil {
+	pg := provider.PgPool()
+	if pg == nil {
 		return
 	}
 
@@ -49,7 +49,7 @@ func notifyBlockpackFileCatalog(ctx context.Context, logger log.Logger, w tempod
 	blockID := meta.BlockID.String()
 	objectKey := path.Join(tenantID, blockID, vblockpack.DataFileName)
 
-	err := blockpack.NewFileCatalogStore(pool).Insert(ctx, blockpack.FileCatalogRow{
+	err := pg.FileCatalogStore().Insert(ctx, blockpack.FileCatalogRow{
 		Subsystem:  "trace",
 		Tenant:     tenantID,
 		ResourceID: "",

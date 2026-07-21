@@ -10,8 +10,6 @@ package blockpack
 import (
 	"context"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"github.com/grafana/blockpack/internal/modules/cube"
 )
 
@@ -134,30 +132,6 @@ func NewCubeRegistryFromEntryStore(store CubeEntryStore, tenant string) *CubeReg
 }
 
 var _ CubeEntryStore = (*cube.PgEntryStore)(nil)
-
-// NewPgCubeEntryStore constructs a native Postgres-backed CubeEntryStore over
-// pool (issue #506). Signature-compatible drop-in substitute for tempo's own
-// newPgCubeEntryStore(pgPool) at all 4 existing call sites
-// (cube_scheduler.go, cube_backfill.go x2, cubequerypath.go), each of which
-// passes the result directly into NewCubeRegistryFromEntryStore(<call>, tenant)
-// and nothing else.
-func NewPgCubeEntryStore(pool *pgxpool.Pool) CubeEntryStore {
-	return cube.NewPgEntryStore(pool)
-}
-
-// NewPgCubeRegistry is a one-call convenience constructor for the common case
-// of wanting a Postgres-backed CubeRegistry without caring about the
-// CubeEntryStore seam directly.
-func NewPgCubeRegistry(pool *pgxpool.Pool, tenant string) *CubeRegistry {
-	return cube.NewPgRegistry(pool, tenant)
-}
-
-// ApplyCubeSchema applies cube's Postgres schema (cube_entries + its tenant
-// index) against pool. Never called automatically by any constructor — the
-// embedding application calls it once at its own startup.
-func ApplyCubeSchema(ctx context.Context, pool *pgxpool.Pool) error {
-	return cube.ApplySchema(ctx, pool)
-}
 
 // CubeReader reads cells from an in-memory cube file.
 type CubeReader = cube.Reader

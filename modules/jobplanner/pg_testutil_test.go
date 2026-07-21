@@ -68,14 +68,8 @@ func newTestPostgresPool(t *testing.T) *pgxpool.Pool {
 	if err := migrate.Apply(ctx, pool); err != nil {
 		t.Fatalf("applying backend_jobs migration: %v", err)
 	}
-	if err := blockpack.ApplyViUsageSchema(ctx, pool); err != nil {
-		t.Fatalf("applying viusage schema: %v", err)
-	}
-	if err := blockpack.ApplyCubeSchema(ctx, pool); err != nil {
-		t.Fatalf("applying cube schema: %v", err)
-	}
-	if err := blockpack.ApplyFileCatalogSchema(ctx, pool); err != nil {
-		t.Fatalf("applying blockpack_file_catalog schema: %v", err)
+	if err := blockpack.NewPostgresFromPool(pool).ApplySchemas(ctx); err != nil {
+		t.Fatalf("applying blockpack postgres schemas: %v", err)
 	}
 	applySchemaFile(ctx, t, pool, fileCatalogSchemaPath)
 
