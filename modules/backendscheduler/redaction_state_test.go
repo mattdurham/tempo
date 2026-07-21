@@ -22,11 +22,12 @@ import (
 	"github.com/grafana/tempo/tempodb/backend"
 )
 
-// TestBackendScheduler_New_AppliesFileCatalogMigration mirrors
-// TestBackendScheduler_New_AppliesBackendJobsMigration's exact shape (backend_jobs_migration_test.go)
-// for the new file_catalog migration (issue #522 #152): tenant_redaction_state (added by #143)
-// must actually exist after construction, closing the pre-existing gap where file_catalog.sql
-// was never applied by any production code path.
+// TestBackendScheduler_New_AppliesFileCatalogMigration proves the file_catalog migration
+// (issue #522 #152): tenant_redaction_state (added by #143) must actually exist after
+// construction, closing the pre-existing gap where file_catalog.sql was never applied by
+// any production code path. (The former backend_jobs migration this once mirrored,
+// TestBackendScheduler_New_AppliesBackendJobsMigration, was removed 2026-07-21 along with
+// backend_jobs itself.)
 func TestBackendScheduler_New_AppliesFileCatalogMigration(t *testing.T) {
 	dsn := newTestPostgresDSN(t)
 

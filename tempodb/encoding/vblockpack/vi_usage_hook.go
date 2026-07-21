@@ -31,7 +31,6 @@ import (
 
 	"github.com/grafana/tempo/tempodb/backend"
 	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
-	"github.com/grafana/tempo/tempodb/encoding/vblockpack/jobstore"
 
 	util_log "github.com/grafana/tempo/pkg/util/log"
 )
@@ -179,18 +178,6 @@ func ConfigureViUsage(
 	} else {
 		backfillDeps = NewViBackfillDepsRaw(rawR, rawW)
 	}
-	// jobStore is the opt-in durable backend_jobs queue (#181) -- nil when
-	// Postgres isn't configured, the same nil-means-disabled convention as
-	// pgPool itself. Inserting via jobStore in onShouldBackfill below is
-	// purely additive: it does NOT replace launchViBackfill's in-process
-	// goroutine, both run (see the "does NOT replace" note on ConfigureViUsage's
-	// own doc comment) -- the durable row makes a crash mid-backfill
-	// recoverable, while the goroutine keeps today's zero-added-latency
-	// common case.
-	var jobStore *jobstore.Store
-	if pgPool != nil {
-		jobStore = jobstore.New(pgPool)
-	}
 	// var + separate assignment (not :=) is required here: onShouldBackfill's
 	// closure below calls rec.registryFor, which needs rec in scope -- a
 	// short variable declaration's RHS cannot see its own LHS identifier.
@@ -201,8 +188,19 @@ func ConfigureViUsage(
 		triggerCfg: triggerCfg,
 		pg:         pg,
 		onShouldBackfill: func(entry blockpack.Entry) {
-			if jobStore != nil {
-				if ierr := jobStore.InsertViBackfill(context.Background(), entry.Tenant, jobstore.ViBackfillDetail{
+			// issue #522: the durable job insert now targets blockpack's OWN
+			// compaction_jobs queue (pg.InsertViBackfillJob) instead of tempo's
+			// separate backend_jobs/jobstore -- chain-continuation planning and
+			// execution both moved fully into blockpack's compaction-planner/
+			// compaction-worker (compactionplanner.planViBackfill,
+			// compactionworker.processViBackfillJob). Inserting here is still
+			// purely additive: it does NOT replace launchViBackfill's in-process
+			// goroutine below, both run (see the "does NOT replace" note on
+			// ConfigureViUsage's own doc comment) -- the durable row makes a
+			// crash mid-backfill recoverable, while the goroutine keeps today's
+			// zero-added-latency common case.
+			if pg != nil {
+				if ierr := pg.InsertViBackfillJob(context.Background(), entry.Tenant, blockpack.ViBackfillDetail{
 					ColumnHash: entry.ColumnHash,
 					ColumnName: entry.ColumnName,
 					ColumnType: entry.ColumnType,
@@ -210,6 +208,9 @@ func ConfigureViUsage(
 					// unbounded (issue #518 decision (c): the very first backfill of a
 					// column always does everything; job-planner's chained
 					// continuation jobs are the ones that pass a real bound).
+					// compactionworker.viBackfillWindowSeconds translates this 0 into a
+					// real math.MaxUint64 sentinel before constructing BackfillConfig --
+					// see blockpack NOTE-COMPACTIONWORKER-7.
 					WindowSeconds: 0,
 				}); ierr != nil {
 					level.Warn(util_log.Logger).Log(

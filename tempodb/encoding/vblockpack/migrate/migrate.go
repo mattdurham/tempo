@@ -2,15 +2,11 @@ package migrate
 
 import (
 	"context"
-	_ "embed"
 	"fmt"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
-
-//go:embed backend_jobs.sql
-var backendJobsSchema string
 
 // SplitStatements splits sql into individual executable statements, stripping
 // `--` line comments first so a comment containing an ordinary English
@@ -40,27 +36,18 @@ func stripSQLLineComments(sql string) string {
 }
 
 // ApplyStatements executes every statement in sql (as produced by
-// SplitStatements) against pool, in order. Shared by Apply (backend_jobs.sql)
-// and by this repo's own test infra for file_catalog.sql, which needs the
-// identical comment/semicolon splitting behavior.
+// SplitStatements) against pool, in order. Shared by this repo's own test infra
+// for file_catalog.sql and schema/schema.go's ApplyFileCatalog, both of which
+// need the identical comment/semicolon splitting behavior. (Apply, the former
+// backend_jobs-specific wrapper around this function, was removed 2026-07-21
+// along with backend_jobs itself, once vi_backfill/cube_backfill -- backend_jobs'
+// only two job types -- retired entirely in favor of blockpack's own
+// compaction_jobs queue.)
 func ApplyStatements(ctx context.Context, pool *pgxpool.Pool, sql string) error {
 	for _, stmt := range SplitStatements(sql) {
 		if _, err := pool.Exec(ctx, stmt); err != nil {
 			return fmt.Errorf("migrate: apply statement: %w\nstatement: %s", err, stmt)
 		}
-	}
-	return nil
-}
-
-// Apply runs the embedded backend_jobs schema against pool. Every statement is
-// written with IF NOT EXISTS (tables/indexes), making a repeated Apply call on
-// an already-migrated database a safe no-op -- this is the entire "migration"
-// mechanism for Phase 1: no version table, no up/down pairs, no migration
-// history tracking. Sufficient because there is exactly one schema and it only
-// ever grows additively for the foreseeable future.
-func Apply(ctx context.Context, pool *pgxpool.Pool) error {
-	if err := ApplyStatements(ctx, pool, backendJobsSchema); err != nil {
-		return fmt.Errorf("apply backend_jobs schema: %w", err)
 	}
 	return nil
 }

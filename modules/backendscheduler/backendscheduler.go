@@ -16,7 +16,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/grafana/dskit/services"
 	"github.com/grafana/dskit/user"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/grafana/tempo/modules/backendscheduler/provider"
 	"github.com/grafana/tempo/modules/backendscheduler/work"
 	"github.com/grafana/tempo/modules/overrides"
@@ -28,8 +27,8 @@ import (
 	"github.com/grafana/tempo/tempodb/backend"
 	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
 	"github.com/grafana/tempo/tempodb/blocklist"
-	"github.com/grafana/tempo/tempodb/encoding/vblockpack/migrate"
 	"github.com/grafana/tempo/tempodb/encoding/vblockpack/schema"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jedib0t/go-pretty/v6/table"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -67,7 +66,7 @@ type BackendScheduler struct {
 	// plan. Backs the direct-write-primary mirror of a redaction batch's
 	// start/finish into tenant_redaction_state (issue #522 #152/Phase 4c) --
 	// SubmitRedaction/cleanupBatchIfDone write to it directly, on the SAME
-	// pool the backend_jobs migration already shares, rather than opening a
+	// pool the file_catalog migration already shares, rather than opening a
 	// second connection.
 	pgPool *pgxpool.Pool
 }
@@ -136,22 +135,16 @@ func New(cfg Config, s3cfg *s3backend.Config, store storage.Store, overrides ove
 	}
 
 	// Postgres pool (2026-07-11): opt-in, nil when cfg.Postgres is nil. Backs
-	// tenant_redaction_state (redaction) and backend_jobs (vi_backfill/
-	// cube_backfill's now-superseded machinery -- retained here only because
-	// this pool is shared).
+	// tenant_redaction_state (redaction). backend_jobs (vi_backfill/
+	// cube_backfill) migration was removed 2026-07-21 once both job types'
+	// tempo-side machinery retired entirely in favor of blockpack's own
+	// compaction_jobs queue -- nothing reads/writes backend_jobs anymore.
 	if cfg.Postgres != nil {
 		pool, perr := postgres.NewPool(context.Background(), cfg.Postgres)
 		if perr != nil {
 			level.Warn(log.Logger).Log("msg", "postgres pool init failed", "err", perr)
 		} else {
-			// backend_jobs migration (2026-07-14, #181 Phase 0): applied
-			// idempotently on every startup -- degrade (warn, leave whatever
-			// depends on the migrated schema unavailable) rather than crash
-			// the process.
-			if merr := migrate.Apply(context.Background(), pool); merr != nil {
-				level.Warn(log.Logger).Log("msg", "backend_jobs schema migration failed", "err", merr)
-			}
-			// file_catalog migration (issue #522 #152): same idempotent,
+			// file_catalog migration (issue #522 #152): idempotent,
 			// apply-on-every-startup posture as backend_jobs above. Kept even
 			// though file_catalog's own table is no longer read/written by
 			// anything (2026-07-21 rollback) -- tenant_redaction_state (#143)

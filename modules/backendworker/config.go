@@ -11,7 +11,6 @@ import (
 	"github.com/grafana/dskit/backoff"
 	"github.com/grafana/dskit/flagext"
 	"github.com/grafana/dskit/ring"
-	"github.com/grafana/tempo/modules/postgres"
 	"github.com/grafana/tempo/pkg/util"
 	"github.com/grafana/tempo/tempodb"
 )
@@ -23,15 +22,6 @@ type Config struct {
 	OverrideRingKey         string                  `yaml:"override_ring_key"`
 	Ring                    RingConfig              `yaml:"ring,omitempty"`
 	FinishOnShutdownTimeout time.Duration           `yaml:"finish_on_shutdown_timeout"`
-
-	// Postgres is the opt-in backend for the #181 durable job queue
-	// (backend_jobs). Nil means "not configured" -- the SAME *postgres.Config
-	// type as backendscheduler.Config.Postgres/tempodb.Config.Postgres,
-	// reused, since all three flow from the same top-level Postgres
-	// connection in a real deployment. When non-nil, processJobs tries a
-	// direct Postgres claim for vi_backfill/cube_backfill before falling back
-	// to the existing gRPC Next() path.
-	Postgres *postgres.Config `yaml:"postgres"`
 
 	// ValueIndexPrefix is the object-storage key prefix under which VI files
 	// live for a tenant (issue #522's catalog_reconcile "vi" branch,

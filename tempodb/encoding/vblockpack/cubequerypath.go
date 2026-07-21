@@ -37,7 +37,6 @@ import (
 	"github.com/grafana/tempo/pkg/traceql"
 	util_log "github.com/grafana/tempo/pkg/util/log"
 	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
-	"github.com/grafana/tempo/tempodb/encoding/vblockpack/jobstore"
 	"github.com/jackc/pgx/v5/pgxpool"
 	minio "github.com/minio/minio-go/v7"
 )
@@ -47,14 +46,13 @@ import (
 type cubeQueryPath struct {
 	client *minio.Client
 	bucket string
-	// jobStore is the opt-in durable backend_jobs queue (#181) -- nil when Postgres isn't
-	// configured. Inserted from qp's OnCreateAttempt callback below; purely additive (does
-	// NOT replace launchBackfill, both run).
-	jobStore *jobstore.Store
 	// pg backs the cube registry (issue #504: Postgres is now the only supported cube
 	// registry backend, no blob/index.json fallback) -- also used by cube_backfill.go's
 	// launchBackfill (which reads it off the shared *cubeQueryPath singleton via
-	// getCubeQueryPath()).
+	// getCubeQueryPath()), and (issue #522) the durable cube_backfill job insert
+	// (pg.InsertCubeBackfillJob) in OnCreateAttempt below -- nil means "not configured,"
+	// disabling the durable insert only (does NOT replace the in-process backfill
+	// goroutine, both run when configured).
 	pg *blockpack.Postgres
 	// qp owns the registry cache, routing, fan-out fetch/rollup, and creation-trigger
 	// orchestration (#508) -- see blockpack.CubeQueryPath's own doc comment.
@@ -81,11 +79,9 @@ func ConfigureCubeQueryPath(enabled bool, s3cfg *s3backend.Config, pg *blockpack
 			level.Warn(util_log.Logger).Log("msg", "vblockpack: cube query path disabled", "err", err)
 			return
 		}
-		var jobStore *jobstore.Store
 		var pgPool *pgxpool.Pool
 		if pg != nil {
 			pgPool = pg.Pool()
-			jobStore = jobstore.New(pgPool)
 		}
 		bucket := s3cfg.Bucket
 		// #508 Decision 2: files (Get/Put) uses cubeFileStore (already satisfies
@@ -117,8 +113,13 @@ func ConfigureCubeQueryPath(enabled bool, s3cfg *s3backend.Config, pg *blockpack
 					)
 					dedicated := dedicatedColumnSet(getDedicatedColumnsForTenant(entry.Tenant))
 					recordCubeColumnUsage(ctx, entry.Tenant, entry, dedicated, time.Now())
-					if jobStore != nil {
-						if ierr := jobStore.InsertCubeBackfill(ctx, entry.Tenant, jobstore.CubeBackfillDetail{
+					// issue #522: the durable job insert now targets blockpack's own
+					// compaction_jobs queue (pg.InsertCubeBackfillJob) instead of tempo's
+					// separate backend_jobs/jobstore -- chain-continuation planning and
+					// execution both moved fully into blockpack's compaction-planner/
+					// compaction-worker.
+					if pg != nil {
+						if ierr := pg.InsertCubeBackfillJob(ctx, entry.Tenant, blockpack.CubeBackfillDetail{
 							CubeID:        entry.CubeID,
 							WindowMinutes: math.MaxUint32,
 						}); ierr != nil {
@@ -173,12 +174,12 @@ func ConfigureCubeQueryPath(enabled bool, s3cfg *s3backend.Config, pg *blockpack
 				// RegistryEntry has no explicit "backfill done" flag; the absence of an L0
 				// watermark (hasL0) is the cheapest available heuristic for "never completed
 				// a single successful backfill pass."
-				if jobStore == nil || hasL0 {
+				if pg == nil || hasL0 {
 					return
 				}
 				dedicated := dedicatedColumnSet(getDedicatedColumnsForTenant(entry.Tenant))
 				recordCubeColumnUsage(ctx, entry.Tenant, entry, dedicated, time.Now())
-				if ierr := jobStore.InsertCubeBackfill(ctx, entry.Tenant, jobstore.CubeBackfillDetail{
+				if ierr := pg.InsertCubeBackfillJob(ctx, entry.Tenant, blockpack.CubeBackfillDetail{
 					CubeID:        entry.CubeID,
 					WindowMinutes: math.MaxUint32,
 				}); ierr != nil {
@@ -191,11 +192,10 @@ func ConfigureCubeQueryPath(enabled bool, s3cfg *s3backend.Config, pg *blockpack
 		})
 		processCubeQueryPathMu.Lock()
 		processCubeQueryPath = &cubeQueryPath{
-			client:   client,
-			bucket:   bucket,
-			jobStore: jobStore,
-			pg:       pg,
-			qp:       qp,
+			client: client,
+			bucket: bucket,
+			pg:     pg,
+			qp:     qp,
 		}
 		processCubeQueryPathMu.Unlock()
 		level.Info(util_log.Logger).Log("msg", "vblockpack: cube query path configured")

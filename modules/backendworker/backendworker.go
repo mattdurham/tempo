@@ -2,7 +2,6 @@ package backendworker
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"math/rand"
@@ -11,14 +10,12 @@ import (
 
 	"github.com/go-kit/log/level"
 	"github.com/gogo/status"
-	blockpack "github.com/grafana/blockpack"
 	"github.com/grafana/dskit/backoff"
 	"github.com/grafana/dskit/kv"
 	"github.com/grafana/dskit/ring"
 	"github.com/grafana/dskit/services"
 	backendscheduler_client "github.com/grafana/tempo/modules/backendscheduler/client"
 	"github.com/grafana/tempo/modules/overrides"
-	"github.com/grafana/tempo/modules/postgres"
 	"github.com/grafana/tempo/modules/storage"
 	"github.com/grafana/tempo/pkg/tempopb"
 	"github.com/grafana/tempo/pkg/util/log"
@@ -26,9 +23,6 @@ import (
 	"github.com/grafana/tempo/tempodb/backend"
 	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
 	"github.com/grafana/tempo/tempodb/encoding/common"
-	vblockpack "github.com/grafana/tempo/tempodb/encoding/vblockpack"
-	"github.com/grafana/tempo/tempodb/encoding/vblockpack/jobstore"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc/codes"
 )
@@ -43,33 +37,7 @@ const (
 	ringNumTokens = 512
 
 	backendWorkerRingKey = "backend-worker"
-
-	// postgresJobReportTimeout bounds reportPostgresJobOutcome's final
-	// Store.Fail/Store.Complete call (2026-07-14 fix). This call must run on
-	// a FRESH context, not the job's own (possibly already-expired) ctx: if
-	// RunCubeBackfill/RunViBackfill failed because that ctx's deadline was
-	// exceeded, reusing the same expired ctx for the reporting call would
-	// make the SQL UPDATE itself fail too, leaving the row stuck in
-	// 'claimed' until its much longer (30m) lease expires -- see
-	// jobstore.claimJobSQL's lease_expires_at reclaim window. 10s is ample
-	// for a single-row UPDATE/transaction against Postgres while still
-	// bounding how long a worker can block on a reporting call gone bad.
-	postgresJobReportTimeout = 10 * time.Second
-
-	// leaseRenewTimeout bounds each individual renewLeasePeriodically tick's
-	// Store.RenewLease call, mirroring postgresJobReportTimeout's own "fresh,
-	// short-lived context" reasoning (issue #520): a renewal call must not be
-	// tied to the job's own (possibly long-running or near-deadline) ctx.
-	leaseRenewTimeout = 10 * time.Second
 )
-
-// leaseRenewInterval is how often dispatchPostgresJob's renewal loop extends a
-// claimed job's lease while it's being processed (issue #520). A package-level
-// var, not a const, so tests can shrink it well below the 30-minute lease TTL
-// (jobstore.claimJobSQL) without a real 30-minute wait. 10 minutes leaves ample
-// margin in production: even a single missed tick still has 20 minutes of
-// slack before the lease actually expires.
-var leaseRenewInterval = 10 * time.Minute
 
 var ringOp = ring.NewOp([]ring.InstanceState{ring.ACTIVE}, nil)
 
@@ -83,23 +51,6 @@ type BackendWorker struct {
 	backendScheduler tempopb.BackendSchedulerClient
 
 	workerID string
-
-	// jobStore is nil when Postgres is not configured (cfg.Postgres == nil)
-	// -- the same nil-means-disabled convention as backendscheduler's
-	// catalogLister. Non-nil means processJobs tries a direct Postgres claim
-	// for vi_backfill/cube_backfill before falling back to the existing gRPC
-	// Next() path (#181 Phase 4).
-	jobStore *jobstore.Store
-	pgPool   *pgxpool.Pool
-
-	// catalogObjectStore is nil when w.s3Cfg is nil (mirrors every other
-	// S3-only Postgres-job handler's "if w.s3Cfg == nil, fail" convention --
-	// processViBackfillJobPostgres/processCubeBackfillJobPostgres are
-	// S3-only today too). Used by the VI/VCNT/cube compaction write path
-	// (issue #522 Phase 0.4) to fetch merge inputs. A field (not a per-call
-	// construction) so tests can override it with a fake, mirroring
-	// jobStore's own override-in-tests convention.
-	catalogObjectStore vblockpack.CatalogObjectStore
 
 	// Ring used for sharding tenant index writing.
 	ringLifecycler *ring.BasicLifecycler
@@ -139,39 +90,6 @@ func New(cfg Config, schedulerClientCfg backendscheduler_client.Config, s3cfg *s
 		return nil, fmt.Errorf("failed to create backend scheduler client: %w", err)
 	}
 	w.backendScheduler = schedulerClient
-
-	// Postgres job store (#181 Phase 4): opt-in, nil when cfg.Postgres is
-	// nil. Not the migration owner (backend-scheduler's New() applies
-	// backend_jobs.sql, per #181 §3.3) -- a worker only ever claims rows an
-	// already-migrated schema exposes.
-	if cfg.Postgres != nil {
-		pool, perr := postgres.NewPool(context.Background(), cfg.Postgres)
-		if perr != nil {
-			level.Warn(log.Logger).Log("msg", "postgres job store disabled -- pool init failed", "err", perr)
-		} else {
-			w.pgPool = pool
-			w.jobStore = jobstore.New(pool)
-			// viusage schema (issue #522): unlike backend_jobs.sql above, this worker IS the
-			// migration owner here -- w.pgPool is passed to NewViBackfillDepsWithPgRegistry
-			// (processViBackfillJobPostgres), which constructs a Postgres-backed registry
-			// against this exact pool and needs viusage_entries to already exist.
-			// blockpack.Postgres.ApplySchemas applies every schema blockpack owns (not just
-			// viusage) -- idempotent, safe to call redundantly alongside tempodb.go's/
-			// job-planner's own identical calls against a shared Postgres instance.
-			if aerr := blockpack.NewPostgresFromPool(pool).ApplySchemas(context.Background()); aerr != nil {
-				level.Warn(log.Logger).Log("msg", "blockpack postgres schema migration failed", "err", aerr)
-			}
-		}
-	}
-
-	if s3cfg != nil {
-		catalogObjectStore, cerr := vblockpack.NewCatalogObjectStoreS3(s3cfg)
-		if cerr != nil {
-			level.Warn(log.Logger).Log("msg", "catalog object store disabled -- client init failed", "err", cerr)
-		} else {
-			w.catalogObjectStore = catalogObjectStore
-		}
-	}
 
 	if w.isSharded() {
 		reg = prometheus.WrapRegistererWithPrefix("tempo_", reg)
@@ -315,18 +233,6 @@ func (w *BackendWorker) running(ctx context.Context) error {
 }
 
 func (w *BackendWorker) processJobs(ctx context.Context) error {
-	if w.jobStore != nil {
-		job, err := w.tryClaimPostgresJob(ctx)
-		if err != nil {
-			return err
-		}
-		if job != nil {
-			return w.dispatchPostgresJob(ctx, job)
-		}
-		// No Postgres job claimable right now -- fall through to the
-		// existing gRPC path below, unchanged.
-	}
-
 	var (
 		resp *tempopb.NextJobResponse
 		err  error
@@ -370,274 +276,6 @@ func (w *BackendWorker) processJobs(ctx context.Context) error {
 	default:
 		return fmt.Errorf("unknown job type: %s", resp.Type.String())
 	}
-}
-
-// postgresJobClaimPriority is the order tryClaimPostgresJob tries each
-// Postgres job type in -- arbitrary priority (revisit if real production
-// data shows one starving another -- no evidence either way today).
-// catalog_reap was removed outright by #154: it processed only vi/vcnt/cube
-// rows against blockpack_file_catalog, which now belongs entirely to
-// blockpack's own compaction-worker (plan.md Section G.4) -- keeping it here
-// too would race the same rows into two independent delete pipelines.
-// vi_compaction was removed by #155: candidate-selection and execution both
-// moved into blockpack's own compaction-planner/compaction-worker, so this
-// job type no longer exists in tempo's jobstore at all.
-// trace_compaction was likewise removed (same session, same-day pivot):
-// candidate-selection and execution both moved into blockpack's own
-// compaction-planner/compaction-worker, using the SAME shared worker pool
-// VI/VCNT/cube already use -- this job type no longer exists in tempo's
-// jobstore at all either.
-// catalog_reconcile (trace/span-only, #154) was retired 2026-07-21: it was
-// filecatalog.Lister's ticker-driven reconciliation, job-triggered instead --
-// file_catalog's whole reason for existing (avoiding a real backend LIST
-// call in the blocklist Poller) was itself rolled back the same day, so both
-// reconciliation paths for that table are gone now.
-var postgresJobClaimPriority = []jobstore.JobType{
-	jobstore.JobTypeViBackfill,
-	jobstore.JobTypeCubeBackfill,
-}
-
-// tryClaimPostgresJob tries each of postgresJobClaimPriority in order.
-// Returns (nil, nil) if none has claimable work.
-func (w *BackendWorker) tryClaimPostgresJob(ctx context.Context) (*jobstore.Job, error) {
-	for _, jobType := range postgresJobClaimPriority {
-		job, err := w.jobStore.Claim(ctx, jobType, w.workerID)
-		if err != nil {
-			return nil, fmt.Errorf("claim %s: %w", jobType, err)
-		}
-		if job != nil {
-			return job, nil
-		}
-	}
-	return nil, nil
-}
-
-// dispatchPostgresJob runs job to completion and reports the result back to
-// Postgres directly (Store.Complete/Fail) -- NOT via w.backendScheduler.
-// UpdateJob. There is no scheduler-mediated status update for Postgres-
-// claimed jobs, since the scheduler was never the one that handed the job
-// out in this branch.
-func (w *BackendWorker) dispatchPostgresJob(ctx context.Context, job *jobstore.Job) error {
-	// Issue #520: renew job.ID's lease every leaseRenewInterval for as long as
-	// this function is actively processing it, so a job genuinely running
-	// longer than the 30-minute lease TTL is never double-claimed by a second
-	// worker. renewCtx is derived from ctx (not context.Background()) so the
-	// loop also stops if the job's own ctx is canceled/expires independently
-	// of this function returning. defer stopRenew() covers every exit path --
-	// normal return, an error return, and a panic unwinding through this frame
-	// -- so the goroutine below is never leaked running past this call.
-	renewCtx, stopRenew := context.WithCancel(ctx)
-	defer stopRenew()
-	go w.renewLeasePeriodically(renewCtx, job.ID)
-
-	var err error
-	switch job.Type {
-	case jobstore.JobTypeViBackfill:
-		err = w.processViBackfillJobPostgres(ctx, job)
-	case jobstore.JobTypeCubeBackfill:
-		err = w.processCubeBackfillJobPostgres(ctx, job)
-	default:
-		err = fmt.Errorf("unknown postgres job type: %s", job.Type)
-	}
-	return w.reportPostgresJobOutcome(job.ID, err)
-}
-
-// renewLeasePeriodically extends jobID's lease every leaseRenewInterval until
-// ctx is done (issue #520). Each renewal call runs on its own short-lived,
-// fresh context (leaseRenewTimeout), not ctx itself -- mirrors
-// reportPostgresJobOutcome's identical "fresh context" reasoning, so a ctx
-// that's already near its own deadline doesn't also starve the renewal call
-// meant to buy the job more time. A failed renewal is logged and NOT
-// otherwise retried before the next scheduled tick: a single missed tick
-// still leaves ample margin (30-minute lease vs 10-minute interval) before
-// the lease could actually expire.
-func (w *BackendWorker) renewLeasePeriodically(ctx context.Context, jobID string) {
-	ticker := time.NewTicker(leaseRenewInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			renewCtx, cancel := context.WithTimeout(context.Background(), leaseRenewTimeout)
-			if err := w.jobStore.RenewLease(renewCtx, jobID); err != nil {
-				level.Warn(log.Logger).Log("msg", "failed to renew backend_jobs lease", "job_id", jobID, "err", err)
-			}
-			cancel()
-		}
-	}
-}
-
-// reportPostgresJobOutcome reports a Postgres-claimed job's execution result
-// directly to w.jobStore (Complete on success, Fail-with-retry on error) --
-// never to w.backendScheduler.UpdateJob, since the scheduler never handed
-// the job out in this branch.
-//
-// The Store.Fail/Store.Complete call itself runs on a fresh, short-lived
-// context (postgresJobReportTimeout), NOT the job's own ctx passed in here
-// (2026-07-14 fix): a job that failed because ITS OWN ctx's deadline was
-// exceeded must still be able to successfully record that failure, which is
-// impossible if the reporting call reuses that same already-expired ctx.
-//
-// Issue #518: this function's Complete/Fail-only shape is intentional and
-// unchanged -- it never enqueued a chained continuation job, before or after
-// #518. Chain-enqueue responsibility belongs entirely to the new job-planner
-// component's own poll loop, which decides independently (by re-reading
-// viusage_entries/cube_entries) whether more history remains to backfill.
-func (w *BackendWorker) reportPostgresJobOutcome(jobID string, jobErr error) error {
-	reportCtx, cancel := context.WithTimeout(context.Background(), postgresJobReportTimeout)
-	defer cancel()
-
-	if jobErr != nil {
-		level.Error(log.Logger).Log("msg", "postgres job failed", "job_id", jobID, "err", jobErr)
-		return w.jobStore.Fail(reportCtx, jobID, jobErr.Error())
-	}
-	return w.jobStore.Complete(reportCtx, jobID)
-}
-
-// processViBackfillJobPostgres unmarshals job.Detail (JSONB) into
-// jobstore.ViBackfillDetail and runs the backfill; success/failure is
-// reported by dispatchPostgresJob's caller via w.jobStore, not
-// w.backendScheduler -- there is no gRPC-path equivalent anymore (deleted,
-// mirroring cube_backfill's earlier removal, once nothing emits
-// JOB_TYPE_VI_BACKFILL into the scheduler's job stream).
-func (w *BackendWorker) processViBackfillJobPostgres(ctx context.Context, job *jobstore.Job) error {
-	if job.Tenant == "" {
-		return fmt.Errorf("vi backfill job missing tenant")
-	}
-
-	var detail jobstore.ViBackfillDetail
-	if err := json.Unmarshal(job.Detail, &detail); err != nil {
-		return fmt.Errorf("vi backfill: unmarshal detail: %w", err)
-	}
-
-	if w.s3Cfg == nil {
-		return fmt.Errorf("vi backfill: S3 not configured on worker")
-	}
-
-	entry := blockpack.Entry{
-		Tenant:     job.Tenant,
-		ColumnHash: detail.ColumnHash,
-		ColumnName: detail.ColumnName,
-		ColumnType: detail.ColumnType,
-	}
-
-	level.Info(log.Logger).Log("msg", "processing vi backfill job (postgres)",
-		"job_id", job.ID, "tenant", job.Tenant, "column", entry.ColumnName)
-
-	deps, err := vblockpack.NewViBackfillDepsS3(w.s3Cfg)
-	if err != nil {
-		return fmt.Errorf("vi backfill: failed to construct deps: %w", err)
-	}
-	// 2026-07-17: use the SAME Postgres-backed registry the querier-side trigger (onShouldBackfill)
-	// already writes entries through -- without this, RunViBackfill falls back to a fresh
-	// blob-backed registry that has never heard of an entry Postgres already created, and every
-	// watermark-persist call fails with "entry ... not found" (see NewViBackfillDepsWithPgRegistry's
-	// own doc comment for the full history).
-	deps = vblockpack.NewViBackfillDepsWithPgRegistry(deps, w.pgPool, job.Tenant)
-
-	// #518: entry above is built fresh from job.Detail's column-identity fields only,
-	// so its Backfill (in particular WatermarkSec, the new AnchorSec source) is always
-	// the zero value -- load the REAL, already-persisted entry so a chained
-	// continuation job anchors to where the last one left off instead of silently
-	// falling back to "anchor to now" every time, exactly the bug this whole feature
-	// exists to fix. Mirrors processCubeBackfillJobPostgres's own blockpack.LoadCubeEntry
-	// call below, which already does this correctly for cube_backfill.
-	if deps.Registry != nil {
-		loaded, ok, loadErr := loadViUsageEntry(ctx, deps.Registry, entry.ColumnHash, entry.ColumnType)
-		if loadErr != nil {
-			return fmt.Errorf("vi backfill: load entry: %w", loadErr)
-		}
-		if ok {
-			entry.Backfill = loaded.Backfill
-		}
-	}
-
-	if err := vblockpack.RunViBackfill(ctx, entry, deps, detail.WindowSeconds); err != nil {
-		return fmt.Errorf("vi backfill failed: %w", err)
-	}
-
-	return nil
-}
-
-// loadViUsageEntry finds the entry matching (colHash, colType) in registry's own
-// tenant (a *blockpack.Registry is bound to exactly one tenant at construction), or
-// (zero-value, false, nil) if no such entry exists yet -- a safe, conservative
-// fallback (AnchorSec stays 0, i.e. "anchor to now") rather than a hard failure,
-// since a genuinely first-ever backfill for a column is expected to have no entry
-// yet the very first time this runs.
-func loadViUsageEntry(ctx context.Context, registry *blockpack.Registry, colHash, colType string) (blockpack.Entry, bool, error) {
-	entries, _, err := registry.Load(ctx)
-	if err != nil {
-		return blockpack.Entry{}, false, err
-	}
-	for _, e := range entries {
-		if e.ColumnHash == colHash && e.ColumnType == colType {
-			return e, true, nil
-		}
-	}
-	return blockpack.Entry{}, false, nil
-}
-
-// processCubeBackfillJobPostgres mirrors processViBackfillJobPostgres's shape
-// for cube_backfill: job.Detail (JSONB) is unmarshaled into
-// jobstore.CubeBackfillDetail, and success/failure is reported by
-// dispatchPostgresJob's caller via w.jobStore, never via w.backendScheduler.
-// #181 Phase 5 deleted the old gRPC-path equivalent (processCubeBackfillJob,
-// which read tempopb.JobDetail.CubeBackfill) once cube_backfill moved
-// entirely off the gRPC Next()/JobDetail path.
-func (w *BackendWorker) processCubeBackfillJobPostgres(ctx context.Context, job *jobstore.Job) error {
-	if job.Tenant == "" {
-		return fmt.Errorf("cube backfill job missing tenant")
-	}
-
-	var detail jobstore.CubeBackfillDetail
-	if err := json.Unmarshal(job.Detail, &detail); err != nil {
-		return fmt.Errorf("cube backfill: unmarshal detail: %w", err)
-	}
-
-	if w.s3Cfg == nil {
-		return fmt.Errorf("cube backfill: S3 not configured on worker")
-	}
-	// w.pgPool backs the cube registry (issue #504: Postgres is now the only supported cube
-	// registry backend, no blob/index.json fallback) -- distinct from w.jobStore's own nil
-	// check above (jobStore is the durable job QUEUE; pgPool here is the cube registry itself,
-	// both opt-in on the SAME cfg.Postgres != nil condition, see w.pgPool's field doc comment).
-	if w.pgPool == nil {
-		return fmt.Errorf("cube backfill: postgres not configured on worker")
-	}
-
-	level.Info(log.Logger).Log("msg", "processing cube backfill job (postgres)",
-		"job_id", job.ID, "tenant", job.Tenant, "cube_id", detail.CubeID)
-
-	// Load the real registry entry (dimensions, AggAttrs, filters). A missing
-	// entry is a hard, immediate failure (2026-07-14 fix) -- proceeding into
-	// RunCubeBackfill with a placeholder entry lacking AggAttrs would fail
-	// cube.Backfiller's per-minute validation on every single minute of the
-	// backfill window, burning the job's entire ctx budget for nothing.
-	entry, err := blockpack.LoadCubeEntry(ctx, w.pgPool, job.Tenant, detail.CubeID)
-	if err != nil {
-		return fmt.Errorf("cube backfill: no registry entry found for cube %s: %w", detail.CubeID, err)
-	}
-
-	// Bound the backfill window by the tenant's actual effective retention (2026-07-17,
-	// follow-up to #512): blocks physically cannot exist past this point, so bounding the
-	// backfill window here is not an artificial cap, just an accurate one -- an unbounded
-	// window still terminates (empty per-minute lookups are cheap), but wastes serial
-	// iterations discovering that on its own instead of knowing it upfront.
-	retentionMinutes := effectiveBlockRetentionMinutes(w.cfg.Compactor.BlockRetention, w.BlockRetentionForTenant(job.Tenant))
-
-	// Run backfill synchronously (the worker goroutine is already async).
-	// detail.WindowMinutes is the per-job bound (job-planner's chained continuation
-	// jobs, or math.MaxUint32 for the reactive trigger's first job -- cubequerypath.go's
-	// existing literal, unchanged); retentionMinutes remains an outer ceiling a job's
-	// window can never exceed, regardless of what WindowMinutes requests (issue #518,
-	// Correction 1: WindowMinutes was previously write-only dead JSONB).
-	if err := vblockpack.RunCubeBackfill(ctx, entry, w.s3Cfg, w.pgPool, detail.WindowMinutes, retentionMinutes); err != nil {
-		return fmt.Errorf("cube backfill failed: %w", err)
-	}
-
-	return nil
 }
 
 func (w *BackendWorker) processCompactionJob(ctx context.Context, resp *tempopb.NextJobResponse) error {
@@ -788,10 +426,6 @@ func (w *BackendWorker) completeRedactionJob(ctx context.Context, jobID string, 
 }
 
 func (w *BackendWorker) stopping(_ error) error {
-	if w.pgPool != nil {
-		w.pgPool.Close()
-	}
-
 	if w.subservices != nil {
 		return services.StopManagerAndAwaitStopped(context.Background(), w.subservices)
 	}
@@ -868,24 +502,6 @@ func (w *BackendWorker) Owns(hash string) bool {
 	level.Debug(log.Logger).Log("msg", "checking addresses", "owning_addr", rs.Instances[0].Addr, "this_addr", ringAddr)
 
 	return rs.Instances[0].Addr == ringAddr
-}
-
-// effectiveBlockRetentionMinutes resolves a tenant's effective block retention, in minutes, for
-// bounding a cube backfill window (2026-07-17, follow-up to blockpack#512): tenantOverride wins
-// when set (nonzero), else cfgDefault -- the SAME "check for overrides" precedence tempodb.go's
-// retainTenant already uses for compaction retention. Returns 0 (RunCubeBackfill's own
-// "unbounded" convention) when the resolved retention is itself zero/unset. Pure, extracted so
-// this precedence logic has a direct unit test independent of BackendWorker's ring/S3/Postgres
-// wiring.
-func effectiveBlockRetentionMinutes(cfgDefault, tenantOverride time.Duration) uint32 {
-	retention := cfgDefault
-	if tenantOverride != 0 {
-		retention = tenantOverride
-	}
-	if retention <= 0 {
-		return 0
-	}
-	return uint32(retention / time.Minute) //nolint:gosec // retention fits uint32 minutes for any realistic config
 }
 
 func (w *BackendWorker) RecordDiscardedSpans(count int, tenantID string, traceID string, rootSpanName string, rootServiceName string) {

@@ -169,10 +169,6 @@ type BlockpackConfig struct {
 	// feature (R12's safety valve, the trigger threshold/window, the lease TTL,
 	// and the historical backfill window).
 	ViUsage ViUsageConfig `yaml:"vi_usage"`
-
-	// JobPlanner configures the job-planner Tempo target (issue #518):
-	// -target=job-planner. Disabled by default.
-	JobPlanner JobPlannerConfig `yaml:"job_planner"`
 }
 
 // ViUsageConfig configures #496's usage-triggered VI column backfill feature
@@ -311,7 +307,6 @@ func (cfg *BlockpackConfig) applyDefaults() {
 		cfg.ValueIndexPrefix = "indexes"
 	}
 	cfg.ViUsage.applyDefaults()
-	cfg.JobPlanner.applyDefaults()
 }
 
 // validate validates blockpack configuration
@@ -441,35 +436,4 @@ type ValueCountCompactorConfig struct {
 	// convention as ValueIndexCompactorConfig above.
 	ShardCount int `yaml:"shard_count"`
 	ShardIndex int `yaml:"shard_index"`
-}
-
-// JobPlannerConfig configures the job-planner Tempo target: a poll loop that
-// chain-enqueues the next bounded-window vi_backfill/cube_backfill job for
-// columns/cubes already triggered at least once with more history left to
-// backfill (issue #518) -- job-planner itself never touches object storage
-// or the block-format execution engine, only Postgres (its own backend_jobs
-// queries; backend-worker executes the actual storage-touching work every
-// job it creates describes). catalog_reap was removed outright by #154:
-// vi/vcnt/cube's reap of blockpack_file_catalog moved entirely to
-// blockpack's own compaction-planner/compaction-worker. The separate
-// catalog-maintenance poll (catalog_reconcile for trace/span, against
-// tempo's own file_catalog) was retired 2026-07-21 along with file_catalog's
-// whole reconciliation mechanism.
-type JobPlannerConfig struct {
-	Enabled           bool          `yaml:"enabled"`
-	PollInterval      time.Duration `yaml:"poll_interval"`       // default 60s
-	ViWindowSeconds   uint64        `yaml:"vi_window_seconds"`   // default 21600 (6h)
-	CubeWindowMinutes uint32        `yaml:"cube_window_minutes"` // default 1440 (24h)
-}
-
-func (c *JobPlannerConfig) applyDefaults() {
-	if c.PollInterval <= 0 {
-		c.PollInterval = 60 * time.Second
-	}
-	if c.ViWindowSeconds == 0 {
-		c.ViWindowSeconds = 6 * 3600
-	}
-	if c.CubeWindowMinutes == 0 {
-		c.CubeWindowMinutes = 1440
-	}
 }

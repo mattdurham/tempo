@@ -17,6 +17,12 @@ package vblockpack
 // 2026-07-15 migration (issue #504): cube's registry is Postgres-only now (no
 // blob/index.json fallback) -- these tests seed the pre-existing entry into a real ephemeral
 // Postgres instance (newTestPostgresPool, shared with pg_entrystore_test.go).
+//
+// 2026-07-21 migration (issue #522): the durable job insert now targets blockpack's own
+// compaction_jobs queue (pg.InsertCubeBackfillJob) instead of tempo's retired backend_jobs/
+// jobstore -- newTestPostgresPool already applies every schema blockpack owns, so no separate
+// migration call is needed, and cqp.jobStore (deleted along with jobstore) is gone; the
+// duplicate-insert test now seeds directly via cqp.pg.InsertCubeBackfillJob instead.
 
 import (
 	"context"
@@ -29,9 +35,6 @@ import (
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/grafana/tempo/tempodb/encoding/vblockpack/jobstore"
-	"github.com/grafana/tempo/tempodb/encoding/vblockpack/migrate"
 )
 
 // existingCubeEntry builds a RegistryEntry that TryCreate will recognize as "already
@@ -58,7 +61,6 @@ func existingCubeEntry(tenant string, dims []string, watermarks map[uint32]block
 // re-evaluation, closing the gap left by removing cube_backfill's poll (§5.3).
 func TestMaybeCreateCube_AlreadyExists_NoL0Watermark_InsertsRetryJob(t *testing.T) {
 	pool := newTestPostgresPool(t)
-	require.NoError(t, migrate.Apply(context.Background(), pool))
 
 	tenant := "tenant-cube-nowatermark"
 	dims := []string{"resource.service.name"}
@@ -83,7 +85,7 @@ func TestMaybeCreateCube_AlreadyExists_NoL0Watermark_InsertsRetryJob(t *testing.
 	var count int
 	require.Eventually(t, func() bool {
 		row := pool.QueryRow(context.Background(),
-			`SELECT count(*) FROM backend_jobs WHERE job_type = 'cube_backfill' AND tenant = $1 AND status = 'pending'`, tenant)
+			`SELECT count(*) FROM compaction_jobs WHERE job_type = 'cube_backfill' AND tenant = $1 AND status = 'pending'`, tenant)
 		return row.Scan(&count) == nil && count == 1
 	}, 5*time.Second, 10*time.Millisecond, "expected a durable retry job to be inserted for a never-backfilled existing cube")
 	assert.Equal(t, 1, count)
@@ -98,7 +100,6 @@ func TestMaybeCreateCube_AlreadyExists_NoL0Watermark_InsertsRetryJob(t *testing.
 // evaluation because Route already found full coverage.
 func TestMaybeCreateCube_AlreadyExists_HasL0Watermark_NoInsert(t *testing.T) {
 	pool := newTestPostgresPool(t)
-	require.NoError(t, migrate.Apply(context.Background(), pool))
 
 	tenant := "tenant-cube-haswatermark"
 	dims := []string{"resource.service.name"}
@@ -127,7 +128,7 @@ func TestMaybeCreateCube_AlreadyExists_HasL0Watermark_NoInsert(t *testing.T) {
 
 	var count int
 	row := pool.QueryRow(context.Background(),
-		`SELECT count(*) FROM backend_jobs WHERE job_type = 'cube_backfill' AND tenant = $1`, tenant)
+		`SELECT count(*) FROM compaction_jobs WHERE job_type = 'cube_backfill' AND tenant = $1`, tenant)
 	require.NoError(t, row.Scan(&count))
 	assert.Equal(t, 0, count, "a cube that already completed a backfill pass must not get a spurious retry job")
 }
@@ -136,10 +137,9 @@ func TestMaybeCreateCube_AlreadyExists_HasL0Watermark_NoInsert(t *testing.T) {
 // the idempotent-insert interaction at this specific call site: if a durable job is already
 // pending for this cube (e.g. from its original creation), re-triggering the "already
 // exists, no L0 watermark" path must not create a second row -- the partial unique dedup
-// index (jobstore) absorbs it as a no-op.
+// index (pgqueue) absorbs it as a no-op.
 func TestMaybeCreateCube_AlreadyExists_NoL0Watermark_ExistingPendingJobIsNotDuplicated(t *testing.T) {
 	pool := newTestPostgresPool(t)
-	require.NoError(t, migrate.Apply(context.Background(), pool))
 
 	tenant := "tenant-cube-dup"
 	dims := []string{"resource.service.name"}
@@ -150,8 +150,8 @@ func TestMaybeCreateCube_AlreadyExists_NoL0Watermark_ExistingPendingJobIsNotDupl
 	ConfigureCubeQueryPath(true, newFakeS3Config(t, "e2e-dup-bucket"), blockpack.NewPostgresFromPool(pool))
 	cqp := getCubeQueryPath()
 	require.NotNil(t, cqp)
-	require.NotNil(t, cqp.jobStore)
-	require.NoError(t, cqp.jobStore.InsertCubeBackfill(context.Background(), tenant, jobstore.CubeBackfillDetail{
+	require.NotNil(t, cqp.pg)
+	require.NoError(t, cqp.pg.InsertCubeBackfillJob(context.Background(), tenant, blockpack.CubeBackfillDetail{
 		CubeID: entry.CubeID, WindowMinutes: 42,
 	}))
 
@@ -170,7 +170,7 @@ func TestMaybeCreateCube_AlreadyExists_NoL0Watermark_ExistingPendingJobIsNotDupl
 
 	var count int
 	row := pool.QueryRow(context.Background(),
-		`SELECT count(*) FROM backend_jobs WHERE job_type = 'cube_backfill' AND tenant = $1`, tenant)
+		`SELECT count(*) FROM compaction_jobs WHERE job_type = 'cube_backfill' AND tenant = $1`, tenant)
 	require.NoError(t, row.Scan(&count))
 	assert.Equal(t, 1, count, "re-triggering must not duplicate an already-pending job for the same cube")
 }
@@ -185,7 +185,6 @@ func TestOnCreateAttempt_CreatedBranch_RecordsCubeColumnUsage(t *testing.T) {
 	withDedicatedColumnsLookup(t, func(string) backend.DedicatedColumns { return nil })
 
 	pool := newTestPostgresPool(t)
-	require.NoError(t, migrate.Apply(context.Background(), pool))
 
 	resetCubeQueryPathSingleton(t)
 	ConfigureCubeQueryPath(true, newFakeS3Config(t, "e2e-oncreate-usage-bucket"), blockpack.NewPostgresFromPool(pool))
@@ -230,7 +229,6 @@ func TestOnCreateAttempt_ReEvaluationBranch_RecordsCubeColumnUsage(t *testing.T)
 	withDedicatedColumnsLookup(t, func(string) backend.DedicatedColumns { return nil })
 
 	pool := newTestPostgresPool(t)
-	require.NoError(t, migrate.Apply(context.Background(), pool))
 
 	tenant := "tenant-reeval-usage"
 	dims := []string{"resource.service.name"}

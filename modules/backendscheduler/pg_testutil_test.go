@@ -6,9 +6,9 @@ package backendscheduler
 // convention already established by
 // modules/backendscheduler/filecatalog/pg_testutil_test.go. This copy
 // applies NO schema at all: BackendScheduler.New's own cfg.Postgres != nil
-// path is what's supposed to apply the backend_jobs migration via
-// migrate.Apply, so the container must start with a genuinely empty
-// database for that to be provable.
+// path is what's supposed to apply the file_catalog migration via
+// schema.ApplyFileCatalog, so the container must start with a genuinely
+// empty database for that to be provable.
 
 import (
 	"context"

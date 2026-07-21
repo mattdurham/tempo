@@ -9,11 +9,10 @@ package vblockpack
 //  1. RunCubeBackfill previously had a void return, so a real failure (e.g. a
 //     watermark-persist call against a cube ID never added to the registry) was silently
 //     swallowed -- TestE2E_RunCubeBackfill_ReturnsErrorOnRegistryFailure proves it now
-//     surfaces as a real error. The Postgres-dispatch-path proof (Store.Fail actually
-//     getting called, with a retry scheduled) lives in
-//     modules/backendworker/backend_jobs_e2e_test.go's
-//     TestE2E_CubeBackfill_FailureThenReclaimSucceeds, since that requires
-//     processCubeBackfillJobPostgres, an unexported method of a different package.
+//     surfaces as a real error. (The former Postgres-dispatch-path proof lived in
+//     modules/backendworker/backend_jobs_e2e_test.go, since retired along with
+//     processCubeBackfillJobPostgres -- issue #522 moved cube_backfill's claim-and-execute
+//     half entirely into blockpack's own compaction-worker.)
 //  2. RunCubeBackfill/LoadCubeEntry built their own minio.Client via
 //     credentials.NewEnvAWS() directly, bypassing s3backend.Config's own
 //     AccessKey/SecretKey fields entirely -- TestE2E_RunCubeBackfill_UsesConfigCredentialsNotEnv
@@ -92,8 +91,7 @@ func TestE2E_RunCubeBackfill_UsesConfigCredentialsNotEnv(t *testing.T) {
 
 	// RunCubeBackfill's own window is unbounded (math.MaxUint32 minutes), so this never
 	// reaches Done=true in test time -- bound the ctx and only assert real partial
-	// progress, mirroring TestE2E_CubeBackfill_WorkerClaimsAndExecutesWithoutGRPC
-	// (modules/backendworker/backend_jobs_e2e_test.go)'s identical accommodation.
+	// progress instead.
 	boundedCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	_ = RunCubeBackfill(boundedCtx, entry, s3cfg, pgPool, math.MaxUint32, 0)

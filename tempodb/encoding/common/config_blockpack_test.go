@@ -69,23 +69,6 @@ func TestConfig_DedicatedColumnsEnabled_ExplicitFalsePreserved(t *testing.T) {
 	assert.False(t, cfg.DedicatedColumnsEnabled)
 }
 
-// TestJobPlannerConfig_Defaults pins issue #518's job-planner poll-loop config
-// defaults (60s poll interval, 6h VI window, 24h cube window) plus issue
-// #522's catalog-maintenance default (5m catalog poll) -- applied
-// transitively via BlockpackConfig.applyDefaults(), mirroring ViUsageConfig's
-// applyDefaults() call convention above. CatalogReapGracePeriod was removed
-// outright by #154 along with the rest of tempo's now-redundant reap
-// mechanism.
-func TestJobPlannerConfig_Defaults(t *testing.T) {
-	cfg := BlockpackConfig{JobPlanner: JobPlannerConfig{Enabled: true}}
-	cfg.applyDefaults()
-
-	assert.True(t, cfg.JobPlanner.Enabled)
-	assert.Equal(t, 60*time.Second, cfg.JobPlanner.PollInterval)
-	assert.Equal(t, uint64(6*3600), cfg.JobPlanner.ViWindowSeconds)
-	assert.Equal(t, uint32(1440), cfg.JobPlanner.CubeWindowMinutes)
-}
-
 func TestBlockpackConfigValidation(t *testing.T) {
 	tests := []struct {
 		name        string
