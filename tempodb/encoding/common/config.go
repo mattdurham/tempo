@@ -446,20 +446,20 @@ type ValueCountCompactorConfig struct {
 // JobPlannerConfig configures the job-planner Tempo target: a poll loop that
 // chain-enqueues the next bounded-window vi_backfill/cube_backfill job for
 // columns/cubes already triggered at least once with more history left to
-// backfill (issue #518), plus (issue #522) a slower catalog-maintenance poll
-// that enumerates trace/span tenants for catalog_reconcile jobs --
-// job-planner itself never touches object storage or the block-format
-// execution engine, only Postgres (its own backend_jobs/file_catalog
+// backfill (issue #518) -- job-planner itself never touches object storage
+// or the block-format execution engine, only Postgres (its own backend_jobs
 // queries; backend-worker executes the actual storage-touching work every
 // job it creates describes). catalog_reap was removed outright by #154:
 // vi/vcnt/cube's reap of blockpack_file_catalog moved entirely to
-// blockpack's own compaction-planner/compaction-worker.
+// blockpack's own compaction-planner/compaction-worker. The separate
+// catalog-maintenance poll (catalog_reconcile for trace/span, against
+// tempo's own file_catalog) was retired 2026-07-21 along with file_catalog's
+// whole reconciliation mechanism.
 type JobPlannerConfig struct {
-	Enabled             bool          `yaml:"enabled"`
-	PollInterval        time.Duration `yaml:"poll_interval"`         // default 60s
-	ViWindowSeconds     uint64        `yaml:"vi_window_seconds"`     // default 21600 (6h)
-	CubeWindowMinutes   uint32        `yaml:"cube_window_minutes"`   // default 1440 (24h)
-	CatalogPollInterval time.Duration `yaml:"catalog_poll_interval"` // default 5m
+	Enabled           bool          `yaml:"enabled"`
+	PollInterval      time.Duration `yaml:"poll_interval"`       // default 60s
+	ViWindowSeconds   uint64        `yaml:"vi_window_seconds"`   // default 21600 (6h)
+	CubeWindowMinutes uint32        `yaml:"cube_window_minutes"` // default 1440 (24h)
 }
 
 func (c *JobPlannerConfig) applyDefaults() {
@@ -471,8 +471,5 @@ func (c *JobPlannerConfig) applyDefaults() {
 	}
 	if c.CubeWindowMinutes == 0 {
 		c.CubeWindowMinutes = 1440
-	}
-	if c.CatalogPollInterval <= 0 {
-		c.CatalogPollInterval = 5 * time.Minute
 	}
 }

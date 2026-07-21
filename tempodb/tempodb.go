@@ -1097,15 +1097,6 @@ func (rw *readerWriter) EnablePolling(ctx context.Context, sharder blocklist.Job
 		SkipNoCompactBlocks:        skipNoCompactBlocks,
 	}, sharder, rw.r, rw.c, rw.w, rw.logger)
 
-	// Poller flip (issue #522 #159): file_catalog as the primary block-discovery source,
-	// avoiding a real backend LIST call, for vblockpack-encoded deployments with Postgres
-	// configured. Every other deployment's polling behavior is completely unchanged --
-	// blocklistPoller.fileCatalogLister stays nil and pollTenantBlocks falls back to
-	// reader.Blocks exactly as it always has.
-	if rw.fileCatalogWriteEnabled() {
-		blocklistPoller.SetFileCatalogLister(newFileCatalogBlockLister(rw.pgPool))
-	}
-
 	rw.blocklistPoller = blocklistPoller
 	rw.pollerShutdownCh = make(chan struct{})
 

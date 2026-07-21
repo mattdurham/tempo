@@ -21,8 +21,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
-	blockpack "github.com/grafana/blockpack"
-
 	util_log "github.com/grafana/tempo/pkg/util/log"
 	"github.com/grafana/tempo/tempodb/encoding/common"
 	"github.com/grafana/tempo/tempodb/encoding/vblockpack/jobstore"
@@ -47,62 +45,35 @@ var (
 		Name:      "poll_errors_total",
 		Help:      "Total number of poll ticks that encountered an error. Never aborts the loop.",
 	})
-	metricCatalogReconcilesPlanned = promauto.NewCounter(prometheus.CounterOpts{
-		Namespace: "tempodb",
-		Subsystem: "jobplanner",
-		Name:      "catalog_reconciles_planned_total",
-		Help:      "Total number of catalog_reconcile jobs enqueued by job-planner (issue #522).",
-	})
-	metricCatalogPollErrors = promauto.NewCounter(prometheus.CounterOpts{
-		Namespace: "tempodb",
-		Subsystem: "jobplanner",
-		Name:      "catalog_poll_errors_total",
-		Help:      "Total number of catalog-maintenance poll ticks that encountered an error. Never aborts the loop.",
-	})
-	metricTraceCompactionsPlanned = promauto.NewCounter(prometheus.CounterOpts{
-		Namespace: "tempodb",
-		Subsystem: "jobplanner",
-		Name:      "trace_compactions_planned_total",
-		Help:      "Total number of trace_compaction jobs enqueued by job-planner (issue #522 #158).",
-	})
 )
 
 // Service is the job-planner poll loop.
 type Service struct {
-	pool             *pgxpool.Pool
-	jobStore         *jobstore.Store
-	fileCatalogStore *blockpack.FileCatalogStore
-	cfg              common.JobPlannerConfig
+	pool     *pgxpool.Pool
+	jobStore *jobstore.Store
+	cfg      common.JobPlannerConfig
 
 	// pollFn defaults to s.pollOnce; overridable in tests so Run's
 	// ticker/error-handling logic is unit-testable without a real Postgres
 	// connection.
 	pollFn func(ctx context.Context) error
-
-	// catalogPollFn defaults to s.catalogPollOnce; overridable in tests for the
-	// same reason as pollFn above (issue #522's catalog-maintenance ticker).
-	catalogPollFn func(ctx context.Context) error
 }
 
 // New constructs a Service backed by pool.
 func New(pool *pgxpool.Pool, cfg common.JobPlannerConfig) *Service {
 	s := &Service{
-		pool: pool, jobStore: jobstore.New(pool), fileCatalogStore: blockpack.NewFileCatalogStore(pool), cfg: cfg,
+		pool: pool, jobStore: jobstore.New(pool), cfg: cfg,
 	}
 	s.pollFn = s.pollOnce
-	s.catalogPollFn = s.catalogPollOnce
 	return s
 }
 
-// Run ticks pollFn every cfg.PollInterval and catalogPollFn every
-// cfg.CatalogPollInterval, on two independent tickers (mirroring
-// backendscheduler.running's multi-ticker select loop) -- catalog
-// maintenance (issue #522's trace/span catalog_reconcile, per #154) has no
-// tight latency requirement, so it runs on its own, slower cadence rather
-// than sharing PollInterval's tick. Either tick's error is logged and never
-// aborts the loop (mirrors backendscheduler's "one bad tick doesn't kill the
-// poller" posture) -- a transient Postgres blip should not require the whole
-// process to restart.
+// Run ticks pollFn every cfg.PollInterval. A tick's error is logged and
+// never aborts the loop -- a transient Postgres blip should not require the
+// whole process to restart. The separate catalog-maintenance ticker (trace/
+// span catalog_reconcile, #154) was retired 2026-07-21 along with
+// file_catalog's whole reconciliation mechanism (both here and
+// backendscheduler's own filecatalog.Lister ticker) -- see NOTES.md.
 func (s *Service) Run(ctx context.Context) error {
 	if !s.cfg.Enabled {
 		<-ctx.Done()
@@ -110,8 +81,6 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 	ticker := time.NewTicker(s.cfg.PollInterval)
 	defer ticker.Stop()
-	catalogTicker := time.NewTicker(s.cfg.CatalogPollInterval)
-	defer catalogTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -120,11 +89,6 @@ func (s *Service) Run(ctx context.Context) error {
 			if err := s.pollFn(ctx); err != nil {
 				metricPollErrors.Inc()
 				level.Warn(util_log.Logger).Log("msg", "jobplanner: poll tick failed", "err", err)
-			}
-		case <-catalogTicker.C:
-			if err := s.catalogPollFn(ctx); err != nil {
-				metricCatalogPollErrors.Inc()
-				level.Warn(util_log.Logger).Log("msg", "jobplanner: catalog poll tick failed", "err", err)
 			}
 		}
 	}
@@ -153,21 +117,4 @@ func (s *Service) pollOnce(ctx context.Context) error {
 		return viErr
 	}
 	return cubeErr
-}
-
-// CatalogPollOnce runs a single catalog-maintenance tick synchronously and
-// returns its error directly, mirroring PollOnce's exported-for-integration-
-// tests rationale above.
-func (s *Service) CatalogPollOnce(ctx context.Context) error {
-	return s.catalogPollFn(ctx)
-}
-
-// catalogPollOnce plans catalog_reconcile for one tick (issue #522,
-// trace/span-only per #154). catalog_reap was removed outright: it
-// processed only vi/vcnt/cube rows against blockpack_file_catalog, which now
-// belongs entirely to blockpack's own compaction-planner (plan.md Section
-// G.3) -- keeping it here too would race the same rows into two independent
-// delete pipelines.
-func (s *Service) catalogPollOnce(ctx context.Context) error {
-	return s.planCatalogReconcile(ctx)
 }

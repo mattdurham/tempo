@@ -100,19 +100,6 @@ type JobSharder interface {
 	Owns(string) bool
 }
 
-// FileCatalogBlockLister is an OPTIONAL capability the Poller uses INSTEAD OF a real backend
-// LIST call (reader.Blocks) to discover a tenant's current live/compacted block IDs, for
-// vblockpack-encoded deployments with Postgres configured (issue #522 #159's poller flip). Set
-// via Poller.SetFileCatalogLister -- nil (the default) means every deployment's existing
-// behavior is completely unchanged: pollTenantBlocks falls back to reader.Blocks exactly as it
-// always has. Returns the same (live, compacted, error) shape as backend.Reader.Blocks so
-// pollTenantBlocks's downstream diff-against-previous/pollUnknown logic needs zero changes --
-// file_catalog rows never carried full BlockMeta content anyway, only IDs/discovery data,
-// matching Blocks()'s own existing contract exactly.
-type FileCatalogBlockLister interface {
-	ListBlockIDs(ctx context.Context, tenantID string) (live []uuid.UUID, compacted []uuid.UUID, err error)
-}
-
 // OwnsNothingSharder owns nothing. You do not want this developer on your team.
 var OwnsNothingSharder = ownsNothingSharder{}
 
@@ -134,10 +121,6 @@ type Poller struct {
 
 	sharder JobSharder
 	logger  log.Logger
-
-	// fileCatalogLister is nil by default (see FileCatalogBlockLister's own doc comment for
-	// the exact fallback contract).
-	fileCatalogLister FileCatalogBlockLister
 }
 
 // NewPoller creates the Poller
@@ -151,15 +134,6 @@ func NewPoller(cfg *PollerConfig, sharder JobSharder, reader backend.Reader, com
 		sharder: sharder,
 		logger:  logger,
 	}
-}
-
-// SetFileCatalogLister installs an optional FileCatalogBlockLister (issue #522 #159) --
-// pollTenantBlocks uses it instead of reader.Blocks whenever it's non-nil. Callers gate this on
-// their own deployment-level conditions (cfg.Postgres configured AND Block.Version ==
-// "vblockpack", see tempodb.go's EnablePolling) -- the Poller itself has no opinion on when
-// this should be set, it only obeys nil-vs-non-nil.
-func (p *Poller) SetFileCatalogLister(lister FileCatalogBlockLister) {
-	p.fileCatalogLister = lister
 }
 
 // Do does the doing of getting a blocklist
@@ -352,21 +326,7 @@ func (p *Poller) pollTenantBlocks(
 	derivedCtx, span := tracer.Start(ctx, "Poller.pollTenantBlocks")
 	defer span.End()
 
-	var (
-		currentBlockIDs          []uuid.UUID
-		currentCompactedBlockIDs []uuid.UUID
-		err                      error
-	)
-	if p.fileCatalogLister != nil {
-		// issue #522 #159: file_catalog as primary source, avoiding the real backend LIST
-		// call below for vblockpack-encoded deployments -- everything downstream (diffing
-		// against previous, pollUnknown/pollBlock fetching full BlockMeta content for
-		// genuinely new IDs) is byte-identical either way.
-		currentBlockIDs, currentCompactedBlockIDs, err = p.fileCatalogLister.ListBlockIDs(derivedCtx, tenantID)
-		span.SetAttributes(attribute.Bool("file_catalog_primary", true))
-	} else {
-		currentBlockIDs, currentCompactedBlockIDs, err = p.reader.Blocks(derivedCtx, tenantID)
-	}
+	currentBlockIDs, currentCompactedBlockIDs, err := p.reader.Blocks(derivedCtx, tenantID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed listing tenant blocks: %w", err)
 	}

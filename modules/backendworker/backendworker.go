@@ -380,8 +380,6 @@ func (w *BackendWorker) processJobs(ctx context.Context) error {
 // postgresJobClaimPriority is the order tryClaimPostgresJob tries each
 // Postgres job type in -- arbitrary priority (revisit if real production
 // data shows one starving another -- no evidence either way today).
-// catalog_reconcile (issue #522, trace/span-only per #154) is tried last:
-// it isn't latency-sensitive the way vi_backfill/cube_backfill chaining is.
 // catalog_reap was removed outright by #154: it processed only vi/vcnt/cube
 // rows against blockpack_file_catalog, which now belongs entirely to
 // blockpack's own compaction-worker (plan.md Section G.4) -- keeping it here
@@ -394,10 +392,14 @@ func (w *BackendWorker) processJobs(ctx context.Context) error {
 // compaction-planner/compaction-worker, using the SAME shared worker pool
 // VI/VCNT/cube already use -- this job type no longer exists in tempo's
 // jobstore at all either.
+// catalog_reconcile (trace/span-only, #154) was retired 2026-07-21: it was
+// filecatalog.Lister's ticker-driven reconciliation, job-triggered instead --
+// file_catalog's whole reason for existing (avoiding a real backend LIST
+// call in the blocklist Poller) was itself rolled back the same day, so both
+// reconciliation paths for that table are gone now.
 var postgresJobClaimPriority = []jobstore.JobType{
 	jobstore.JobTypeViBackfill,
 	jobstore.JobTypeCubeBackfill,
-	jobstore.JobTypeCatalogReconcile,
 }
 
 // tryClaimPostgresJob tries each of postgresJobClaimPriority in order.
@@ -439,8 +441,6 @@ func (w *BackendWorker) dispatchPostgresJob(ctx context.Context, job *jobstore.J
 		err = w.processViBackfillJobPostgres(ctx, job)
 	case jobstore.JobTypeCubeBackfill:
 		err = w.processCubeBackfillJobPostgres(ctx, job)
-	case jobstore.JobTypeCatalogReconcile:
-		err = w.processCatalogReconcileJobPostgres(ctx, job)
 	default:
 		err = fmt.Errorf("unknown postgres job type: %s", job.Type)
 	}

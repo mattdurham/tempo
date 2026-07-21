@@ -84,7 +84,6 @@ func TestJobPlannerConfig_Defaults(t *testing.T) {
 	assert.Equal(t, 60*time.Second, cfg.JobPlanner.PollInterval)
 	assert.Equal(t, uint64(6*3600), cfg.JobPlanner.ViWindowSeconds)
 	assert.Equal(t, uint32(1440), cfg.JobPlanner.CubeWindowMinutes)
-	assert.Equal(t, 5*time.Minute, cfg.JobPlanner.CatalogPollInterval)
 }
 
 func TestBlockpackConfigValidation(t *testing.T) {

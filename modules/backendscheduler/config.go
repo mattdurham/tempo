@@ -27,11 +27,6 @@ type Config struct {
 	// tempodb.Config.Postgres, reused (not a second copy), since both flow
 	// from the same top-level Postgres connection in a real deployment.
 	Postgres *postgres.Config `yaml:"postgres"`
-	// CatalogListInterval is how often the file-catalog lister reconciles
-	// backend-scheduler's in-memory blocklist into Postgres. Default 5m.
-	// Independent of BlocklistPoll -- see filecatalog package doc comment for
-	// the CompactedBlockRetention safety-margin dependency this interval has.
-	CatalogListInterval time.Duration `yaml:"catalog_list_interval"`
 }
 
 func (cfg *Config) RegisterFlagsAndApplyDefaults(prefix string, f *flag.FlagSet) {
@@ -40,8 +35,6 @@ func (cfg *Config) RegisterFlagsAndApplyDefaults(prefix string, f *flag.FlagSet)
 	f.DurationVar(&cfg.JobTimeout, prefix+"backend-scheduler.job-timeout", 15*time.Second, "Internal duration to wait for a job before telling the worker to try again")
 
 	f.StringVar(&cfg.LocalWorkPath, prefix+"backend-scheduler.local-work-path", "/var/tempo", "Path to store local work cache.")
-
-	f.DurationVar(&cfg.CatalogListInterval, prefix+"backend-scheduler.catalog-list-interval", 5*time.Minute, "Interval at which to reconcile the in-memory blocklist into the Postgres file catalog (only used when postgres is configured)")
 
 	cfg.Work.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "work"), f)
 

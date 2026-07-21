@@ -17,7 +17,6 @@ import (
 	"github.com/grafana/dskit/services"
 	"github.com/grafana/dskit/user"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/grafana/tempo/modules/backendscheduler/filecatalog"
 	"github.com/grafana/tempo/modules/backendscheduler/provider"
 	"github.com/grafana/tempo/modules/backendscheduler/work"
 	"github.com/grafana/tempo/modules/overrides"
@@ -63,17 +62,13 @@ type BackendScheduler struct {
 
 	mergedJobs chan *work.Job
 
-	// catalogLister is nil when Postgres is not configured (cfg.Postgres ==
-	// nil) -- the same nil-means-disabled convention used everywhere else in
-	// this plan. Non-nil means running() ticks it on cfg.CatalogListInterval.
-	catalogLister *filecatalog.Lister
-
-	// pgPool is nil under the exact same condition as catalogLister
-	// (cfg.Postgres == nil). Backs the direct-write-primary mirror of a
-	// redaction batch's start/finish into tenant_redaction_state (issue #522
-	// #152/Phase 4c) -- SubmitRedaction/cleanupBatchIfDone write to it
-	// directly, on the SAME pool catalogLister/the backend_jobs migration
-	// already share, rather than opening a second connection.
+	// pgPool is nil when Postgres is not configured (cfg.Postgres == nil) --
+	// the same nil-means-disabled convention used everywhere else in this
+	// plan. Backs the direct-write-primary mirror of a redaction batch's
+	// start/finish into tenant_redaction_state (issue #522 #152/Phase 4c) --
+	// SubmitRedaction/cleanupBatchIfDone write to it directly, on the SAME
+	// pool the backend_jobs migration already shares, rather than opening a
+	// second connection.
 	pgPool *pgxpool.Pool
 }
 
@@ -140,35 +135,32 @@ func New(cfg Config, s3cfg *s3backend.Config, store storage.Store, overrides ove
 		},
 	}
 
-	// File catalog lister (2026-07-11): opt-in, nil when cfg.Postgres is nil.
-	// No new binary -- piggybacks on this already-singleton process, reusing
-	// s.store.BlockMetas/Tenants (already-live, already-maintained state) on
-	// its own, independent tick.
+	// Postgres pool (2026-07-11): opt-in, nil when cfg.Postgres is nil. Backs
+	// tenant_redaction_state (redaction) and backend_jobs (vi_backfill/
+	// cube_backfill's now-superseded machinery -- retained here only because
+	// this pool is shared).
 	if cfg.Postgres != nil {
 		pool, perr := postgres.NewPool(context.Background(), cfg.Postgres)
 		if perr != nil {
-			level.Warn(log.Logger).Log("msg", "file catalog lister disabled -- postgres pool init failed", "err", perr)
+			level.Warn(log.Logger).Log("msg", "postgres pool init failed", "err", perr)
 		} else {
 			// backend_jobs migration (2026-07-14, #181 Phase 0): applied
-			// idempotently on every startup, same failure posture as
-			// filecatalog.NewLister below -- degrade (warn, leave whatever
+			// idempotently on every startup -- degrade (warn, leave whatever
 			// depends on the migrated schema unavailable) rather than crash
 			// the process.
 			if merr := migrate.Apply(context.Background(), pool); merr != nil {
 				level.Warn(log.Logger).Log("msg", "backend_jobs schema migration failed", "err", merr)
 			}
 			// file_catalog migration (issue #522 #152): same idempotent,
-			// apply-on-every-startup posture as backend_jobs above -- closes a
-			// pre-existing gap where file_catalog.sql (including
-			// tenant_redaction_state, #143) was never actually applied by any
-			// production code path, only by test infra's os.ReadFile-based
-			// helpers. Needed now that markTenantRedactionPending/
-			// clearTenantRedactionPending (redaction_state.go) depend on
-			// tenant_redaction_state genuinely existing.
+			// apply-on-every-startup posture as backend_jobs above. Kept even
+			// though file_catalog's own table is no longer read/written by
+			// anything (2026-07-21 rollback) -- tenant_redaction_state (#143)
+			// lives in the SAME schema file and markTenantRedactionPending/
+			// clearTenantRedactionPending (redaction_state.go) still depend on
+			// it genuinely existing.
 			if merr := schema.ApplyFileCatalog(context.Background(), pool); merr != nil {
 				level.Warn(log.Logger).Log("msg", "file_catalog schema migration failed", "err", merr)
 			}
-			s.catalogLister = filecatalog.NewLister(pool, s.store.BlockMetas, s.store.Tenants)
 			s.pgPool = pool
 		}
 	}
@@ -244,9 +236,6 @@ func (s *BackendScheduler) running(ctx context.Context) error {
 	backendFlushTicker := time.NewTicker(s.cfg.BackendFlushInterval)
 	defer backendFlushTicker.Stop()
 
-	catalogListTicker := time.NewTicker(s.cfg.CatalogListInterval)
-	defer catalogListTicker.Stop()
-
 	var err error
 
 	for {
@@ -263,15 +252,6 @@ func (s *BackendScheduler) running(ctx context.Context) error {
 			if err != nil && !errors.Is(err, context.Canceled) {
 				metricWorkFlushesFailed.Inc()
 				level.Error(log.Logger).Log("msg", "failed to flush work cache to backend", "error", err)
-			}
-		case <-catalogListTicker.C:
-			// s.catalogLister == nil (Postgres not configured) makes this a
-			// cheap no-op nil check per tick -- zero risk to this singleton's
-			// other responsibilities.
-			if s.catalogLister != nil {
-				if lerr := s.catalogLister.RunOnce(ctx); lerr != nil {
-					level.Warn(log.Logger).Log("msg", "file catalog list pass failed", "err", lerr)
-				}
 			}
 		}
 	}
@@ -292,11 +272,12 @@ func (s *BackendScheduler) stopping(_ error) error {
 		return fmt.Errorf("failed to flush work cache to backend on shutdown: %w", err)
 	}
 
-	// s.catalogLister.Close() is nil-safe (both on a nil *Lister and a nil
-	// pool) -- closes the file-catalog Postgres pool so it never leaks past
-	// this process's shutdown, mirroring tempodb.go's readerWriter.Shutdown()
+	// nil-safe -- closes the Postgres pool so it never leaks past this
+	// process's shutdown, mirroring tempodb.go's readerWriter.Shutdown()
 	// closing its own pgPool identically.
-	s.catalogLister.Close()
+	if s.pgPool != nil {
+		s.pgPool.Close()
+	}
 
 	level.Info(log.Logger).Log("msg", "backend scheduler stopping")
 	return nil

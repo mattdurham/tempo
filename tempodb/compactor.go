@@ -393,11 +393,6 @@ func markCompacted(ctx context.Context, rw *readerWriter, tenantID string, oldBl
 	// Update blocklist in memory
 	rw.blocklist.Update(tenantID, newBlocks, oldBlocks, newCompactions, nil)
 
-	// Direct-write-primary mirror into file_catalog (issue #522 #159) -- in addition to, not
-	// instead of, the filesystem-level MarkBlockCompacted calls above. No-op unless this
-	// deployment has both Postgres configured and Block.Version == "vblockpack".
-	rw.writeCompactionToFileCatalog(ctx, tenantID, oldBlocks, newBlocks)
-
 	if errCount > 0 {
 		return fmt.Errorf("unable to mark %d blocks compacted", errCount)
 	}

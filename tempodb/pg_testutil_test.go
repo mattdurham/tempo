@@ -11,12 +11,54 @@ package tempodb
 
 import (
 	"context"
+	"path"
 	"strings"
 	"testing"
 
+	"github.com/go-kit/log"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/stretchr/testify/require"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
+
+	"github.com/grafana/tempo/modules/postgres"
+	"github.com/grafana/tempo/tempodb/backend"
+	"github.com/grafana/tempo/tempodb/backend/local"
+	"github.com/grafana/tempo/tempodb/encoding/common"
+	"github.com/grafana/tempo/tempodb/wal"
 )
+
+// newTestReaderWriter constructs a real *readerWriter (via New(), the same
+// production factory every caller uses) over a local backend, optionally with
+// a real Postgres pool wired in (cfg.Postgres) -- shared by any test in this
+// package that needs a genuine *readerWriter rather than a fake.
+func newTestReaderWriter(t *testing.T, version string, withPostgres bool) *readerWriter {
+	t.Helper()
+	tempDir := t.TempDir()
+	cfg := &Config{
+		Backend: backend.Local,
+		Local:   &local.Config{Path: path.Join(tempDir, "traces")},
+		Block: &common.BlockConfig{
+			BloomFP:             .01,
+			BloomShardSizeBytes: 100_000,
+			Version:             version,
+		},
+		WAL:           &wal.Config{Filepath: path.Join(tempDir, "wal")},
+		BlocklistPoll: 0,
+		Search: &SearchConfig{
+			ChunkSizeBytes:  1_000_000,
+			ReadBufferCount: 8, ReadBufferSizeBytes: 4 * 1024 * 1024,
+		},
+	}
+	if withPostgres {
+		cfg.Postgres = &postgres.Config{DSN: newTestPostgresPool(t)}
+	}
+
+	r, _, _, err := New(cfg, nil, log.NewNopLogger())
+	require.NoError(t, err)
+	rw, ok := r.(*readerWriter)
+	require.True(t, ok, "New() must return a *readerWriter under the Reader interface")
+	return rw
+}
 
 func newTestPostgresPool(t *testing.T) string {
 	t.Helper()
