@@ -406,6 +406,44 @@ func TestReadError(t *testing.T) {
 	assert.Equal(t, wups, errB)
 }
 
+// TestReadRange_NoSuchKey_ReturnsErrDoesNotExist is a real, over-the-wire regression guard
+// (2026-07-21): readRange's own error handling previously wrapped every GetObject failure --
+// including a genuine 404 -- into an opaque fmt.Errorf chain that lost the underlying
+// minio.ErrorResponse, so errors.Is(err, backend.ErrDoesNotExist) could never match a range-read
+// 404 the way it already could for a whole-object read (readAllWithObjInfo). This is the actual
+// bug behind vblockpack query paths hard-failing on a block deleted since the querier's last
+// blocklist poll, since vblockpack's footer/section reads all go through ReadRange, never Read.
+func TestReadRange_NoSuchKey_ReturnsErrDoesNotExist(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A GET carrying a Range header is the actual per-object range read under test; any
+		// other GET (bucket-exists check, ListObjects during New()) gets a benign empty-list
+		// response so only the object read itself exercises the 404 path.
+		if r.Method == getMethod && r.Header.Get("Range") != "" {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message><Key>test/object</Key></Error>`))
+			return
+		}
+		_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><ListBucketResult></ListBucketResult>`))
+	}))
+	t.Cleanup(server.Close)
+
+	r, _, _, err := New(&Config{
+		Region:    "blerg",
+		AccessKey: "test",
+		SecretKey: flagext.SecretWithValue("test"),
+		Bucket:    "blerg",
+		Insecure:  true,
+		Endpoint:  server.URL[7:], // [7:] -> strip http://
+	})
+	require.NoError(t, err)
+
+	err = r.ReadRange(context.Background(), "object", backend.KeyPath{"test"}, 0, make([]byte, 10), nil)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, backend.ErrDoesNotExist,
+		"a range-read 404 must classify as backend.ErrDoesNotExist so callers can tolerate a block deleted since the last blocklist poll, not just whole-object Read")
+}
+
 func fakeServerWithHeader(t *testing.T, httpHeader *http.Header) *httptest.Server {
 	require.NotNil(t, httpHeader)
 

@@ -677,6 +677,12 @@ func (rw *readerWriter) readRange(ctx context.Context, objName string, offset in
 		return fmt.Errorf("error setting headers for range read in s3: %w", err)
 	}
 	reader, _, _, err := rw.hedgedCore.GetObject(ctx, rw.cfg.Bucket, objName, options)
+	// readError classifies a 404 as backend.ErrDoesNotExist -- must run on the raw minio error
+	// here, before any fmt.Errorf wrapping below, since minio.ToErrorResponse (which readError
+	// uses) cannot see through a %w chain to find the underlying minio.ErrorResponse.
+	if errors.Is(readError(err), backend.ErrDoesNotExist) {
+		return backend.ErrDoesNotExist
+	}
 	if err != nil {
 		return fmt.Errorf("error in range read from s3 backend, bucket: %s, objName: %s: %w", rw.cfg.Bucket, objName, err)
 	}

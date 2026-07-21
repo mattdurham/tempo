@@ -22,6 +22,8 @@ import (
 	"net/http"
 
 	"github.com/grafana/blockpack"
+
+	"github.com/grafana/tempo/tempodb/backend"
 )
 
 // DeclineErrorToHTTPResponse maps a typed decline sentinel (from either repo — blockpack's F-4
@@ -119,6 +121,19 @@ func DeclineErrorToHTTPResponse(err error) (status int, message string, matched 
 		// same distinct-message reason as ErrTraceByIDIndexNotConfigured above.
 		return http.StatusUnprocessableEntity,
 			"trace lookup index has no coverage yet (materialized index still building for this window)",
+			true
+
+	case errors.Is(err, backend.ErrDoesNotExist):
+		// 2026-07-21: the querier's own local blocklist cache (poller-refreshed on a multi-minute
+		// cycle, independently per replica) can still reference a block that blockpack's own
+		// compaction-worker has already deleted via catalog_reap -- the SAME data now lives in a
+		// newer, already-compacted output block that IS a current candidate, so dropping this one
+		// stale reference loses nothing once the blocklist catches up (grafana/blockpack#525 is
+		// the real, structural fix: source block existence from Postgres directly instead of the
+		// classic poller). Tolerable exactly like ErrCubeWarming above -- a repeat query after the
+		// next poll cycle should no longer even select this block.
+		return http.StatusUnprocessableEntity,
+			"a candidate block was already compacted away since this querier's last blocklist refresh; retry shortly",
 			true
 
 	default:

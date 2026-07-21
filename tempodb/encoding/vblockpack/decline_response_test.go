@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/grafana/blockpack"
+	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding/common"
 	"github.com/stretchr/testify/require"
 )
@@ -36,6 +37,7 @@ func TestDeclineErrorToHTTPResponse_ShapeNotAnswerable_Returns4xxWithActionableM
 		{"StructuralIndexCoverageGap", blockpack.ErrStructuralIndexCoverageGap},
 		{"TraceByIDIndexNotConfigured", blockpack.ErrTraceByIDIndexNotConfigured},
 		{"TraceByIDCoverageGap", blockpack.ErrTraceByIDCoverageGap},
+		{"BlockCompactedAwaySinceLastPoll", backend.ErrDoesNotExist},
 	}
 	seenMessages := make(map[string]bool, len(cases))
 	for _, tc := range cases {
