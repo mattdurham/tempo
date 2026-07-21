@@ -389,14 +389,14 @@ func (w *BackendWorker) processJobs(ctx context.Context) error {
 // vi_compaction was removed by #155: candidate-selection and execution both
 // moved into blockpack's own compaction-planner/compaction-worker, so this
 // job type no longer exists in tempo's jobstore at all.
-// trace_compaction (issue #522 #158, staged rollout) is tried right after the
-// existing backfill chaining and before catalog_reconcile -- pairwise
-// trace/span compaction for vblockpack-encoded tenants, alongside (not yet
-// replacing) the legacy gRPC CompactionProvider path.
+// trace_compaction was likewise removed (same session, same-day pivot):
+// candidate-selection and execution both moved into blockpack's own
+// compaction-planner/compaction-worker, using the SAME shared worker pool
+// VI/VCNT/cube already use -- this job type no longer exists in tempo's
+// jobstore at all either.
 var postgresJobClaimPriority = []jobstore.JobType{
 	jobstore.JobTypeViBackfill,
 	jobstore.JobTypeCubeBackfill,
-	jobstore.JobTypeTraceCompaction,
 	jobstore.JobTypeCatalogReconcile,
 }
 
@@ -439,8 +439,6 @@ func (w *BackendWorker) dispatchPostgresJob(ctx context.Context, job *jobstore.J
 		err = w.processViBackfillJobPostgres(ctx, job)
 	case jobstore.JobTypeCubeBackfill:
 		err = w.processCubeBackfillJobPostgres(ctx, job)
-	case jobstore.JobTypeTraceCompaction:
-		err = w.processTraceCompactionJobPostgres(ctx, job)
 	case jobstore.JobTypeCatalogReconcile:
 		err = w.processCatalogReconcileJobPostgres(ctx, job)
 	default:

@@ -140,27 +140,19 @@ func (s *Service) PollOnce(ctx context.Context) error {
 	return s.pollFn(ctx)
 }
 
-// pollOnce plans vi_backfill/cube_backfill continuations, plus (issue #522
-// #158) trace/span pairwise compaction candidates, for one tick. Each part
-// runs independently -- a failure planning one must not prevent the others
-// from being planned in the same tick. VI compaction candidate selection no
-// longer lives here (issue #522 revision note pivot #4): it moved to
-// blockpack's own compaction-planner (#155). trace_compaction stays here,
-// not catalogPollOnce's slower ticker -- unlike catalog_reconcile's
-// maintenance-only cadence, compaction candidate selection benefits from the
-// main, faster PollInterval the same way vi_backfill/cube_backfill chaining
-// does.
+// pollOnce plans vi_backfill/cube_backfill continuations for one tick. Each part runs
+// independently -- a failure planning one must not prevent the other from being planned in the
+// same tick. Compaction candidate selection (VI/VCNT/cube, and -- as of this same session --
+// trace/span too) no longer lives here at all: it moved entirely to blockpack's own
+// compaction-planner, which plans directly from blockpack_file_catalog and dispatches to the
+// same shared compaction-worker pool regardless of subsystem.
 func (s *Service) pollOnce(ctx context.Context) error {
 	viErr := s.planVi(ctx)
 	cubeErr := s.planCube(ctx)
-	traceCompactionErr := s.planTraceCompaction(ctx)
 	if viErr != nil {
 		return viErr
 	}
-	if cubeErr != nil {
-		return cubeErr
-	}
-	return traceCompactionErr
+	return cubeErr
 }
 
 // CatalogPollOnce runs a single catalog-maintenance tick synchronously and

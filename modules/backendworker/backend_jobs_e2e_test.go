@@ -188,11 +188,12 @@ func newTestPostgresPoolAndDSN(t *testing.T) (*pgxpool.Pool, string) {
 	// still write to, and trace/span's own catalog_reconcile still reads it here).
 	require.NoError(t, blockpack.ApplyFileCatalogSchema(ctx, pool))
 	// issue #522 #158: tempo's OWN file_catalog.sql (a different table from
-	// blockpack_file_catalog above) -- jobplanner.Service.PollOnce now also runs
-	// planTraceCompaction on every tick, which queries file_catalog/tenant_redaction_state
-	// unconditionally, so any test driving PollOnce against this pool (e.g.
-	// jobplanner_chained_progress_e2e_test.go) needs this schema present even though its
-	// own assertions are about VI/cube chaining, not trace compaction.
+	// blockpack_file_catalog above) -- trace/span compaction planning moved out of
+	// jobplanner entirely (it now lives in blockpack's own compaction-planner, reading
+	// blockpack_file_catalog), but jobplanner.Service.CatalogPollOnce still runs
+	// planCatalogReconcile against this table for retention/redaction/VCNT-exclusion
+	// purposes, so any test driving that path against this pool still needs this
+	// schema present.
 	applySchemaFile(ctx, t, pool, fileCatalogSchemaPath)
 	return pool, dsn
 }
