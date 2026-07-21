@@ -53,11 +53,23 @@ func (w *BackendWorker) processTraceCompactionJobPostgres(ctx context.Context, j
 			}
 		}
 	}
-	if len(sourceMetas) != len(detail.InputBlockIDs) {
-		return fmt.Errorf(
-			"trace_compaction: found %d of %d input blocks still live in tenant %q's blocklist",
-			len(sourceMetas), len(detail.InputBlockIDs), job.Tenant,
+	if len(sourceMetas) < 2 {
+		// A planned input already vanished from the live blocklist by the time this job
+		// actually ran (already compacted by a race, or cleared by retention/reconciliation)
+		// -- not a failure. Blocks disappear independent of this handler's own actions,
+		// exactly like blockpack_file_catalog's VI/VCNT/cube inputs do (issue #522,
+		// SPEC-COMPACTIONWORKER-7/8 in blockpack) -- file_catalog's own
+		// modules/backendscheduler/filecatalog/lister.go already notices and soft-deletes
+		// the vanished block's row independently on its own reconciliation tick, so this
+		// handler doesn't need to touch file_catalog itself. Any block that IS still live
+		// is left completely untouched for job-planner to pair with a different sibling in
+		// a future planning pass.
+		level.Warn(log.Logger).Log(
+			"msg", "trace_compaction job has fewer than 2 live input blocks, skipping",
+			"job_id", job.ID, "tenant", job.Tenant,
+			"requested", len(detail.InputBlockIDs), "live", len(sourceMetas),
 		)
+		return nil
 	}
 
 	newCompacted, err := w.compact(ctx, sourceMetas, job.Tenant)

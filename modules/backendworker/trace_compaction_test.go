@@ -75,10 +75,14 @@ func TestProcessTraceCompactionJobPostgres_WrongInputCount_ReturnsError(t *testi
 	}
 }
 
-// TestProcessTraceCompactionJobPostgres_BlockNotLive_ReturnsError proves the handler fails
-// rather than silently compacting fewer blocks than the job specified, when an input block ID
-// can no longer be found in the tenant's live blocklist (e.g. already compacted by a race).
-func TestProcessTraceCompactionJobPostgres_BlockNotLive_ReturnsError(t *testing.T) {
+// TestProcessTraceCompactionJobPostgres_BlockNotLive_SkipsWithoutFailingJob proves the handler
+// does NOT fail the whole job when one input block ID can no longer be found in the tenant's
+// live blocklist (already compacted by a race, cleared by retention, or otherwise vanished
+// independent of this handler's own actions -- mirrors blockpack's identical
+// ErrObjectNotFound/SPEC-COMPACTIONWORKER-7 handling for VI/VCNT/cube). The still-live input
+// block must remain completely untouched (still live, not compacted) so a future job-planner
+// pass can pair it with a different sibling.
+func TestProcessTraceCompactionJobPostgres_BlockNotLive_SkipsWithoutFailingJob(t *testing.T) {
 	ctx := context.Background()
 	store, _, _ := newStore(ctx, t, t.TempDir())
 	blocks := cutTestBlocks(t, store, tenant, 1, 5)
@@ -91,10 +95,24 @@ func TestProcessTraceCompactionJobPostgres_BlockNotLive_ReturnsError(t *testing.
 	require.NoError(t, err)
 
 	w := &BackendWorker{store: store, cfg: cfg, overrides: limits}
+	liveBlockID := blocks[0].BlockMeta().BlockID
 	job := newJobFromDetail(t, tenant, jobstore.JobTypeTraceCompaction, jobstore.TraceCompactionDetail{
-		InputBlockIDs: []string{blocks[0].BlockMeta().BlockID.String(), backend.NewUUID().String()},
+		InputBlockIDs: []string{liveBlockID.String(), backend.NewUUID().String()},
 	})
-	require.Error(t, w.processTraceCompactionJobPostgres(ctx, job))
+	require.NoError(t, w.processTraceCompactionJobPostgres(ctx, job), "a missing input must not fail the job")
+
+	liveMetas := store.BlockMetas(tenant)
+	var stillLive bool
+	for _, m := range liveMetas {
+		if m.BlockID == liveBlockID {
+			stillLive = true
+		}
+	}
+	require.True(t, stillLive, "the still-live input block must remain untouched, not compacted")
+
+	_, compactedMeta, err := store.BlockMeta(ctx, tenant, liveBlockID)
+	require.NoError(t, err)
+	require.Nil(t, compactedMeta, "the still-live input block must not be recorded as compacted")
 }
 
 // TestTryClaimPostgresJob_ClaimsTraceCompactionWhenNoBackfillWorkExists proves the
