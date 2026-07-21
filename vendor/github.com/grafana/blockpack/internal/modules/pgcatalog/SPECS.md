@@ -94,3 +94,15 @@ set BEFORE downloading and summing it — a compacted-but-undeleted source coexi
 merged replacement for up to the reaper's 30-minute grace window would otherwise be summed twice.
 
 Back-ref: `internal/modules/pgcatalog/pgcatalog.go:ListCompactedKeys`, `cube_backfill_runner.go:buildVCNTSection`.
+
+## SPEC-PGCATALOG-8: `Store.ListLiveKeys` — every live row for `(subsystem, tenant)`, across all `resource_id`s
+
+`ListLiveKeys(ctx, subsystem, tenant) ([]Row, error)` returns every live (not compacted, not
+deleted) row for the given `(subsystem, tenant)`, unscoped by `resource_id` — unlike
+`ListCandidates` (`SPEC-PGCATALOG-4`), which requires one and is shaped for compaction's own
+pairwise candidate grouping. This is `catalog_reconcile`'s own candidate set for detecting a
+catalog row whose backing object has vanished out-of-band (files fall out of retention or
+otherwise disappear independent of this system's own compaction/reap actions) — see
+`compactionworker`'s `SPEC-COMPACTIONWORKER-8`.
+
+Back-ref: `internal/modules/pgcatalog/pgcatalog.go:ListLiveKeys`, `internal/modules/compactionworker/catalog_reconcile.go:pruneVanishedRows`.

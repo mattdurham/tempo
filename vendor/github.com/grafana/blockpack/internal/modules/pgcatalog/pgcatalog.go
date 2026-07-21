@@ -118,6 +118,30 @@ func (s *Store) ListCandidates(ctx context.Context, subsystem, tenant, resourceI
 	return scanFileCatalogRows(rows)
 }
 
+// ListLiveKeys returns every live (not compacted, not deleted) row for
+// (subsystem, tenant), across ALL resourceIDs -- unlike ListCandidates, which
+// is scoped to one resourceID for compaction's own pairwise grouping.
+// SPEC-PGCATALOG-8: this is catalog_reconcile's own candidate set for
+// detecting rows whose backing object has vanished out-of-band (files fall
+// out of retention or otherwise disappear independent of this system's own
+// compaction/reap actions) -- see compactionworker's own SPEC-COMPACTIONWORKER-8.
+func (s *Store) ListLiveKeys(ctx context.Context, subsystem, tenant string) ([]Row, error) {
+	rows, err := s.pool.Query(
+		ctx, `
+		SELECT row_id, subsystem, tenant, resource_id, object_key, level, min_sec, max_sec,
+			size_bytes, created_at, compacted_at, deleted_at
+		FROM blockpack_file_catalog
+		WHERE subsystem = $1 AND tenant = $2
+			AND compacted_at IS NULL AND deleted_at IS NULL`,
+		subsystem, tenant,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("pgcatalog: list live keys: %w", err)
+	}
+	defer rows.Close()
+	return scanFileCatalogRows(rows)
+}
+
 // ListCompactedOlderThan returns every row whose compacted_at is non-NULL and
 // strictly before cutoff, and not yet deleted. SPEC-PGCATALOG-5: this is the
 // reaper's candidate set for physical deletion once the grace window has

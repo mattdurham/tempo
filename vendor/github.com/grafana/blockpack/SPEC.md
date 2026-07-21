@@ -1354,3 +1354,59 @@ path) — no blockpack code or contract change was needed or made. Recorded here
 that this entry's Limit-required contract is load-bearing: a caller that gets this wrong fails
 loudly (a hard error) rather than silently, which is what let this incident be caught and fixed
 quickly rather than silently under/over-counting.
+
+---
+
+## SPEC-ROOT-025: Never Buffer a Whole Remote Object in Memory as an Intermediate Step
+
+**When a component's actual processing of a remote object is disk-based (or otherwise doesn't
+need the whole object resident in memory at once), fetching that object must stream directly to
+its final destination — never download the full object into a `[]byte` first and then write that
+buffer straight back out.**
+
+This is distinct from this repo's existing single-I/O-per-block invariant (`CLAUDE.md`'s "Key
+design invariant — object storage I/O"): that rule is about *how many round trips* a fetch takes
+(always one, never per-column), not about *what happens to the bytes once they arrive*. A single
+round-trip fetch can still be streamed directly to its consumer instead of buffered in memory —
+the two concerns are independent, and both matter.
+
+**Rule:** if the immediate consumer of a fetched object is a local temp file (disk-based staging
+for a streaming decoder, a merge/compaction input, etc.), the fetch itself must write directly to
+that file (e.g. a `GetToFile(ctx, key, destPath)`-shaped call using the object-storage client's own
+streaming download, such as minio-go's `FGetObject`/`io.Copy` from a `GetObject` response body) —
+never `Get(ctx, key) ([]byte, error)` followed by `os.WriteFile`/`file.Write(data)`. Reserve a
+whole-object-in-memory `Get` for consumers that genuinely need the whole object resident in memory
+regardless (a decoder that only accepts a `[]byte`/requires random-access into the whole buffer,
+matching the single-I/O invariant's own object-format assumptions) — never as a "download, then
+immediately write back to disk" intermediate hop.
+
+**Rationale (found live, 2026-07-20, issue #522 compaction-worker on tempo-dev-test-03):**
+`compactionworker`'s VI compaction path fetched each input via `Get` (`io.ReadAll` under the hood)
+and then wrote the resulting `[]byte` straight into a fresh local temp file for disk-streamed
+decoding — the temp file existed specifically *because* downstream processing was already
+disk-based. With the per-file global size cutoff allowing inputs up to just under 1GiB, and each
+job pairing exactly 2 inputs, this held up to ~2GiB of pure transfer buffer in memory per job on
+top of whatever the merge itself needed, causing real `OOMKilled` pod restarts under production
+load. Fixed by adding `CatalogObjectStore.GetToFile` and threading it through
+`stageAndOpenViCompactionInput`/`stageAndOpenTraceIndexInput` (`internal/modules/compactionworker`)
+so the download writes directly to the destination temp file, eliminating the in-memory buffer
+for the hot path entirely — the rare quarantine-on-corruption path re-reads the (already-local)
+temp file's bytes only when it actually needs to re-upload them as forensic evidence.
+
+**A closely related distinction surfaced by the same incident:** a fetch failure (network error,
+permission error on the local destination, object not found) is not evidence that the object's
+*bytes* are corrupt, and must never be routed through corruption-quarantine logic identically to a
+genuine decode failure — doing so silently quarantines good data on a purely transient/
+infrastructure failure. Any refactor introducing a streaming fetch must preserve (or introduce, if
+missing) this distinction: a download-layer error propagates as a real, retryable failure; only a
+failure from the *decoder*, after a successful download, is quarantine-eligible.
+
+Back-ref: `internal/modules/compactionworker/store.go` (`CatalogObjectStore.GetToFile`),
+`internal/modules/compactionworker/vi_compaction.go`
+(`stageAndOpenViCompactionInput`/`stageAndOpenTraceIndexInput`), `cmd/compaction-worker/main.go`
+(`s3CatalogObjectStore.GetToFile`, via minio's `FGetObject`). VCNT's decoder
+(`valuecounts.DecodeVCNTObject`) and cube's `OpenReaderFromBytes` are NOT affected by this entry —
+both require the whole object resident in memory to decode at all (no disk-based intermediate
+consumer exists for them to stream into), so their existing `Get` usage is the correct,
+deliberate case this entry's "genuinely needs the whole object" exception describes, not a
+remaining instance of the bug.
