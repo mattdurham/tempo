@@ -20,9 +20,19 @@ CREATE TABLE IF NOT EXISTS blockpack_file_catalog (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     compacted_at  TIMESTAMPTZ NULL,   -- set the moment this file is superseded by a
                                        -- merge output; NULL = live and eligible
-    deleted_at    TIMESTAMPTZ NULL    -- set the moment the reaper physically deletes
+    deleted_at    TIMESTAMPTZ NULL,   -- set the moment the reaper physically deletes
                                        -- the object; row is then eligible for hard
                                        -- delete from Postgres itself
+    meta          JSONB NULL          -- subsystem='trace' only (issue #522/#525): the
+                                       -- backend.BlockMeta fields this table's own columns
+                                       -- don't already cover (Version, TotalObjects,
+                                       -- IndexPageSize, TotalRecords, BloomShardCount,
+                                       -- FooterSize, DedicatedColumns, ReplicationFactor),
+                                       -- written once at block-creation time by tempo's
+                                       -- block-builder notification hook -- makes this table
+                                       -- fully self-sufficient for trace block discovery, no
+                                       -- per-block meta.json fetch ever needed. NULL for
+                                       -- vi/vcnt/cube rows, which have no BlockMeta concept.
 );
 
 CREATE INDEX IF NOT EXISTS idx_bfc_candidacy

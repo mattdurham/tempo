@@ -31,17 +31,49 @@ func ApplyFileCatalogSchema(ctx context.Context, pool *pgxpool.Pool) error {
 // subsystem-defined merge level, for one (tenant, resource_id).
 type Row struct {
 	CreatedAt   time.Time
-	CompactedAt *time.Time
 	DeletedAt   *time.Time
-	Subsystem   string
-	Tenant      string
-	ResourceID  string
+	CompactedAt *time.Time
 	ObjectKey   string
+	Subsystem   string
+	ResourceID  string
+	Tenant      string
+	Meta        []byte
 	RowID       int64
 	MinSec      int64
 	MaxSec      int64
 	SizeBytes   int64
 	Level       int
+}
+
+// TraceBlockMeta is the JSON shape stored in a subsystem="trace" Row's Meta column -- the
+// tempo backend.BlockMeta fields this table's own typed columns don't already cover
+// (Tenant/MinSec/MaxSec/SizeBytes map onto Tenant/StartTime/EndTime/Size_; BlockID is parsed
+// from ObjectKey's own path). Field names deliberately mirror backend.BlockMeta's own proto
+// field names (issue #522/#525) -- tempo's block-builder notification hook populates this at
+// block-creation time (it already has the full BlockMeta in hand, zero extra I/O), and tempo's
+// Postgres-sourced block lister unmarshals it back to reconstruct a complete BlockMeta with no
+// per-block meta.json fetch ever needed.
+type TraceBlockMeta struct {
+	Version           string                 `json:"version"`
+	DedicatedColumns  []TraceDedicatedColumn `json:"dedicatedColumns,omitempty"`
+	TotalObjects      int64                  `json:"totalObjects"`
+	TotalRecords      int64                  `json:"totalRecords"`
+	IndexPageSize     int                    `json:"indexPageSize"`
+	BloomShardCount   int                    `json:"bloomShardCount"`
+	FooterSize        int                    `json:"footerSize"`
+	ReplicationFactor uint32                 `json:"replicationFactor"`
+}
+
+// TraceDedicatedColumn mirrors tempo's backend.DedicatedColumn own JSON shape
+// (Scope/Name/Type) -- duplicated here rather than imported, since this package cannot depend
+// on tempo's backend package (this repo has no dependency on tempo at all), and distinctly
+// named from this repo's OWN, unrelated, simpler DedicatedColumn (internal/modules/blockio/
+// writer/dedicatedcolumn.go, Name-only) to avoid confusing the two. Field names/JSON tags
+// must stay in sync with tempo's backend.DedicatedColumn by hand.
+type TraceDedicatedColumn struct {
+	Scope string `json:"scope"`
+	Name  string `json:"name"`
+	Type  string `json:"type"`
 }
 
 // Store satisfies pgcatalog's Postgres-backed catalog operations over a
@@ -62,10 +94,10 @@ func (s *Store) Insert(ctx context.Context, row Row) error {
 	_, err := s.pool.Exec(
 		ctx, `
 		INSERT INTO blockpack_file_catalog
-			(subsystem, tenant, resource_id, object_key, level, min_sec, max_sec, size_bytes)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			(subsystem, tenant, resource_id, object_key, level, min_sec, max_sec, size_bytes, meta)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (object_key) DO NOTHING`,
-		row.Subsystem, row.Tenant, row.ResourceID, row.ObjectKey, row.Level, row.MinSec, row.MaxSec, row.SizeBytes,
+		row.Subsystem, row.Tenant, row.ResourceID, row.ObjectKey, row.Level, row.MinSec, row.MaxSec, row.SizeBytes, row.Meta,
 	)
 	if err != nil {
 		return fmt.Errorf("pgcatalog: insert %q: %w", row.ObjectKey, err)
@@ -104,7 +136,7 @@ func (s *Store) ListCandidates(ctx context.Context, subsystem, tenant, resourceI
 	rows, err := s.pool.Query(
 		ctx, `
 		SELECT row_id, subsystem, tenant, resource_id, object_key, level, min_sec, max_sec,
-			size_bytes, created_at, compacted_at, deleted_at
+			size_bytes, created_at, compacted_at, deleted_at, meta
 		FROM blockpack_file_catalog
 		WHERE subsystem = $1 AND tenant = $2 AND resource_id = $3
 			AND compacted_at IS NULL AND deleted_at IS NULL
@@ -129,7 +161,7 @@ func (s *Store) ListLiveKeys(ctx context.Context, subsystem, tenant string) ([]R
 	rows, err := s.pool.Query(
 		ctx, `
 		SELECT row_id, subsystem, tenant, resource_id, object_key, level, min_sec, max_sec,
-			size_bytes, created_at, compacted_at, deleted_at
+			size_bytes, created_at, compacted_at, deleted_at, meta
 		FROM blockpack_file_catalog
 		WHERE subsystem = $1 AND tenant = $2
 			AND compacted_at IS NULL AND deleted_at IS NULL`,
@@ -137,6 +169,31 @@ func (s *Store) ListLiveKeys(ctx context.Context, subsystem, tenant string) ([]R
 	)
 	if err != nil {
 		return nil, fmt.Errorf("pgcatalog: list live keys: %w", err)
+	}
+	defer rows.Close()
+	return scanFileCatalogRows(rows)
+}
+
+// ListLiveKeysInRange returns every live (not compacted, not deleted) row for
+// (subsystem, tenant) whose [min_sec, max_sec] overlaps [minSec, maxSec], newest-first
+// (ORDER BY min_sec DESC) -- SPEC-PGCATALOG-9: vi_backfill's own BlockFetcher.ListBlocksInRange
+// (issue #522, vi_backfill moved fully into blockpack) needs this exact contract:
+// newest-to-oldest so BackfillEngine.Run processes newest data first, mirroring tempo's
+// now-retired viBlockFetcher/catalogBlockFetcher's identical ordering.
+func (s *Store) ListLiveKeysInRange(ctx context.Context, subsystem, tenant string, minSec, maxSec uint64) ([]Row, error) {
+	rows, err := s.pool.Query(
+		ctx, `
+		SELECT row_id, subsystem, tenant, resource_id, object_key, level, min_sec, max_sec,
+			size_bytes, created_at, compacted_at, deleted_at, meta
+		FROM blockpack_file_catalog
+		WHERE subsystem = $1 AND tenant = $2
+			AND compacted_at IS NULL AND deleted_at IS NULL
+			AND max_sec >= $3 AND min_sec <= $4
+		ORDER BY min_sec DESC`,
+		subsystem, tenant, minSec, maxSec,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("pgcatalog: list live keys in range: %w", err)
 	}
 	defer rows.Close()
 	return scanFileCatalogRows(rows)
@@ -150,7 +207,7 @@ func (s *Store) ListCompactedOlderThan(ctx context.Context, cutoff time.Time) ([
 	rows, err := s.pool.Query(
 		ctx, `
 		SELECT row_id, subsystem, tenant, resource_id, object_key, level, min_sec, max_sec,
-			size_bytes, created_at, compacted_at, deleted_at
+			size_bytes, created_at, compacted_at, deleted_at, meta
 		FROM blockpack_file_catalog
 		WHERE compacted_at IS NOT NULL AND compacted_at < $1 AND deleted_at IS NULL`,
 		cutoff,
@@ -216,7 +273,7 @@ func scanFileCatalogRows(rows pgx.Rows) ([]Row, error) {
 		var r Row
 		if err := rows.Scan(
 			&r.RowID, &r.Subsystem, &r.Tenant, &r.ResourceID, &r.ObjectKey, &r.Level,
-			&r.MinSec, &r.MaxSec, &r.SizeBytes, &r.CreatedAt, &r.CompactedAt, &r.DeletedAt,
+			&r.MinSec, &r.MaxSec, &r.SizeBytes, &r.CreatedAt, &r.CompactedAt, &r.DeletedAt, &r.Meta,
 		); err != nil {
 			return nil, fmt.Errorf("pgcatalog: scan: %w", err)
 		}

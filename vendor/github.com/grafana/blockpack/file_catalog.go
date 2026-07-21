@@ -24,3 +24,13 @@ type FileCatalogRow = pgcatalog.Row
 
 // FileCatalogStore is the Postgres-backed blockpack_file_catalog store.
 type FileCatalogStore = pgcatalog.Store
+
+// TraceBlockMeta is the JSON shape stored in a subsystem="trace" FileCatalogRow's Meta
+// column (issue #522/#525): tempo's block-builder notification hook populates it at
+// block-creation time, and tempo's Postgres-sourced block lister unmarshals it back to
+// reconstruct a complete backend.BlockMeta with no per-block meta.json fetch ever needed.
+type TraceBlockMeta = pgcatalog.TraceBlockMeta
+
+// TraceDedicatedColumn mirrors tempo's backend.DedicatedColumn JSON shape (Scope/Name/Type)
+// for TraceBlockMeta.DedicatedColumns.
+type TraceDedicatedColumn = pgcatalog.TraceDedicatedColumn

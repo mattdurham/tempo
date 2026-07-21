@@ -2,6 +2,7 @@ package blockbuilder
 
 import (
 	"context"
+	"encoding/json"
 	"path"
 	"strings"
 	"testing"
@@ -10,6 +11,8 @@ import (
 	"github.com/go-kit/log"
 	"github.com/stretchr/testify/require"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
+
+	blockpack "github.com/grafana/blockpack"
 
 	"github.com/grafana/tempo/modules/postgres"
 	"github.com/grafana/tempo/tempodb"
@@ -35,7 +38,8 @@ func newTestWriter(t *testing.T, withPostgres bool) tempodb.Writer {
 	}
 	if withPostgres {
 		ctx := context.Background()
-		container, err := tcpostgres.Run(ctx, "postgres:16-alpine",
+		container, err := tcpostgres.Run(
+			ctx, "postgres:16-alpine",
 			tcpostgres.WithDatabase("blockbuilder_notify_test"),
 			tcpostgres.WithUsername("blockbuilder_notify_test"),
 			tcpostgres.WithPassword("blockbuilder_notify_test"),
@@ -58,10 +62,10 @@ func newTestWriter(t *testing.T, withPostgres bool) tempodb.Writer {
 	return w
 }
 
-func testBlockMeta(tenant, version string) *backend.BlockMeta {
+func testBlockMeta(version string) *backend.BlockMeta {
 	return &backend.BlockMeta{
 		BlockID:         backend.NewUUID(),
-		TenantID:        tenant,
+		TenantID:        "tenant-a",
 		Version:         version,
 		CompactionLevel: 0,
 		StartTime:       time.Unix(1000, 0),
@@ -81,7 +85,7 @@ func TestNotifyBlockpackFileCatalog_VblockpackWithPostgres_InsertsRow(t *testing
 	pg := provider.PgPool()
 	require.NotNil(t, pg)
 
-	meta := testBlockMeta("tenant-a", vblockpack.VersionString)
+	meta := testBlockMeta(vblockpack.VersionString)
 	notifyBlockpackFileCatalog(context.Background(), log.NewNopLogger(), w, meta)
 
 	rows, err := pg.FileCatalogStore().ListLiveKeys(context.Background(), "trace", "tenant-a")
@@ -93,6 +97,43 @@ func TestNotifyBlockpackFileCatalog_VblockpackWithPostgres_InsertsRow(t *testing
 	require.Equal(t, int64(12345), rows[0].SizeBytes)
 }
 
+// TestNotifyBlockpackFileCatalog_PopulatesMetaColumn proves the fields blockpack_file_catalog's
+// own typed columns don't cover (issue #522/#525: Postgres as the sole source of truth for
+// trace block existence, no per-block meta.json fetch needed at listing time) survive a real
+// notify -> ListLiveKeys round trip in the Meta JSONB column.
+func TestNotifyBlockpackFileCatalog_PopulatesMetaColumn(t *testing.T) {
+	w := newTestWriter(t, true)
+	provider, ok := w.(tempodb.PgPoolProvider)
+	require.True(t, ok)
+	pg := provider.PgPool()
+
+	meta := testBlockMeta(vblockpack.VersionString)
+	meta.TotalObjects = 254726
+	meta.TotalRecords = 254726
+	meta.IndexPageSize = 1024
+	meta.ReplicationFactor = 1
+	meta.DedicatedColumns = backend.DedicatedColumns{
+		{Scope: backend.DedicatedColumnScopeSpan, Name: "http.status_code", Type: backend.DedicatedColumnTypeInt},
+	}
+	notifyBlockpackFileCatalog(context.Background(), log.NewNopLogger(), w, meta)
+
+	rows, err := pg.FileCatalogStore().ListLiveKeys(context.Background(), "trace", "tenant-a")
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	require.NotNil(t, rows[0].Meta, "Meta must be populated for a vblockpack block notification")
+
+	var gotMeta blockpack.TraceBlockMeta
+	require.NoError(t, json.Unmarshal(rows[0].Meta, &gotMeta))
+	require.Equal(t, vblockpack.VersionString, gotMeta.Version)
+	require.EqualValues(t, 254726, gotMeta.TotalObjects)
+	require.EqualValues(t, 254726, gotMeta.TotalRecords)
+	require.EqualValues(t, 1024, gotMeta.IndexPageSize)
+	require.EqualValues(t, 1, gotMeta.ReplicationFactor)
+	require.Equal(t, []blockpack.TraceDedicatedColumn{
+		{Scope: "span", Name: "http.status_code", Type: "int"},
+	}, gotMeta.DedicatedColumns)
+}
+
 // TestNotifyBlockpackFileCatalog_NonVblockpackVersion_DoesNothing proves vparquet/standard
 // blocks are never cataloged here, matching this project's "vparquet stays untouched forever"
 // scoping (mirrors filecatalog.Lister.reconcileTenant's identical Version filter).
@@ -102,7 +143,7 @@ func TestNotifyBlockpackFileCatalog_NonVblockpackVersion_DoesNothing(t *testing.
 	require.True(t, ok)
 	pg := provider.PgPool()
 
-	meta := testBlockMeta("tenant-a", "vParquet4")
+	meta := testBlockMeta("vParquet4")
 	notifyBlockpackFileCatalog(context.Background(), log.NewNopLogger(), w, meta)
 
 	rows, err := pg.FileCatalogStore().ListLiveKeys(context.Background(), "trace", "tenant-a")
@@ -115,7 +156,7 @@ func TestNotifyBlockpackFileCatalog_NonVblockpackVersion_DoesNothing(t *testing.
 // type-assertion or nil-pool check must short-circuit cleanly, never panic or error the flush.
 func TestNotifyBlockpackFileCatalog_NoPostgresConfigured_DoesNotPanic(t *testing.T) {
 	w := newTestWriter(t, false)
-	meta := testBlockMeta("tenant-a", vblockpack.VersionString)
+	meta := testBlockMeta(vblockpack.VersionString)
 	require.NotPanics(t, func() {
 		notifyBlockpackFileCatalog(context.Background(), log.NewNopLogger(), w, meta)
 	})

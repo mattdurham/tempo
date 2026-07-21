@@ -17,6 +17,7 @@ package blockbuilder
 
 import (
 	"context"
+	"encoding/json"
 	"path"
 
 	"github.com/go-kit/log"
@@ -49,6 +50,16 @@ func notifyBlockpackFileCatalog(ctx context.Context, logger log.Logger, w tempod
 	blockID := meta.BlockID.String()
 	objectKey := path.Join(tenantID, blockID, vblockpack.DataFileName)
 
+	metaJSON, jsonErr := json.Marshal(traceBlockMetaFromBackendMeta(meta))
+	if jsonErr != nil {
+		level.Warn(logger).Log(
+			"msg", "blockbuilder: marshal TraceBlockMeta failed (non-fatal, row still inserted without it -- "+
+				"tempo's Postgres-sourced block lister falls back to a meta.json fetch for a row with nil Meta)",
+			"tenant", tenantID, "blockID", blockID, "err", jsonErr,
+		)
+		metaJSON = nil
+	}
+
 	err := pg.FileCatalogStore().Insert(ctx, blockpack.FileCatalogRow{
 		Subsystem:  "trace",
 		Tenant:     tenantID,
@@ -58,11 +69,42 @@ func notifyBlockpackFileCatalog(ctx context.Context, logger log.Logger, w tempod
 		MinSec:     meta.StartTime.Unix(),
 		MaxSec:     meta.EndTime.Unix(),
 		SizeBytes:  int64(meta.Size_), //nolint:gosec // G115: block size never approaches int64 overflow
+		Meta:       metaJSON,
 	})
 	if err != nil {
 		level.Warn(logger).Log(
 			"msg", "blockbuilder: notify blockpack_file_catalog failed (non-fatal, compaction-planner's own reconcile will self-heal)",
 			"tenant", tenantID, "blockID", blockID, "err", err,
 		)
+	}
+}
+
+// traceBlockMetaFromBackendMeta converts meta's fields not already covered by
+// blockpack.FileCatalogRow's own typed columns (Tenant/MinSec/MaxSec/SizeBytes) into the JSON
+// shape stored in Row.Meta -- issue #522/#525: makes blockpack_file_catalog fully
+// self-sufficient for trace block discovery, no per-block meta.json fetch ever needed by
+// tempo's own Postgres-sourced block lister.
+//
+// Known, accepted gap: backend.DedicatedColumn.Options is not carried over -- dedicated
+// column encoding options are a rarely-used sub-feature, and TraceDedicatedColumn's own
+// Scope/Name/Type already cover what block selection needs. Revisit if that ever changes.
+func traceBlockMetaFromBackendMeta(meta *backend.BlockMeta) blockpack.TraceBlockMeta {
+	dedicated := make([]blockpack.TraceDedicatedColumn, 0, len(meta.DedicatedColumns))
+	for _, dc := range meta.DedicatedColumns {
+		dedicated = append(dedicated, blockpack.TraceDedicatedColumn{
+			Scope: string(dc.Scope),
+			Name:  dc.Name,
+			Type:  string(dc.Type),
+		})
+	}
+	return blockpack.TraceBlockMeta{
+		Version:           meta.Version,
+		DedicatedColumns:  dedicated,
+		TotalObjects:      meta.TotalObjects,
+		TotalRecords:      int64(meta.TotalRecords),
+		IndexPageSize:     int(meta.IndexPageSize),
+		BloomShardCount:   int(meta.BloomShardCount),
+		FooterSize:        int(meta.FooterSize),
+		ReplicationFactor: meta.ReplicationFactor,
 	}
 }
