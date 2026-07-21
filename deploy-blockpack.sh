@@ -191,6 +191,14 @@ kubectl set image deployment/compaction-worker -n "$NAMESPACE" "compaction-worke
 kubectl rollout restart deployment/compaction-worker -n "$NAMESPACE"
 
 # Roll components
+echo "--- Updating backend-scheduler ---"
+# Never rolled by this script before (2026-07-21 fix) despite its ConfigMap being patched in
+# the loop above -- backend-scheduler owns CompactionProvider (the classic gRPC compaction
+# candidate selector), so it needs the same image as backend-worker whenever compaction-path
+# code changes (e.g. Encoding.CompactionSupported), not just when its own config changes.
+kubectl set image statefulset/backend-scheduler -n "$NAMESPACE" "backend-scheduler=${IMAGE}"
+kubectl delete pod backend-scheduler-0 -n "$NAMESPACE"
+
 echo "--- Updating block-builder ---"
 kubectl set image statefulset/block-builder -n "$NAMESPACE" "block-builder=${IMAGE}"
 kubectl delete pod block-builder-0 -n "$NAMESPACE"
@@ -252,11 +260,20 @@ kubectl rollout restart statefulset/live-store-zone-a -n "$NAMESPACE"
 kubectl rollout restart statefulset/live-store-zone-b -n "$NAMESPACE"
 
 echo "--- Updating value-index-compactor ---"
-kubectl set image statefulset/value-index-compactor -n "$NAMESPACE" "value-index-compactor=${IMAGE}"
-kubectl rollout restart statefulset/value-index-compactor -n "$NAMESPACE"
+# 2026-07-21: this StatefulSet no longer exists in the cluster (VI/VCNT/cube compaction
+# already moved entirely to blockpack's own compaction-worker in an earlier #522 phase) --
+# tolerate its absence instead of aborting the rest of the rollout, since set -e would
+# otherwise kill this script the moment kubectl reports it missing.
+if kubectl get statefulset/value-index-compactor -n "$NAMESPACE" >/dev/null 2>&1; then
+    kubectl set image statefulset/value-index-compactor -n "$NAMESPACE" "value-index-compactor=${IMAGE}"
+    kubectl rollout restart statefulset/value-index-compactor -n "$NAMESPACE"
+else
+    echo "    value-index-compactor no longer exists in this cluster -- skipping"
+fi
 
 # Wait for readiness
 echo "--- Waiting for pods to be ready ---"
+kubectl wait --for=condition=Ready pod/backend-scheduler-0 -n "$NAMESPACE" --timeout=120s
 kubectl wait --for=condition=Ready pod/block-builder-0 -n "$NAMESPACE" --timeout=120s
 kubectl wait --for=condition=Ready pod/backend-worker-0 -n "$NAMESPACE" --timeout=120s
 kubectl rollout status deployment/querier -n "$NAMESPACE" --timeout=120s
@@ -277,6 +294,7 @@ kubectl wait --for=condition=Ready pod/value-index-compactor-0 -n "$NAMESPACE" -
 
 echo ""
 echo "==> Deploy complete: ${IMAGE}"
+echo "    backend-scheduler:    $(kubectl get pod backend-scheduler-0 -n $NAMESPACE -o jsonpath='{.spec.containers[0].image}')"
 echo "    block-builder:        $(kubectl get pod block-builder-0 -n $NAMESPACE -o jsonpath='{.spec.containers[0].image}')"
 echo "    backend-worker:       $(kubectl get pod backend-worker-0 -n $NAMESPACE -o jsonpath='{.spec.containers[0].image}')"
 echo "    querier:              $(kubectl get deployment querier -n $NAMESPACE -o jsonpath='{.spec.template.spec.containers[0].image}')"
