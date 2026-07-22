@@ -50,6 +50,17 @@ CREATE TABLE IF NOT EXISTS compaction_jobs (
     window_end_sec   BIGINT NULL
 );
 
+-- ALTER TABLE ... ADD COLUMN IF NOT EXISTS (issue #529): CREATE TABLE IF NOT EXISTS above is a
+-- no-op against an already-live compaction_jobs table -- it does NOT retrofit newly-added
+-- columns onto an existing table, so every column added after this table's original rollout
+-- needs its own explicit, idempotent ALTER TABLE here (mirrors the same fix already applied for
+-- pgcatalog's blockpack_file_catalog.meta column gap).
+ALTER TABLE compaction_jobs ADD COLUMN IF NOT EXISTS priority BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE compaction_jobs ADD COLUMN IF NOT EXISTS column_hash TEXT NULL;
+ALTER TABLE compaction_jobs ADD COLUMN IF NOT EXISTS column_type TEXT NULL;
+ALTER TABLE compaction_jobs ADD COLUMN IF NOT EXISTS window_start_sec BIGINT NULL;
+ALTER TABLE compaction_jobs ADD COLUMN IF NOT EXISTS window_end_sec BIGINT NULL;
+
 CREATE INDEX IF NOT EXISTS idx_compaction_jobs_claimable
     ON compaction_jobs (job_type, status, created_at)
     WHERE status = 'pending';
