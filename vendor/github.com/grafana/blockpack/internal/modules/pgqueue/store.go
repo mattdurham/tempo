@@ -288,6 +288,84 @@ func (s *Store) ViBackfillGapRanges(ctx context.Context, tenant string, col ViBa
 	return merged, nil
 }
 
+const viBackfillExistingWindowEndsSQL = `
+	SELECT window_end_sec
+	FROM compaction_jobs
+	WHERE job_type = 'vi_backfill'
+	  AND tenant = $1 AND column_hash = $2 AND column_type = $3
+	  AND window_end_sec BETWEEN $4 AND $5`
+
+// MissingViBackfillWindows is the job-history gap-finder (issue #529 follow-up): given the FULL
+// set of windows a column's retention says should exist (caller computes this via
+// WindowsForRetention/WindowsBefore), returns exactly the subset that have NO row at all --
+// any status, including 'succeeded' and 'failed' -- in compaction_jobs for (tenant, columnHash,
+// columnType). This is deliberately distinct from ViBackfillGapRanges (which only sees rows that
+// already exist and aren't yet 'succeeded'): a window that was NEVER INSERTED in the first place
+// is invisible to that query, exactly the blind spot that let an already-triggered column (from
+// before this per-window model existed, or one whose bulk-insert crashed partway through) get
+// silently treated as "fully covered" by CoversRange's absence-of-a-gap-row default, with zero
+// actual backfill verification ever having run against its history. Callers re-run the idempotent
+// InsertViBackfillWindows with exactly this missing subset to self-heal, no manual intervention
+// needed.
+//
+// Backed by idx_vi_backfill_all_windows -- unlike idx_vi_backfill_coverage_gap, this index is NOT
+// scoped to status != 'succeeded', since a succeeded row is exactly the "not missing" signal this
+// query needs to see.
+//
+// The existence lookup is bounded to windows' own [min,max] EndSec (not "every window this
+// column has ever had"), so a caller checking only a handful of windows (e.g. the trailing
+// top-up's 5-minute range) pays for a narrow indexed range scan, not a full fetch of a
+// fully-backfilled column's entire retention history -- windows must be non-empty.
+func (s *Store) MissingViBackfillWindows(
+	ctx context.Context, tenant string, col ViBackfillColumn, windows []WindowSpec,
+) ([]WindowSpec, error) {
+	if len(windows) == 0 {
+		return nil, nil
+	}
+	minEnd, maxEnd := windows[0].EndSec, windows[0].EndSec
+	for _, w := range windows[1:] {
+		if w.EndSec < minEnd {
+			minEnd = w.EndSec
+		}
+		if w.EndSec > maxEnd {
+			maxEnd = w.EndSec
+		}
+	}
+	rows, err := s.pool.Query(
+		ctx,
+		viBackfillExistingWindowEndsSQL,
+		tenant,
+		col.ColumnHash,
+		col.ColumnType,
+		minEnd,
+		maxEnd,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("pgqueue: vi_backfill existing window ends: %w", err)
+	}
+	defer rows.Close()
+
+	existing := make(map[int64]struct{})
+	for rows.Next() {
+		var endSec int64
+		if err := rows.Scan(&endSec); err != nil {
+			return nil, fmt.Errorf("pgqueue: scan vi_backfill window end: %w", err)
+		}
+		existing[endSec] = struct{}{}
+	}
+	if rows.Err() != nil {
+		return nil, fmt.Errorf("pgqueue: iterate vi_backfill window ends: %w", rows.Err())
+	}
+
+	var missing []WindowSpec
+	for _, w := range windows {
+		if _, ok := existing[w.EndSec]; !ok {
+			missing = append(missing, w)
+		}
+	}
+	return missing, nil
+}
+
 // claimJobSQL is the standard single-statement SKIP LOCKED claim idiom: find
 // the highest-priority, oldest claimable row of ANY job_type (fresh pending, OR claimed/running
 // with an expired lease -- crashed-worker self-heal, OR failed with a due

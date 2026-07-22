@@ -118,3 +118,13 @@ DROP INDEX IF EXISTS idx_vi_backfill_coverage_gap;
 CREATE INDEX idx_vi_backfill_coverage_gap
     ON compaction_jobs (tenant, column_hash, column_type, window_end_sec)
     WHERE job_type = 'vi_backfill' AND status != 'succeeded';
+
+-- idx_vi_backfill_all_windows (issue #529 follow-up): backs MissingViBackfillWindows' "does a
+-- row exist at all for this window" check -- deliberately NOT scoped to status != 'succeeded'
+-- like idx_vi_backfill_coverage_gap above, since a succeeded row is exactly the "not missing"
+-- signal that query needs to see (idx_vi_backfill_coverage_gap's partial index can't answer
+-- that; it excludes succeeded rows entirely).
+DROP INDEX IF EXISTS idx_vi_backfill_all_windows;
+CREATE INDEX idx_vi_backfill_all_windows
+    ON compaction_jobs (tenant, column_hash, column_type, window_end_sec)
+    WHERE job_type = 'vi_backfill';
