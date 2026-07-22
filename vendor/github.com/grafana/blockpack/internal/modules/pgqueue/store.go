@@ -103,8 +103,13 @@ func (s *Store) insertWithPriority(
 	if err != nil {
 		return fmt.Errorf("pgqueue: marshal %s detail: %w", jobType, err)
 	}
+	// string(rawDetail), not the raw []byte: under simple_protocol query mode (required for
+	// pgbouncer transaction pooling, see schema.sql/deploy config comments), pgx encodes a []byte
+	// argument as a bytea hex literal, which Postgres then rejects trying to cast into detail's
+	// jsonb column ("invalid input syntax for type json") -- a plain Go string is sent as a text
+	// literal instead, which Postgres CAN implicitly cast to jsonb.
 	if _, err := s.pool.Exec(
-		ctx, insertJobSQL, uuid.NewString(), string(jobType), subsystem, tenant, rawDetail, dedupKey, priority,
+		ctx, insertJobSQL, uuid.NewString(), string(jobType), subsystem, tenant, string(rawDetail), dedupKey, priority,
 	); err != nil {
 		return fmt.Errorf("pgqueue: insert %s job: %w", jobType, err)
 	}
@@ -210,7 +215,9 @@ func (s *Store) insertViBackfillWindowChunk(
 		))
 		args = append(
 			args,
-			uuid.NewString(), string(JobTypeViBackfill), "vi", tenant, rawDetail,
+			// string(rawDetail): see insertWithPriority's identical comment -- []byte encodes as
+			// a bytea literal under simple_protocol, which Postgres can't cast to jsonb.
+			uuid.NewString(), string(JobTypeViBackfill), "vi", tenant, string(rawDetail),
 			viBackfillDedupKey(tenant, col.ColumnHash, col.ColumnType, w.EndSec), w.Priority,
 			col.ColumnHash, col.ColumnType, w.StartSec, w.EndSec,
 		)

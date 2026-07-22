@@ -91,13 +91,33 @@ func NewStore(pool *pgxpool.Pool) *Store {
 // writing the object and reporting job success can safely re-Insert the same
 // row.
 func (s *Store) Insert(ctx context.Context, row Row) error {
+	// meta: string(row.Meta), not the raw []byte -- under simple_protocol query mode (required
+	// for pgbouncer transaction pooling), pgx encodes a []byte argument as a bytea hex literal,
+	// which Postgres then rejects casting into meta's jsonb column ("invalid input syntax for
+	// type json"); a plain Go string is sent as a text literal, which Postgres CAN implicitly
+	// cast to jsonb. Explicitly nil (not "") when row.Meta is nil, so a non-trace-subsystem row
+	// still gets a true SQL NULL rather than the empty string "" (invalid JSON, and not the same
+	// value as the column's own NULL default).
+	var meta any
+	if row.Meta != nil {
+		meta = string(row.Meta)
+	}
 	_, err := s.pool.Exec(
-		ctx, `
+		ctx,
+		`
 		INSERT INTO blockpack_file_catalog
 			(subsystem, tenant, resource_id, object_key, level, min_sec, max_sec, size_bytes, meta)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (object_key) DO NOTHING`,
-		row.Subsystem, row.Tenant, row.ResourceID, row.ObjectKey, row.Level, row.MinSec, row.MaxSec, row.SizeBytes, row.Meta,
+		row.Subsystem,
+		row.Tenant,
+		row.ResourceID,
+		row.ObjectKey,
+		row.Level,
+		row.MinSec,
+		row.MaxSec,
+		row.SizeBytes,
+		meta,
 	)
 	if err != nil {
 		return fmt.Errorf("pgcatalog: insert %q: %w", row.ObjectKey, err)
@@ -180,7 +200,11 @@ func (s *Store) ListLiveKeys(ctx context.Context, subsystem, tenant string) ([]R
 // (issue #522, vi_backfill moved fully into blockpack) needs this exact contract:
 // newest-to-oldest so BackfillEngine.Run processes newest data first, mirroring tempo's
 // now-retired viBlockFetcher/catalogBlockFetcher's identical ordering.
-func (s *Store) ListLiveKeysInRange(ctx context.Context, subsystem, tenant string, minSec, maxSec uint64) ([]Row, error) {
+func (s *Store) ListLiveKeysInRange(
+	ctx context.Context,
+	subsystem, tenant string,
+	minSec, maxSec uint64,
+) ([]Row, error) {
 	rows, err := s.pool.Query(
 		ctx, `
 		SELECT row_id, subsystem, tenant, resource_id, object_key, level, min_sec, max_sec,
