@@ -89,7 +89,7 @@ func (rw *readerWriter) retainTenant(ctx context.Context, tenantID string, compa
 		default:
 			if b.EndTime.Before(cutoff) && compactorSharder.Owns(b.BlockID.String()) {
 				level.Info(rw.logger).Log("msg", "marking block for deletion", "blockID", b.BlockID, "tenantID", tenantID)
-				err := rw.c.MarkBlockCompacted((uuid.UUID)(b.BlockID), tenantID)
+				err := rw.markBlockCompactedForRetention(ctx, tenantID, b.BlockID)
 				if err != nil {
 					level.Error(rw.logger).Log("msg", "failed to mark block compacted during retention", "blockID", b.BlockID, "tenantID", tenantID, "err", err)
 					metricRetentionErrors.Inc()
@@ -117,6 +117,20 @@ func (rw *readerWriter) retainTenant(ctx context.Context, tenantID string, compa
 		default:
 			level.Debug(rw.logger).Log("owns", compactorSharder.Owns(b.BlockID.String()), "blockID", b.BlockID, "tenantID", tenantID)
 			if b.CompactedTime.Before(cutoff) && compactorSharder.Owns(b.BlockID.String()) {
+				if rw.pg != nil {
+					// Postgres is the sole source of truth for vblockpack block existence
+					// (issue #522/#525): blockpack's own compaction-planner/catalog_reap
+					// pipeline already reaps every row with an old-enough compacted_at
+					// (ListCompactedOlderThan is subsystem-agnostic, so this includes rows
+					// this loop's own MarkCompacted call above set). Calling ClearBlock here
+					// too would race a second, independent deleter against that pipeline --
+					// skip it and just drop tempo's local read caches for the block; the next
+					// Postgres poll drops it from rw.blocklist once blockpack's reaper runs.
+					level.Debug(rw.logger).Log("msg", "skipping ClearBlock, deferring to blockpack's own catalog_reap", "blockID", b.BlockID, "tenantID", tenantID)
+					rw.removeCachedBlock(ctx, tenantID, (uuid.UUID)(b.BlockID), int(b.BloomShardCount))
+					continue
+				}
+
 				level.Info(rw.logger).Log("msg", "deleting block", "blockID", b.BlockID, "tenantID", tenantID)
 				err := rw.c.ClearBlock((uuid.UUID)(b.BlockID), tenantID)
 				if err != nil {

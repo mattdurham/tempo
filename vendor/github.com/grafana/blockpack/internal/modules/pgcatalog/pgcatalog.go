@@ -255,6 +255,53 @@ func (s *Store) ListCompactedKeys(ctx context.Context, keys []string) (map[strin
 	return out, nil
 }
 
+// ListLiveTenants returns every distinct tenant with at least one row for subsystem that
+// isn't hard-deleted (live OR still within its post-compaction grace window) -- issue
+// #522/#525: tempo's Postgres-sourced block lister needs this for tenant enumeration, the
+// same role backend.Reader.Tenants() plays for the classic S3 bucket-index poller.
+func (s *Store) ListLiveTenants(ctx context.Context, subsystem string) ([]string, error) {
+	rows, err := s.pool.Query(
+		ctx, `SELECT DISTINCT tenant FROM blockpack_file_catalog WHERE subsystem = $1 AND deleted_at IS NULL`,
+		subsystem,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("pgcatalog: list live tenants: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var tenant string
+		if err := rows.Scan(&tenant); err != nil {
+			return nil, fmt.Errorf("pgcatalog: scan tenant: %w", err)
+		}
+		out = append(out, tenant)
+	}
+	return out, rows.Err()
+}
+
+// ListCompactedNotDeleted returns every row for (subsystem, tenant) that has been compacted
+// but not yet physically reaped -- issue #522/#525: the Postgres-sourced equivalent of the
+// classic poller's "compacted blocklist" (blocks still visible during their post-compaction
+// grace window), unscoped by any cutoff time (unlike ListCompactedOlderThan, which is the
+// reaper's own candidate query).
+func (s *Store) ListCompactedNotDeleted(ctx context.Context, subsystem, tenant string) ([]Row, error) {
+	rows, err := s.pool.Query(
+		ctx, `
+		SELECT row_id, subsystem, tenant, resource_id, object_key, level, min_sec, max_sec,
+			size_bytes, created_at, compacted_at, deleted_at, meta
+		FROM blockpack_file_catalog
+		WHERE subsystem = $1 AND tenant = $2
+			AND compacted_at IS NOT NULL AND deleted_at IS NULL`,
+		subsystem, tenant,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("pgcatalog: list compacted not deleted: %w", err)
+	}
+	defer rows.Close()
+	return scanFileCatalogRows(rows)
+}
+
 // DeleteRow hard-deletes the row identified by rowID. Callers (the reaper's
 // backend-worker handler) must only call this AFTER the row's underlying
 // object has been physically deleted from storage -- there is no audit value

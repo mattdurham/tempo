@@ -1120,7 +1120,20 @@ func (rw *readerWriter) pollingLoop(ctx context.Context) {
 }
 
 func (rw *readerWriter) pollBlocklist(ctx context.Context) {
-	blocklist, compactedBlocklist, err := rw.blocklistPoller.Do(ctx, rw.blocklist)
+	// issue #522/#525: Postgres is the sole source of truth for vblockpack block existence --
+	// when configured, every poll cycle sources trace blocks from blockpack_file_catalog
+	// instead of the classic S3 bucket-index poller, so search/metrics/tag sharding,
+	// trace-by-id Find, retention, and redaction (all of which read from rw.blocklist, never
+	// rw.blocklistPoller directly) automatically agree with blockpack's own compaction-worker
+	// about which blocks still exist.
+	pollFn := rw.blocklistPoller.Do
+	if rw.pg != nil {
+		pollFn = func(ctx context.Context, _ *blocklist.List) (blocklist.PerTenant, blocklist.PerTenantCompacted, error) {
+			return rw.pollBlocklistFromPostgres(ctx)
+		}
+	}
+
+	blocklist, compactedBlocklist, err := pollFn(ctx, rw.blocklist)
 	if err != nil {
 		if ctx.Err() == nil {
 			level.Error(rw.logger).Log("msg", "failed to poll blocklist", "err", err)
