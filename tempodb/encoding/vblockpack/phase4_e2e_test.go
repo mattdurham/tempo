@@ -85,7 +85,7 @@ func TestPhase4_RealPipeline_PartialBackfillServesCoveredSlicesAsPartial(t *test
 	watermarkSec := windowStart + 6*60
 	objStore := newFakeViObjectStore()
 	seedTriggeredWatermarkEntry(t, objStore, tenant, col, "string", watermarkSec)
-	withViWatermarkCache(t, newViWatermarkCache(objStore, time.Minute))
+	withViWatermarkCache(t, newViWatermarkCache(objStore, nil, time.Minute))
 
 	// Real #217 dispatch: the SAME entry point tempo's frontend uses (buildQueryPlanFromProgram
 	// mirrors this exactly) — forces exactly 10 one-minute TimeSlices for this window.

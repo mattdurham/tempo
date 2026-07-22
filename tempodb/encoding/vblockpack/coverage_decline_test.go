@@ -110,7 +110,10 @@ func TestCheckIndexCoverage_IgnoresWatermarks_EvenWithHalfBackfill(t *testing.T)
 			tenant: {
 				fetched: time.Now(),
 				watermarks: map[string]blockpack.ColumnWatermark{
-					"resource.service.name": {Triggered: true, Done: false, WatermarkSec: midpoint},
+					"resource.service.name": {
+						Triggered: true, Done: false, WatermarkSec: midpoint,
+						GapRanges: []blockpack.ColumnWatermarkGapRange{{StartSec: 0, EndSec: midpoint}},
+					},
 				},
 			},
 		},

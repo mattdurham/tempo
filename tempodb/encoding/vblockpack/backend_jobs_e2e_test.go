@@ -31,7 +31,6 @@ import (
 
 	blockpack "github.com/grafana/blockpack"
 	"github.com/grafana/tempo/pkg/tempopb"
-	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -57,19 +56,19 @@ func TestE2E_ViRecordUse_RealTrigger_InsertsPendingJobAndBackfillCompletes(t *te
 
 	usageCfg := blockpack.Config{DedicatedColumnsEnabled: true}
 	triggerCfg := blockpack.TriggerConfig{LeaseTTLSeconds: 1800}
-	require.NoError(t, ConfigureViUsage(s3cfg, nil, nil, usageCfg, triggerCfg, pg))
+	require.NoError(t, ConfigureViUsage(s3cfg, nil, nil, usageCfg, triggerCfg, pg, 5*time.Minute))
 
 	rec := getViUsageRecorder()
 	require.NotNil(t, rec)
 
 	tenant := "e2e-vi-tenant"
-	before := testutil.ToFloat64(metricViBackfillCompleted)
 	result, err := rec.RecordUse(context.Background(), tenant, "span.custom.attr", "string", time.Now())
 	require.NoError(t, err)
 	require.True(t, result.ShouldBackfill, "first recorded use must trigger per LeaseTTLSeconds' threshold")
 
-	// Real side effect 1: a durable pending row landed in blockpack's own compaction_jobs
-	// table via the REAL pg.InsertViBackfillJob call inside onShouldBackfill.
+	// Real side effect 1: durable pending rows landed in blockpack's own compaction_jobs table
+	// via the REAL pg.InsertViBackfillHistory call inside onShouldBackfill -- one row per
+	// 1-minute window covering the bulk-inserted retention (issue #529), not a single row.
 	var (
 		jobType, gotTenant, status string
 		count                      int
@@ -77,19 +76,19 @@ func TestE2E_ViRecordUse_RealTrigger_InsertsPendingJobAndBackfillCompletes(t *te
 	require.Eventually(t, func() bool {
 		row := pool.QueryRow(context.Background(),
 			`SELECT count(*) FROM compaction_jobs WHERE job_type = 'vi_backfill' AND tenant = $1`, tenant)
-		return row.Scan(&count) == nil && count == 1
-	}, 5*time.Second, 10*time.Millisecond, "expected exactly one vi_backfill row for %s", tenant)
+		return row.Scan(&count) == nil && count > 1
+	}, 5*time.Second, 10*time.Millisecond, "expected many vi_backfill window rows for %s", tenant)
 	row := pool.QueryRow(context.Background(),
-		`SELECT job_type, tenant, status FROM compaction_jobs WHERE job_type = 'vi_backfill' AND tenant = $1`, tenant)
+		`SELECT job_type, tenant, status FROM compaction_jobs WHERE job_type = 'vi_backfill' AND tenant = $1 LIMIT 1`, tenant)
 	require.NoError(t, row.Scan(&jobType, &gotTenant, &status))
 	assert.Equal(t, "vi_backfill", jobType)
 	assert.Equal(t, tenant, gotTenant)
 	assert.Equal(t, "pending", status)
 
 	// Real side effect 2: the SAME trigger's in-process goroutine (launchViBackfill)
-	// really ran and really persisted a Done=true watermark to the real registry --
-	// not a hand-built Entry, and not merely a metric increment divorced from actual
-	// registry state. Because pgPool is configured here, rec.registryFor(tenant)
+	// really ran and really persisted watermark progress to the real registry -- not a
+	// hand-built Entry, and not merely a metric increment divorced from actual registry
+	// state. Because pgPool is configured here, rec.registryFor(tenant)
 	// (vi_usage_hook.go's registryFor) uses the POSTGRES-backed registry
 	// (NewRegistryFromEntryStore(blockpack.NewPgViUsageEntryStore(pgPool), tenant)), not the
 	// S3-backed one -- confirmed live (a direct fake-S3 object dump during this test's
@@ -98,19 +97,26 @@ func TestE2E_ViRecordUse_RealTrigger_InsertsPendingJobAndBackfillCompletes(t *te
 	// when pgPool != nil, exactly per the 2026-07-11 registryFor fix this test
 	// exercises for real). Block listing also transparently switches to the
 	// Postgres-backed file_catalog fetcher (NewViBackfillDepsCatalogOverride) in this
-	// configuration -- an empty catalog (no rows for this tenant) is a real, valid
-	// "zero blocks" outcome, exactly like the empty-S3-bucket case, and Done=true
-	// still requires the real registry write to have round-tripped through Postgres.
+	// configuration -- an empty catalog (no rows for this tenant) is a real, valid "zero
+	// blocks" outcome, exactly like the empty-S3-bucket case. This goroutine is now bounded
+	// to a small 60-second quick-start window (issue #529) rather than the column's whole
+	// retention, so minSec never reaches the literal Unix epoch and Done (which requires
+	// exactly that, per #519) never becomes true here by design -- completion of the FULL
+	// backfill is the job queue's responsibility now, not this goroutine's. What this
+	// goroutine still guarantees is that it ran and persisted its own bounded window's
+	// progress, which metricViBackfillStarted (incremented unconditionally at RunViBackfill's
+	// start, before before was captured) doesn't itself prove landed in the registry.
 	require.Eventually(t, func() bool {
-		return testutil.ToFloat64(metricViBackfillCompleted) > before
-	}, 10*time.Second, 20*time.Millisecond, "the real in-process backfill goroutine must complete")
+		entries, _, loadErr := pg.ViUsageRegistry(tenant).Load(context.Background())
+		return loadErr == nil && len(entries) == 1 && entries[0].Backfill.WindowEndSec > 0
+	}, 10*time.Second, 20*time.Millisecond, "the real in-process backfill goroutine must persist its bounded window's progress")
 
 	registry := pg.ViUsageRegistry(tenant)
 	entries, _, loadErr := registry.Load(context.Background())
 	require.NoError(t, loadErr)
 	require.Len(t, entries, 1)
-	assert.True(t, entries[0].Backfill.Done,
-		"the real backfill run must have persisted Done=true to the real Postgres-backed registry")
+	assert.False(t, entries[0].Backfill.Done,
+		"a 60-second bounded quick-start run must never itself reach Done -- that's the job queue's responsibility now")
 }
 
 // TestE2E_MaybeCreateCube_RealTrigger_InsertsPendingJob is the real-wiring half: a real

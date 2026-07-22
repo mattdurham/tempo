@@ -101,7 +101,7 @@ func TestTryIndexFetch_RealWatermarkCache_DeclinesOnPartialCoverage(t *testing.T
 
 	objStore := newFakeViObjectStore()
 	seedTriggeredWatermarkEntry(t, objStore, tenant, col, "string", watermarkSec)
-	withViWatermarkCache(t, newViWatermarkCache(objStore, time.Minute))
+	withViWatermarkCache(t, newViWatermarkCache(objStore, nil, time.Minute))
 
 	query := `{ resource.service.name = "svc-alpha" }`
 	ctx := common.WithOriginalTraceQLQuery(context.Background(), query, false)
@@ -150,7 +150,7 @@ func TestTryIndexFetch_RealWatermarkCache_ControlCoveredRangeSucceeds(t *testing
 
 	objStore := newFakeViObjectStore()
 	seedTriggeredWatermarkEntry(t, objStore, tenant, col, "string", watermarkSec)
-	withViWatermarkCache(t, newViWatermarkCache(objStore, time.Minute))
+	withViWatermarkCache(t, newViWatermarkCache(objStore, nil, time.Minute))
 
 	query := `{ resource.service.name = "svc-alpha" }`
 	ctx := common.WithOriginalTraceQLQuery(context.Background(), query, false)

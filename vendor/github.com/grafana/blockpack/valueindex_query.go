@@ -93,6 +93,11 @@ var ErrValueIndexFileNotFound = vibuilder.ErrFileNotFound
 // already imports -- is the actual consumer of the gate.
 type ColumnWatermark = vibuilder.ColumnWatermark
 
+// ColumnWatermarkGapRange is one contiguous, NOT-yet-covered [StartSec, EndSec) span --
+// ColumnWatermark.GapRanges's element type, re-exported for the same reason ColumnWatermark is
+// (issue #529).
+type ColumnWatermarkGapRange = vibuilder.GapRange
+
 // LeafColumnInfo describes one leaf's column name and whether its predicate shape is
 // representable against the value index at all (#496/B1, SPEC-VB-5): re-exported from
 // vibuilder for the same reason ColumnWatermark is -- vibuilder.LeafIndexable is the

@@ -400,7 +400,7 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 		// (ValueIndexQuery.Enabled=false) still has a live cache to read from,
 		// independent of whether this process also happens to be a querier.
 		vu := cfg.Block.Blockpack.ViUsage
-		if werr := vblockpack.ConfigureViWatermarkCache(s3cfg, rawRUncached, rawWUncached, vu.DedicatedColumnsEnabled, vu.WatermarkCacheTTL); werr != nil {
+		if werr := vblockpack.ConfigureViWatermarkCache(s3cfg, rawRUncached, rawWUncached, vu.DedicatedColumnsEnabled, vu.WatermarkCacheTTL, pg); werr != nil {
 			level.Warn(logger).Log("msg", "vi watermark cache: failed to configure; write-path ColumnPolicy will index every column", "err", werr)
 		}
 	}
@@ -438,7 +438,7 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 	triggerCfg := blockpack.TriggerConfig{
 		LeaseTTLSeconds: uint64(vu.LeaseTTL.Seconds()),
 	}
-	if uerr := vblockpack.ConfigureViUsage(s3cfg, rawRUncached, rawWUncached, usageCfg, triggerCfg, pg); uerr != nil {
+	if uerr := vblockpack.ConfigureViUsage(s3cfg, rawRUncached, rawWUncached, usageCfg, triggerCfg, pg, vu.BackfillRetention); uerr != nil {
 		level.Warn(logger).Log("msg", "vi usage: failed to configure; usage-recording hook disabled", "err", uerr)
 	}
 	// #496 B3 fix (go-presubmit.md CRITICAL finding): the R7 watermark gate is
@@ -451,7 +451,7 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 	// any registry I/O, matching R12's "no machinery engaged at all" for the
 	// query-time gate the same way it already does for the write-path policy and
 	// the usage-recording hook.
-	if werr := vblockpack.ConfigureViWatermarkCache(s3cfg, rawRUncached, rawWUncached, vu.DedicatedColumnsEnabled, vu.WatermarkCacheTTL); werr != nil {
+	if werr := vblockpack.ConfigureViWatermarkCache(s3cfg, rawRUncached, rawWUncached, vu.DedicatedColumnsEnabled, vu.WatermarkCacheTTL, pg); werr != nil {
 		level.Warn(logger).Log("msg", "vi watermark cache: failed to configure; R7 gate disabled (queries proceed without partial-coverage gating)", "err", werr)
 	}
 

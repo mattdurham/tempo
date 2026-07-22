@@ -28,11 +28,37 @@ CREATE TABLE IF NOT EXISTS compaction_jobs (
     finished_at      TIMESTAMPTZ NULL,
     retries          INT NOT NULL DEFAULT 0,
     last_error       TEXT NULL,
-    next_retry_at    TIMESTAMPTZ NULL
+    next_retry_at    TIMESTAMPTZ NULL,
+    -- priority (issue #529): claim ordering tiebreaker, ASC (lower = claimed first). Every
+    -- job type except vi_backfill leaves this at its DEFAULT 0, preserving today's exact
+    -- FIFO-by-created_at behavior for them (0 always ties on created_at). vi_backfill's bulk
+    -- 1-minute-window jobs assign an ordinal value per window (0 = newest window in the batch,
+    -- increasing for older ones) so its own backlog is claimed newest-first without ever
+    -- starving other job types: any priority-0 row of ANY type is at least as eligible as an
+    -- older vi_backfill window.
+    priority         BIGINT NOT NULL DEFAULT 0,
+    -- column_hash/column_type/window_start_sec/window_end_sec (issue #529): populated ONLY for
+    -- vi_backfill rows (NULL for every other job_type), denormalized OUT of detail's JSONB blob
+    -- into real, indexed columns specifically so the query-time coverage check
+    -- (ViBackfillCoverageGap) can efficiently answer "does any non-succeeded window overlap
+    -- [minSec, maxSec] for this column" without a JSONB field-extraction scan across
+    -- potentially tens of thousands of rows per column. detail remains the source of truth for
+    -- the full ViBackfillDetail struct; these are a query-optimization-only denormalized copy.
+    column_hash      TEXT NULL,
+    column_type      TEXT NULL,
+    window_start_sec BIGINT NULL,
+    window_end_sec   BIGINT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_compaction_jobs_claimable
     ON compaction_jobs (job_type, status, created_at)
+    WHERE status = 'pending';
+
+-- DROP+recreate: see idx_compaction_jobs_dedup_active's own comment below for why "IF NOT
+-- EXISTS" alone can't apply a definition change to an already-existing index.
+DROP INDEX IF EXISTS idx_compaction_jobs_claimable_priority;
+CREATE INDEX idx_compaction_jobs_claimable_priority
+    ON compaction_jobs (priority, created_at)
     WHERE status = 'pending';
 
 -- DROP+recreate rather than plain CREATE ... IF NOT EXISTS: an index's WHERE
@@ -70,3 +96,14 @@ CREATE INDEX IF NOT EXISTS idx_compaction_jobs_lease_expiry
 CREATE INDEX IF NOT EXISTS idx_compaction_jobs_retry_due
     ON compaction_jobs (next_retry_at)
     WHERE status = 'failed' AND next_retry_at IS NOT NULL;
+
+-- idx_vi_backfill_coverage_gap (issue #529): backs ViBackfillCoverageGap's "does any
+-- non-succeeded vi_backfill window overlap [minSec, maxSec] for this column" query. Scoped to
+-- status != 'succeeded' specifically because that is the ONLY subset this query ever needs
+-- (and, in steady state, a small one -- most windows behind the priority-ordered claim frontier
+-- succeed quickly; the non-succeeded set concentrates on the still-catching-up historical tail
+-- and any genuinely stuck/retrying windows).
+DROP INDEX IF EXISTS idx_vi_backfill_coverage_gap;
+CREATE INDEX idx_vi_backfill_coverage_gap
+    ON compaction_jobs (tenant, column_hash, column_type, window_end_sec)
+    WHERE job_type = 'vi_backfill' AND status != 'succeeded';

@@ -7,6 +7,7 @@ package vblockpack
 
 import (
 	"testing"
+	"time"
 
 	blockpack "github.com/grafana/blockpack"
 	"github.com/stretchr/testify/assert"
@@ -29,7 +30,7 @@ func TestNewViUsageObjectStoreForBackend_GenericBackendUsesRawObjectStore(t *tes
 }
 
 func TestConfigureViUsage_NoBackendConfigured_ReturnsError(t *testing.T) {
-	err := ConfigureViUsage(nil, nil, nil, blockpack.Config{DedicatedColumnsEnabled: true}, blockpack.TriggerConfig{}, nil)
+	err := ConfigureViUsage(nil, nil, nil, blockpack.Config{DedicatedColumnsEnabled: true}, blockpack.TriggerConfig{}, nil, 720*time.Hour)
 	assert.Error(t, err)
 }
 
@@ -37,7 +38,7 @@ func TestConfigureViUsage_DedicatedColumnsDisabled_NoopEvenWithNoBackend(t *test
 	prev := getViUsageRecorder()
 	t.Cleanup(func() { ConfigureViUsageRecorder(prev) })
 
-	err := ConfigureViUsage(nil, nil, nil, blockpack.Config{DedicatedColumnsEnabled: false}, blockpack.TriggerConfig{}, nil)
+	err := ConfigureViUsage(nil, nil, nil, blockpack.Config{DedicatedColumnsEnabled: false}, blockpack.TriggerConfig{}, nil, 720*time.Hour)
 	require.NoError(t, err, "disabled config must not attempt backend construction at all")
 	assert.Nil(t, getViUsageRecorder())
 }

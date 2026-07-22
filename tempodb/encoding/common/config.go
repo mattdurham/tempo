@@ -205,6 +205,23 @@ type ViUsageConfig struct {
 	// re-fetching, mirroring ValueIndexQueryConfig.CacheTTL/backfillListTTL's
 	// identical short-TTL-collapses-concurrent-loads pattern. Default 30s.
 	WatermarkCacheTTL time.Duration `yaml:"watermark_cache_ttl"`
+
+	// BackfillRetention (issue #529) bounds how far back the reactive first-trigger hook
+	// bulk-inserts 1-minute vi_backfill windows the instant a never-before-queried column is
+	// seen. A genuine per-tenant value would need modules/overrides' runtime config, which
+	// isn't available at this call site (querier/query-frontend construct tempodb.New long
+	// before any CompactorOverrides gets wired in, and querier/query-frontend never call
+	// EnableCompaction at all -- see DedicatedColumnsOverride's own doc comment above for the
+	// identical, already-accepted "full per-tenant support needs modules/overrides, deferred"
+	// tradeoff in this same config struct). A single deployment-wide value is a deliberate
+	// simplification: get it wrong and a tenant either bulk-inserts a handful of harmless
+	// extra ancient windows (too long, wasted work only) or never gets an immediate bulk
+	// backfill for history older than this value (too short -- the reactive trigger fires
+	// once per column, per RecordUseAndMaybeTrigger's own Triggered gate, so a shortfall here
+	// is not automatically closed by a later query against an even older range). Default
+	// 720h (30 days), matching this deployment's own block_retention convention -- set this
+	// explicitly if a deployment's real retention differs.
+	BackfillRetention time.Duration `yaml:"backfill_retention"`
 }
 
 func (cfg *ViUsageConfig) applyDefaults() {
@@ -217,6 +234,9 @@ func (cfg *ViUsageConfig) applyDefaults() {
 	}
 	if cfg.WatermarkCacheTTL == 0 {
 		cfg.WatermarkCacheTTL = 30 * time.Second
+	}
+	if cfg.BackfillRetention == 0 {
+		cfg.BackfillRetention = 720 * time.Hour
 	}
 }
 

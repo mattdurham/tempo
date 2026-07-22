@@ -38,8 +38,23 @@ type viWatermarkCacheEntry struct {
 // Backfill.Triggered=true. Dedicated columns and never-triggered columns are
 // simply absent from the map, matching BuildValueIndexSource's own
 // nil/absent-means-no-gating contract (A5).
+//
+// registryFor resolves per tenant exactly like realUsageRecorder.registryFor
+// (vi_usage_hook.go) -- pg preferred when configured, falling back to the
+// object-store-backed registry otherwise. Before this fix (2026-07-22), this
+// cache ALWAYS used the object-store registry regardless of pg, silently
+// disconnected from the Postgres-backed registry every other component
+// (ConfigureViUsage's write-path recorder, compaction-worker's backfill
+// execution, the reactive first-trigger bulk insert) actually reads/writes for
+// a Postgres-configured deployment -- the R7 "never trust partial coverage as
+// complete" gate was a no-op in production: every column was absent from the
+// (permanently empty) object-store registry's map, and absence means
+// no-gating (A5's own contract), so any VI files discovered for a range were
+// trusted as complete regardless of whether that range's backfill had
+// actually finished.
 type viWatermarkCache struct {
 	store   blockpack.ObjectStore
+	pg      *blockpack.Postgres
 	ttl     time.Duration
 	now     func() time.Time
 	mu      sync.Mutex
@@ -47,18 +62,33 @@ type viWatermarkCache struct {
 	group   singleflight.Group
 }
 
-// newViWatermarkCache creates a viWatermarkCache backed by store, refreshing
-// each tenant's snapshot after ttl. A ttl <= 0 uses defaultWatermarkCacheTTL.
-func newViWatermarkCache(store blockpack.ObjectStore, ttl time.Duration) *viWatermarkCache {
+// newViWatermarkCache creates a viWatermarkCache, refreshing each tenant's
+// snapshot after ttl (a ttl <= 0 uses defaultWatermarkCacheTTL). pg, when
+// non-nil, takes priority over store for registry construction (registryFor's
+// own doc comment) -- store is still recorded either way since it costs
+// nothing extra (the caller already built it for other uses) and remains the
+// fallback for a deployment that never configures Postgres.
+func newViWatermarkCache(store blockpack.ObjectStore, pg *blockpack.Postgres, ttl time.Duration) *viWatermarkCache {
 	if ttl <= 0 {
 		ttl = defaultWatermarkCacheTTL
 	}
 	return &viWatermarkCache{
 		store:   store,
+		pg:      pg,
 		ttl:     ttl,
 		now:     time.Now,
 		entries: make(map[string]viWatermarkCacheEntry),
 	}
+}
+
+// registryFor mirrors realUsageRecorder.registryFor (vi_usage_hook.go) exactly -- pg preferred
+// when configured, so the read-side watermark cache and the write-side usage recorder/backfill
+// machinery always agree on which registry is authoritative for a given deployment.
+func (c *viWatermarkCache) registryFor(tenant string) *blockpack.Registry {
+	if c.pg != nil {
+		return c.pg.ViUsageRegistry(tenant)
+	}
+	return blockpack.NewRegistry(c.store, tenant)
 }
 
 // WatermarksFor returns tenant's current watermarks map, refreshing from the
@@ -79,7 +109,7 @@ func (c *viWatermarkCache) WatermarksFor(ctx context.Context, tenant string) (ma
 			return wm, nil
 		}
 
-		registry := blockpack.NewRegistry(c.store, tenant)
+		registry := c.registryFor(tenant)
 		entries, _, lerr := registry.Load(ctx)
 		if lerr != nil {
 			return nil, lerr
@@ -90,10 +120,15 @@ func (c *viWatermarkCache) WatermarksFor(ctx context.Context, tenant string) (ma
 			if !e.Backfill.Triggered {
 				continue
 			}
+			gapRanges, gerr := c.gapRangesFor(ctx, tenant, e)
+			if gerr != nil {
+				return nil, gerr
+			}
 			watermarks[e.ColumnName] = blockpack.ColumnWatermark{
 				Triggered:    e.Backfill.Triggered,
 				Done:         e.Backfill.Done,
 				WatermarkSec: e.Backfill.WatermarkSec,
+				GapRanges:    gapRanges,
 			}
 		}
 
@@ -106,6 +141,40 @@ func (c *viWatermarkCache) WatermarksFor(ctx context.Context, tenant string) (ma
 		return nil, err
 	}
 	return v.(map[string]blockpack.ColumnWatermark), nil //nolint:forcetypeassert // group.Do's fn always returns this type
+}
+
+// gapRangesFor resolves the not-yet-covered ranges for e (issue #529): when pg is configured,
+// the compaction_jobs queue is the sole source of truth (every 1-minute window in e's retention
+// was bulk-inserted on first trigger, and only compaction-worker's own success marks a window
+// covered), so this fetches the real per-window gaps via Postgres.ViBackfillGapRanges --
+// e.Backfill.WatermarkSec is NOT consulted in this case, since it only reflects the separate,
+// best-effort in-process quick-start goroutine (launchViBackfill), not the job queue's
+// authoritative state. Without pg, there is no job queue at all -- e.Backfill.WatermarkSec is the
+// only coverage signal that exists, so it's synthesized into a single gap [0, WatermarkSec),
+// reproducing this cache's pre-#529 behavior exactly.
+func (c *viWatermarkCache) gapRangesFor(ctx context.Context, tenant string, e blockpack.Entry) ([]blockpack.ColumnWatermarkGapRange, error) {
+	if c.pg == nil {
+		if e.Backfill.WatermarkSec == 0 {
+			return nil, nil
+		}
+		return []blockpack.ColumnWatermarkGapRange{{StartSec: 0, EndSec: e.Backfill.WatermarkSec}}, nil
+	}
+	ranges, err := c.pg.ViBackfillGapRanges(ctx, tenant, blockpack.ViBackfillColumn{
+		ColumnHash: e.ColumnHash,
+		ColumnName: e.ColumnName,
+		ColumnType: e.ColumnType,
+	})
+	if err != nil {
+		return nil, err
+	}
+	gaps := make([]blockpack.ColumnWatermarkGapRange, len(ranges))
+	for i, r := range ranges {
+		gaps[i] = blockpack.ColumnWatermarkGapRange{
+			StartSec: uint64(r.StartSec), //nolint:gosec // G115: Unix time is non-negative for any real clock
+			EndSec:   uint64(r.EndSec),   //nolint:gosec // G115: Unix time is non-negative for any real clock
+		}
+	}
+	return gaps, nil
 }
 
 // cached returns tenant's cached watermarks map if present and within ttl.
@@ -140,8 +209,15 @@ var (
 // constructing a store or touching the registry -- "no usage-tracking/backfill
 // machinery engaged at all" applies to the query-time gate exactly as it already
 // does to the B1 usage-recording hook (ConfigureViUsage).
+//
+// pg (2026-07-22 fix): threaded through exactly like ConfigureViUsage's own pg param, so this
+// cache's registryFor resolves to the SAME Postgres-backed registry the write-path recorder and
+// backfill machinery use for a Postgres-configured deployment -- see viWatermarkCache's own doc
+// comment for why this was a real, silent gap before this fix (the R7 gate was reading a
+// permanently-empty, disconnected object-store registry instead).
 func ConfigureViWatermarkCache(
 	s3cfg *s3backend.Config, rawR backend.RawReader, rawW backend.RawWriter, enabled bool, ttl time.Duration,
+	pg *blockpack.Postgres,
 ) error {
 	if !enabled {
 		setViWatermarkCache(nil)
@@ -151,7 +227,7 @@ func ConfigureViWatermarkCache(
 	if err != nil {
 		return err
 	}
-	setViWatermarkCache(newViWatermarkCache(store, ttl))
+	setViWatermarkCache(newViWatermarkCache(store, pg, ttl))
 	return nil
 }
 

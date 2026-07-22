@@ -32,6 +32,7 @@ package blockpack
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -153,20 +154,46 @@ func (p *Postgres) ColumnManifestStore() colhashmanifest.Store {
 	return colhashmanifest.NewPgStore(p.pool)
 }
 
-// InsertViBackfillJob inserts a pending vi_backfill job for tenant, deduped
-// on (tenant, column hash, column type) -- a repeat call for a column
-// already pending/claimed/running is a silent no-op. Called from tempo's
-// reactive first-trigger query-path hook the instant a never-before-queried
-// column is seen (WindowSeconds left at zero for "backfill everything");
-// compaction-planner's own chained-continuation logic calls the same
-// underlying Store method with a bounded WindowSeconds for every later
-// continuation.
-func (p *Postgres) InsertViBackfillJob(ctx context.Context, tenant string, d ViBackfillDetail) error {
-	return pgqueue.New(p.pool).InsertViBackfill(ctx, tenant, d)
+// InsertViBackfillHistory bulk-inserts one pending vi_backfill job per 1-minute window covering
+// [now-retention, now) for tenant's column, newest-window-first priority (issue #529). Called
+// from tempo's reactive first-trigger query-path hook the instant a never-before-queried column
+// is seen, with retention resolved from the tenant's own BlockRetention override -- the caller
+// no longer picks an unbounded/arbitrary window; every job is a fixed 1-minute slice, and the
+// full retention history is queued immediately instead of trickling in one bounded chunk per
+// compaction-planner tick. Idempotent per window: a repeat call for the same column (e.g. a
+// crash-recovery re-trigger) silently no-ops on windows already queued, non-terminal.
+//
+// compaction-planner's own periodic top-up (the "ongoing coverage for new data" half of #529)
+// calls the same underlying pgqueue.Store.InsertViBackfillWindows directly for a small trailing
+// range on every tick -- it lives entirely inside blockpack and has no need to cross this root
+// API boundary.
+func (p *Postgres) InsertViBackfillHistory(
+	ctx context.Context,
+	tenant string,
+	col ViBackfillColumn,
+	retention time.Duration,
+	now time.Time,
+) error {
+	return pgqueue.New(p.pool).InsertViBackfillWindows(
+		ctx, tenant, col, pgqueue.WindowsForRetention(retention, now),
+	)
 }
 
 // InsertCubeBackfillJob mirrors InsertViBackfillJob for cube_backfill,
 // deduped on (tenant, cube ID).
 func (p *Postgres) InsertCubeBackfillJob(ctx context.Context, tenant string, d CubeBackfillDetail) error {
 	return pgqueue.New(p.pool).InsertCubeBackfill(ctx, tenant, d)
+}
+
+// ViBackfillGapRanges returns every NOT-yet-succeeded 1-minute window for (tenant, col), merged
+// into the minimal number of contiguous ranges (issue #529) -- the query-time coverage-check
+// primitive callers use in place of a single scalar watermark, which cannot correctly represent
+// a column whose windows complete out of order across many parallel workers. An empty,
+// non-error result means every enqueued window for this column has succeeded.
+func (p *Postgres) ViBackfillGapRanges(
+	ctx context.Context,
+	tenant string,
+	col ViBackfillColumn,
+) ([]WindowRange, error) {
+	return pgqueue.New(p.pool).ViBackfillGapRanges(ctx, tenant, col)
 }

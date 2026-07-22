@@ -33,7 +33,7 @@ func TestConfigureViUsage_OnShouldBackfill_InsertsPendingJobWhenPgPoolConfigured
 	usageCfg := blockpack.Config{DedicatedColumnsEnabled: true}
 	triggerCfg := blockpack.TriggerConfig{LeaseTTLSeconds: 1800}
 
-	err := ConfigureViUsage(nil, rawR, rawW, usageCfg, triggerCfg, blockpack.NewPostgresFromPool(pool))
+	err := ConfigureViUsage(nil, rawR, rawW, usageCfg, triggerCfg, blockpack.NewPostgresFromPool(pool), 5*time.Minute)
 	require.NoError(t, err)
 
 	before := testutil.ToFloat64(metricViBackfillStarted)
@@ -44,7 +44,8 @@ func TestConfigureViUsage_OnShouldBackfill_InsertsPendingJobWhenPgPoolConfigured
 	require.NoError(t, err)
 	require.True(t, result.ShouldBackfill, "first recorded use must trigger per LeaseTTLSeconds' threshold")
 
-	// Half 1: the durable row exists in blockpack's own compaction_jobs table.
+	// Half 1: the durable rows exist in blockpack's own compaction_jobs table -- one per
+	// 1-minute window covering the bulk-inserted retention (issue #529), not a single row.
 	var (
 		jobType, tenant, status string
 		count                   int
@@ -52,11 +53,11 @@ func TestConfigureViUsage_OnShouldBackfill_InsertsPendingJobWhenPgPoolConfigured
 	require.Eventually(t, func() bool {
 		row := pool.QueryRow(context.Background(),
 			`SELECT count(*) FROM compaction_jobs WHERE job_type = 'vi_backfill' AND tenant = 'tenant-a'`)
-		return row.Scan(&count) == nil && count == 1
-	}, 5*time.Second, 10*time.Millisecond, "expected exactly one vi_backfill row for tenant-a")
+		return row.Scan(&count) == nil && count > 1
+	}, 5*time.Second, 10*time.Millisecond, "expected many vi_backfill window rows for tenant-a")
 
 	row := pool.QueryRow(context.Background(),
-		`SELECT job_type, tenant, status FROM compaction_jobs WHERE job_type = 'vi_backfill' AND tenant = 'tenant-a'`)
+		`SELECT job_type, tenant, status FROM compaction_jobs WHERE job_type = 'vi_backfill' AND tenant = 'tenant-a' LIMIT 1`)
 	require.NoError(t, row.Scan(&jobType, &tenant, &status))
 	assert.Equal(t, "vi_backfill", jobType)
 	assert.Equal(t, "tenant-a", tenant)
@@ -85,7 +86,7 @@ func TestConfigureViUsage_OnShouldBackfill_CrossTypeSameNameColumns_EachGetsOwnR
 	usageCfg := blockpack.Config{DedicatedColumnsEnabled: true}
 	triggerCfg := blockpack.TriggerConfig{LeaseTTLSeconds: 1800}
 
-	err := ConfigureViUsage(nil, rawR, rawW, usageCfg, triggerCfg, blockpack.NewPostgresFromPool(pool))
+	err := ConfigureViUsage(nil, rawR, rawW, usageCfg, triggerCfg, blockpack.NewPostgresFromPool(pool), 5*time.Minute)
 	require.NoError(t, err)
 
 	rec := getViUsageRecorder()
@@ -96,13 +97,27 @@ func TestConfigureViUsage_OnShouldBackfill_CrossTypeSameNameColumns_EachGetsOwnR
 	_, err = rec.RecordUse(context.Background(), "tenant-collision", "span.custom.attr", "int", time.Now())
 	require.NoError(t, err)
 
-	var count int
+	// Each column type now bulk-inserts many window rows (issue #529), not one -- the dedup-key
+	// guard this test proves is that BOTH types' full sets of rows exist independently (distinct
+	// column_type count of 2), never collapsed onto one type's rows via a colliding dedup_key.
+	var distinctTypes int
 	require.Eventually(t, func() bool {
 		row := pool.QueryRow(context.Background(),
-			`SELECT count(*) FROM compaction_jobs WHERE job_type = 'vi_backfill' AND tenant = 'tenant-collision'`)
-		return row.Scan(&count) == nil && count == 2
+			`SELECT count(DISTINCT column_type) FROM compaction_jobs WHERE job_type = 'vi_backfill' AND tenant = 'tenant-collision'`)
+		return row.Scan(&distinctTypes) == nil && distinctTypes == 2
 	}, 5*time.Second, 10*time.Millisecond,
-		"same-name, different-typed columns must each get their own compaction_jobs row, got count=%d", count)
+		"same-name, different-typed columns must each get their own independent set of compaction_jobs rows, got distinct types=%d", distinctTypes)
+
+	var stringCount, intCount int
+	require.NoError(t, pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM compaction_jobs WHERE job_type = 'vi_backfill' AND tenant = 'tenant-collision' AND column_type = 'string'`,
+	).Scan(&stringCount))
+	require.NoError(t, pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM compaction_jobs WHERE job_type = 'vi_backfill' AND tenant = 'tenant-collision' AND column_type = 'int'`,
+	).Scan(&intCount))
+	assert.True(t, stringCount > 1 && intCount > 1,
+		"each column type must get its own full set of window rows, got string=%d int=%d", stringCount, intCount)
+	assert.Equal(t, stringCount, intCount, "same retention must produce the same window count for both types")
 }
 
 // TestConfigureViUsage_OnShouldBackfill_NilPgPool_SkipsInsertNoError is the regression guard
@@ -116,7 +131,7 @@ func TestConfigureViUsage_OnShouldBackfill_NilPgPool_SkipsInsertNoError(t *testi
 	usageCfg := blockpack.Config{DedicatedColumnsEnabled: true}
 	triggerCfg := blockpack.TriggerConfig{LeaseTTLSeconds: 1800}
 
-	err := ConfigureViUsage(nil, rawR, rawW, usageCfg, triggerCfg, nil)
+	err := ConfigureViUsage(nil, rawR, rawW, usageCfg, triggerCfg, nil, 5*time.Minute)
 	require.NoError(t, err)
 
 	before := testutil.ToFloat64(metricViBackfillStarted)

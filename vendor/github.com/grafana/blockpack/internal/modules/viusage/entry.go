@@ -84,10 +84,18 @@ type BackfillState struct {
 }
 
 // CoversRange reports whether bs's backfill state fully covers [minSec, maxSec] — the
-// R7 query-time coverage-check primitive. Pure, no I/O. This is the ONE function every
-// query-path coverage decision for a non-dedicated, usage-tracked column must call before
-// trusting a non-empty FilesForTimeRange result. #519: Done is never consulted here — see
-// BackfillState.Done's own doc comment.
+// R7 query-time coverage-check primitive. Pure, no I/O. #519: Done is never consulted here —
+// see BackfillState.Done's own doc comment.
+//
+// NOTE (issue #529): this scalar-watermark check has ZERO live callers as of 2026-07-22 --
+// vibuilder.ColumnWatermark.CoversRange (the actual, wired-up query-path gate, via
+// watermarksForOrNil/tryIndexFetch in tempo) has moved to a per-window GapRanges model, since a
+// single scalar cannot correctly represent coverage with gaps in the middle once many
+// independent 1-minute vi_backfill jobs can complete out of order across parallel workers. This
+// method is kept for whatever legacy/observability role BackfillState itself still serves, but
+// it is NO LONGER claimed to be behaviorally identical to ColumnWatermark's -- do not assume
+// parity between the two (the coversrange_parity_test.go table-driven test asserting exactly
+// that was retired alongside this change).
 func (bs BackfillState) CoversRange(minSec, maxSec uint64) bool {
 	if !bs.Triggered {
 		return false // never indexed — no coverage at all, matches today's "zero files" case

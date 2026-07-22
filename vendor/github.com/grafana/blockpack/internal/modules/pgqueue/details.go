@@ -62,21 +62,17 @@ type TraceCompactionDetail struct {
 	Level           int      `json:"level"`
 }
 
-// ViBackfillDetail identifies which (tenant, column) a vi_backfill job
-// historically indexes, and how far back -- mirrors tempo jobstore.go's
-// now-retired identical struct (issue #522: vi_backfill moved fully into
-// blockpack, self-contained via compactionworker's own catalogBlockFetcher
-// reading blockpack_file_catalog directly, no tempo backend.Reader dependency
-// for vblockpack-encoded tenants; see NOTE-COMPACTIONWORKER-7).
+// ViBackfillDetail identifies which (tenant, column) a vi_backfill job indexes, and the exact
+// [WindowStartSec, WindowEndSec) span it covers (issue #529: every vi_backfill job -- the
+// initial bulk-inserted history and every later trailing-window job -- is a fully
+// self-contained, fixed 1-minute window; no watermark/chain-continuation state carries between
+// jobs the way the old WindowSeconds-relative-to-a-watermark design required).
 type ViBackfillDetail struct {
-	ColumnHash string `json:"column_hash"`
-	ColumnName string `json:"column_name"`
-	ColumnType string `json:"column_type"`
-	// WindowSeconds bounds how far back from the column's current watermark this
-	// job processes. Zero means unbounded (full remaining history) -- the reactive
-	// first-trigger path passes zero, preserving "first backfill does everything";
-	// compactionplanner's chained continuation jobs pass a real bounded value.
-	WindowSeconds uint64 `json:"window_seconds"`
+	ColumnHash     string `json:"column_hash"`
+	ColumnName     string `json:"column_name"`
+	ColumnType     string `json:"column_type"`
+	WindowStartSec int64  `json:"window_start_sec"`
+	WindowEndSec   int64  `json:"window_end_sec"`
 }
 
 // CubeBackfillDetail identifies which (tenant, cube) a cube_backfill job

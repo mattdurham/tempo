@@ -17,13 +17,29 @@ package blockpack
 // reactive first-trigger insert crosses the repo boundary.
 
 import (
+	"time"
+
 	"github.com/grafana/blockpack/internal/modules/pgqueue"
 )
 
-// ViBackfillDetail identifies which (tenant, column) a vi_backfill job
-// historically indexes, and how far back.
+// ViBackfillDetail identifies which (tenant, column) a vi_backfill job indexes and the exact
+// 1-minute window it covers.
 type ViBackfillDetail = pgqueue.ViBackfillDetail
+
+// ViBackfillColumn identifies the (tenant, column) a batch of vi_backfill windows covers.
+type ViBackfillColumn = pgqueue.ViBackfillColumn
 
 // CubeBackfillDetail identifies which (tenant, cube) a cube_backfill job
 // processes, and how far back.
 type CubeBackfillDetail = pgqueue.CubeBackfillDetail
+
+// WindowRange is one contiguous [StartSec, EndSec) span -- ViBackfillGapRanges's return shape.
+type WindowRange = pgqueue.WindowRange
+
+// ViBackfillWindowsForRetention generates one job-window per 1-minute slice covering
+// [now-retention, now), newest-first -- the exact set InsertViBackfillHistory bulk-inserts.
+// Exported so callers computing their own retention-driven window sets (or just inspecting the
+// count/shape in tests) don't need to reach into internal/modules/pgqueue directly.
+func ViBackfillWindowsForRetention(retention time.Duration, now time.Time) []pgqueue.WindowSpec {
+	return pgqueue.WindowsForRetention(retention, now)
+}

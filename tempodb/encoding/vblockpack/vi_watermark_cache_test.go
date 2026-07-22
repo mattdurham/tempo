@@ -72,7 +72,7 @@ func TestViWatermarkCache_ReturnsTriggeredColumnsOnly(t *testing.T) {
 	store := newCountingObjectStore()
 	seedViWatermarkEntry(t, store, "tenant-a", "span.custom.attr")
 
-	cache := newViWatermarkCache(store, time.Minute)
+	cache := newViWatermarkCache(store, nil, time.Minute)
 	wm, err := cache.WatermarksFor(context.Background(), "tenant-a")
 	require.NoError(t, err)
 
@@ -83,11 +83,52 @@ func TestViWatermarkCache_ReturnsTriggeredColumnsOnly(t *testing.T) {
 
 func TestViWatermarkCache_EmptyRegistryReturnsEmptyMap(t *testing.T) {
 	store := newCountingObjectStore()
-	cache := newViWatermarkCache(store, time.Minute)
+	cache := newViWatermarkCache(store, nil, time.Minute)
 
 	wm, err := cache.WatermarksFor(context.Background(), "tenant-a")
 	require.NoError(t, err)
 	assert.Empty(t, wm)
+}
+
+// TestViWatermarkCache_PgConfigured_UsesPostgresRegistryNotObjectStore is the direct
+// regression guard for the 2026-07-22 fix: before it, this cache ALWAYS read the
+// object-store-backed registry regardless of pg, silently disconnected from the
+// Postgres-backed registry every other component (ConfigureViUsage's write-path recorder,
+// compaction-worker's backfill execution) actually reads/writes for a Postgres-configured
+// deployment -- making the R7 partial-coverage gate a permanent no-op in production. Seeds
+// ONLY the Postgres-backed registry (via the exact same pg.ViUsageRegistry construction
+// realUsageRecorder.registryFor uses when pg != nil) and leaves the object store genuinely
+// empty, so a pass here is only possible if WatermarksFor actually read from Postgres.
+func TestViWatermarkCache_PgConfigured_UsesPostgresRegistryNotObjectStore(t *testing.T) {
+	pool := newTestPostgresPool(t)
+	pg := blockpack.NewPostgresFromPool(pool)
+
+	pgRegistry := pg.ViUsageRegistry("tenant-a")
+	result, err := blockpack.RecordUseAndMaybeTrigger(
+		context.Background(), pgRegistry, "tenant-a", "span.custom.attr", "string", time.Unix(1000, 0),
+		blockpack.TriggerConfig{LeaseTTLSeconds: 1800},
+	)
+	require.NoError(t, err)
+	require.True(t, result.ShouldBackfill)
+	require.NoError(t, pgRegistry.UpdateWatermark(
+		context.Background(), "tenant-a", result.Entry.ColumnHash, result.Entry.ColumnType, 500, 100, 1000, false,
+	))
+
+	objStore := newCountingObjectStore() // deliberately left empty
+
+	cache := newViWatermarkCache(objStore, pg, time.Minute)
+	wm, err := cache.WatermarksFor(context.Background(), "tenant-a")
+	require.NoError(t, err)
+
+	require.Contains(t, wm, "span.custom.attr",
+		"must read the Postgres-backed registry when pg is configured, not the empty object store")
+	assert.True(t, wm["span.custom.attr"].Triggered)
+	assert.Equal(t, uint64(500), wm["span.custom.attr"].WatermarkSec)
+
+	objStore.mu.Lock()
+	gets := objStore.getCalls
+	objStore.mu.Unlock()
+	assert.Zero(t, gets, "must never touch the object store when pg is configured")
 }
 
 // TestWatermarkCache_ShortTTL_CollapsesRepeatedLoads mirrors
@@ -101,7 +142,7 @@ func TestWatermarkCache_ShortTTL_CollapsesRepeatedLoads(t *testing.T) {
 	store.getCalls = 0 // reset after seeding (seeding itself performs Gets via the registry's own retry loop)
 	store.mu.Unlock()
 
-	cache := newViWatermarkCache(store, time.Minute)
+	cache := newViWatermarkCache(store, nil, time.Minute)
 
 	const concurrency = 20
 	var wg sync.WaitGroup
@@ -137,7 +178,7 @@ func TestViWatermarkCache_RefreshesAfterTTLExpiry(t *testing.T) {
 	store.mu.Unlock()
 
 	fixedNow := time.Now()
-	cache := newViWatermarkCache(store, time.Second)
+	cache := newViWatermarkCache(store, nil, time.Second)
 	cache.now = func() time.Time { return fixedNow }
 
 	_, err := cache.WatermarksFor(context.Background(), "tenant-a")
@@ -159,7 +200,7 @@ func TestViWatermarkCache_RefreshesAfterTTLExpiry(t *testing.T) {
 
 func TestConfigureViWatermarkCache_DisabledIsNoop(t *testing.T) {
 	setViWatermarkCache(nil)
-	err := ConfigureViWatermarkCache(nil, nil, nil, false, time.Second)
+	err := ConfigureViWatermarkCache(nil, nil, nil, false, time.Second, nil)
 	require.NoError(t, err)
 	assert.Nil(t, getViWatermarkCache())
 }
@@ -169,7 +210,7 @@ func TestConfigureViWatermarkCache_GenericBackendInstallsRawBackedCache(t *testi
 	t.Cleanup(func() { setViWatermarkCache(nil) })
 	rawR, rawW := newLocalRawBackend(t)
 
-	err := ConfigureViWatermarkCache(nil, rawR, rawW, true, time.Second)
+	err := ConfigureViWatermarkCache(nil, rawR, rawW, true, time.Second, nil)
 	require.NoError(t, err)
 
 	cache := getViWatermarkCache()

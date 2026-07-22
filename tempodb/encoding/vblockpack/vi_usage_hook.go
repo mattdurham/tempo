@@ -153,9 +153,15 @@ func (r *realUsageRecorder) RecordUse(
 // object-store construction below is UNTOUCHED either way (it's simply
 // unused by registryFor when pg != nil, costing nothing extra since it
 // was already being built for the backfill deps regardless).
+// backfillRetention (issue #529) bounds how far back the reactive first-trigger hook's bulk
+// insert covers -- see common.ViUsageConfig.BackfillRetention's own doc comment (its only
+// caller, tempodb.go) for why this is a single deployment-wide config value rather than a
+// live per-tenant CompactorOverrides lookup (not available at every process type that can
+// experience a reactive trigger).
 func ConfigureViUsage(
 	s3cfg *s3backend.Config, rawR backend.RawReader, rawW backend.RawWriter,
 	usageCfg blockpack.Config, triggerCfg blockpack.TriggerConfig, pg *blockpack.Postgres,
+	backfillRetention time.Duration,
 ) error {
 	if !usageCfg.DedicatedColumnsEnabled {
 		ConfigureViUsageRecorder(nil)
@@ -188,33 +194,23 @@ func ConfigureViUsage(
 		triggerCfg: triggerCfg,
 		pg:         pg,
 		onShouldBackfill: func(entry blockpack.Entry) {
-			// issue #522: the durable job insert now targets blockpack's OWN
-			// compaction_jobs queue (pg.InsertViBackfillJob) instead of tempo's
-			// separate backend_jobs/jobstore -- chain-continuation planning and
-			// execution both moved fully into blockpack's compaction-planner/
-			// compaction-worker (compactionplanner.planViBackfill,
-			// compactionworker.processViBackfillJob). Inserting here is still
-			// purely additive: it does NOT replace launchViBackfill's in-process
-			// goroutine below, both run (see the "does NOT replace" note on
-			// ConfigureViUsage's own doc comment) -- the durable row makes a
-			// crash mid-backfill recoverable, while the goroutine keeps today's
-			// zero-added-latency common case.
+			// issue #529: the durable job insert bulk-inserts one job per 1-minute window
+			// covering [now-backfillRetention, now) immediately (newest-window-first
+			// priority), superseding issue #518 decision (c)'s single unbounded job --
+			// see blockpack.Postgres.InsertViBackfillHistory's own doc comment. Inserting
+			// here is still purely additive: it does NOT replace launchViBackfill's
+			// in-process goroutine below, both run -- the durable rows make a crash
+			// mid-backfill recoverable and let compaction-worker's fleet parallelize the
+			// full retention window, while the goroutine keeps today's zero-added-latency
+			// common case for the single newest window.
 			if pg != nil {
-				if ierr := pg.InsertViBackfillJob(context.Background(), entry.Tenant, blockpack.ViBackfillDetail{
+				if ierr := pg.InsertViBackfillHistory(context.Background(), entry.Tenant, blockpack.ViBackfillColumn{
 					ColumnHash: entry.ColumnHash,
 					ColumnName: entry.ColumnName,
 					ColumnType: entry.ColumnType,
-					// WindowSeconds: 0 -- this reactive first-trigger path is
-					// unbounded (issue #518 decision (c): the very first backfill of a
-					// column always does everything; job-planner's chained
-					// continuation jobs are the ones that pass a real bound).
-					// compactionworker.viBackfillWindowSeconds translates this 0 into a
-					// real math.MaxUint64 sentinel before constructing BackfillConfig --
-					// see blockpack NOTE-COMPACTIONWORKER-7.
-					WindowSeconds: 0,
-				}); ierr != nil {
+				}, backfillRetention, time.Now()); ierr != nil {
 					level.Warn(util_log.Logger).Log(
-						"msg", "vblockpack: failed to insert durable vi_backfill job",
+						"msg", "vblockpack: failed to bulk-insert durable vi_backfill history",
 						"tenant", entry.Tenant, "column", entry.ColumnName, "err", ierr,
 					)
 				}
@@ -231,10 +227,14 @@ func ConfigureViUsage(
 			if pgPool != nil {
 				deps = NewViBackfillDepsCatalogOverride(deps, pgPool, entry, backend.NewReader(rawR))
 			}
-			// windowSeconds: 0 -- unbounded, matching the InsertViBackfill call
-			// above (this is the reactive first-trigger path, issue #518
-			// decision (c)).
-			launchViBackfill(entry, deps, 0)
+			// windowSeconds: 60 (issue #529) -- a single, small, fast in-process window for
+			// immediate availability of the NEWEST minute only, consistent with every
+			// vi_backfill job now being a fixed 1-minute unit; the durable bulk insert above
+			// covers the rest of backfillRetention via compaction-worker's fleet. No longer
+			// unbounded (issue #518 decision (c) is superseded) -- running a potentially huge,
+			// unbounded backfill synchronously inside a live query-serving process was never
+			// the right place for that work once a parallelizable durable queue exists.
+			launchViBackfill(entry, deps, 60)
 		},
 	}
 	ConfigureViUsageRecorder(rec)
