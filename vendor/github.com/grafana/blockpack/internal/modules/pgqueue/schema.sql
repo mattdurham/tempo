@@ -65,19 +65,39 @@ CREATE INDEX IF NOT EXISTS idx_compaction_jobs_claimable
     ON compaction_jobs (job_type, status, created_at)
     WHERE status = 'pending';
 
--- DROP+recreate: see idx_compaction_jobs_dedup_active's own comment below for why "IF NOT
--- EXISTS" alone can't apply a definition change to an already-existing index.
-DROP INDEX IF EXISTS idx_compaction_jobs_claimable_priority;
-CREATE INDEX idx_compaction_jobs_claimable_priority
+-- DROP+recreate CONCURRENTLY: see idx_compaction_jobs_dedup_active's own comment below for why
+-- "IF NOT EXISTS" alone can't apply a definition change to an already-existing index. CONCURRENTLY
+-- on both statements (issue #529 incident, 2026-07-23): a plain (non-concurrent) DROP+CREATE
+-- takes a lock that blocks EVERY other write against compaction_jobs for as long as the rebuild
+-- takes -- harmless at this table's original, small size, but once the #529 bulk-insert grew it
+-- past a million rows, a routine compaction-worker pod restart's schema-apply (re-running this
+-- exact statement on every single startup) stalled the ENTIRE fleet's claim/complete throughput
+-- for several seconds at a time. CONCURRENTLY costs more total rebuild time and cannot run inside
+-- an explicit transaction block (fine here -- pgschema.ApplyStatements executes each statement as
+-- its own autocommitted Exec call, never wrapped in BEGIN/COMMIT) but never blocks concurrent
+-- reads or writes.
+--
+-- status != 'succeeded' (issue #529 incident, 2026-07-23): originally scoped to status = 'pending'
+-- only, matching this index's own name -- but Claim's real query (claimJobSQL below) is a 4-way OR
+-- across pending, lease-expired claimed/running, and retry-due failed rows, and Postgres can't use
+-- a partial index scoped to just ONE of those branches to satisfy an ORDER BY + LIMIT 1 across all
+-- four without risking a wrong answer, so it fell back to a full parallel sequential scan --
+-- correct, but a 1.24M-row table turns "correct" into a 3.6-SECOND claim attempt, repeated by
+-- every worker, every claim. status != 'succeeded' covers all four OR branches in one partial
+-- index (a succeeded row is the only status this claim query never wants), restoring the
+-- ORDER-BY-driven index scan's early-exit behavior regardless of total table size.
+DROP INDEX CONCURRENTLY IF EXISTS idx_compaction_jobs_claimable_priority;
+CREATE INDEX CONCURRENTLY idx_compaction_jobs_claimable_priority
     ON compaction_jobs (priority, created_at)
-    WHERE status = 'pending';
+    WHERE status != 'succeeded';
 
--- DROP+recreate rather than plain CREATE ... IF NOT EXISTS: an index's WHERE
+-- DROP+recreate CONCURRENTLY rather than plain CREATE ... IF NOT EXISTS: an index's WHERE
 -- predicate is part of its identity to Postgres, but "IF NOT EXISTS" only
 -- checks the NAME -- a schema.sql change to this predicate would otherwise
 -- silently never apply to an already-existing live database, leaving it
--- permanently running the stale definition. Cheap and safe to redo on every
--- startup (rebuilds fast at this table's realistic size; touches no data).
+-- permanently running the stale definition. CONCURRENTLY (issue #529 incident, 2026-07-23): see
+-- idx_compaction_jobs_claimable_priority's own comment above for why a non-concurrent rebuild on
+-- this table's current size blocks the whole fleet, not just this index's own readers.
 --
 -- status != 'succeeded' (not just pending/claimed/running): a 'failed' row is
 -- NEVER terminal (pgqueue.Store.Fail unconditionally schedules a retry, see
@@ -92,8 +112,8 @@ CREATE INDEX idx_compaction_jobs_claimable_priority
 -- query always selects the single oldest claimable row, that one failing
 -- UPDATE permanently jammed the entire queue behind it -- found live on
 -- tempo-dev-test-03, 2026-07-21.
-DROP INDEX IF EXISTS idx_compaction_jobs_dedup_active;
-CREATE UNIQUE INDEX idx_compaction_jobs_dedup_active
+DROP INDEX CONCURRENTLY IF EXISTS idx_compaction_jobs_dedup_active;
+CREATE UNIQUE INDEX CONCURRENTLY idx_compaction_jobs_dedup_active
     ON compaction_jobs (dedup_key)
     WHERE status != 'succeeded';
 
@@ -114,8 +134,14 @@ CREATE INDEX IF NOT EXISTS idx_compaction_jobs_retry_due
 -- (and, in steady state, a small one -- most windows behind the priority-ordered claim frontier
 -- succeed quickly; the non-succeeded set concentrates on the still-catching-up historical tail
 -- and any genuinely stuck/retrying windows).
-DROP INDEX IF EXISTS idx_vi_backfill_coverage_gap;
-CREATE INDEX idx_vi_backfill_coverage_gap
+--
+-- CONCURRENTLY (issue #529 incident, 2026-07-23): a plain DROP+CREATE rebuild of this index on
+-- every compaction-worker/compaction-planner startup blocks ALL writes to compaction_jobs for the
+-- rebuild's duration -- negligible when this table was small, several seconds of fleet-wide
+-- write-stall once the #529 bulk-insert grew it past a million rows. See
+-- idx_compaction_jobs_claimable_priority's own comment for the fuller incident writeup.
+DROP INDEX CONCURRENTLY IF EXISTS idx_vi_backfill_coverage_gap;
+CREATE INDEX CONCURRENTLY idx_vi_backfill_coverage_gap
     ON compaction_jobs (tenant, column_hash, column_type, window_end_sec)
     WHERE job_type = 'vi_backfill' AND status != 'succeeded';
 
@@ -124,7 +150,12 @@ CREATE INDEX idx_vi_backfill_coverage_gap
 -- like idx_vi_backfill_coverage_gap above, since a succeeded row is exactly the "not missing"
 -- signal that query needs to see (idx_vi_backfill_coverage_gap's partial index can't answer
 -- that; it excludes succeeded rows entirely).
-DROP INDEX IF EXISTS idx_vi_backfill_all_windows;
-CREATE INDEX idx_vi_backfill_all_windows
+--
+-- CONCURRENTLY (issue #529 incident, 2026-07-23): this specific index's own non-concurrent
+-- rebuild, re-run by a routine compaction-worker pod restart against the by-then-1.24M-row table,
+-- is the exact statement caught mid-execution stalling the whole fleet during this incident's
+-- live diagnosis. See idx_compaction_jobs_claimable_priority's own comment for the fuller writeup.
+DROP INDEX CONCURRENTLY IF EXISTS idx_vi_backfill_all_windows;
+CREATE INDEX CONCURRENTLY idx_vi_backfill_all_windows
     ON compaction_jobs (tenant, column_hash, column_type, window_end_sec)
     WHERE job_type = 'vi_backfill';
