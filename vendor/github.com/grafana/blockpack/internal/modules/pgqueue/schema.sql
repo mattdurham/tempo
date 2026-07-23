@@ -47,7 +47,16 @@ CREATE TABLE IF NOT EXISTS compaction_jobs (
     column_hash      TEXT NULL,
     column_type      TEXT NULL,
     window_start_sec BIGINT NULL,
-    window_end_sec   BIGINT NULL
+    window_end_sec   BIGINT NULL,
+    -- block_object_key (issue #532): populated ONLY for NEW-model vi_backfill rows -- one job
+    -- per (column, actual trace block) instead of one job per synthetic 1-minute wall-clock
+    -- window. NULL for every other job_type AND for OLD-model vi_backfill rows (the two shapes
+    -- coexist during the transition -- see pgqueue/NOTES.md and ViBackfillDetail's own doc
+    -- comment). window_start_sec/window_end_sec are still populated for NEW-model rows too
+    -- (from the block's own real MinSec/MaxSec), so ViBackfillGapRanges' existing time-range
+    -- coverage query works unchanged across both shapes without needing to know which one
+    -- produced a given row.
+    block_object_key TEXT NULL
 );
 
 -- ALTER TABLE ... ADD COLUMN IF NOT EXISTS (issue #529): CREATE TABLE IF NOT EXISTS above is a
@@ -60,6 +69,7 @@ ALTER TABLE compaction_jobs ADD COLUMN IF NOT EXISTS column_hash TEXT NULL;
 ALTER TABLE compaction_jobs ADD COLUMN IF NOT EXISTS column_type TEXT NULL;
 ALTER TABLE compaction_jobs ADD COLUMN IF NOT EXISTS window_start_sec BIGINT NULL;
 ALTER TABLE compaction_jobs ADD COLUMN IF NOT EXISTS window_end_sec BIGINT NULL;
+ALTER TABLE compaction_jobs ADD COLUMN IF NOT EXISTS block_object_key TEXT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_compaction_jobs_claimable
     ON compaction_jobs (job_type, status, created_at)
@@ -159,3 +169,26 @@ DROP INDEX CONCURRENTLY IF EXISTS idx_vi_backfill_all_windows;
 CREATE INDEX CONCURRENTLY idx_vi_backfill_all_windows
     ON compaction_jobs (tenant, column_hash, column_type, window_end_sec)
     WHERE job_type = 'vi_backfill';
+
+-- idx_vi_backfill_all_blocks (issue #532): backs MissingViBackfillBlocks' "does a row exist at
+-- all for this exact block" check -- the block-shaped-job analog of idx_vi_backfill_all_windows
+-- above, scoped to block_object_key IS NOT NULL so only NEW-model rows are indexed here (OLD
+-- window-shaped rows never populate block_object_key and are irrelevant to this check).
+-- Deliberately NOT status-scoped, for the identical reason idx_vi_backfill_all_windows isn't: a
+-- succeeded row is exactly the "not missing" signal this query needs to see.
+--
+-- DROP+recreate CONCURRENTLY (matching every sibling index above, not a bare
+-- "CREATE ... IF NOT EXISTS"): an index's WHERE predicate is part of its identity to Postgres,
+-- but "IF NOT EXISTS" only checks the NAME, so a predicate change would otherwise never apply
+-- to an already-provisioned live database. A bare CREATE CONCURRENTLY IF NOT EXISTS also risks
+-- leaving an unrepairable INVALID index behind if the build is ever interrupted mid-create with
+-- no DROP IF EXISTS guard to clear it on the next apply attempt.
+--
+-- CONCURRENTLY (not a plain CREATE): this table carries a live multi-hundred-thousand-row
+-- backlog under the OLD model at the time this ships -- see
+-- idx_compaction_jobs_claimable_priority's own comment for the full 2026-07-23 incident
+-- writeup a non-concurrent rebuild on this table caused.
+DROP INDEX CONCURRENTLY IF EXISTS idx_vi_backfill_all_blocks;
+CREATE INDEX CONCURRENTLY idx_vi_backfill_all_blocks
+    ON compaction_jobs (tenant, column_hash, column_type, block_object_key)
+    WHERE job_type = 'vi_backfill' AND block_object_key IS NOT NULL;

@@ -172,10 +172,14 @@ func NewPlanner(r BlockIndexer) *Planner {
 // Stage 0 (time-range): blocks whose time window does not overlap [timeRange.MinNano,
 // timeRange.MaxNano] are eliminated. A zero TimeRange skips this stage.
 //
-// Each predicate applies an OR bloom check across its Columns: a block is removed
-// if all of its columns are definitely absent. When Values is non-empty, a range
-// index lookup further narrows the candidates. Multiple predicates are ANDed:
-// a block must survive every predicate. With no predicates, all blocks are selected.
+// Stage 1 (column-presence bloom, issue #531): each predicate applies an OR bloom check
+// across its Columns — a block is removed if ALL of a leaf's named columns are
+// definitively absent per BlockIndexer.MayContainColumn. Multiple top-level predicates
+// are ANDed: a block must survive every predicate (composite Children nest the same
+// AND/OR semantics recursively). This is column-PRESENCE pruning only — value-based
+// pruning (matching a specific value, not just column existence) was removed with the
+// range index (#439) and is NOT reinstated here; the value index remains the sole
+// source of value-level pruning. With no predicates, all blocks are selected.
 //
 // Plan always produces Plan.Explain == "". Use PlanWithOptions with EnableExplain: true
 // to populate the explain string. NOTE-020.
@@ -270,19 +274,86 @@ func (p *Planner) planInternal(predicates []Predicate, timeRange TimeRange, enab
 		return plan
 	}
 
-	// NOTE(#439): Range-index value pruning removed — the range index no longer
-	// exists in the data file (the value index is now the authoritative source for
-	// value-based pruning). Predicates only carry column-tree structure for explain
-	// output. Time-range pruning (Stage 0 above) remains the only in-planner pruning.
+	// NOTE(#439): Range-index VALUE pruning removed — the range index no longer exists
+	// in the data file (the value index is now the authoritative source for
+	// value-based pruning). Predicates' Columns are used below only for column-PRESENCE
+	// pruning (issue #531), never a value comparison.
 	//
 	// NOTE(#435,#437): BinaryFuse8 sketch pruning and block scoring also removed — the
 	// KLL sketch index was removed in #435 and file-level bloom in #437. Blocks are
-	// sorted by MinStart only.
+	// sorted by MinStart only; column-presence pruning below affects SET membership,
+	// not ordering.
+	//
+	// Stage 1 (issue #531): column-presence bloom pruning. A block is removed only when
+	// at least one top-level predicate is PROVABLY unsatisfiable for it (every leaf
+	// column definitively absent per MayContainColumn's no-false-negative contract) —
+	// this can never incorrectly drop a block that could actually match; it only fails
+	// to prune when the bloom lacks the information (old files) or has a false-positive
+	// hit, exactly the same conservative-degradation contract MayContainColumn documents.
+	candidates.iter(func(blockIdx int) {
+		if !blockMayMatchPredicates(p.r, blockIdx, predicates) {
+			candidates.clear(blockIdx)
+			plan.PrunedByColumnBloom++
+		}
+	})
+
 	plan.SelectedBlocks = setToSortedByTime(candidates, p.r)
 	if enableExplain {
 		explainPlan(predicates, plan, timeBlocks)
 	}
 	return plan
+}
+
+// blockMayMatchPredicates reports whether blockIdx might satisfy every predicate in
+// predicates (issue #531). The top-level list is implicitly ANDed, mirroring this
+// package's own documented example ("AND query { A && B }: two leaf predicates at the
+// top level"). Returns false only when at least one predicate is PROVEN unsatisfiable
+// for this block via column-presence bloom checks; returns true whenever the bloom
+// lacks the information to prove that (conservative — never a false negative).
+func blockMayMatchPredicates(idx BlockIndexer, blockIdx int, predicates []Predicate) bool {
+	for _, p := range predicates {
+		if !predicateMayMatchBlock(idx, blockIdx, p) {
+			return false
+		}
+	}
+	return true
+}
+
+// predicateMayMatchBlock recursively evaluates one predicate node against blockIdx using
+// only column-PRESENCE bloom checks (never a value comparison — value pruning stays
+// value-index-only per NOTE(#439)):
+//
+//   - Leaf (no Children): Columns are OR'd together — the leaf may match if ANY named
+//     column may be present (this package's doc comment: "applies an OR bloom check
+//     across its Columns"). An empty Columns leaf is a no-op (always may-match).
+//   - Composite LogicalAND: may match only if ALL children may match.
+//   - Composite LogicalOR: may match if ANY child may match.
+func predicateMayMatchBlock(idx BlockIndexer, blockIdx int, p Predicate) bool {
+	if len(p.Children) == 0 {
+		if len(p.Columns) == 0 {
+			return true
+		}
+		for _, col := range p.Columns {
+			if idx.MayContainColumn(blockIdx, col) {
+				return true
+			}
+		}
+		return false
+	}
+	if p.Op == LogicalOR {
+		for _, child := range p.Children {
+			if predicateMayMatchBlock(idx, blockIdx, child) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, child := range p.Children {
+		if !predicateMayMatchBlock(idx, blockIdx, child) {
+			return false
+		}
+	}
+	return true
 }
 
 // FetchBlocks reads raw bytes for all blocks in plan using aggressive coalescing.

@@ -201,14 +201,23 @@ func buildBlock(
 		return builtBlock{}, bb, err
 	}
 	// NOTE: colStats field removed from builtBlock (2026-06-29, in-file block pruning removal).
+	// issue #531: copy the column-name set out of bb.columns NOW, before bb goes back to
+	// the pool — reset() deletes b.columns' entries in place on the NEXT buildBlock call
+	// that reuses this bb, so an aliased map/slice would be corrupted out from under a
+	// still-live builtBlock (the same hazard colMinMax's own doc comment calls out).
+	columnNames := make([]string, 0, len(bb.columns))
+	for key := range bb.columns {
+		columnNames = append(columnNames, key.Name)
+	}
 	return builtBlock{
-		payload:    payload,
-		spanCount:  bb.spanCount,
-		minStart:   bb.minStart,
-		maxStart:   bb.maxStart,
-		minTraceID: bb.minTraceID,
-		maxTraceID: bb.maxTraceID,
-		colMinMax:  bb.colMinMax,
+		payload:     payload,
+		spanCount:   bb.spanCount,
+		minStart:    bb.minStart,
+		maxStart:    bb.maxStart,
+		minTraceID:  bb.minTraceID,
+		maxTraceID:  bb.maxTraceID,
+		colMinMax:   bb.colMinMax,
+		columnNames: columnNames,
 	}, bb, nil
 }
 

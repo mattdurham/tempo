@@ -239,8 +239,23 @@ func extractBlockColumns(
 		// by a page-unit BlockRef. Block 0 sits at offset 0 (PageNum==0). Legacy BlockID is unused.
 		//nolint:gosec // meta.Offset/Length bounded by valid file size (<64 GiB)
 		blockRef, _ := valueindex.BlockRefFromByteRange(int64(meta.Offset), int64(meta.Length))
-		raw, rerr := r.ReadBlockRaw(bi)
+		// issue #530 follow-up: r.ReadBlocks (not the uncached r.ReadBlockRaw) so that a
+		// Reader constructed with a real SectionCache -- as compactionworker's vi_backfill
+		// block-fetch path now does -- actually benefits from it. ReadBlockRaw calls
+		// readRange -> provider.ReadAt directly, unconditionally bypassing any configured
+		// cache; ReadBlocks routes through ReadGroup -> cache.GetBlockColumns/
+		// CacheBlockColumns, the SAME cache-aware path the query-time executor already uses
+		// (Planner.FetchBlocks). For every OTHER caller of this function (vibuilder,
+		// valueindexconsumer, fresh-ingestion WriteValueIndexL0), the Reader has no
+		// SectionCache configured (fileID=="" or a NopSectionCache), so ReadGroup falls
+		// through to the identical single-block ReadCoalescedBlocks fast path (NOTE-365) --
+		// same bytes, same one-block-at-a-time memory footprint, no behavior change for them.
+		blocksMap, rerr := r.ReadBlocks([]int{bi})
 		if rerr != nil {
+			continue
+		}
+		raw, ok := blocksMap[bi]
+		if !ok {
 			continue
 		}
 		block, perr := r.ParseBlockFromBytes(raw, WantAll(), meta)

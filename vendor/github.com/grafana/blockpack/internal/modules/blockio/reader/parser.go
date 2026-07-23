@@ -283,10 +283,66 @@ func (r *Reader) parseSectionsV8() error {
 		r.blockMetas = metas
 	}
 
+	// Column-name bloom (issue #531): eager, alongside the block index — a SEPARATE
+	// optional section, absent for files written before this change or by any writer
+	// that never computed it. Absence means "no information": r.blockMetas[i].ColumnBloom
+	// simply stays nil, and MayContainColumn's own contract treats nil/empty as
+	// "conservatively present, don't prune" — never a false negative.
+	if err := r.parseColumnBloomIndex(); err != nil {
+		return fmt.Errorf("parseSectionsV8: column_bloom: %w", err)
+	}
+
 	// NOTE-436: v2 files have no IntrinsicTOC section — all columns are inner-block
 	// columns. No intrinsic index is built.
 
 	return nil
+}
+
+// parseColumnBloomIndex fetches and decodes the optional ToCSubTypeColumnBloom section
+// (issue #531), merging each block's fixed-size bloom into the already-populated
+// r.blockMetas. Missing section, a block count mismatch, or a truncated tail all degrade
+// gracefully — the remaining/all ColumnBloom fields simply stay nil, which
+// MayContainColumn's contract already treats as "no information."
+func (r *Reader) parseColumnBloomIndex() error {
+	raw, err := r.fetchToCSection(shared.ToCKey{
+		Type:    shared.ToCTypeIndex,
+		SubType: shared.ToCSubTypeColumnBloom,
+	})
+	if err != nil {
+		return err
+	}
+	if len(raw) < 4 {
+		return nil
+	}
+	bloomCount := int(binary.LittleEndian.Uint32(raw[0:]))
+	pos := 4
+	for i := 0; i < bloomCount && i < len(r.blockMetas); i++ {
+		end := pos + int(shared.ColumnBloomBytes)
+		if end > len(raw) {
+			break // truncated/corrupt tail: stop, leave any remaining ColumnBloom fields nil
+		}
+		r.blockMetas[i].ColumnBloom = raw[pos:end]
+		pos = end
+	}
+	return nil
+}
+
+// MayContainColumn reports whether the block at blockIdx may contain a column named name.
+// Returns false only when the block's bloom filter DEFINITELY proves the column absent —
+// callers may safely skip fetching/decoding that block's data for name's sake. Returns
+// true (conservative — "no information, must fetch to be sure") when: blockIdx is out of
+// range, the file predates this feature (or was written by a source that never computed
+// it), or the bloom is otherwise empty. Never a false negative, by construction of a bloom
+// filter plus this conservative-on-absence contract — see shared/columnbloom.go.
+//
+// SPEC-COLUMNBLOOM-1: usable from any read-path caller (vi_backfill's block-fetch
+// decision, queryplanner's block selection, or any future consumer) — not a private
+// detail of any one caller.
+func (r *Reader) MayContainColumn(blockIdx int, name string) bool {
+	if blockIdx < 0 || blockIdx >= len(r.blockMetas) {
+		return true
+	}
+	return shared.TestColumnNameBloom(r.blockMetas[blockIdx].ColumnBloom, name)
 }
 
 // ensureV8TSSection lazily loads the V8 timestamp index on first call.

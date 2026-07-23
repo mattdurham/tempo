@@ -62,13 +62,16 @@ func TestE2E_ViRecordUse_RealTrigger_InsertsPendingJobAndBackfillCompletes(t *te
 	require.NotNil(t, rec)
 
 	tenant := "e2e-vi-tenant"
+	seedLiveTraceBlock(t, pool, tenant, time.Now().Unix())
 	result, err := rec.RecordUse(context.Background(), tenant, "span.custom.attr", "string", time.Now())
 	require.NoError(t, err)
 	require.True(t, result.ShouldBackfill, "first recorded use must trigger per LeaseTTLSeconds' threshold")
 
-	// Real side effect 1: durable pending rows landed in blockpack's own compaction_jobs table
-	// via the REAL pg.InsertViBackfillHistory call inside onShouldBackfill -- one row per
-	// 1-minute window covering the bulk-inserted retention (issue #529), not a single row.
+	// Real side effect 1: a durable pending row landed in blockpack's own compaction_jobs table
+	// via the REAL pg.InsertViBackfillHistory call inside onShouldBackfill -- one row per real
+	// block in the Postgres file catalog overlapping the retention window (issue #532), not a
+	// synthetic wall-clock window -- exactly one here since seedLiveTraceBlock seeded exactly
+	// one block for this tenant.
 	var (
 		jobType, gotTenant, status string
 		count                      int
@@ -76,8 +79,8 @@ func TestE2E_ViRecordUse_RealTrigger_InsertsPendingJobAndBackfillCompletes(t *te
 	require.Eventually(t, func() bool {
 		row := pool.QueryRow(context.Background(),
 			`SELECT count(*) FROM compaction_jobs WHERE job_type = 'vi_backfill' AND tenant = $1`, tenant)
-		return row.Scan(&count) == nil && count > 1
-	}, 5*time.Second, 10*time.Millisecond, "expected many vi_backfill window rows for %s", tenant)
+		return row.Scan(&count) == nil && count == 1
+	}, 5*time.Second, 10*time.Millisecond, "expected exactly one vi_backfill row for %s's one seeded block", tenant)
 	row := pool.QueryRow(context.Background(),
 		`SELECT job_type, tenant, status FROM compaction_jobs WHERE job_type = 'vi_backfill' AND tenant = $1 LIMIT 1`, tenant)
 	require.NoError(t, row.Scan(&jobType, &gotTenant, &status))

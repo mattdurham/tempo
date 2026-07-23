@@ -545,14 +545,24 @@ func (r *Reader) AddColumnsToBlock(bwb *BlockWithBytes, addColumns map[string]st
 }
 
 // GetBlockWithBytes reads, parses, and returns a full block. Compatibility shim that
-// combines ReadBlockRaw + ParseBlockFromBytes into a single call.
+// combines a cache-aware block read (issue #530 follow-up: ReadBlocks, not the uncached
+// ReadBlockRaw -- see valueindex_extract.go's identical fix and its doc comment for the full
+// rationale) with ParseBlockFromBytes in a single call. For any Reader with no SectionCache
+// configured (fileID=="" or NopSectionCache -- every caller before issue #530 except
+// compaction-worker's vi_backfill path), ReadBlocks falls through to the identical
+// single-block ReadCoalescedBlocks fast path (NOTE-365) ReadBlockRaw itself used -- same
+// bytes, same behavior, no regression for any existing caller.
 func (r *Reader) GetBlockWithBytes(
 	blockIdx int,
 	wantColumns map[string]struct{},
 ) (*BlockWithBytes, error) {
-	raw, err := r.ReadBlockRaw(blockIdx)
+	blocksMap, err := r.ReadBlocks([]int{blockIdx})
 	if err != nil {
 		return nil, err
+	}
+	raw, ok := blocksMap[blockIdx]
+	if !ok {
+		return nil, fmt.Errorf("GetBlockWithBytes: block %d not found in ReadBlocks result", blockIdx)
 	}
 	bwb, err := r.ParseBlockFromBytes(raw, WantOnly(wantColumns), r.BlockMeta(blockIdx))
 	if err != nil {

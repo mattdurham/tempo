@@ -87,6 +87,14 @@ const (
 	// (source block deleted by retention, or superseded by a compacted output).
 	ToCSubTypeValueCounts uint32 = 16
 
+	// ToCSubTypeColumnBloom carries the per-block column-name bloom filter section
+	// (issue #531, NOTE-COLUMNBLOOM-1): a cheap, ToC-resident "does this block contain
+	// column X" check, loaded eagerly alongside the block index. A SEPARATE optional
+	// section from ToCSubTypeBlockIndex (Type=2), not inlined into its fixed-layout
+	// entries, so files/writers that never wrote it decode unaffected (absence means "no
+	// information," never "definitely absent"). See shared/columnbloom.go.
+	ToCSubTypeColumnBloom uint32 = 17
+
 	// ToCEntry SubType constants for ToCTypeIndex (Type=2).
 	ToCSubTypeBlockIndex uint32 = 7 // block offset table
 

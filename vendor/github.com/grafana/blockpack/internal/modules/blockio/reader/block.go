@@ -377,16 +377,16 @@ type Block struct {
 	// Built by buildNameIndex after all columns are registered. When multiple typed
 	// variants exist for the same name, the lowest ColumnType value wins (stable tie-breaker).
 	nameIndex map[string]*Column
-	// NOTE-002: lazyColumnStore is the arena-like backing store for lazily-registered
-	// Column structs. One slice allocation replaces N individual *Column allocations.
-	// Pointers into this slice (stored in columns map) are stable because the slice
-	// is sized to exact capacity before any appends — no reallocation ever occurs.
-	lazyColumnStore []Column
 	// NOTE-153: lazyStorePtr is the pool handle for lazyColumnStore's backing array. When
 	// parseBlockColumnsReuse sourced lazyColumnStore from lazyColumnStorePool, this holds the
 	// *[]Column so ReleaseLazyColumnStore can return it. nil when the arena was not pooled
 	// (e.g. WantAll path, where no lazy columns are registered).
 	lazyStorePtr *[]Column
+	// NOTE-002: lazyColumnStore is the arena-like backing store for lazily-registered
+	// Column structs. One slice allocation replaces N individual *Column allocations.
+	// Pointers into this slice (stored in columns map) are stable because the slice
+	// is sized to exact capacity before any appends — no reallocation ever occurs.
+	lazyColumnStore []Column
 	// iterFields is the pre-computed deduplicated column iteration list, built by
 	// BuildIterFields. When non-nil, IterateFields uses this slice directly — zero allocs.
 	// NOTE-049: see blockio/NOTES.md §49.
@@ -395,9 +395,9 @@ type Block struct {
 	// pay no O(colCount) build/alloc per block. Search/filter queries trigger the build
 	// on their first per-row IterateFields call.
 	iterFields     []ColIterEntry
-	iterFieldsOnce sync.Once
 	meta           shared.BlockMeta
 	spanCount      int
+	iterFieldsOnce sync.Once
 }
 
 // newBlockForParsing creates a Block with an empty columns map, for use with AddColumnsToBlock.

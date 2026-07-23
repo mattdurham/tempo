@@ -123,8 +123,8 @@ func (s *Store) InsertCubeBackfill(ctx context.Context, tenant string, d CubeBac
 	return s.Insert(ctx, JobTypeCubeBackfill, "cube", tenant, dedupKey, d)
 }
 
-// ViBackfillColumn identifies the (tenant, column) a batch of vi_backfill windows covers -- the
-// parts of ViBackfillDetail that stay constant across every window in one InsertViBackfillWindows
+// ViBackfillColumn identifies the (tenant, column) a batch of vi_backfill blocks covers -- the
+// parts of ViBackfillDetail that stay constant across every block in one InsertViBackfillBlocks
 // call.
 type ViBackfillColumn struct {
 	ColumnHash string
@@ -132,102 +132,111 @@ type ViBackfillColumn struct {
 	ColumnType string
 }
 
-// WindowSpec is one [StartSec, EndSec) vi_backfill job to insert. Priority is the row's claim
-// priority (0 = highest/newest; see claimJobSQL's ORDER BY and schema.sql's priority column
-// doc comment for why higher values can never starve other job types).
-type WindowSpec struct {
-	StartSec int64
-	EndSec   int64
-	Priority int64
+// BlockSpec is one vi_backfill block-shaped job to insert (issue #532): exactly one real trace
+// block, identified by its own object key, replacing the old synthetic 1-minute WindowSpec.
+// MinSec/MaxSec are the block's own real wall-clock time range (from blockpack_file_catalog),
+// stored into the row's window_start_sec/window_end_sec columns so ViBackfillGapRanges' existing
+// time-range coverage query keeps answering correctly across both job shapes without needing to
+// know which one produced a given row. Priority is the row's claim-ordering tiebreaker -- same
+// "0 = newest, increasing for older" convention the old WindowSpec used, just computed from the
+// block's own MinSec instead of a synthetic minute-index ordinal.
+type BlockSpec struct {
+	ObjectKey string
+	MinSec    int64
+	MaxSec    int64
+	Priority  int64
+	// SizeBytes is the block's known object size (pgcatalog.Row.SizeBytes), threaded into
+	// ViBackfillDetail.BlockSizeBytes -- see that field's own doc comment for why.
+	SizeBytes int64
 }
 
-// viBackfillDedupKey is one row per (column, 1-minute window) pair -- unlike the old
-// column-wide InsertViBackfill dedup key, so the SAME column can have many independently
-// claimable, independently idempotent jobs in flight at once (issue #529).
-func viBackfillDedupKey(tenant, columnHash, columnType string, windowEndSec int64) string {
-	return fmt.Sprintf("%s|%s|%s|%s|%d", JobTypeViBackfill, tenant, columnHash, columnType, windowEndSec)
+// viBackfillBlockDedupKey is one row per (column, exact block) pair (issue #532) -- the
+// block-shaped analog of the old per-window dedup key, so the SAME column can have many
+// independently claimable, independently idempotent per-block jobs in flight at once. Distinct
+// key format from the old window-shaped key (a block object key always contains '/' and is
+// never a bare integer), so old and new rows for the same column never collide on dedup_key even
+// though both formats share the shared unique index.
+func viBackfillBlockDedupKey(tenant, columnHash, columnType, blockObjectKey string) string {
+	return fmt.Sprintf("%s|%s|%s|%s|%s", JobTypeViBackfill, tenant, columnHash, columnType, blockObjectKey)
 }
 
-// maxViBackfillWindowsPerInsert bounds each multi-row INSERT statement's size. Chunking a large
-// InsertViBackfillWindows call (e.g. bulk-inserting a month of 1-minute windows, tens of
-// thousands of rows) keeps any single statement's parameter count and lock duration bounded,
-// at the cost of more round trips -- an acceptable tradeoff since this only runs once per
-// newly-triggered column (plus small, frequent trailing-window batches thereafter).
-const maxViBackfillWindowsPerInsert = 1000
+// maxViBackfillBlocksPerInsert bounds each multi-row INSERT statement's size, mirroring the old
+// maxViBackfillWindowsPerInsert's identical chunking rationale.
+const maxViBackfillBlocksPerInsert = 1000
 
-// viBackfillInsertParamsPerRow is id, job_type, subsystem, tenant, detail, dedup_key, priority,
-// column_hash, column_type, window_start_sec, window_end_sec -- every compaction_jobs column
-// this insert populates except the literal 'pending' status. The last four are a
-// query-optimization-only denormalized copy of fields already inside detail -- see
-// idx_vi_backfill_coverage_gap's own doc comment in schema.sql for why they exist as real,
-// indexed columns instead of only living in the JSONB blob.
-const viBackfillInsertParamsPerRow = 11
+// viBackfillBlockInsertParamsPerRow is id, job_type, subsystem, tenant, detail, dedup_key,
+// priority, column_hash, column_type, window_start_sec, window_end_sec, block_object_key --
+// every compaction_jobs column this insert populates except the literal 'pending' status.
+const viBackfillBlockInsertParamsPerRow = 12
 
-// InsertViBackfillWindows bulk-inserts one pending vi_backfill job per window in windows,
-// chunked to stay under maxViBackfillWindowsPerInsert rows per statement. Idempotent per row,
-// exactly like Insert -- a window whose dedup key already exists (non-succeeded) is a silent
-// no-op, so this is safe to call repeatedly for the same trailing range every planner tick
-// (issue #529's "ongoing coverage" mechanism) without needing a separate watermark to track
-// what was already enqueued.
-func (s *Store) InsertViBackfillWindows(
+// InsertViBackfillBlocks bulk-inserts one pending vi_backfill job per block in blocks, chunked
+// to stay under maxViBackfillBlocksPerInsert rows per statement (issue #532). Idempotent per
+// row, exactly like Insert -- a block whose dedup key already exists (non-succeeded) is a
+// silent no-op, so this is safe to call repeatedly for the same candidate block set every
+// planner tick without needing a separate watermark. Callers should filter through
+// MissingViBackfillBlocks first (status-agnostic) so an already-SUCCEEDED block is never
+// re-inserted as a duplicate row -- the partial unique dedup index only protects against
+// non-succeeded duplicates, mirroring the old window-shaped model's identical requirement.
+func (s *Store) InsertViBackfillBlocks(
 	ctx context.Context,
 	tenant string,
 	col ViBackfillColumn,
-	windows []WindowSpec,
+	blocks []BlockSpec,
 ) error {
-	for start := 0; start < len(windows); start += maxViBackfillWindowsPerInsert {
-		end := start + maxViBackfillWindowsPerInsert
-		if end > len(windows) {
-			end = len(windows)
+	for start := 0; start < len(blocks); start += maxViBackfillBlocksPerInsert {
+		end := start + maxViBackfillBlocksPerInsert
+		if end > len(blocks) {
+			end = len(blocks)
 		}
-		if err := s.insertViBackfillWindowChunk(ctx, tenant, col, windows[start:end]); err != nil {
-			return fmt.Errorf("pgqueue: insert vi_backfill windows [%d:%d): %w", start, end, err)
+		if err := s.insertViBackfillBlockChunk(ctx, tenant, col, blocks[start:end]); err != nil {
+			return fmt.Errorf("pgqueue: insert vi_backfill blocks [%d:%d): %w", start, end, err)
 		}
 	}
 	return nil
 }
 
-func (s *Store) insertViBackfillWindowChunk(
+func (s *Store) insertViBackfillBlockChunk(
 	ctx context.Context,
 	tenant string,
 	col ViBackfillColumn,
-	windows []WindowSpec,
+	blocks []BlockSpec,
 ) error {
-	if len(windows) == 0 {
+	if len(blocks) == 0 {
 		return nil
 	}
 
-	valuesSQL := make([]string, 0, len(windows))
-	args := make([]any, 0, len(windows)*viBackfillInsertParamsPerRow)
-	for i, w := range windows {
+	valuesSQL := make([]string, 0, len(blocks))
+	args := make([]any, 0, len(blocks)*viBackfillBlockInsertParamsPerRow)
+	for i, b := range blocks {
 		detail := ViBackfillDetail{
 			ColumnHash: col.ColumnHash, ColumnName: col.ColumnName, ColumnType: col.ColumnType,
-			WindowStartSec: w.StartSec, WindowEndSec: w.EndSec,
+			BlockObjectKey: b.ObjectKey, BlockSizeBytes: b.SizeBytes,
+			WindowStartSec: b.MinSec, WindowEndSec: b.MaxSec,
 		}
 		rawDetail, err := json.Marshal(detail)
 		if err != nil {
-			return fmt.Errorf("marshal detail for window ending %d: %w", w.EndSec, err)
+			return fmt.Errorf("marshal detail for block %q: %w", b.ObjectKey, err)
 		}
-		base := i * viBackfillInsertParamsPerRow
+		base := i * viBackfillBlockInsertParamsPerRow
 		valuesSQL = append(valuesSQL, fmt.Sprintf(
-			"($%d,$%d,$%d,$%d,'pending',$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
-			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10, base+11,
+			"($%d,$%d,$%d,$%d,'pending',$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10, base+11, base+12,
 		))
 		args = append(
 			args,
 			// string(rawDetail): see insertWithPriority's identical comment -- []byte encodes as
 			// a bytea literal under simple_protocol, which Postgres can't cast to jsonb.
 			uuid.NewString(), string(JobTypeViBackfill), "vi", tenant, string(rawDetail),
-			viBackfillDedupKey(tenant, col.ColumnHash, col.ColumnType, w.EndSec), w.Priority,
-			col.ColumnHash, col.ColumnType, w.StartSec, w.EndSec,
+			viBackfillBlockDedupKey(tenant, col.ColumnHash, col.ColumnType, b.ObjectKey), b.Priority,
+			col.ColumnHash, col.ColumnType, b.MinSec, b.MaxSec, b.ObjectKey,
 		)
 	}
 
 	query := "INSERT INTO compaction_jobs " +
-		"(id, job_type, subsystem, tenant, status, detail, dedup_key, priority, column_hash, column_type, window_start_sec, window_end_sec) " +
+		"(id, job_type, subsystem, tenant, status, detail, dedup_key, priority, column_hash, column_type, window_start_sec, window_end_sec, block_object_key) " +
 		"VALUES " + strings.Join(valuesSQL, ",") + " ON CONFLICT (dedup_key) WHERE status != 'succeeded' DO NOTHING"
 	if _, err := s.pool.Exec(ctx, query, args...); err != nil {
-		return fmt.Errorf("pgqueue: batch insert vi_backfill windows: %w", err)
+		return fmt.Errorf("pgqueue: batch insert vi_backfill blocks: %w", err)
 	}
 	return nil
 }
@@ -288,79 +297,64 @@ func (s *Store) ViBackfillGapRanges(ctx context.Context, tenant string, col ViBa
 	return merged, nil
 }
 
-const viBackfillExistingWindowEndsSQL = `
-	SELECT window_end_sec
+const viBackfillExistingBlockKeysSQL = `
+	SELECT block_object_key
 	FROM compaction_jobs
 	WHERE job_type = 'vi_backfill'
 	  AND tenant = $1 AND column_hash = $2 AND column_type = $3
-	  AND window_end_sec BETWEEN $4 AND $5`
+	  AND block_object_key = ANY($4)`
 
-// MissingViBackfillWindows is the job-history gap-finder (issue #529 follow-up): given the FULL
-// set of windows a column's retention says should exist (caller computes this via
-// WindowsForRetention/WindowsBefore), returns exactly the subset that have NO row at all --
-// any status, including 'succeeded' and 'failed' -- in compaction_jobs for (tenant, columnHash,
-// columnType). This is deliberately distinct from ViBackfillGapRanges (which only sees rows that
-// already exist and aren't yet 'succeeded'): a window that was NEVER INSERTED in the first place
-// is invisible to that query, exactly the blind spot that let an already-triggered column (from
-// before this per-window model existed, or one whose bulk-insert crashed partway through) get
-// silently treated as "fully covered" by CoversRange's absence-of-a-gap-row default, with zero
-// actual backfill verification ever having run against its history. Callers re-run the idempotent
-// InsertViBackfillWindows with exactly this missing subset to self-heal, no manual intervention
-// needed.
+// MissingViBackfillBlocks is the job-history gap-finder for the block-shaped model (issue #532),
+// the direct analog of the old MissingViBackfillWindows: given the full set of candidate block
+// object keys a column's retention window currently contains (caller enumerates these from
+// blockpack_file_catalog), returns exactly the subset that have NO row at all -- any status,
+// including 'succeeded' and 'failed' -- in compaction_jobs for (tenant, columnHash, columnType).
+// Callers re-run the idempotent InsertViBackfillBlocks with exactly this missing subset.
 //
-// Backed by idx_vi_backfill_all_windows -- unlike idx_vi_backfill_coverage_gap, this index is NOT
-// scoped to status != 'succeeded', since a succeeded row is exactly the "not missing" signal this
-// query needs to see.
+// This distinction matters for the identical reason it did for windows: a block whose job
+// already succeeded does NOT show up as a dedup-key conflict on a fresh insert attempt (the
+// unique dedup index is scoped to status != 'succeeded', so OTHER job types can legitimately
+// re-enqueue an already-succeeded candidate) -- without this check, a planner tick would insert
+// a brand new duplicate row for every already-completed block, forever, unboundedly growing the
+// table exactly like the incident MissingViBackfillWindows was added to prevent for windows.
 //
-// The existence lookup is bounded to windows' own [min,max] EndSec (not "every window this
-// column has ever had"), so a caller checking only a handful of windows (e.g. the trailing
-// top-up's 5-minute range) pays for a narrow indexed range scan, not a full fetch of a
-// fully-backfilled column's entire retention history -- windows must be non-empty.
-func (s *Store) MissingViBackfillWindows(
-	ctx context.Context, tenant string, col ViBackfillColumn, windows []WindowSpec,
-) ([]WindowSpec, error) {
-	if len(windows) == 0 {
+// Backed by idx_vi_backfill_all_blocks -- NOT scoped to status != 'succeeded', since a succeeded
+// row is exactly the "not missing" signal this query needs to see.
+func (s *Store) MissingViBackfillBlocks(
+	ctx context.Context, tenant string, col ViBackfillColumn, blockKeys []string,
+) ([]string, error) {
+	if len(blockKeys) == 0 {
 		return nil, nil
-	}
-	minEnd, maxEnd := windows[0].EndSec, windows[0].EndSec
-	for _, w := range windows[1:] {
-		if w.EndSec < minEnd {
-			minEnd = w.EndSec
-		}
-		if w.EndSec > maxEnd {
-			maxEnd = w.EndSec
-		}
 	}
 	rows, err := s.pool.Query(
 		ctx,
-		viBackfillExistingWindowEndsSQL,
+		viBackfillExistingBlockKeysSQL,
 		tenant,
 		col.ColumnHash,
 		col.ColumnType,
-		minEnd,
-		maxEnd,
+		blockKeys,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("pgqueue: vi_backfill existing window ends: %w", err)
+		return nil, fmt.Errorf("pgqueue: vi_backfill existing block keys: %w", err)
 	}
 	defer rows.Close()
 
-	existing := make(map[int64]struct{})
+	existing := make(map[string]struct{}, len(blockKeys))
 	for rows.Next() {
-		var endSec int64
-		if err := rows.Scan(&endSec); err != nil {
-			return nil, fmt.Errorf("pgqueue: scan vi_backfill window end: %w", err)
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, fmt.Errorf("pgqueue: scan vi_backfill block key: %w", err)
 		}
-		existing[endSec] = struct{}{}
+		existing[key] = struct{}{}
 	}
 	if rows.Err() != nil {
-		return nil, fmt.Errorf("pgqueue: iterate vi_backfill window ends: %w", rows.Err())
+		return nil, fmt.Errorf("pgqueue: iterate vi_backfill block keys: %w", rows.Err())
 	}
 
-	var missing []WindowSpec
-	for _, w := range windows {
-		if _, ok := existing[w.EndSec]; !ok {
-			missing = append(missing, w)
+	var missing []string
+	for _, k := range blockKeys {
+		if _, ok := existing[k]; !ok {
+			missing = append(missing, k)
 		}
 	}
 	return missing, nil

@@ -7,6 +7,12 @@ package vblockpack
 // queue (pg.InsertViBackfillJob) -- newTestPostgresPool already applies every schema
 // blockpack owns (including compaction_jobs), so no separate migration call is needed
 // here anymore.
+//
+// seedLiveTraceBlock (issue #532, 2026-07-23): InsertViBackfillHistory now enumerates REAL
+// blocks from blockpack_file_catalog instead of computing wall-clock windows analytically --
+// a tenant with zero catalog rows correctly gets zero vi_backfill jobs regardless of how many
+// times a column is used. Every test below that expects a durable insert must seed at least
+// one live (uncompacted, undeleted) trace-subsystem catalog row first.
 
 import (
 	"context"
@@ -14,10 +20,23 @@ import (
 	"time"
 
 	blockpack "github.com/grafana/blockpack"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// seedLiveTraceBlock inserts one live blockpack_file_catalog row for tenant so
+// InsertViBackfillHistory's real block enumeration has something to find -- see this file's own
+// package doc comment for why this is required after issue #532.
+func seedLiveTraceBlock(t *testing.T, pool *pgxpool.Pool, tenant string, nowSec int64) {
+	t.Helper()
+	_, err := pool.Exec(context.Background(), `
+		INSERT INTO blockpack_file_catalog (subsystem, tenant, resource_id, object_key, min_sec, max_sec)
+		VALUES ('trace', $1, '', $2, $3, $4)`,
+		tenant, tenant+"/00000000-0000-0000-0000-000000000001/data.blockpack", nowSec-60, nowSec)
+	require.NoError(t, err)
+}
 
 // TestConfigureViUsage_OnShouldBackfill_InsertsPendingJobWhenPgPoolConfigured proves both
 // halves of the "insert alongside, don't replace" design: a real Postgres pending
@@ -33,6 +52,8 @@ func TestConfigureViUsage_OnShouldBackfill_InsertsPendingJobWhenPgPoolConfigured
 	usageCfg := blockpack.Config{DedicatedColumnsEnabled: true}
 	triggerCfg := blockpack.TriggerConfig{LeaseTTLSeconds: 1800}
 
+	seedLiveTraceBlock(t, pool, "tenant-a", time.Now().Unix())
+
 	err := ConfigureViUsage(nil, rawR, rawW, usageCfg, triggerCfg, blockpack.NewPostgresFromPool(pool), 5*time.Minute)
 	require.NoError(t, err)
 
@@ -44,8 +65,9 @@ func TestConfigureViUsage_OnShouldBackfill_InsertsPendingJobWhenPgPoolConfigured
 	require.NoError(t, err)
 	require.True(t, result.ShouldBackfill, "first recorded use must trigger per LeaseTTLSeconds' threshold")
 
-	// Half 1: the durable rows exist in blockpack's own compaction_jobs table -- one per
-	// 1-minute window covering the bulk-inserted retention (issue #529), not a single row.
+	// Half 1: the durable row exists in blockpack's own compaction_jobs table -- one per real
+	// block in the file catalog overlapping the retention window (issue #532), not a synthetic
+	// wall-clock window -- exactly one here since seedLiveTraceBlock seeded exactly one block.
 	var (
 		jobType, tenant, status string
 		count                   int
@@ -53,8 +75,8 @@ func TestConfigureViUsage_OnShouldBackfill_InsertsPendingJobWhenPgPoolConfigured
 	require.Eventually(t, func() bool {
 		row := pool.QueryRow(context.Background(),
 			`SELECT count(*) FROM compaction_jobs WHERE job_type = 'vi_backfill' AND tenant = 'tenant-a'`)
-		return row.Scan(&count) == nil && count > 1
-	}, 5*time.Second, 10*time.Millisecond, "expected many vi_backfill window rows for tenant-a")
+		return row.Scan(&count) == nil && count == 1
+	}, 5*time.Second, 10*time.Millisecond, "expected exactly one vi_backfill row for tenant-a's one seeded block")
 
 	row := pool.QueryRow(context.Background(),
 		`SELECT job_type, tenant, status FROM compaction_jobs WHERE job_type = 'vi_backfill' AND tenant = 'tenant-a' LIMIT 1`)
@@ -86,6 +108,8 @@ func TestConfigureViUsage_OnShouldBackfill_CrossTypeSameNameColumns_EachGetsOwnR
 	usageCfg := blockpack.Config{DedicatedColumnsEnabled: true}
 	triggerCfg := blockpack.TriggerConfig{LeaseTTLSeconds: 1800}
 
+	seedLiveTraceBlock(t, pool, "tenant-collision", time.Now().Unix())
+
 	err := ConfigureViUsage(nil, rawR, rawW, usageCfg, triggerCfg, blockpack.NewPostgresFromPool(pool), 5*time.Minute)
 	require.NoError(t, err)
 
@@ -97,9 +121,10 @@ func TestConfigureViUsage_OnShouldBackfill_CrossTypeSameNameColumns_EachGetsOwnR
 	_, err = rec.RecordUse(context.Background(), "tenant-collision", "span.custom.attr", "int", time.Now())
 	require.NoError(t, err)
 
-	// Each column type now bulk-inserts many window rows (issue #529), not one -- the dedup-key
-	// guard this test proves is that BOTH types' full sets of rows exist independently (distinct
-	// column_type count of 2), never collapsed onto one type's rows via a colliding dedup_key.
+	// Each column type gets its own set of block-shaped rows (issue #532) -- the dedup-key guard
+	// this test proves is that BOTH types' rows exist independently (distinct column_type count
+	// of 2), never collapsed onto one type's rows via a colliding dedup_key. Exactly one row per
+	// type here since seedLiveTraceBlock seeded exactly one block.
 	var distinctTypes int
 	require.Eventually(t, func() bool {
 		row := pool.QueryRow(context.Background(),
@@ -115,9 +140,8 @@ func TestConfigureViUsage_OnShouldBackfill_CrossTypeSameNameColumns_EachGetsOwnR
 	require.NoError(t, pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM compaction_jobs WHERE job_type = 'vi_backfill' AND tenant = 'tenant-collision' AND column_type = 'int'`,
 	).Scan(&intCount))
-	assert.True(t, stringCount > 1 && intCount > 1,
-		"each column type must get its own full set of window rows, got string=%d int=%d", stringCount, intCount)
-	assert.Equal(t, stringCount, intCount, "same retention must produce the same window count for both types")
+	assert.Equal(t, 1, stringCount, "expected exactly one vi_backfill row for the string column's one seeded block")
+	assert.Equal(t, 1, intCount, "expected exactly one vi_backfill row for the int column's one seeded block")
 }
 
 // TestConfigureViUsage_OnShouldBackfill_NilPgPool_SkipsInsertNoError is the regression guard

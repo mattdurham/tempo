@@ -39,6 +39,12 @@ func (w *Writer) writeV8Sections() error {
 	if err := w.writeV8BlockIndex(sw); err != nil {
 		return err
 	}
+	// (1b) Column-name bloom index (issue #531) — always written alongside the block
+	// index, one fixed-size bloom per block, so readers can prune a block's DATA fetch
+	// without any additional I/O beyond what already loading the block index costs.
+	if err := w.writeV8ColumnBloomIndex(sw); err != nil {
+		return err
+	}
 	// (2) Per-column range blobs — no-op since #439 (range index removed). The column
 	//     sketch blobs (KLL/HLL/TopK) were removed in #435; the value index is authoritative.
 	if err := w.writeV8RangeBlobs(sw); err != nil {
@@ -59,6 +65,14 @@ func (w *Writer) writeV8BlockIndex(sw *v8SectionWriter) error {
 	return sw.writeToCEntry(
 		shared.ToCKey{Type: shared.ToCTypeIndex, SubType: shared.ToCSubTypeBlockIndex},
 		blockIdxRaw,
+	)
+}
+
+// writeV8ColumnBloomIndex writes the column-name bloom ToCEntry (issue #531).
+func (w *Writer) writeV8ColumnBloomIndex(sw *v8SectionWriter) error {
+	return sw.writeToCEntry(
+		shared.ToCKey{Type: shared.ToCTypeIndex, SubType: shared.ToCSubTypeColumnBloom},
+		writeColumnBloomSection(w.blockMetas),
 	)
 }
 

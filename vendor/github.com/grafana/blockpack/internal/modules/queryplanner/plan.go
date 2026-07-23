@@ -9,6 +9,12 @@ type Plan struct {
 	PrunedByTime       int
 	PrunedByColStats   int // NOTE-449: blocks eliminated by per-block column statistics (issue #368)
 	PrunedByFileBounds int // NOTE-456: blocks eliminated by file-level range/bloom reject
-	Limit              int
-	Direction          Direction
+	// PrunedByColumnBloom is the number of blocks eliminated by column-presence bloom
+	// checks (issue #531): a block whose predicate-required column(s) are all
+	// definitively absent per BlockIndexer.MayContainColumn. Distinct from the
+	// value-based pruning NOTE(#439) removed — this only proves column ABSENCE, never a
+	// value match.
+	PrunedByColumnBloom int
+	Limit               int
+	Direction           Direction
 }

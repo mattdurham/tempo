@@ -116,6 +116,13 @@ func (p *Postgres) Close() {
 // genuinely needs it directly (e.g. a test seeding a fixture row with raw
 // SQL against a table this package owns). Production code should prefer a
 // dedicated method below over this escape hatch.
+//
+// NOT dead code: tempo's own tempodb/encoding/vblockpack/vi_usage_hook.go and
+// cubequerypath.go both call this directly in production
+// (pgPool = pg.Pool()) -- confirmed live 2026-07-22 after an earlier pass
+// mistakenly deleted this as unreachable (deadcode's own analysis only
+// traces reachability from THIS repo's public API surface, which cannot see
+// cross-repo callers in a separate, non-vendored-at-analysis-time consumer).
 func (p *Postgres) Pool() *pgxpool.Pool {
 	return p.pool
 }
@@ -154,19 +161,23 @@ func (p *Postgres) ColumnManifestStore() colhashmanifest.Store {
 	return colhashmanifest.NewPgStore(p.pool)
 }
 
-// InsertViBackfillHistory bulk-inserts one pending vi_backfill job per 1-minute window covering
-// [now-retention, now) for tenant's column, newest-window-first priority (issue #529). Called
-// from tempo's reactive first-trigger query-path hook the instant a never-before-queried column
-// is seen, with retention resolved from the tenant's own BlockRetention override -- the caller
-// no longer picks an unbounded/arbitrary window; every job is a fixed 1-minute slice, and the
-// full retention history is queued immediately instead of trickling in one bounded chunk per
-// compaction-planner tick. Idempotent per window: a repeat call for the same column (e.g. a
-// crash-recovery re-trigger) silently no-ops on windows already queued, non-terminal.
+// InsertViBackfillHistory bulk-inserts one pending vi_backfill job per REAL trace block
+// (blockpack_file_catalog) overlapping [now-retention, now) for tenant's column,
+// newest-block-first priority (issue #532, superseding #529's synthetic 1-minute-window
+// design -- see pgqueue.ViBackfillDetail's own doc comment for why). Called from tempo's
+// reactive first-trigger query-path hook the instant a never-before-queried column is seen,
+// with retention resolved from the tenant's own BlockRetention override -- the full retention
+// history is queued immediately instead of trickling in one bounded chunk per
+// compaction-planner tick. Idempotent per block: a repeat call for the same column (e.g. a
+// crash-recovery re-trigger) silently no-ops on blocks already queued (non-succeeded) or
+// already succeeded (filtered out before the insert, via MissingViBackfillBlocks -- an
+// already-succeeded block's dedup key does NOT protect against a duplicate re-insert, since the
+// unique index is scoped to status != 'succeeded').
 //
-// compaction-planner's own periodic top-up (the "ongoing coverage for new data" half of #529)
-// calls the same underlying pgqueue.Store.InsertViBackfillWindows directly for a small trailing
-// range on every tick -- it lives entirely inside blockpack and has no need to cross this root
-// API boundary.
+// compaction-planner's own periodic top-up (the "ongoing coverage for new data" half of #529,
+// now block-shaped per #532) enumerates blocks and calls the same underlying
+// pgqueue.Store.InsertViBackfillBlocks directly for a small trailing range on every tick -- it
+// lives entirely inside blockpack and has no need to cross this root API boundary.
 func (p *Postgres) InsertViBackfillHistory(
 	ctx context.Context,
 	tenant string,
@@ -174,9 +185,49 @@ func (p *Postgres) InsertViBackfillHistory(
 	retention time.Duration,
 	now time.Time,
 ) error {
-	return pgqueue.New(p.pool).InsertViBackfillWindows(
-		ctx, tenant, col, pgqueue.WindowsForRetention(retention, now),
-	)
+	maxSec := uint64(now.Unix()) //nolint:gosec // Unix time is non-negative for any real clock
+	var minSec uint64
+	retentionSec := uint64(retention.Seconds()) //nolint:gosec // retention is always a small positive config value
+	if maxSec > retentionSec {
+		minSec = maxSec - retentionSec
+	}
+
+	catalog := pgcatalog.NewStore(p.pool)
+	rows, err := catalog.ListLiveKeysInRange(ctx, "trace", tenant, minSec, maxSec)
+	if err != nil {
+		return fmt.Errorf("blockpack: InsertViBackfillHistory: list trace blocks: %w", err)
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+
+	jobStore := pgqueue.New(p.pool)
+	keys := make([]string, len(rows))
+	byKey := make(map[string]pgqueue.BlockSpec, len(rows))
+	for i, r := range rows {
+		keys[i] = r.ObjectKey
+		byKey[r.ObjectKey] = pgqueue.BlockSpec{
+			ObjectKey: r.ObjectKey,
+			MinSec:    r.MinSec,
+			MaxSec:    r.MaxSec,
+			Priority: int64(
+				i,
+			), //nolint:gosec // i is bounded by one column's candidate block count, never near int64 overflow
+			SizeBytes: r.SizeBytes,
+		}
+	}
+	missingKeys, err := jobStore.MissingViBackfillBlocks(ctx, tenant, col, keys)
+	if err != nil {
+		return fmt.Errorf("blockpack: InsertViBackfillHistory: find missing blocks: %w", err)
+	}
+	if len(missingKeys) == 0 {
+		return nil
+	}
+	missing := make([]pgqueue.BlockSpec, len(missingKeys))
+	for i, k := range missingKeys {
+		missing[i] = byKey[k]
+	}
+	return jobStore.InsertViBackfillBlocks(ctx, tenant, col, missing)
 }
 
 // InsertCubeBackfillJob mirrors InsertViBackfillJob for cube_backfill,

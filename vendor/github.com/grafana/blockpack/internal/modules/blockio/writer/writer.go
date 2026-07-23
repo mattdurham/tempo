@@ -599,6 +599,14 @@ func (w *Writer) mergeBuiltBlock(i int, s blockSlice, results []builtBlock) erro
 		SpanCount: uint32(built.spanCount), //nolint:gosec
 		MinStart:  built.minStart,
 		MaxStart:  built.maxStart,
+		// issue #531: computed fresh from THIS block's own just-built column set, for
+		// every block this writer produces — fresh ingestion and compaction-merged
+		// output alike (trace_compaction.go routes through this exact same flushBlocks/
+		// mergeBuiltBlock path via blockio/compaction.CompactBlocksStreaming, with no
+		// special-casing needed here). Never carried over from an input block: a
+		// compacted output's bloom always reflects the real merged column set, even when
+		// none of the inputs being merged ever had a bloom at all.
+		ColumnBloom: shared.BuildColumnBloom(built.columnNames),
 	}
 	// V2 unconditional: record page number for ReadBlockByRef.
 	meta.PageNum = uint32(blockOffset / v2PageSize) //nolint:gosec // blockOffset always page-aligned
