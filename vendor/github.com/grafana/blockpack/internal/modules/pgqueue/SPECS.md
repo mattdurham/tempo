@@ -86,3 +86,55 @@ otherwise never apply to an already-provisioned live database.
 
 Back-ref: `internal/modules/pgqueue/schema.sql`, `internal/modules/pgqueue/store.go:insertJobSQL`,
 `store_test.go:TestStore_Insert_DedupKeyPreventsDoubleEnqueue_AfterFailure`.
+
+## SPEC-PGQUEUE-7: `ViBackfillDetail` carries two coexisting vi_backfill job shapes (issue #532)
+
+Retired by issue #533 — every vi_backfill job is now block-shaped by construction
+(`ViBackfillDetail` no longer carries column identity at all). See SPEC-PGQUEUE-8/9.
+
+## SPEC-PGQUEUE-8: vi_backfill column identity lives in `vi_backfill_job_columns`, not the parent job (issue #533)
+
+Column identity (`column_hash`/`column_type`/`column_name`) no longer lives on the parent
+`compaction_jobs` row at all — it's membership rows in the child table
+`vi_backfill_job_columns`, keyed `UNIQUE(job_id, column_hash, column_type)`. This is what lets N
+columns triggered for the SAME physical block collapse onto exactly ONE parent job row (the
+`INSERT ... ON CONFLICT (dedup_key) ... DO UPDATE` get-or-create idiom) instead of N independent,
+independently-claimable rows for the identical block — the root fix for the live "N concurrent
+claims/downloads of the same block" incident.
+
+**Contract:** the `UNIQUE(job_id, column_hash, column_type)` index makes child-row registration
+idempotent per (job, column) pair — a repeat `InsertViBackfillBlocks` call for a column already
+registered on a block's job is a silent no-op on the child insert (`ON CONFLICT ... DO NOTHING`),
+mirroring `Store.Insert`'s own idempotent-dedup convention at the parent-row level.
+`MissingViBackfillBlocks`/`ViBackfillGapRanges` are now JOINs against this child table (filtered
+on `column_hash`/`column_type`, `MissingViBackfillBlocks` status-agnostic on the child row exactly
+like its #532 predecessor was on the parent row) rather than filters against parent-row columns
+that no longer exist.
+
+Back-ref: `internal/modules/pgqueue/schema.sql` (`vi_backfill_job_columns`,
+`idx_vi_backfill_job_columns_lookup`, `idx_vi_backfill_job_columns_pending`),
+`internal/modules/pgqueue/store.go` (`ViBackfillPendingColumns`, `ViBackfillMarkColumnDone`,
+`ViBackfillMarkAllColumnsResolved`, `viBackfillExistingBlockKeysSQL`, `viBackfillGapRangesSQL`).
+See NOTES.md NOTE-PGQUEUE-VI-BLOCK-2.
+
+## SPEC-PGQUEUE-9: `ViBackfillFinalize` — parent-row lock is the race-closing serialization point, not a child-row lock (issue #533)
+
+Both the get-or-create insert side (`insertViBackfillBlockChunk`'s round trip 1, a genuine
+`ON CONFLICT ... DO UPDATE` — not `DO NOTHING` — so it always takes a real row-level lock for the
+whole transaction) and the finalize side (`ViBackfillFinalize`'s own `SELECT ... FOR UPDATE`) lock
+the IDENTICAL parent `compaction_jobs` row via Postgres's normal row-level locking. This is
+deliberate: a lock on already-EXISTING child rows cannot, by itself, prevent a brand-new child-row
+`INSERT` from landing in the gap between a "read the pending-column list" step and a "flip to
+succeeded" step, because the new row doesn't exist yet to be locked. Locking the shared PARENT row
+closes that gap, since both sides of the race contend for the same lock.
+
+**Contract:** `ViBackfillFinalize` returns `(false, nil)` — never an error — when pending children
+remain; the caller (`compactionworker.processViBackfillJob`) must reprocess those columns and call
+`ViBackfillFinalize` again, bounded by `viBackfillFinalizeMaxAttempts`. If a column arrives for a
+block whose job has ALREADY finalized to `succeeded` (excluded from the dedup conflict target),
+`InsertViBackfillBlocks` self-corrects by creating a genuine NEW parent job instead — a column is
+never silently dropped in either race outcome.
+
+Back-ref: `store.go:ViBackfillFinalize,insertViBackfillBlockChunk`,
+`vi_backfill_race_test.go:TestStore_ViBackfillRace_ColumnInsertDuringFinalize_NeverDropsColumn`.
+See NOTES.md NOTE-PGQUEUE-VI-BLOCK-2.

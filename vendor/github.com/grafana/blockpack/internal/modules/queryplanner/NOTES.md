@@ -780,3 +780,39 @@ at the planner level; these two fields extend that pattern for the executor's po
 
 **Back-ref:** `internal/modules/executor/plan_blocks.go:planBlocks` (counter wiring),
 `internal/modules/queryplanner/plan.go:Plan` (struct definition).
+
+---
+
+## NOTE-478: Column-Presence Bloom Pruning Reinstated, Value Pruning Stays Removed (issue #531)
+
+**Problem:** `Plan`'s own doc comment ("each predicate applies an OR bloom check across its
+Columns... Multiple predicates are ANDed") had been describing dead prose since #439/#435/#437
+removed every pruning mechanism the comment implicitly relied on — a real "comment lie"
+(documenting behavior that didn't exist). `TestPlanPredicatesDoNotPrune` existed specifically to
+pin that no pruning happened at all.
+
+**Decision:** `internal/modules/blockio`'s new per-block column-name bloom
+(`shared/NOTES.md` NOTE-COLUMNBLOOM-1) gives the planner a real, cheap signal to revive EXACTLY
+the AND/OR semantics the doc comment already described — but for column PRESENCE only, never a
+value comparison. `blockMayMatchPredicates`/`predicateMayMatchBlock` (`planner.go`) implement
+the recursive AND/OR tree walk; `Plan.PrunedByColumnBloom` is the new counter.
+
+**AND/OR-safety test rigor:** a naive test fixture where a composite `LogicalOR`'s two children
+happen to always agree (both true or both false for every test block) CANNOT distinguish correct
+OR semantics from a buggy AND-like mutation — both produce the same `SelectedBlocks` either way.
+`planner_columnbloom_test.go`'s `newBloomStub` fixture deliberately includes a third block (block
+2: has column "B", lacks "C") specifically to create a genuinely divergent case for
+`TestPlanColumnBloom_ORAcrossCompositeChildren` — confirmed via an actual mutation test during
+development (flipping the `LogicalOR` branch to require ALL children instead of ANY) that this
+specific test, and only this one among the AND/OR suite, fails without the divergent block.
+
+**`TestPlanPredicatesDoNotPrune` was NOT deleted** — its fixture's predicate column
+(`resource.service.name`) is present in every block, so #531's pruning correctly declines to
+prune there too; its assertions (and doc comment) were narrowed to clarify they pin
+VALUE-pruning absence specifically, not the absence of all pruning.
+
+Back-ref: `internal/modules/queryplanner/planner.go` (`blockMayMatchPredicates`,
+`predicateMayMatchBlock`), `internal/modules/queryplanner/blockindexer.go`
+(`BlockIndexer.MayContainColumn`), `internal/modules/queryplanner/plan.go`
+(`Plan.PrunedByColumnBloom`), `planner_columnbloom_test.go`,
+`planner_test.go:TestPlanColumnBloomPruning`. See SPECS.md §9.

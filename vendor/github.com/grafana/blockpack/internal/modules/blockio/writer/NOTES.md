@@ -1784,3 +1784,32 @@ satisfied with no further edits needed to those five notes.
 Back-refs: `internal/modules/blockio/writer/constants.go` (deleted alias block),
 `internal/modules/blockio/shared/constants.go:205` (deleted backward-compatibility comment, the
 canonical `Kind*` block itself unchanged).
+
+---
+
+## NOTE-COLUMNBLOOM-WRITER-1 — `mergeBuiltBlock` computes each block's column-name bloom fresh (issue #531)
+
+`writer_block.go:buildBlock` now copies the block's actual column-name set out of
+`bb.columns` (NOT `bb.colMinMax`, which does not reliably cover every attribute column —
+`b.columns` is the authoritative set, populated by `addColumn` for every column that ends up
+with any encoded data in the block) into `builtBlock.columnNames`, captured BEFORE `bb` returns
+to `w.bbPool` — `bb.reset()` deletes `b.columns`' entries in place on the next reuse, which would
+silently corrupt an aliased slice out from under a still-live `builtBlock` (the same hazard
+`colMinMax`'s own doc comment already calls out and avoids by reallocating instead of
+clearing in place).
+
+`writer.go:mergeBuiltBlock` then sets `BlockMeta.ColumnBloom = shared.BuildColumnBloom(built.columnNames)`
+for EVERY block this writer produces — fresh ingestion (`AddSpan`/`AddTracesData`) and
+compaction-merged output (`trace_compaction.go` via `blockio/compaction.CompactBlocksStreaming`)
+alike, since both paths funnel through this exact same `flushBlocks`/`mergeBuiltBlock` code.
+There is no special-casing for compaction: the bloom is never copied or derived from an input
+block's own `ColumnBloom` at all, so a compacted output's bloom always reflects its real,
+just-built merged column set, regardless of whether any input carried a bloom.
+
+Back-ref: `internal/modules/blockio/writer/builtblock.go` (`columnNames` field),
+`internal/modules/blockio/writer/writer_block.go:buildBlock`,
+`internal/modules/blockio/writer/writer.go:mergeBuiltBlock`,
+`internal/modules/blockio/writer/metadata.go:writeColumnBloomSection`,
+`internal/modules/blockio/writer/v8_sections.go:writeV8ColumnBloomIndex`. See
+`internal/modules/blockio/shared/NOTES.md` NOTE-COLUMNBLOOM-1,
+`internal/modules/blockio/SPECS.md` SPEC-COLUMNBLOOM-1.

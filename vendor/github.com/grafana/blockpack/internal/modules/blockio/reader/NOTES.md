@@ -3558,3 +3558,65 @@ Back-refs: `internal/modules/blockio/reader/column.go:readColumnEncoding` (delet
 `KindInlineBytesAllPresent` — definitions kept, see Consequence). Cross-ref:
 `blockio/shared/NOTES.md` (one-line pointer to this note), `internal/modules/blockio/SPECS.md`
 (Encoding Kind Registry table update). Test: `encoding_removed_kinds_test.go`.
+
+---
+
+## NOTE-COLUMNBLOOM-READER-1 — `MayContainColumn` and eager column-bloom section parse (issue #531)
+
+`parseSectionsV8` now also calls `parseColumnBloomIndex` right after eagerly loading the block
+index — same cost class (a single small ToC-directed section fetch), same "eager, required by
+block-access decisions" rationale. Missing section (old files, or any writer that never computed
+it), a block-count mismatch, or a truncated tail all degrade gracefully: the remaining/all
+`BlockMeta.ColumnBloom` fields simply stay nil, never an error.
+
+`Reader.MayContainColumn(blockIdx, name) bool` is the public consultation API this section
+exists to serve — SPEC-COLUMNBLOOM-1: deliberately usable from ANY read-path caller (not a
+private detail of one consumer). Returns `false` ONLY when the bloom definitively proves absence
+(no false negatives, by construction); `true` for an out-of-range `blockIdx`, an absent/empty
+bloom, or genuine presence. Two current consumers: `compactionworker`'s vi_backfill block-fetch
+decision (root `blockpack`'s `valueindex_backfill.go:extractAndWriteBlock`) and
+`queryplanner.Plan`'s new column-presence pruning stage (via the `BlockIndexer` interface, which
+`*Reader` satisfies structurally).
+
+Back-ref: `internal/modules/blockio/reader/parser.go` (`parseColumnBloomIndex`,
+`MayContainColumn`), `columnbloom_internal_test.go`, `columnbloom_test.go`. See
+`internal/modules/blockio/shared/NOTES.md` NOTE-COLUMNBLOOM-1,
+`internal/modules/blockio/SPECS.md` SPEC-COLUMNBLOOM-1.
+
+---
+
+## NOTE-READER-GETBLOCKWITHBYTES-1: `GetBlockWithBytes` now routes through the cache-aware `ReadBlocks`, not `ReadBlockRaw` (issue #530 follow-up)
+
+*Added: 2026-07-22*
+
+**Problem:** `compactionworker`'s vi_backfill block-fetch path (issue #530) constructs `Reader`s
+with a real `SectionCache`, expecting repeated per-block reads across independently-triggered
+columns' jobs to hit the cache instead of re-fetching. Adversarial review found this cache
+provided ZERO benefit in practice: `GetBlockWithBytes` (used by root `valueindex_extract.go`'s
+`buildSpanStartSecByRef`, `blocksimilarity.go`, and `blockio/compaction/compaction.go`) called
+`ReadBlockRaw`, which calls `readRange` -> `provider.ReadAt` DIRECTLY -- completely bypassing
+any configured `SectionCache`. The cache's typed "Block" slot (`GetBlockColumns`/
+`CacheBlockColumns`) only backs `Reader.ReadGroup`/`ReadBlocks`, a DIFFERENT read path the
+query-time executor's `Planner.FetchBlocks` already used, but `GetBlockWithBytes` never did.
+
+**Decision:** `GetBlockWithBytes` now calls `r.ReadBlocks([]int{blockIdx})` instead of
+`r.ReadBlockRaw(blockIdx)`. For every caller whose `Reader` has no `SectionCache` configured
+(fileID=="" or `NopSectionCache` -- every caller before this fix, and still every caller except
+compaction-worker's vi_backfill path), `ReadBlocks` falls through to the identical single-block
+`ReadCoalescedBlocks` fast path (NOTE-365) `ReadBlockRaw` itself used internally -- same bytes,
+same one-block-at-a-time memory footprint, zero behavior change. Only a `Reader` constructed
+with a real cache (vi_backfill's new usage) actually benefits.
+
+**Companion fix, root package:** `valueindex_extract.go`'s `extractBlockColumns` (the OTHER
+block-data read site `ExtractValueIndexEntriesForColumns` uses, independent of
+`GetBlockWithBytes`) needed the identical fix -- it also called `ReadBlockRaw` directly. Both
+fixes were required together: a single block's extraction pass calls into BOTH
+`buildSpanStartSecByRef` (via `GetBlockWithBytes`) and `extractBlockColumns` for the SAME
+block, and leaving either one uncached defeats the cache for that block regardless of whether
+the other one is fixed (confirmed by a real cross-job test failure during development that
+persisted until both call sites were fixed).
+
+Back-ref: `internal/modules/blockio/reader/reader.go:GetBlockWithBytes`,
+root `valueindex_extract.go:extractBlockColumns`,
+`internal/modules/compactionworker/NOTES.md` NOTE-COMPACTIONWORKER-8 (the compaction-worker
+side of this same investigation).

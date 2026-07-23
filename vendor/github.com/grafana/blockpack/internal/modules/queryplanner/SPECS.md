@@ -480,3 +480,36 @@ type Plan struct {
 **Invariant:** When `Direction == Forward`, `SelectedBlocks` is sorted ascending.
 When `Direction == Backward`, `SelectedBlocks` is sorted descending.
 Calling `Plan()` directly always returns `Direction == Forward`.
+
+## 9. Column-Presence Bloom Pruning (issue #531)
+
+`BlockIndexer.MayContainColumn(blockIdx, name) bool` (implemented by `reader.Reader`) exposes a
+per-block column-name bloom check (`internal/modules/blockio/SPECS.md` SPEC-COLUMNBLOOM-1) —
+returns `false` ONLY when the column is DEFINITIVELY absent from that block (no false
+negatives); `true` for present, unknown/old files, or an out-of-range block index.
+
+`Plan`'s Stage 1 (after Stage 0 time-range pruning, before block ordering) uses this to prune
+blocks a predicate can PROVE unsatisfiable, via `blockMayMatchPredicates`/
+`predicateMayMatchBlock` (`planner.go`):
+
+- **Leaf** (`len(Children) == 0`): `Columns` are OR'd — may-match if ANY named column may be
+  present. Matches this package's own long-standing `Predicate` doc comment ("applies an OR
+  bloom check across its Columns"), which predates this pruning stage's actual implementation.
+- **Composite `LogicalAND`**: may-match only if ALL children may-match.
+- **Composite `LogicalOR`**: may-match if ANY child may-match.
+- **Top-level predicate list**: implicitly ANDed (mirrors the package's own documented `{ A &&
+  B }` example) — a block must survive every top-level predicate.
+
+`Plan.PrunedByColumnBloom` counts blocks eliminated by this stage.
+
+**This is column-PRESENCE pruning only.** Value-based pruning (matching a specific VALUE, not
+just column existence) was removed with the range index (NOTE(#439)) and is deliberately NOT
+reinstated by this stage — the value index remains the sole source of value-level pruning. A
+predicate naming a column that IS present in a block, but whose actual matched VALUE isn't,
+still leaves that block selected; this stage can only ever REMOVE candidates a subsequent value
+check would also have rejected, never the reverse.
+
+Back-ref: `internal/modules/queryplanner/blockindexer.go` (`MayContainColumn`),
+`internal/modules/queryplanner/planner.go` (`blockMayMatchPredicates`,
+`predicateMayMatchBlock`), `internal/modules/queryplanner/plan.go`
+(`Plan.PrunedByColumnBloom`). See NOTES.md's own entry for the AND/OR-safety test rationale.

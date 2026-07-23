@@ -37,15 +37,13 @@ CREATE TABLE IF NOT EXISTS compaction_jobs (
     -- starving other job types: any priority-0 row of ANY type is at least as eligible as an
     -- older vi_backfill window.
     priority         BIGINT NOT NULL DEFAULT 0,
-    -- column_hash/column_type/window_start_sec/window_end_sec (issue #529): populated ONLY for
-    -- vi_backfill rows (NULL for every other job_type), denormalized OUT of detail's JSONB blob
-    -- into real, indexed columns specifically so the query-time coverage check
-    -- (ViBackfillCoverageGap) can efficiently answer "does any non-succeeded window overlap
-    -- [minSec, maxSec] for this column" without a JSONB field-extraction scan across
-    -- potentially tens of thousands of rows per column. detail remains the source of truth for
-    -- the full ViBackfillDetail struct; these are a query-optimization-only denormalized copy.
-    column_hash      TEXT NULL,
-    column_type      TEXT NULL,
+    -- window_start_sec/window_end_sec (issue #529): populated ONLY for vi_backfill rows (NULL for
+    -- every other job_type), denormalized OUT of detail's JSONB blob into real, indexed columns.
+    -- detail remains the source of truth for the full ViBackfillDetail struct; these are a
+    -- query-optimization-only denormalized copy. column_hash/column_type used to live here too
+    -- (issue #529) but moved off the parent row entirely into vi_backfill_job_columns (issue
+    -- #533) -- column identity is now membership, not job identity; see that table's own comment
+    -- below.
     window_start_sec BIGINT NULL,
     window_end_sec   BIGINT NULL,
     -- block_object_key (issue #532): populated ONLY for NEW-model vi_backfill rows -- one job
@@ -65,8 +63,6 @@ CREATE TABLE IF NOT EXISTS compaction_jobs (
 -- needs its own explicit, idempotent ALTER TABLE here (mirrors the same fix already applied for
 -- pgcatalog's blockpack_file_catalog.meta column gap).
 ALTER TABLE compaction_jobs ADD COLUMN IF NOT EXISTS priority BIGINT NOT NULL DEFAULT 0;
-ALTER TABLE compaction_jobs ADD COLUMN IF NOT EXISTS column_hash TEXT NULL;
-ALTER TABLE compaction_jobs ADD COLUMN IF NOT EXISTS column_type TEXT NULL;
 ALTER TABLE compaction_jobs ADD COLUMN IF NOT EXISTS window_start_sec BIGINT NULL;
 ALTER TABLE compaction_jobs ADD COLUMN IF NOT EXISTS window_end_sec BIGINT NULL;
 ALTER TABLE compaction_jobs ADD COLUMN IF NOT EXISTS block_object_key TEXT NULL;
@@ -138,57 +134,53 @@ CREATE INDEX IF NOT EXISTS idx_compaction_jobs_retry_due
     ON compaction_jobs (next_retry_at)
     WHERE status = 'failed' AND next_retry_at IS NOT NULL;
 
--- idx_vi_backfill_coverage_gap (issue #529): backs ViBackfillCoverageGap's "does any
--- non-succeeded vi_backfill window overlap [minSec, maxSec] for this column" query. Scoped to
--- status != 'succeeded' specifically because that is the ONLY subset this query ever needs
--- (and, in steady state, a small one -- most windows behind the priority-ordered claim frontier
--- succeed quickly; the non-succeeded set concentrates on the still-catching-up historical tail
--- and any genuinely stuck/retrying windows).
---
--- CONCURRENTLY (issue #529 incident, 2026-07-23): a plain DROP+CREATE rebuild of this index on
--- every compaction-worker/compaction-planner startup blocks ALL writes to compaction_jobs for the
--- rebuild's duration -- negligible when this table was small, several seconds of fleet-wide
--- write-stall once the #529 bulk-insert grew it past a million rows. See
--- idx_compaction_jobs_claimable_priority's own comment for the fuller incident writeup.
+-- issue #533: column_hash/column_type move off the parent row entirely into
+-- vi_backfill_job_columns (column membership, not job identity). These 3 indexes all
+-- reference column_hash/column_type directly and must be dropped before the columns
+-- themselves can be dropped. None are recreated in the new column-less shape --
+-- MissingViBackfillBlocks/ViBackfillGapRanges become JOINs against the new child table's
+-- own idx_vi_backfill_job_columns_lookup index instead (see below).
 DROP INDEX CONCURRENTLY IF EXISTS idx_vi_backfill_coverage_gap;
-CREATE INDEX CONCURRENTLY idx_vi_backfill_coverage_gap
-    ON compaction_jobs (tenant, column_hash, column_type, window_end_sec)
-    WHERE job_type = 'vi_backfill' AND status != 'succeeded';
-
--- idx_vi_backfill_all_windows (issue #529 follow-up): backs MissingViBackfillWindows' "does a
--- row exist at all for this window" check -- deliberately NOT scoped to status != 'succeeded'
--- like idx_vi_backfill_coverage_gap above, since a succeeded row is exactly the "not missing"
--- signal that query needs to see (idx_vi_backfill_coverage_gap's partial index can't answer
--- that; it excludes succeeded rows entirely).
---
--- CONCURRENTLY (issue #529 incident, 2026-07-23): this specific index's own non-concurrent
--- rebuild, re-run by a routine compaction-worker pod restart against the by-then-1.24M-row table,
--- is the exact statement caught mid-execution stalling the whole fleet during this incident's
--- live diagnosis. See idx_compaction_jobs_claimable_priority's own comment for the fuller writeup.
 DROP INDEX CONCURRENTLY IF EXISTS idx_vi_backfill_all_windows;
-CREATE INDEX CONCURRENTLY idx_vi_backfill_all_windows
-    ON compaction_jobs (tenant, column_hash, column_type, window_end_sec)
-    WHERE job_type = 'vi_backfill';
-
--- idx_vi_backfill_all_blocks (issue #532): backs MissingViBackfillBlocks' "does a row exist at
--- all for this exact block" check -- the block-shaped-job analog of idx_vi_backfill_all_windows
--- above, scoped to block_object_key IS NOT NULL so only NEW-model rows are indexed here (OLD
--- window-shaped rows never populate block_object_key and are irrelevant to this check).
--- Deliberately NOT status-scoped, for the identical reason idx_vi_backfill_all_windows isn't: a
--- succeeded row is exactly the "not missing" signal this query needs to see.
---
--- DROP+recreate CONCURRENTLY (matching every sibling index above, not a bare
--- "CREATE ... IF NOT EXISTS"): an index's WHERE predicate is part of its identity to Postgres,
--- but "IF NOT EXISTS" only checks the NAME, so a predicate change would otherwise never apply
--- to an already-provisioned live database. A bare CREATE CONCURRENTLY IF NOT EXISTS also risks
--- leaving an unrepairable INVALID index behind if the build is ever interrupted mid-create with
--- no DROP IF EXISTS guard to clear it on the next apply attempt.
---
--- CONCURRENTLY (not a plain CREATE): this table carries a live multi-hundred-thousand-row
--- backlog under the OLD model at the time this ships -- see
--- idx_compaction_jobs_claimable_priority's own comment for the full 2026-07-23 incident
--- writeup a non-concurrent rebuild on this table caused.
 DROP INDEX CONCURRENTLY IF EXISTS idx_vi_backfill_all_blocks;
-CREATE INDEX CONCURRENTLY idx_vi_backfill_all_blocks
-    ON compaction_jobs (tenant, column_hash, column_type, block_object_key)
-    WHERE job_type = 'vi_backfill' AND block_object_key IS NOT NULL;
+
+-- DROP COLUMN is a fast, metadata-only operation in Postgres (marks the column dropped in
+-- the catalog; does not rewrite existing rows) -- NOT a repeat of this table's documented
+-- index-rebuild-locking incident (see idx_compaction_jobs_claimable_priority's own comment).
+ALTER TABLE compaction_jobs DROP COLUMN IF EXISTS column_hash;
+ALTER TABLE compaction_jobs DROP COLUMN IF EXISTS column_type;
+
+-- vi_backfill_job_columns (issue #533): column membership + per-column status for a
+-- block-shaped vi_backfill job. ON DELETE CASCADE: the live rollout's `DELETE FROM
+-- compaction_jobs WHERE job_type = 'vi_backfill'` step (see NOTES.md's own rollout entry)
+-- cascades to this table automatically, no separate cleanup needed.
+CREATE TABLE IF NOT EXISTS vi_backfill_job_columns (
+    id           BIGSERIAL PRIMARY KEY,
+    job_id       UUID NOT NULL REFERENCES compaction_jobs(id) ON DELETE CASCADE,
+    column_hash  TEXT NOT NULL,
+    column_type  TEXT NOT NULL,
+    column_name  TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'pending',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    succeeded_at TIMESTAMPTZ NULL,
+    UNIQUE (job_id, column_hash, column_type)
+);
+
+-- idx_vi_backfill_job_columns_lookup: backs both the rewritten ViBackfillGapRanges (filters
+-- column_hash/column_type/status, joins job_id -> compaction_jobs.id) and the rewritten
+-- MissingViBackfillBlocks (filters column_hash/column_type only, status-agnostic --
+-- Postgres can still use this index's leading columns even when the status predicate is
+-- omitted, at the cost of scanning slightly more rows within one (column_hash, column_type)
+-- group).
+DROP INDEX CONCURRENTLY IF EXISTS idx_vi_backfill_job_columns_lookup;
+CREATE INDEX CONCURRENTLY idx_vi_backfill_job_columns_lookup
+    ON vi_backfill_job_columns (column_hash, column_type, status, job_id);
+
+-- idx_vi_backfill_job_columns_pending: backs ViBackfillFinalize's "any pending children left
+-- for this job?" check and ViBackfillPendingColumns' per-job pending-column lookup. Partial on
+-- status != 'succeeded' -- mirrors idx_compaction_jobs_dedup_active's own "succeeded is the
+-- only status this query never wants" rationale.
+DROP INDEX CONCURRENTLY IF EXISTS idx_vi_backfill_job_columns_pending;
+CREATE INDEX CONCURRENTLY idx_vi_backfill_job_columns_pending
+    ON vi_backfill_job_columns (job_id)
+    WHERE status != 'succeeded';

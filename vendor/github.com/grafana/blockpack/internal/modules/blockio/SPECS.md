@@ -1133,11 +1133,57 @@ numeric-string promotion, and the dense kind already handles interleaved nulls v
 
 ## 10. Bloom Filter
 
-### 10.1 Column Name Bloom Filter (Removed 2026-03-07)
+### 10.1 Column Name Bloom Filter (Removed 2026-03-07, re-added from scratch 2026-07-22 as its own section — see §10.3)
 
-The `column_name_bloom` field was removed from every Block Index Entry. See
-NOTE-BLOOM-REMOVAL in NOTES.md. CMS (Count-Min Sketch) subsumes column presence:
-an absent column has CMS count 0, which the planner treats conservatively (block passes).
+The original `column_name_bloom` field (inlined into every Block Index Entry) was removed. See
+NOTE-BLOOM-REMOVAL in NOTES.md. That entry's stated rationale — "CMS (Count-Min Sketch)
+subsumes column presence" — is now stale: CMS was never actually implemented as a real
+per-block presence check anywhere in this codebase, and the sketch/pruning subsystem it would
+have lived in was independently removed in full later anyway (#435/#437/#439). Issue #531
+re-adds an equivalent presence check as a NEW, separate, optional ToC section — see §10.3 — not
+by reinstating this removed inline field.
+
+### SPEC-COLUMNBLOOM-1
+
+### 10.3 Column-Name Bloom Index Section (issue #531)
+
+Per-block bloom filter over the names of every column actually present in that block, stored
+as its own ToC section (`ToCTypeIndex`/`ToCSubTypeColumnBloom=17`), loaded eagerly alongside
+the Block Index (`internal/modules/blockio/reader/parser.go:parseColumnBloomIndex`) so
+`Reader.MayContainColumn` never costs additional I/O beyond what opening the file already does.
+
+**Wire format** (raw section body, before the outer snappy the ToC entry mechanism already
+applies to every section uniformly):
+
+```
+block_count[4 LE]
+per block (block_count entries, in block-ID order):
+  bloom[32 bytes]   // ColumnBloomBytes; no per-entry length prefix, fixed size
+```
+
+**Hash algorithm:** same Kirsch-Mitzenmacher double-FNV-1a construction as
+`internal/modules/valueindex/bucketbloom.go`'s value bloom (k=7 probes), operating on the
+column's full string name (e.g. `"span.http.method"`, `"resource.service.name"`) rather than a
+value.
+
+**Population:** computed FRESH by the writer for every block it produces
+(`writer.mergeBuiltBlock`), from that block's own actual column set — never carried over from an
+input block. This means a compaction-merged output block's bloom always reflects its real
+merged column set, even when none of the inputs being merged had a bloom at all (compaction is
+exactly the mechanism that "upgrades" older data to carry this field as it flows through).
+
+**Backward/forward compatibility:** this section is entirely optional. A file written before
+2026-07-22, or by any writer that never computed it, simply has no `ToCSubTypeColumnBloom`
+entry in its ToC — `fetchToCSection` returns `(nil, nil)` for the missing key (its existing,
+already-established "absent key" contract), and every `BlockMeta.ColumnBloom` stays nil.
+`MayContainColumn` treats nil/empty as "no information, must fetch" (returns `true`), never as
+"definitely absent." No false negatives, ever, by construction of the bloom filter plus this
+absence contract.
+
+**Consumers:** `internal/modules/compactionworker`'s vi_backfill block-fetch decision
+(`extractAndWriteBlock` in root `blockpack`'s `valueindex_backfill.go`) and
+`internal/modules/queryplanner`'s `Plan` (Stage 1 column-presence pruning, AND/OR-safe over the
+`Predicate` tree — see queryplanner's own SPECS.md/NOTES.md).
 
 ### 10.2 Trace ID Bloom Filter (Compact Index §6 version 2)
 

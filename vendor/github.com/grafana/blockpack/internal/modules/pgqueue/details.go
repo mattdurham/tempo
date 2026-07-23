@@ -62,44 +62,23 @@ type TraceCompactionDetail struct {
 	Level           int      `json:"level"`
 }
 
-// ViBackfillDetail identifies which (tenant, column) a vi_backfill job indexes, and the exact
-// span it covers -- either shape below may appear in a live compaction_jobs row; compaction-
-// worker's dispatch (compactionworker.processViBackfillJob) branches on which one a row carries.
-//
-// Two coexisting job shapes (issue #532 transition):
-//
-//   - OLD, window-shaped (issue #529): BlockObjectKey is empty. [WindowStartSec, WindowEndSec) is
-//     a fixed, synthetic 1-minute wall-clock slice; the worker lists every trace block
-//     overlapping it and processes all of them. Still fully supported for DRAINING already
-//     in-flight rows (a live cluster can carry hundreds of thousands of these at migration
-//     time) -- no new rows of this shape are created once #532 ships.
-//   - NEW, block-shaped (issue #532): BlockObjectKey names the exact trace block object key to
-//     process -- exactly one block per job, no listing needed at all. WindowStartSec/
-//     WindowEndSec are still populated (from the block's own real MinSec/MaxSec, not a
-//     synthetic slice) so query-time coverage checks (ViBackfillGapRanges) keep working
-//     unchanged across both shapes without knowing which one produced a given row.
-//
-// Rationale for the redesign: blocks don't align to 1-minute wall-clock boundaries, so the old
-// model routinely had MULTIPLE 1-minute-window jobs (even within a single column's own
-// backfill) redundantly re-list and re-fetch the SAME underlying block. Per-block jobs make
-// "has this block been processed for this column" the unit of dedup/coverage instead.
+// ViBackfillDetail identifies which trace block a vi_backfill job processes (issue #533: one job
+// per block; column identity lives entirely in vi_backfill_job_columns as membership rows, not
+// here or on the parent job row at all). BlockObjectKey names the exact trace block object key to
+// process -- exactly one block per job, no listing needed. WindowStartSec/WindowEndSec are the
+// block's own real [MinSec, MaxSec) (not a synthetic wall-clock slice), so query-time coverage
+// checks (ViBackfillGapRanges) can still range-filter on them directly.
 type ViBackfillDetail struct {
-	ColumnHash string `json:"column_hash"`
-	ColumnName string `json:"column_name"`
-	ColumnType string `json:"column_type"`
-	// BlockObjectKey is empty for an OLD window-shaped job, non-empty (the exact trace block's
-	// object key) for a NEW block-shaped job (issue #532). This is the field
-	// compactionworker's dispatch branches on.
-	BlockObjectKey string `json:"block_object_key,omitempty"`
+	// BlockObjectKey is the exact trace block object key this job processes. Every row has one,
+	// by construction -- there is no other job shape anymore.
+	BlockObjectKey string `json:"block_object_key"`
 	// BlockSizeBytes is the block's known object size (pgcatalog.Row.SizeBytes, captured at
-	// enumeration time), populated ONLY alongside BlockObjectKey. Lets
-	// compactionworker.catalogDiskBlockProvider.Size() answer without staging the block to
-	// disk at all when the size is already known -- required for issue #530's cache to
-	// actually skip ALL I/O (not just the in-memory-buffering it was originally, and
-	// incorrectly, designed around) when every section a job needs is already cached. Zero
-	// (e.g. an older enqueued job predating this field) degrades gracefully to staging the
-	// block to answer Size(), exactly like an unset hint already does for the OLD
-	// window-shaped path's own per-listed-block knownSizes map.
+	// enumeration time). Lets compactionworker.catalogDiskBlockProvider.Size() answer without
+	// staging the block to disk at all when the size is already known -- required for issue
+	// #530's cache to actually skip ALL I/O (not just the in-memory-buffering it was originally,
+	// and incorrectly, designed around) when every section a job needs is already cached. Zero
+	// (e.g. an older enqueued job predating this field) degrades gracefully to staging the block
+	// to answer Size() instead.
 	BlockSizeBytes int64 `json:"block_size_bytes,omitempty"`
 	WindowStartSec int64 `json:"window_start_sec"`
 	WindowEndSec   int64 `json:"window_end_sec"`

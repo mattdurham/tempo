@@ -150,14 +150,12 @@ type BlockSpec struct {
 	SizeBytes int64
 }
 
-// viBackfillBlockDedupKey is one row per (column, exact block) pair (issue #532) -- the
-// block-shaped analog of the old per-window dedup key, so the SAME column can have many
-// independently claimable, independently idempotent per-block jobs in flight at once. Distinct
-// key format from the old window-shaped key (a block object key always contains '/' and is
-// never a bare integer), so old and new rows for the same column never collide on dedup_key even
-// though both formats share the shared unique index.
-func viBackfillBlockDedupKey(tenant, columnHash, columnType, blockObjectKey string) string {
-	return fmt.Sprintf("%s|%s|%s|%s|%s", JobTypeViBackfill, tenant, columnHash, columnType, blockObjectKey)
+// viBackfillBlockDedupKey is one row per exact block (issue #533) -- column identity no longer
+// participates in job dedup at all now that columns are membership rows in
+// vi_backfill_job_columns, not part of the parent job's identity, so N columns triggered for the
+// SAME block all collapse onto exactly one parent row instead of N independently-dedup'd rows.
+func viBackfillBlockDedupKey(tenant, blockObjectKey string) string {
+	return fmt.Sprintf("%s|%s|%s", JobTypeViBackfill, tenant, blockObjectKey)
 }
 
 // maxViBackfillBlocksPerInsert bounds each multi-row INSERT statement's size, mirroring the old
@@ -165,9 +163,14 @@ func viBackfillBlockDedupKey(tenant, columnHash, columnType, blockObjectKey stri
 const maxViBackfillBlocksPerInsert = 1000
 
 // viBackfillBlockInsertParamsPerRow is id, job_type, subsystem, tenant, detail, dedup_key,
-// priority, column_hash, column_type, window_start_sec, window_end_sec, block_object_key --
-// every compaction_jobs column this insert populates except the literal 'pending' status.
-const viBackfillBlockInsertParamsPerRow = 12
+// priority, window_start_sec, window_end_sec, block_object_key -- every compaction_jobs column
+// round trip 1 populates except the literal 'pending' status. column_hash/column_type/
+// column_name no longer appear here (issue #533) -- they move to round trip 2's child-row insert.
+const viBackfillBlockInsertParamsPerRow = 10
+
+// viBackfillJobColumnsInsertParamsPerRow is job_id, column_hash, column_type, column_name --
+// round trip 2's per-row params (status is the literal 'pending').
+const viBackfillJobColumnsInsertParamsPerRow = 4
 
 // InsertViBackfillBlocks bulk-inserts one pending vi_backfill job per block in blocks, chunked
 // to stay under maxViBackfillBlocksPerInsert rows per statement (issue #532). Idempotent per
@@ -195,6 +198,23 @@ func (s *Store) InsertViBackfillBlocks(
 	return nil
 }
 
+// insertViBackfillBlockChunk is the get-or-create-parent-then-insert-child bulk insert path
+// (issue #533): one explicit transaction, exactly 2 round trips.
+//
+// Round trip 1 gets-or-creates each block's parent compaction_jobs row via a genuine
+// ON CONFLICT ... DO UPDATE (not DO NOTHING) -- a well-known Postgres idiom for "get-or-create
+// with a row lock, returning the id either way, in one INSERT statement." Because it's a real
+// UPDATE, Postgres always returns a row via RETURNING whether the row was freshly inserted or
+// already existed, AND takes a row-level lock on that row for the WHOLE TRANSACTION's duration
+// (not just this one statement) -- this is the mechanism that makes the parent-row lock
+// (SPEC-PGQUEUE-9) actually work: a concurrent ViBackfillFinalize's own FOR UPDATE on the same row
+// blocks until this transaction commits, and vice versa. Every other column (detail, priority,
+// etc.) is left completely untouched on conflict (only dedup_key is "updated," to its own
+// existing value) -- an existing job's priority stays "set exactly once."
+//
+// Round trip 2 bulk-inserts the child membership rows using round trip 1's id mapping.
+// col.ColumnHash/col.ColumnType/col.ColumnName are identical across every tuple in this statement
+// (InsertViBackfillBlocks is always scoped to one column already); only job_id varies per block.
 func (s *Store) insertViBackfillBlockChunk(
 	ctx context.Context,
 	tenant string,
@@ -205,40 +225,221 @@ func (s *Store) insertViBackfillBlockChunk(
 		return nil
 	}
 
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("pgqueue: insert vi_backfill block chunk: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	jobIDByDedupKey, err := insertViBackfillParentJobs(ctx, tx, tenant, blocks)
+	if err != nil {
+		return err
+	}
+	if err := insertViBackfillJobColumns(ctx, tx, tenant, col, blocks, jobIDByDedupKey); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("pgqueue: insert vi_backfill block chunk: commit: %w", err)
+	}
+	return nil
+}
+
+// insertViBackfillParentJobs is insertViBackfillBlockChunk's round trip 1 -- see that function's
+// own doc comment for the get-or-create-with-lock rationale. Returns each block's job id, keyed
+// by that block's own dedup key.
+func insertViBackfillParentJobs(
+	ctx context.Context, tx pgx.Tx, tenant string, blocks []BlockSpec,
+) (map[string]string, error) {
 	valuesSQL := make([]string, 0, len(blocks))
 	args := make([]any, 0, len(blocks)*viBackfillBlockInsertParamsPerRow)
 	for i, b := range blocks {
 		detail := ViBackfillDetail{
-			ColumnHash: col.ColumnHash, ColumnName: col.ColumnName, ColumnType: col.ColumnType,
 			BlockObjectKey: b.ObjectKey, BlockSizeBytes: b.SizeBytes,
 			WindowStartSec: b.MinSec, WindowEndSec: b.MaxSec,
 		}
 		rawDetail, err := json.Marshal(detail)
 		if err != nil {
-			return fmt.Errorf("marshal detail for block %q: %w", b.ObjectKey, err)
+			return nil, fmt.Errorf("marshal detail for block %q: %w", b.ObjectKey, err)
 		}
 		base := i * viBackfillBlockInsertParamsPerRow
 		valuesSQL = append(valuesSQL, fmt.Sprintf(
-			"($%d,$%d,$%d,$%d,'pending',$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
-			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10, base+11, base+12,
+			"($%d,$%d,$%d,$%d,'pending',$%d,$%d,$%d,$%d,$%d,$%d)",
+			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10,
 		))
 		args = append(
 			args,
 			// string(rawDetail): see insertWithPriority's identical comment -- []byte encodes as
 			// a bytea literal under simple_protocol, which Postgres can't cast to jsonb.
 			uuid.NewString(), string(JobTypeViBackfill), "vi", tenant, string(rawDetail),
-			viBackfillBlockDedupKey(tenant, col.ColumnHash, col.ColumnType, b.ObjectKey), b.Priority,
-			col.ColumnHash, col.ColumnType, b.MinSec, b.MaxSec, b.ObjectKey,
+			viBackfillBlockDedupKey(tenant, b.ObjectKey), b.Priority, b.MinSec, b.MaxSec, b.ObjectKey,
 		)
 	}
 
 	query := "INSERT INTO compaction_jobs " +
-		"(id, job_type, subsystem, tenant, status, detail, dedup_key, priority, column_hash, column_type, window_start_sec, window_end_sec, block_object_key) " +
-		"VALUES " + strings.Join(valuesSQL, ",") + " ON CONFLICT (dedup_key) WHERE status != 'succeeded' DO NOTHING"
-	if _, err := s.pool.Exec(ctx, query, args...); err != nil {
-		return fmt.Errorf("pgqueue: batch insert vi_backfill blocks: %w", err)
+		"(id, job_type, subsystem, tenant, status, detail, dedup_key, priority, window_start_sec, window_end_sec, block_object_key) " +
+		"VALUES " + strings.Join(valuesSQL, ",") +
+		" ON CONFLICT (dedup_key) WHERE status != 'succeeded' DO UPDATE SET dedup_key = EXCLUDED.dedup_key" +
+		" RETURNING id, dedup_key"
+	rows, err := tx.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("pgqueue: get-or-create vi_backfill parent jobs: %w", err)
+	}
+	defer rows.Close()
+
+	jobIDByDedupKey := make(map[string]string, len(blocks))
+	for rows.Next() {
+		var id, dedupKey string
+		if err := rows.Scan(&id, &dedupKey); err != nil {
+			return nil, fmt.Errorf("pgqueue: scan vi_backfill parent job: %w", err)
+		}
+		jobIDByDedupKey[dedupKey] = id
+	}
+	if rows.Err() != nil {
+		return nil, fmt.Errorf("pgqueue: iterate vi_backfill parent jobs: %w", rows.Err())
+	}
+	return jobIDByDedupKey, nil
+}
+
+// insertViBackfillJobColumns is insertViBackfillBlockChunk's round trip 2 -- bulk-inserts col's
+// child membership row for every block's parent job id from round trip 1.
+func insertViBackfillJobColumns(
+	ctx context.Context, tx pgx.Tx, tenant string, col ViBackfillColumn, blocks []BlockSpec, jobIDByDedupKey map[string]string,
+) error {
+	valuesSQL := make([]string, 0, len(blocks))
+	args := make([]any, 0, len(blocks)*viBackfillJobColumnsInsertParamsPerRow)
+	for i, b := range blocks {
+		jobID, ok := jobIDByDedupKey[viBackfillBlockDedupKey(tenant, b.ObjectKey)]
+		if !ok {
+			return fmt.Errorf("pgqueue: no parent job id returned for block %q", b.ObjectKey)
+		}
+		base := i * viBackfillJobColumnsInsertParamsPerRow
+		valuesSQL = append(valuesSQL, fmt.Sprintf("($%d,$%d,$%d,$%d,'pending')", base+1, base+2, base+3, base+4))
+		args = append(args, jobID, col.ColumnHash, col.ColumnType, col.ColumnName)
+	}
+
+	query := "INSERT INTO vi_backfill_job_columns (job_id, column_hash, column_type, column_name, status) " +
+		"VALUES " + strings.Join(valuesSQL, ",") +
+		" ON CONFLICT (job_id, column_hash, column_type) DO NOTHING"
+	if _, err := tx.Exec(ctx, query, args...); err != nil {
+		return fmt.Errorf("pgqueue: batch insert vi_backfill job columns: %w", err)
 	}
 	return nil
+}
+
+const viBackfillPendingColumnsSQL = `
+	SELECT column_hash, column_type, column_name
+	FROM vi_backfill_job_columns
+	WHERE job_id = $1 AND status != 'succeeded'`
+
+// ViBackfillPendingColumns returns every still-pending column for jobID (issue #533) -- the
+// column-loop primitive compactionworker.processViBackfillJob iterates to process a block-shaped
+// job's remaining work.
+func (s *Store) ViBackfillPendingColumns(ctx context.Context, jobID string) ([]ViBackfillColumn, error) {
+	rows, err := s.pool.Query(ctx, viBackfillPendingColumnsSQL, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("pgqueue: vi_backfill pending columns: %w", err)
+	}
+	defer rows.Close()
+
+	var cols []ViBackfillColumn
+	for rows.Next() {
+		var c ViBackfillColumn
+		if err := rows.Scan(&c.ColumnHash, &c.ColumnType, &c.ColumnName); err != nil {
+			return nil, fmt.Errorf("pgqueue: scan vi_backfill pending column: %w", err)
+		}
+		cols = append(cols, c)
+	}
+	if rows.Err() != nil {
+		return nil, fmt.Errorf("pgqueue: iterate vi_backfill pending columns: %w", rows.Err())
+	}
+	return cols, nil
+}
+
+const viBackfillMarkColumnDoneSQL = `
+	UPDATE vi_backfill_job_columns
+	SET status = 'succeeded', succeeded_at = now()
+	WHERE job_id = $1 AND column_hash = $2 AND column_type = $3`
+
+// ViBackfillMarkColumnDone marks jobID's (columnHash, columnType) child row succeeded (issue
+// #533). Deliberately no transaction, no parent-row lock (SPEC-PGQUEUE-9's own "extraction/flush
+// must never happen inside the row-locking transaction" contract): this call happens once per
+// successfully-processed column, potentially minutes apart from the next one, and must never hold
+// a lock on the parent row while that column's own extraction/flush I/O runs.
+func (s *Store) ViBackfillMarkColumnDone(ctx context.Context, jobID, columnHash, columnType string) error {
+	if _, err := s.pool.Exec(ctx, viBackfillMarkColumnDoneSQL, jobID, columnHash, columnType); err != nil {
+		return fmt.Errorf("pgqueue: vi_backfill mark column done: %w", err)
+	}
+	return nil
+}
+
+const viBackfillMarkAllColumnsResolvedSQL = `
+	UPDATE vi_backfill_job_columns
+	SET status = 'succeeded', succeeded_at = now()
+	WHERE job_id = $1 AND status != 'succeeded'`
+
+// ViBackfillMarkAllColumnsResolved resolves every still-pending column for jobID in one pass
+// (issue #533) -- used when the whole target block is gone (ErrObjectNotFound): a gone block has
+// nothing left to index for ANY of its columns, mirroring SPEC-COMPACTIONWORKER-13's existing
+// per-job terminal-success contract, now applied per-column. Idempotent: a column already
+// succeeded from a prior partial run is simply not matched by the WHERE clause, left untouched.
+func (s *Store) ViBackfillMarkAllColumnsResolved(ctx context.Context, jobID string) error {
+	if _, err := s.pool.Exec(ctx, viBackfillMarkAllColumnsResolvedSQL, jobID); err != nil {
+		return fmt.Errorf("pgqueue: vi_backfill mark all columns resolved: %w", err)
+	}
+	return nil
+}
+
+// ViBackfillFinalize is the race-closing serialization point (issue #533, refining the issue's
+// own literal "lock the child rows" text -- see NOTES.md NOTE-PGQUEUE-VI-BLOCK-2 for the full
+// Q3-derived rationale): takes a FOR UPDATE lock on the PARENT row FIRST, so it serializes against
+// insertViBackfillBlockChunk's own DO-UPDATE-lock on the identical row (round trip 1 above) -- a
+// row-level lock on rows that ALREADY EXIST cannot, by itself, stop a brand-new child-row INSERT
+// from landing in the gap between a "read the child list" step and a "flip to succeeded" step;
+// locking the PARENT is what actually closes that gap, because BOTH sides of the race contend for
+// the identical row lock.
+//
+// Returns (true, nil) once the row is genuinely 'succeeded' (either just now, or already was --
+// ErrNoRows on the initial lock query means "no non-succeeded row with this id," treated as
+// already-finalized, not an error). Returns (false, nil) when pending children remain -- the
+// caller (compactionworker.processViBackfillJob) must reprocess those columns and call this again;
+// see SPEC-PGQUEUE-9.
+func (s *Store) ViBackfillFinalize(ctx context.Context, jobID string) (bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("pgqueue: vi_backfill finalize: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var lockedID string
+	row := tx.QueryRow(ctx, `SELECT id FROM compaction_jobs WHERE id = $1 AND status != 'succeeded' FOR UPDATE`, jobID)
+	if err := row.Scan(&lockedID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return true, nil // already succeeded (or gone) -- nothing left to finalize
+		}
+		return false, fmt.Errorf("pgqueue: vi_backfill finalize: lock job %s: %w", jobID, err)
+	}
+
+	var hasPending bool
+	hpRow := tx.QueryRow(
+		ctx, `SELECT EXISTS (SELECT 1 FROM vi_backfill_job_columns WHERE job_id = $1 AND status != 'succeeded')`, jobID,
+	)
+	if err := hpRow.Scan(&hasPending); err != nil {
+		return false, fmt.Errorf("pgqueue: vi_backfill finalize: check pending children %s: %w", jobID, err)
+	}
+	if hasPending {
+		return false, tx.Commit(ctx) // release the lock; caller reprocesses and retries
+	}
+
+	if _, err := tx.Exec(
+		ctx, `UPDATE compaction_jobs SET status = 'succeeded', finished_at = now() WHERE id = $1`, jobID,
+	); err != nil {
+		return false, fmt.Errorf("pgqueue: vi_backfill finalize: mark succeeded %s: %w", jobID, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("pgqueue: vi_backfill finalize: commit %s: %w", jobID, err)
+	}
+	return true, nil
 }
 
 // WindowRange is one contiguous [StartSec, EndSec) span. ViBackfillGapRanges returns a
@@ -249,11 +450,12 @@ type WindowRange struct {
 }
 
 const viBackfillGapRangesSQL = `
-	SELECT window_start_sec, window_end_sec
-	FROM compaction_jobs
-	WHERE job_type = 'vi_backfill' AND status != 'succeeded'
-	  AND tenant = $1 AND column_hash = $2 AND column_type = $3
-	ORDER BY window_start_sec`
+	SELECT cj.window_start_sec, cj.window_end_sec
+	FROM compaction_jobs cj
+	JOIN vi_backfill_job_columns vc ON vc.job_id = cj.id
+	WHERE cj.job_type = 'vi_backfill' AND cj.tenant = $1
+	  AND vc.column_hash = $2 AND vc.column_type = $3 AND vc.status != 'succeeded'
+	ORDER BY cj.window_start_sec`
 
 // ViBackfillGapRanges returns every NOT-yet-succeeded window for (tenant, columnHash,
 // columnType), merged into the minimal number of contiguous [StartSec, EndSec) ranges (issue
@@ -264,9 +466,10 @@ const viBackfillGapRangesSQL = `
 // Triggered check still gates "never indexed at all" separately, exactly like the old
 // watermark-based CoversRange did.
 //
-// Backed by idx_vi_backfill_coverage_gap -- see that index's own doc comment in schema.sql for
-// why window_start_sec/window_end_sec are real, indexed columns rather than only living in
-// detail's JSONB blob.
+// Issue #533: column identity moved off the parent row into vi_backfill_job_columns, so this is
+// now a JOIN against that child table's own idx_vi_backfill_job_columns_lookup index instead of a
+// direct filter on compaction_jobs.column_hash/column_type (both dropped; the old
+// idx_vi_backfill_coverage_gap index that used to back this query is gone too).
 func (s *Store) ViBackfillGapRanges(ctx context.Context, tenant string, col ViBackfillColumn) ([]WindowRange, error) {
 	rows, err := s.pool.Query(ctx, viBackfillGapRangesSQL, tenant, col.ColumnHash, col.ColumnType)
 	if err != nil {
@@ -298,11 +501,12 @@ func (s *Store) ViBackfillGapRanges(ctx context.Context, tenant string, col ViBa
 }
 
 const viBackfillExistingBlockKeysSQL = `
-	SELECT block_object_key
-	FROM compaction_jobs
-	WHERE job_type = 'vi_backfill'
-	  AND tenant = $1 AND column_hash = $2 AND column_type = $3
-	  AND block_object_key = ANY($4)`
+	SELECT cj.block_object_key
+	FROM compaction_jobs cj
+	JOIN vi_backfill_job_columns vc ON vc.job_id = cj.id
+	WHERE cj.job_type = 'vi_backfill' AND cj.tenant = $1
+	  AND vc.column_hash = $2 AND vc.column_type = $3
+	  AND cj.block_object_key = ANY($4)`
 
 // MissingViBackfillBlocks is the job-history gap-finder for the block-shaped model (issue #532),
 // the direct analog of the old MissingViBackfillWindows: given the full set of candidate block
@@ -318,8 +522,11 @@ const viBackfillExistingBlockKeysSQL = `
 // a brand new duplicate row for every already-completed block, forever, unboundedly growing the
 // table exactly like the incident MissingViBackfillWindows was added to prevent for windows.
 //
-// Backed by idx_vi_backfill_all_blocks -- NOT scoped to status != 'succeeded', since a succeeded
-// row is exactly the "not missing" signal this query needs to see.
+// Issue #533: a JOIN against vi_backfill_job_columns, backed by that child table's own
+// idx_vi_backfill_job_columns_lookup index (leading columns column_hash, column_type) -- NOT
+// scoped to vc.status != 'succeeded' here, since a succeeded child row is exactly the "not
+// missing" signal this query needs to see (the old idx_vi_backfill_all_blocks index this used to
+// be backed by is gone; column_hash/column_type no longer live on compaction_jobs at all).
 func (s *Store) MissingViBackfillBlocks(
 	ctx context.Context, tenant string, col ViBackfillColumn, blockKeys []string,
 ) ([]string, error) {

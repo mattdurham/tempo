@@ -106,3 +106,18 @@ otherwise disappear independent of this system's own compaction/reap actions) â€
 `compactionworker`'s `SPEC-COMPACTIONWORKER-8`.
 
 Back-ref: `internal/modules/pgcatalog/pgcatalog.go:ListLiveKeys`, `internal/modules/compactionworker/catalog_reconcile.go:pruneVanishedRows`.
+
+## SPEC-PGCATALOG-9: `Store.ListLiveKeysInRange` â€” live rows for `(subsystem, tenant)` overlapping a time window, newest-first
+
+`ListLiveKeysInRange(ctx, subsystem, tenant, minSec, maxSec) ([]Row, error)` returns every live
+(not compacted, not deleted) row for `(subsystem, tenant)` whose own `[min_sec, max_sec]`
+genuinely overlaps the query window (`max_sec >= minSec AND min_sec <= maxSec`), ordered newest
+first (`ORDER BY min_sec DESC`). Unlike `ListLiveKeys` (`SPEC-PGCATALOG-8`), which is unscoped by
+time and shaped for out-of-band vanished-row detection, this is issue #522's vi_backfill
+block-discovery query: `compactionworker`'s `catalogBlockFetcher.ListBlocksInRange`
+(`subsystem="trace"`) uses the newest-first ordering directly to satisfy
+`blockpack.BlockFetcher.ListBlocksInRange`'s own ordering contract, so `BackfillEngine.Run`
+processes newest-to-oldest with zero re-sorting.
+
+Back-ref: `internal/modules/pgcatalog/pgcatalog.go:ListLiveKeysInRange`,
+`internal/modules/compactionworker/vi_backfill.go:catalogBlockFetcher.ListBlocksInRange`.

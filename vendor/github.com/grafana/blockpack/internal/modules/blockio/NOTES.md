@@ -1936,3 +1936,35 @@ the next PR alongside the compaction dedup path update.
 
 Back-ref: `internal/modules/blockio/writer/v8_sections.go:writeV8Sections`,
 `internal/modules/blockio/writer/v2_alignment_test.go:TestV2OmitsSections`
+
+---
+
+## NOTE-COLUMNBLOOM-1: Column-Name Bloom Re-Added As Its Own ToC Section (issue #531, 2026-07-22)
+
+**Change:** a per-block column-name bloom filter is back — not by reverting NOTE-BLOOM-REMOVAL
+(above), but as a brand-new, separate, optional ToC section (`ToCSubTypeColumnBloom`) alongside
+the Block Index, populated fresh by the writer for every block (including compaction-merged
+output) and consulted via `reader.Reader.MayContainColumn(blockIdx, name)`.
+
+**Why NOTE-BLOOM-REMOVAL's rationale no longer held:** that entry justified removing the old
+inline field because "CMS subsumes column-name bloom." Investigation for #531 found CMS was
+never actually implemented as a real per-block presence check anywhere in this codebase's Go
+source (only in docs-site wiki prose describing a design that either was never built or was
+built and then fully removed — `queryplanner/NOTES.md` NOTE-013/NOTE-018 — and the broader
+sketch/pruning subsystem was independently removed in full again later: #435/#437/#439). There
+was no column-presence signal of any kind left in the file format for vi_backfill's block
+selection (or querier's) to consult before deciding to fetch/decode a block.
+
+**Why a NEW section instead of reverting the old field:** the old field was inlined into every
+fixed-layout Block Index entry, so removing (or re-adding) it changes that entry's byte size —
+a breaking wire-format change either way. A separate, independently-optional section makes
+absence (old files, or a writer that never computed it) a graceful, non-error "no information"
+signal instead.
+
+Full design: `internal/modules/blockio/shared/NOTES.md` NOTE-COLUMNBLOOM-1 (bloom construction),
+`internal/modules/blockio/writer/NOTES.md` NOTE-COLUMNBLOOM-WRITER-1 (write side, incl.
+compaction fresh-computation), `internal/modules/blockio/reader/NOTES.md`
+NOTE-COLUMNBLOOM-READER-1 (read side, `MayContainColumn`), `internal/modules/blockio/SPECS.md`
+SPEC-COLUMNBLOOM-1 §10.3 (wire format), `internal/modules/queryplanner/NOTES.md` (querier
+consumer), `internal/modules/compactionworker/NOTES.md` NOTE-COMPACTIONWORKER-8 (vi_backfill
+consumer).

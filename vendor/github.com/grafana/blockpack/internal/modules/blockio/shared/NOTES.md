@@ -26,6 +26,18 @@ format).
 `TraceIDBloomSize`) are **not** removed — they serve a different purpose (compact index
 trace-ID lookup).
 
+**Superseded [2026-07-22, issue #531]:** this entry's own rationale ("CMS subsumes bloom") is
+now stale. `BlockCMS`/CMS (Count-Min Sketch) was never actually implemented as a real
+per-block presence check anywhere in this codebase's Go source — the only occurrences of "CMS"
+outside prose are in the docs-site wiki pages (`CMS.md`, `Write-Path.md`, etc.), which describe
+an aspirational design that was never built, or — per `internal/modules/queryplanner/NOTES.md`
+NOTE-013/NOTE-018 — was built at some point and then fully removed (2026-04-02, "CMS pruning
+stage eliminated from the query pipeline"). The broader sketch/pruning subsystem it would have
+lived in was removed again later anyway (#435 KLL sketch, #437 file-level bloom, #439 range
+index). There was, at the time #531 was filed, NO column-presence signal anywhere in the file
+format. See `columnbloom.go`'s own doc comment and NOTE-COLUMNBLOOM-1 below for the NEW,
+from-scratch mechanism that fills this gap.
+
 ---
 
 ## 2. *(Removed)* 256-Bit Column-Name Bloom Filter Size
@@ -2620,3 +2632,35 @@ kind-number status (3/4/16 marked removed, permanently retired).
 
 Back-ref: `internal/modules/blockio/shared/constants.go` (`KindInlineBytes`,
 `KindSparseInlineBytes`, `KindInlineBytesAllPresent`). See `blockio/reader/NOTES.md` NOTE-490.
+
+---
+
+## NOTE-COLUMNBLOOM-1 — per-block column-name bloom filter, re-added from scratch (issue #531)
+
+Date: 2026-07-22
+
+Added `columnbloom.go`: `ColumnBloomBytes` (32, matching the old removed field's size),
+`AddColumnNameToBloom`/`TestColumnNameBloom`/`BuildColumnBloom`, and a `ColumnBloom []byte`
+field on `BlockMeta`. See NOTE-BLOOM-REMOVAL's "Superseded" annotation above for why this is a
+genuinely NEW mechanism, not a revival of the 2026-03-07-removed field — CMS, its stated
+replacement, was never implemented and is itself long gone.
+
+**Key design difference from the old (removed) field:** the old `ColumnNameBloom` was inlined
+into each fixed-layout block index entry, so removing it was a breaking wire-format change. This
+one lives in its OWN optional ToC section (`ToCSubTypeColumnBloom`, alongside but separate from
+the block index) — a file/writer that never computed it simply has no such ToC entry, and every
+consumer (`reader.Reader.MayContainColumn`) treats that absence as "no information, don't prune,
+must fetch" rather than an error or a hard requirement. No false negatives, ever, by construction
+of both the bloom filter itself and this absence contract.
+
+**Hash construction** mirrors `internal/modules/valueindex/bucketbloom.go`'s
+`valueBloomHashes` exactly (double FNV-1a, Kirsch-Mitzenmacher probing, k=7) for consistency
+with this codebase's other bloom filter — just against a fixed 32-byte budget instead of one
+scaled by distinct-value count.
+
+Back-ref: `internal/modules/blockio/shared/columnbloom.go`, `blockmeta.go` (`ColumnBloom`
+field), `constants.go` (`ColumnBloomBytes`, `ToCSubTypeColumnBloom`). See
+`internal/modules/blockio/SPECS.md` SPEC-COLUMNBLOOM-1 for the wire format,
+`internal/modules/blockio/writer/NOTES.md` and `internal/modules/blockio/reader/NOTES.md` for
+the write/read-side design, and `internal/modules/queryplanner/NOTES.md` for the querier
+block-selection consumer.

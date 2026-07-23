@@ -121,27 +121,42 @@ func TestConfigureViUsage_OnShouldBackfill_CrossTypeSameNameColumns_EachGetsOwnR
 	_, err = rec.RecordUse(context.Background(), "tenant-collision", "span.custom.attr", "int", time.Now())
 	require.NoError(t, err)
 
-	// Each column type gets its own set of block-shaped rows (issue #532) -- the dedup-key guard
-	// this test proves is that BOTH types' rows exist independently (distinct column_type count
-	// of 2), never collapsed onto one type's rows via a colliding dedup_key. Exactly one row per
-	// type here since seedLiveTraceBlock seeded exactly one block.
-	var distinctTypes int
+	// Issue #533: column identity moved off the parent compaction_jobs row entirely into the
+	// child table vi_backfill_job_columns -- both columns target the SAME block, so they now
+	// correctly collapse onto ONE parent job (the whole point of #533: N columns for one block
+	// is one job, not N), with each column type as its own child row. The dedup-key guard this
+	// test proves is now: both types' CHILD rows exist independently under that single parent,
+	// never collapsed onto one type's child row via a colliding (job_id, column_hash,
+	// column_type) unique constraint.
+	var parentCount int
 	require.Eventually(t, func() bool {
 		row := pool.QueryRow(context.Background(),
-			`SELECT count(DISTINCT column_type) FROM compaction_jobs WHERE job_type = 'vi_backfill' AND tenant = 'tenant-collision'`)
+			`SELECT count(*) FROM compaction_jobs WHERE job_type = 'vi_backfill' AND tenant = 'tenant-collision'`)
+		return row.Scan(&parentCount) == nil && parentCount == 1
+	}, 5*time.Second, 10*time.Millisecond,
+		"both column types target the same block, so exactly one parent job is expected, got parentCount=%d", parentCount)
+
+	var distinctTypes int
+	require.Eventually(t, func() bool {
+		row := pool.QueryRow(context.Background(), `
+			SELECT count(DISTINCT vc.column_type)
+			FROM compaction_jobs cj JOIN vi_backfill_job_columns vc ON vc.job_id = cj.id
+			WHERE cj.job_type = 'vi_backfill' AND cj.tenant = 'tenant-collision'`)
 		return row.Scan(&distinctTypes) == nil && distinctTypes == 2
 	}, 5*time.Second, 10*time.Millisecond,
-		"same-name, different-typed columns must each get their own independent set of compaction_jobs rows, got distinct types=%d", distinctTypes)
+		"same-name, different-typed columns must each get their own independent child row, got distinct types=%d", distinctTypes)
 
 	var stringCount, intCount int
-	require.NoError(t, pool.QueryRow(context.Background(),
-		`SELECT count(*) FROM compaction_jobs WHERE job_type = 'vi_backfill' AND tenant = 'tenant-collision' AND column_type = 'string'`,
+	require.NoError(t, pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM compaction_jobs cj JOIN vi_backfill_job_columns vc ON vc.job_id = cj.id
+		WHERE cj.job_type = 'vi_backfill' AND cj.tenant = 'tenant-collision' AND vc.column_type = 'string'`,
 	).Scan(&stringCount))
-	require.NoError(t, pool.QueryRow(context.Background(),
-		`SELECT count(*) FROM compaction_jobs WHERE job_type = 'vi_backfill' AND tenant = 'tenant-collision' AND column_type = 'int'`,
+	require.NoError(t, pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM compaction_jobs cj JOIN vi_backfill_job_columns vc ON vc.job_id = cj.id
+		WHERE cj.job_type = 'vi_backfill' AND cj.tenant = 'tenant-collision' AND vc.column_type = 'int'`,
 	).Scan(&intCount))
-	assert.Equal(t, 1, stringCount, "expected exactly one vi_backfill row for the string column's one seeded block")
-	assert.Equal(t, 1, intCount, "expected exactly one vi_backfill row for the int column's one seeded block")
+	assert.Equal(t, 1, stringCount, "expected exactly one child row for the string column on the shared parent job")
+	assert.Equal(t, 1, intCount, "expected exactly one child row for the int column on the shared parent job")
 }
 
 // TestConfigureViUsage_OnShouldBackfill_NilPgPool_SkipsInsertNoError is the regression guard
