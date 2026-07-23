@@ -1410,3 +1410,40 @@ both require the whole object resident in memory to decode at all (no disk-based
 consumer exists for them to stream into), so their existing `Get` usage is the correct,
 deliberate case this entry's "genuinely needs the whole object" exception describes, not a
 remaining instance of the bug.
+
+## SPEC-ROOT-026: Stream Extracted Entries Into a Writer, Never Accumulate a Full-File Slice First
+
+**When a downstream writer already buffers and bounds its own memory (e.g. by spilling to disk
+past a fixed threshold), an upstream extraction loop must feed it entries one at a time as they're
+produced — never collect every entry into an intermediate slice first and hand the writer the
+whole slice in one call at the end.** Accumulating first defeats the writer's own bounded-memory
+design: every entry ends up held in memory simultaneously anyway, just one layer higher than where
+the actual bounding mechanism lives.
+
+**Rationale (found live, 2026-07-23, issue #533 rollout on tempo-dev-test-03):**
+`BackfillEngine.extractAndWriteBlock` accumulated every matching `ValueIndexEntry` for an entire
+file into a `map[ColumnType][]ValueIndexEntry` before calling `FlushAndPutValueIndexColumn` once at
+the end — even though `valueindex.Writer.AddEntry*` (the thing it eventually called, once, with the
+whole slice) already spills its own internal buffer to disk once it reaches
+`shared.ValueIndexWriterSpillEntries`, specifically to bound memory regardless of total input size.
+That bounding mechanism never got a chance to do its job: a single high-cardinality column in one
+file could accumulate 10+ GB in the intermediate slice alone, confirmed live via `kubectl top`
+during #533's rollout (individual compaction-worker pods observed climbing to 15-16Gi from ONE
+job's extraction, even at `concurrency=1`). Fixed by building the `l0Group`/writer once (lazily, on
+the first matching entry, since normally exactly one `ColType` survives the filter) and calling
+`addValueIndexEntryToGroup` directly from inside the extraction callback — the writer's own
+spill-to-disk mechanism now actually bounds memory as designed, instead of being starved by an
+unbounded accumulation one layer above it.
+
+**Rule:** before adding or reviewing any extraction-then-flush pipeline, check whether the
+downstream writer already has its own bounded-memory contract (a spill threshold, a fixed-size
+ring buffer, streaming disk I/O). If it does, the upstream loop must call it incrementally — an
+intermediate full-collection slice is never just "a convenience," it silently reintroduces the
+exact unbounded memory growth the writer was built to prevent.
+
+Back-ref: `valueindex_backfill.go` (`BackfillEngine.extractAndWriteBlock`),
+`internal/modules/valueindex/writer.go` (`writerImpl.addRaw`/`spillRun`, the pre-existing bounded
+mechanism this fix lets actually function),
+`valueindex_backfill_test.go:TestBackfillEngine_StreamedExtraction_ManySpansAllPreserved` (mutation-
+tested: reintroducing a per-entry group rebuild — the exact "accumulate/rebuild instead of stream
+once" class of bug — makes this test fail).

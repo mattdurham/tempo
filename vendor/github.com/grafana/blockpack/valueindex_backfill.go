@@ -288,8 +288,20 @@ func (e *BackfillEngine) processBlocks(
 
 // extractAndWriteBlock extracts e.entry's target column from r (allowlist already
 // scoped to e.entry.ColumnName), keeps only entries whose extracted type matches
-// e.entry.ColumnType, groups by ColType (defensive -- normally exactly one type
-// survives the filter), and flushes/PUTs each group via FlushAndPutValueIndexColumn.
+// e.entry.ColumnType, and streams them directly into one l0Group's writer as they're
+// produced, flushing/PUTing the result via flushAndPutL0 once extraction finishes.
+//
+// SPEC-ROOT-026: entries are streamed straight into the writer instead of being
+// accumulated into an intermediate []ValueIndexEntry slice first. valueindex.Writer's
+// AddEntry* already spills its own buffer to disk once it reaches
+// shared.ValueIndexWriterSpillEntries -- that mechanism is unconditional and already
+// existed before this fix, but accumulating a full-file slice one layer above it (the
+// old FlushAndPutValueIndexColumn(entries, ...) call this replaced) meant every entry
+// still had to live in memory simultaneously as a ValueIndexEntry regardless, defeating
+// the writer's own bounded-memory design. There is normally exactly one ColType among
+// matching entries (the filter below already narrows to e.entry.ColumnType), so a single
+// group -- lazily created on the first matching entry -- replaces the old defensive
+// map[ColumnType][]ValueIndexEntry grouping.
 //
 // R2 defense-in-depth: repeats Run's own HardExcludedColumns guard here too, at the
 // point that actually performs I/O -- Run's guard alone would be bypassed by any future
@@ -303,25 +315,35 @@ func (e *BackfillEngine) extractAndWriteBlock(
 	if _, excluded := HardExcludedColumns[e.entry.ColumnName]; excluded {
 		return nil
 	}
-	byType := map[ColumnType][]ValueIndexEntry{}
+
+	var g *l0Group
 	err := ExtractValueIndexEntriesForColumns(r, allowlist, func(ent ValueIndexEntry) error {
 		if valueindex.ColTypeName(ent.ColType) != e.entry.ColumnType {
 			return nil
 		}
-		byType[ent.ColType] = append(byType[ent.ColType], ent)
-		return nil
+		if g == nil {
+			g = &l0Group{
+				writer:  valueindex.NewWriter(e.entry.ColumnName, ent.ColType),
+				colName: e.entry.ColumnName,
+				colType: ent.ColType,
+			}
+		}
+		return addValueIndexEntryToGroup(g, ent, sourceRef)
 	})
 	if err != nil {
 		return fmt.Errorf("blockpack: BackfillEngine.Run: extract %q: %w", sourceRef, err)
 	}
+	if g == nil {
+		return nil // no entries matched e.entry.ColumnType -- nothing to flush
+	}
+	defer g.writer.Close()
 
-	for colType, entries := range byType {
-		putErr := FlushAndPutValueIndexColumn(
-			entries, e.cfg.Store, sourceRef, e.entry.Tenant, e.cfg.IndexPrefix, e.entry.ColumnName, colType,
-		)
-		if putErr != nil {
-			return fmt.Errorf("blockpack: BackfillEngine.Run: flush %q: %w", sourceRef, putErr)
-		}
+	indexPrefix := e.cfg.IndexPrefix
+	if indexPrefix == "" {
+		indexPrefix = defaultL0IndexPrefix
+	}
+	if putErr := flushAndPutL0(e.cfg.Store, g, e.entry.Tenant, indexPrefix); putErr != nil {
+		return fmt.Errorf("blockpack: BackfillEngine.Run: flush %q: %w", sourceRef, putErr)
 	}
 	return nil
 }
