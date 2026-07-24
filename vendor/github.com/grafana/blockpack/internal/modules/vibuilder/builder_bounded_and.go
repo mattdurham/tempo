@@ -186,9 +186,11 @@ func buildSourceBoundedMultiLeafAND(
 	// Issue #536: keyed by (col, colType), not colName alone -- see ColumnWatermark's own
 	// doc comment for why a colName-only key silently collides two same-name,
 	// different-type columns.
+	// Issue #534: attachResidual is a no-op whenever the leaf's own residual is nil (the
+	// overwhelmingly common case) -- see attachResidual's own doc comment.
 	anchorWmKey := ColumnWatermarkKey(anchor.col, valueindex.ColTypeName(anchor.colType))
 	if wm, ok := watermarks[anchorWmKey]; !ok || wm.CoversRange(minSec, maxSec) {
-		src.AddLeaf(anchor.idx, anchor.col, anchor.colType, confirmed)
+		src.AddLeaf(anchor.idx, anchor.col, anchor.colType, attachResidual(confirmed, anchor.residual))
 		added = true
 	}
 	for i, w := range work {
@@ -199,7 +201,7 @@ func buildSourceBoundedMultiLeafAND(
 		if wm, ok := watermarks[wmKey]; ok && !wm.CoversRange(minSec, maxSec) {
 			continue
 		}
-		src.AddLeaf(w.idx, w.col, w.colType, otherResults[i])
+		src.AddLeaf(w.idx, w.col, w.colType, attachResidual(otherResults[i], w.residual))
 		added = true
 	}
 	return added, nil

@@ -1716,4 +1716,76 @@ Task #212's original fix keyed the carve-out by bare COLUMN NAME (`s.data[colNam
 
 **New/changed public API surface:** `MarkRequirePresentLeaf` is a new exported method on `SliceValueIndexSource` (task #212), alongside the pre-existing `AddLeaf`/`LookupLeaf`/`MarkNewestFirst` leaf-identity-bookkeeping family. Its signature CHANGED (task #213) from `MarkRequirePresentLeaf(leafIdx int, colName string)` to `MarkRequirePresentLeaf(leafIdx int, pairedLeafIdxs []int)`.
 
-Back-ref: `internal/modules/executor/metrics_trace.go:SliceValueIndexSource.AddLeaf, SliceValueIndexSource.LookupLeaf, SliceValueIndexSource.MarkRequirePresentLeaf, SliceValueIndexSource.leafAware, SliceValueIndexSource.requirePresentLeaves`, `internal/modules/vibuilder/builder.go:collectLeaves, neqRangeSiblingLeaves`, `internal/vm/rangenode.go:RangeNode.NeqPairedRange`. Tests: `value_index_oracle_comparison_test.go` (`TestOracle_Shape09a_SameColumnAND_MixedCoverageDecline`, `TestOracle_Shape09b_SameColumnOR_MixedCoverageDecline`, `TestOracle_Shape09c_DifferentColumnAND_MixedCoverageDecline`, `TestOracle_Shape11a_NotEquals_AND_ResolvesCorrectly`, `TestOracle_Shape11c_NotEquals_OR_ResolvesCorrectly`), `neq_metrics_realvi_test.go`, `neq_unscoped_collision_realvi_test.go`, `structural_oracle_comparison_test.go` Shape7. Issues #206, #207, #212, #213.
+Back-ref: `internal/modules/executor/metrics_trace.go:SliceValueIndexSource.AddLeaf, SliceValueIndexSource.LookupLeaf, SliceValueIndexSource.MarkRequirePresentLeaf, SliceValueIndexSource.leafAware, SliceValueIndexSource.requirePresentLeaves`, `internal/modules/vibuilder/builder.go:collectLeaves, neqRangeSiblingLeaves`, `internal/vm/rangenode.go:RangeNode.NeqPairedRange`. Tests: `value_index_oracle_comparison_test.go` (`TestOracle_Shape09a_SameColumnAND_MixedResidual`, `TestOracle_Shape09b_SameColumnOR_MixedResidual`, `TestOracle_Shape09c_DifferentColumnAND_MixedResidual` — renamed 2026-07-24, issue #534, from `...MixedCoverageDecline`; see SPEC-VIS-7 for why these three now resolve via residual instead of declining — `TestOracle_Shape11a_NotEquals_AND_ResolvesCorrectly`, `TestOracle_Shape11c_NotEquals_OR_ResolvesCorrectly`), `neq_metrics_realvi_test.go`, `neq_unscoped_collision_realvi_test.go`, `structural_oracle_comparison_test.go` Shape7. Issues #206, #207, #212, #213.
+
+## SPEC-VIS-7: `ResidualColumnPredicate`/`ResidualGroup` — residual-predicate re-verification for a value-index candidate (issue #534)
+*Added: 2026-07-24*
+
+**Contract:** `VILookupResult.Residual` (`*ResidualGroup`, nil by default) is an optional,
+per-result annotation meaning "the value index alone did not fully resolve this candidate —
+re-verify it against its own REAL raw column value(s) once its block is fetched, before
+trusting it." Absence (`nil`) means "fully resolved by the index" and MUST remain the default
+for every existing decidable predicate shape and every column other than the two
+millisecond-bucket-truncated dedicated time columns (`span:start`/`span:duration`) —
+`vibuilder` is the only producer of a non-nil `Residual` today (see `vibuilder/builder.go`'s
+SPEC-VB-8 for the build-time half of this contract).
+
+**Enforcement is caller-specific, not automatic:**
+
+1. **`QueryTraceQLFromIndex` (search path) enforces it.** Once a matched candidate's block is
+   fetched for its own, ordinary field materialization (which already has to happen for every
+   matched candidate, residual or not), `evaluateResidual` decodes the real raw value of each
+   `ResidualColumnPredicate.Column` referenced anywhere in the group (forced into the decode
+   column set via `withColumns`, mirroring the pre-existing `span:id`-forcing pattern) and
+   calls `residual.Evaluate`. A row failing the check is silently excluded from the result —
+   not an error, not a decline; it was a real candidate the index correctly narrowed to, that
+   the exact original predicate does not actually match. This adds ZERO extra I/O: the block
+   read already happens regardless (SPEC-ROOT: single I/O per block).
+2. **`ExecuteTraceMetricsFromVI` (metrics path) does NOT enforce it — it declines instead.**
+   This function answers entirely from value-index data (NOTE-VI-032) and never fetches a
+   block, so it has no raw value to check a residual against. It therefore returns
+   `ErrMetricsNoCoverage` whenever ANY matched result carries a non-nil `Residual` — the exact
+   decline this leaf shape already produced before issue #534 (when the leaf simply had no
+   coverage at all), so this is a zero-behavior-change preservation for metrics, not a new
+   decline category.
+
+**`ResidualGroup`'s recursive AND/OR shape exists to fix a cross-leaf merge hazard, not for
+vibuilder's own single-leaf case (which only ever constructs a trivial one-`Check` group).**
+A multi-leaf TraceQL query's own boolean combination
+(`viIntersectSorted`/`viUnionSorted`/`viIntersectOrdered`/`ViUnionNewestFirst`) can return
+EITHER leaf's own copy of a matching row when two leaves independently match the identical
+physical span (same `SourceRef`+`BlockPage`+`RowIdx`). Every one of those four merge points
+now calls `CombineAND` (the AND-merge direction: `viIntersectSorted`, `viIntersectOrdered`) or
+`CombineOR` (the OR-merge direction: `viUnionSorted`, `ViUnionNewestFirst`) on both sides'
+`Residual` whenever it emits a merged/deduplicated entry for a shared identity key, instead of
+silently keeping (or dropping) only one side's own annotation:
+
+- `CombineAND(a, b)`: `nil` combined with anything returns the other side unchanged (an
+  unconditional truth AND'd with X is just X); two non-`Any` groups flatten into one (their
+  `Checks`/`Groups` concatenated); an `Any` group on either side nests instead of flattening
+  (cannot flatten OR-of-AND into a flat AND list without changing its meaning).
+- `CombineOR(a, b)`: EITHER side `nil` returns `nil` (an unconditional truth OR'd with
+  anything is itself unconditionally true — no further check needed regardless of the other
+  side); two `Any` groups flatten; otherwise nests, same rationale as `CombineAND`.
+
+Dropping the "wrong" side silently (this package's own pre-#534 merge-function behavior, when
+no result ever carried a residual so the gap was latent) would have reintroduced exactly
+issue #206/#207's "same-column sibling leaf silently substituted" wrong-answer class through a
+new mechanism: an AND merge losing a residual could wrongly INCLUDE a row that fails that
+leaf's real check; an OR merge losing a residual could wrongly EXCLUDE a row that IS true via
+the other, certain leaf.
+
+**Regression tests:** see SPEC-VB-8 (`vibuilder/SPECS.md`) and NOTE-VI-123
+(`vibuilder/NOTES.md`) for the full real-fixture and mutation-test proof list, including
+`value_index_oracle_comparison_test.go`'s Shape 9(a/b/c) — the tests that specifically exercise
+`CombineAND`/`CombineOR` through the real production `QueryTraceQLFromIndex` path (a
+residual-carrying `duration` leaf combined with a decidable sibling via AND same-column, OR
+same-column, and AND different-column).
+
+Back-ref: `internal/modules/executor/metrics_trace.go:VILookupResult.Residual,
+ResidualColumnPredicate, ResidualColumnPredicate.Match, ResidualOp, ResidualGroup,
+ResidualGroup.Evaluate, ResidualGroup.collectColumns, CombineAND, CombineOR,
+ExecuteTraceMetricsFromVI, viIntersectSorted, viUnionSorted, ViUnionNewestFirst`,
+`internal/modules/executor/metrics_trace_bounded.go:viIntersectOrdered`,
+`internal/modules/executor/search_trace_vi.go:QueryTraceQLFromIndex, evaluateResidual,
+residualRawValue, withColumns`. Issue #534.

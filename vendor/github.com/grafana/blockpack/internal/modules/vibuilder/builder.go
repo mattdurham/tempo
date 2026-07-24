@@ -199,7 +199,7 @@ func BuildSource(
 	leaves := collectLeaves(preds.Nodes)
 	var work []leafWork
 	for i := range leaves {
-		pred, colType, ok := buildPredicate(&leaves[i])
+		pred, colType, residual, ok := buildPredicate(&leaves[i])
 		if !ok {
 			// Unindexable predicate for this leaf — leave the column uncovered so
 			// the executor falls back. Task #212 (NOTE-VI-107 addendum), corrected by task
@@ -220,7 +220,9 @@ func BuildSource(
 			}
 			continue
 		}
-		work = append(work, leafWork{col: leaves[i].col, colType: colType, pred: pred, idx: leaves[i].idx})
+		work = append(
+			work, leafWork{col: leaves[i].col, colType: colType, pred: pred, idx: leaves[i].idx, residual: residual},
+		)
 	}
 	if len(work) > 0 {
 		g, gctx := errgroup.WithContext(ctx)
@@ -264,7 +266,10 @@ func BuildSource(
 				// but the same idx numbering for identical query text) -- so a same-column
 				// sibling leaf (e.g. a second range bound) never gets merged into the
 				// same bucket -- see SliceValueIndexSource.AddLeaf's doc comment.
-				src.AddLeaf(w.idx, w.col, w.colType, results)
+				// Issue #534: attachResidual is a no-op (returns results unchanged) whenever
+				// w.residual is nil -- the overwhelmingly common case, byte-identical to
+				// before this fix.
+				src.AddLeaf(w.idx, w.col, w.colType, attachResidual(results, w.residual))
 				anyLeafAdded.Store(true)
 				return nil
 			})
@@ -339,7 +344,7 @@ func BuildSourceBounded(
 	leaves := collectLeaves(preds.Nodes)
 	var work []leafWork
 	for i := range leaves {
-		pred, colType, ok := buildPredicate(&leaves[i])
+		pred, colType, residual, ok := buildPredicate(&leaves[i])
 		if !ok {
 			// Task #212 (NOTE-VI-107 addendum), corrected by task #213: mirrors
 			// BuildSource's own leaf loop -- mark a RequirePresent-shaped leaf ONLY when it
@@ -351,7 +356,9 @@ func BuildSourceBounded(
 			}
 			continue
 		}
-		work = append(work, leafWork{col: leaves[i].col, colType: colType, pred: pred, idx: leaves[i].idx})
+		work = append(
+			work, leafWork{col: leaves[i].col, colType: colType, pred: pred, idx: leaves[i].idx, residual: residual},
+		)
 	}
 
 	discNewestFirst, canEarlyStop := disc.(FileDiscovererNewestFirst)
@@ -473,7 +480,8 @@ func buildSourceBoundedPerLeaf(
 			// even though the overall query fell through to this per-leaf resolution rather
 			// than buildSourceBoundedMultiLeafAND -- disambiguation by leaf identity is
 			// needed here for exactly the same reason as BuildSource's own leaf loop.
-			src.AddLeaf(w.idx, w.col, w.colType, results)
+			// Issue #534: attachResidual is a no-op when w.residual is nil.
+			src.AddLeaf(w.idx, w.col, w.colType, attachResidual(results, w.residual))
 			anyLeafAdded.Store(true)
 			return nil
 		})
@@ -531,10 +539,16 @@ type leaf struct {
 // leaf-slot number and would collide with a real leaf 0 elsewhere), so any such construction
 // explicitly sets idx: -1 or pulls idx from its own leaf.idx.
 type leafWork struct {
-	pred    valueindex.Predicate
-	col     string
-	colType modules_shared.ColumnType
-	idx     int
+	pred valueindex.Predicate
+	// residual (issue #534) is the optional residual predicate buildPredicate resolved for
+	// this leaf -- nil for every existing decidable shape (the overwhelmingly common case).
+	// attachResidual applies it to this leaf's own lookupColumn/lookupColumnNewestFirst
+	// results right before AddLeaf; see ResidualColumnPredicate's own doc comment
+	// (executor/metrics_trace.go) for the full rationale.
+	residual *modules_executor.ResidualColumnPredicate
+	col      string
+	idx      int
+	colType  modules_shared.ColumnType
 }
 
 // hasORNode reports whether nodes (or anything nested under it) contains an OR composite
@@ -667,10 +681,19 @@ func neqRangeSiblingLeaves(sib *vm.RangeNode, col string, nextIdx int) (p0, p1 i
 }
 
 // buildPredicate turns a leaf RangeNode into a valueindex.Predicate plus the
-// column type it operates on. Returns ok=false when the leaf cannot be expressed
-// against the value index (present-only or an unsupported value type), in which
-// case the caller leaves the column uncovered.
-func buildPredicate(l *leaf) (valueindex.Predicate, modules_shared.ColumnType, bool) {
+// column type it operates on, plus an optional residual predicate (issue #534) the
+// caller must attach to every result this leaf's VI query returns. residual is nil
+// for every existing decidable shape (byte-identical to before #534) and non-nil ONLY
+// for the millisecond-boundary-bucket-ambiguity shape buildRangePredicate/valueAsColType
+// now resolve instead of declining outright — see ResidualColumnPredicate's own doc
+// comment (executor/metrics_trace.go) for the full rationale.
+//
+// Returns ok=false when the leaf cannot be expressed against the value index at all
+// (present-only or an unsupported value type), in which case the caller leaves the
+// column uncovered.
+func buildPredicate(
+	l *leaf,
+) (valueindex.Predicate, modules_shared.ColumnType, *modules_executor.ResidualColumnPredicate, bool) {
 	n := l.node
 	switch {
 	case len(n.Values) > 0:
@@ -679,17 +702,17 @@ func buildPredicate(l *leaf) (valueindex.Predicate, modules_shared.ColumnType, b
 		// index path when there is exactly one value. Multi-value OR is left to the
 		// block scan (the executor would otherwise need per-value passes).
 		if len(n.Values) != 1 {
-			return nil, 0, false
+			return nil, 0, nil, false
 		}
-		colType, val, ok := valueAsColType(l.col, n.Values[0])
+		colType, val, residual, ok := valueAsColType(l.col, n.Values[0])
 		if !ok {
-			return nil, 0, false
+			return nil, 0, nil, false
 		}
 		pred, err := valueindex.NewEqPredicate(colType, val)
 		if err != nil {
-			return nil, 0, false
+			return nil, 0, nil, false
 		}
-		return pred, colType, true
+		return pred, colType, residual, true
 
 	case n.Min != nil || n.Max != nil:
 		return buildRangePredicate(n)
@@ -697,13 +720,13 @@ func buildPredicate(l *leaf) (valueindex.Predicate, modules_shared.ColumnType, b
 	case n.Pattern != "":
 		pred, err := valueindex.NewRegexPredicate(modules_shared.ColumnTypeString, n.Pattern)
 		if err != nil {
-			return nil, 0, false
+			return nil, 0, nil, false
 		}
-		return pred, modules_shared.ColumnTypeString, true
+		return pred, modules_shared.ColumnTypeString, nil, true
 
 	default:
 		// RequirePresent or empty leaf: existence-only, not a value predicate.
-		return nil, 0, false
+		return nil, 0, nil, false
 	}
 }
 
@@ -727,7 +750,7 @@ func LeafIndexable(n *vm.RangeNode) bool {
 	if n == nil {
 		return false
 	}
-	_, _, ok := buildPredicate(&leaf{node: n, col: n.Column})
+	_, _, _, ok := buildPredicate(&leaf{node: n, col: n.Column})
 	return ok
 }
 
@@ -788,7 +811,7 @@ func LeafColumns(prog *vm.Program) []LeafColumnInfo {
 	leaves := collectLeaves(preds.Nodes)
 	out := make([]LeafColumnInfo, len(leaves))
 	for i := range leaves {
-		_, colType, ok := buildPredicate(&leaves[i])
+		_, colType, _, ok := buildPredicate(&leaves[i])
 		out[i] = LeafColumnInfo{Column: leaves[i].col, ColType: colType, Indexable: ok}
 	}
 	return out
@@ -806,7 +829,9 @@ func LeafColumns(prog *vm.Program) []LeafColumnInfo {
 // (decidableTimeBucketThreshold's doc comment has the full derivation). Every other
 // column/value shape is unaffected — op is simply unused there, identical behavior to
 // before this fix.
-func buildRangePredicate(n *vm.RangeNode) (valueindex.Predicate, modules_shared.ColumnType, bool) {
+func buildRangePredicate(
+	n *vm.RangeNode,
+) (valueindex.Predicate, modules_shared.ColumnType, *modules_executor.ResidualColumnPredicate, bool) {
 	switch {
 	// SPEC-VB-7 (task #206 correction): DEAD CODE for every real TraceQL query today.
 	// traceql_compiler's extractTraceQLNodes always decomposes an AND of two range bounds on
@@ -815,6 +840,12 @@ func buildRangePredicate(n *vm.RangeNode) (valueindex.Predicate, modules_shared.
 	// combined-bound shape no current compiler path produces; untested (no unit or end-to-end
 	// test exercises it) — see SPEC-VB-7's own "Reachability" note for the full writeup,
 	// including a correction to this branch's own decidable-alignment description.
+	//
+	// Issue #534: residual pushdown is NOT implemented for this two-sided shape — it stays on
+	// the exact pre-#534 "not decidable ⇒ decline the whole leaf" contract for either bound
+	// (loResidual/hiResidual != nil below), rather than risk a silently wrong answer for a
+	// shape with zero real-world test coverage. This is a non-goal per the issue's own scope
+	// (dead code, not the reachable boundary case this fix targets).
 	case n.Min != nil && n.Max != nil:
 		// between never carries an explicit valueindex.Op — NewBetweenPredicate is
 		// always inclusive-inclusive — so only the timeCompareOp (used for the
@@ -828,13 +859,13 @@ func buildRangePredicate(n *vm.RangeNode) (valueindex.Predicate, modules_shared.
 			maxTimeOp = timeOpLTE
 		}
 
-		colType, lo, ok := valueAsRangeColType(n.Column, *n.Min, minTimeOp)
-		if !ok {
-			return nil, 0, false
+		colType, lo, _, loResidual, ok := valueAsRangeColType(n.Column, *n.Min, minTimeOp)
+		if !ok || loResidual != nil {
+			return nil, 0, nil, false
 		}
-		hiColType, hi, ok := valueAsRangeColType(n.Column, *n.Max, maxTimeOp)
-		if !ok {
-			return nil, 0, false
+		hiColType, hi, _, hiResidual, ok := valueAsRangeColType(n.Column, *n.Max, maxTimeOp)
+		if !ok || hiResidual != nil {
+			return nil, 0, nil, false
 		}
 
 		if override, isTime := dedicatedNumericColumnTypes[n.Column]; isTime &&
@@ -852,46 +883,66 @@ func buildRangePredicate(n *vm.RangeNode) (valueindex.Predicate, modules_shared.
 				maxTimeOp,
 			) //nolint:forcetypeassert // guarded by colType==Uint64 check above
 			if !normOK {
-				return nil, 0, false
+				return nil, 0, nil, false
 			}
 			lo, hi = loBucket, hiBucket
 		}
 
 		pred, err := valueindex.NewBetweenPredicate(colType, lo, hi)
 		if err != nil {
-			return nil, 0, false
+			return nil, 0, nil, false
 		}
-		return pred, colType, true
+		return pred, colType, nil, true
 
 	case n.Min != nil:
-		op, timeOp := valueindex.OpGT, timeOpGT
+		timeOp := timeOpGT
 		if n.MinInclusive {
-			op, timeOp = valueindex.OpGTE, timeOpGTE
+			timeOp = timeOpGTE
 		}
-		colType, lo, ok := valueAsRangeColType(n.Column, *n.Min, timeOp)
+		colType, lo, queryOp, residual, ok := valueAsRangeColType(n.Column, *n.Min, timeOp)
 		if !ok {
-			return nil, 0, false
+			return nil, 0, nil, false
 		}
-		pred, err := valueindex.NewRangePredicate(colType, lo, op)
+		pred, err := valueindex.NewRangePredicate(colType, lo, valueindexOpFromTimeOp(queryOp))
 		if err != nil {
-			return nil, 0, false
+			return nil, 0, nil, false
 		}
-		return pred, colType, true
+		return pred, colType, residual, true
 
 	default: // n.Max != nil
-		op, timeOp := valueindex.OpLT, timeOpLT
+		timeOp := timeOpLT
 		if n.MaxInclusive {
-			op, timeOp = valueindex.OpLTE, timeOpLTE
+			timeOp = timeOpLTE
 		}
-		colType, hi, ok := valueAsRangeColType(n.Column, *n.Max, timeOp)
+		colType, hi, queryOp, residual, ok := valueAsRangeColType(n.Column, *n.Max, timeOp)
 		if !ok {
-			return nil, 0, false
+			return nil, 0, nil, false
 		}
-		pred, err := valueindex.NewRangePredicate(colType, hi, op)
+		pred, err := valueindex.NewRangePredicate(colType, hi, valueindexOpFromTimeOp(queryOp))
 		if err != nil {
-			return nil, 0, false
+			return nil, 0, nil, false
 		}
-		return pred, colType, true
+		return pred, colType, residual, true
+	}
+}
+
+// valueindexOpFromTimeOp maps a timeCompareOp to the equivalent valueindex.Op for
+// building a range predicate. timeOpEQ is unreachable here — buildRangePredicate only
+// ever resolves a Min or Max bound (never an equality leaf, which goes through
+// valueAsColType/NewEqPredicate instead) — so it falls through to the same default as an
+// unrecognized value; a range bound can never carry it.
+func valueindexOpFromTimeOp(op timeCompareOp) valueindex.Op {
+	switch op {
+	case timeOpGT:
+		return valueindex.OpGT
+	case timeOpGTE:
+		return valueindex.OpGTE
+	case timeOpLT:
+		return valueindex.OpLT
+	case timeOpLTE:
+		return valueindex.OpLTE
+	default:
+		return valueindex.OpGT
 	}
 }
 
@@ -1135,34 +1186,42 @@ var dedicatedNumericColumnTypes = map[string]dedicatedColumnOverride{ //nolint:g
 // doc comment for the full root-cause writeup).
 //
 // Equality against a millisecond-truncated dedicated time column (span:start/
-// span:duration) is UNCONDITIONALLY undecidable (decidableTimeBucketThreshold's doc,
-// task #204) — passing timeOpEQ here always resolves ok=false for those two columns,
-// regardless of the literal's value.
-func valueAsColType(col string, v vm.Value) (modules_shared.ColumnType, any, bool) {
+// span:duration) is decided by decidableTimeBucketThreshold exactly like every other
+// operator (task #204's doc comment: EQ is unconditionally undecidable, since no
+// alignment ever makes a single point fall gap-free inside a 1ms bucket). Since issue
+// #534 this no longer means "decline the leaf outright": intOrDedicatedColType widens
+// the VI query to bucket q and returns a non-nil residual instead — see
+// ResidualColumnPredicate's own doc comment (executor/metrics_trace.go).
+func valueAsColType(
+	col string,
+	v vm.Value,
+) (modules_shared.ColumnType, any, *modules_executor.ResidualColumnPredicate, bool) {
 	switch v.Type {
 	case vm.TypeString:
 		s, ok := v.Data.(string)
 		if !ok {
-			return 0, nil, false
+			return 0, nil, nil, false
 		}
-		return modules_shared.ColumnTypeString, s, true
+		return modules_shared.ColumnTypeString, s, nil, true
 	case vm.TypeInt, vm.TypeDuration:
 		switch d := v.Data.(type) {
 		case int64:
-			return intOrDedicatedColType(col, d, timeOpEQ)
+			colType, val, _, residual, ok := intOrDedicatedColType(col, d, timeOpEQ)
+			return colType, val, residual, ok
 		case int:
-			return intOrDedicatedColType(col, int64(d), timeOpEQ)
+			colType, val, _, residual, ok := intOrDedicatedColType(col, int64(d), timeOpEQ)
+			return colType, val, residual, ok
 		default:
-			return 0, nil, false
+			return 0, nil, nil, false
 		}
 	case vm.TypeFloat:
 		f, ok := v.Data.(float64)
 		if !ok {
-			return 0, nil, false
+			return 0, nil, nil, false
 		}
-		return modules_shared.ColumnTypeFloat64, f, true
+		return modules_shared.ColumnTypeFloat64, f, nil, true
 	default:
-		return 0, nil, false
+		return 0, nil, nil, false
 	}
 }
 
@@ -1170,10 +1229,15 @@ func valueAsColType(col string, v vm.Value) (modules_shared.ColumnType, any, boo
 // (buildRangePredicate's Min/Max/between branches), where the caller already knows the
 // exact comparison operator (op) that bound will be evaluated with. For every
 // column/value shape except an Int/Duration literal against a millisecond-truncated
-// dedicated time column this is identical to valueAsColType — op is simply unused. op
-// only changes behavior for span:start/span:duration, where the operator determines
-// millisecond-granularity decidability (decidableTimeBucketThreshold; task #204).
-func valueAsRangeColType(col string, v vm.Value, op timeCompareOp) (modules_shared.ColumnType, any, bool) {
+// dedicated time column this is identical to valueAsColType (queryOp echoes op back
+// unchanged, residual is nil) — op only changes behavior for span:start/span:duration,
+// where it determines millisecond-granularity decidability (decidableTimeBucketThreshold;
+// task #204) and, since issue #534, the widened query operator for the
+// undecidable-boundary-bucket case (queryOp may then differ from op — see
+// widenedTimeBucketQuery's own doc comment).
+func valueAsRangeColType(
+	col string, v vm.Value, op timeCompareOp,
+) (modules_shared.ColumnType, any, timeCompareOp, *modules_executor.ResidualColumnPredicate, bool) {
 	switch d := v.Data.(type) {
 	case int64:
 		if v.Type == vm.TypeInt || v.Type == vm.TypeDuration {
@@ -1184,7 +1248,8 @@ func valueAsRangeColType(col string, v vm.Value, op timeCompareOp) (modules_shar
 			return intOrDedicatedColType(col, int64(d), op)
 		}
 	}
-	return valueAsColType(col, v)
+	colType, val, residual, ok := valueAsColType(col, v)
+	return colType, val, op, residual, ok
 }
 
 // intOrDedicatedColType resolves an Int/Duration literal's value-index column type and
@@ -1200,28 +1265,95 @@ func valueAsRangeColType(col string, v vm.Value, op timeCompareOp) (modules_shar
 // approach): when the override requests truncateMillis, d (a raw-nanosecond TraceQL
 // literal) is passed to decidableTimeBucketThreshold together with the caller's own
 // comparison operator. That function is the single source of truth for whether this
-// specific (op, d) pair can be answered correctly at millisecond bucket granularity at
-// all — see its doc comment for the full per-operator derivation and truth table. A
-// decidable pair resolves to the exact bucket-domain threshold to compare the STORED
-// value against (using the SAME operator, unchanged); an undecidable pair resolves
-// ok=false, and this leaf is left unindexable rather than risk a silently wrong answer.
-func intOrDedicatedColType(col string, d int64, op timeCompareOp) (modules_shared.ColumnType, any, bool) {
+// specific (op, d) pair can be answered correctly at millisecond bucket granularity
+// alone, with no further check — see its doc comment for the full per-operator
+// derivation and truth table. A decidable pair resolves to the exact bucket-domain
+// threshold to compare the STORED value against (using the SAME operator, unchanged;
+// queryOp == op and residual == nil, byte-identical to pre-#534 behavior).
+//
+// Issue #534: an UNdecidable pair no longer resolves ok=false (declining the whole
+// leaf). Instead, widenedTimeBucketQuery computes a widened bucket-domain query that
+// captures the union of the already-decided region and the one genuinely ambiguous
+// boundary bucket, and residual carries the ORIGINAL (op, d) pair so the caller
+// re-verifies each candidate against its real raw value once fetched (see
+// ResidualColumnPredicate's own doc comment). ok=false is now reserved for a genuinely
+// unrepresentable shape (e.g. the negative-literal guard above) — decidability alone
+// never causes a decline anymore for these two columns.
+func intOrDedicatedColType(col string, d int64, op timeCompareOp) (
+	modules_shared.ColumnType, any, timeCompareOp, *modules_executor.ResidualColumnPredicate, bool,
+) {
 	override, ok := dedicatedNumericColumnTypes[col]
 	if !ok || override.colType != modules_shared.ColumnTypeUint64 {
-		return modules_shared.ColumnTypeInt64, d, true
+		return modules_shared.ColumnTypeInt64, d, op, nil, true
 	}
 	if d < 0 {
-		return 0, nil, false
+		return 0, nil, op, nil, false
 	}
 	v := uint64(d) //nolint:gosec // d >= 0 checked above
 	if !override.truncateMillis {
-		return modules_shared.ColumnTypeUint64, v, true
+		return modules_shared.ColumnTypeUint64, v, op, nil, true
 	}
 	bucket, decidable := decidableTimeBucketThreshold(v, op)
-	if !decidable {
-		return 0, nil, false
+	if decidable {
+		return modules_shared.ColumnTypeUint64, bucket, op, nil, true
 	}
-	return modules_shared.ColumnTypeUint64, bucket, true
+	widenedBucket, widenedOp := widenedTimeBucketQuery(v, op)
+	residual := &modules_executor.ResidualColumnPredicate{
+		Column:    col,
+		ColType:   modules_shared.ColumnTypeUint64,
+		Op:        residualOpFor(op),
+		Threshold: v,
+	}
+	return modules_shared.ColumnTypeUint64, widenedBucket, widenedOp, residual, true
+}
+
+// widenedTimeBucketQuery (issue #534) computes the VI bucket-domain query that captures
+// the union of two regions for an (op, nanos) pair decidableTimeBucketThreshold already
+// reported ok=false for: the region the index alone already proves is a definite match,
+// plus the single genuinely ambiguous boundary bucket (q = nanos / 1_000_000) — see
+// decidableTimeBucketThreshold's own doc comment for the per-operator derivation this
+// mirrors. Every bucket strictly on the OTHER side of q is excluded by construction
+// (never queried), so the index still does real pruning; only bucket q's own entries
+// require the caller's residual re-check (they, and only they, may or may not actually
+// satisfy the ORIGINAL comparison — every other returned entry unconditionally does).
+//
+// The widened query is always the INCLUSIVE operator in op's own direction, evaluated at
+// q itself:
+//   - GT or GTE (a "greater" comparison) widens to GTE(q) — this already equals the
+//     decidable-case formula for GTE, so GTE's own decidable branch is a no-op special
+//     case of this same rule; GT relaxes from its decidable formula (GT(q)) to include q.
+//   - LT or LTE (a "less" comparison) widens to LTE(q) — symmetric to the above.
+//   - EQ widens to EQ(q): equality's true region is a single point that can only ever
+//     fall inside bucket q itself, so there is no "beyond" region to also capture.
+func widenedTimeBucketQuery(nanos uint64, op timeCompareOp) (bucket uint64, queryOp timeCompareOp) {
+	q := nanos / 1_000_000
+	switch op {
+	case timeOpGT, timeOpGTE:
+		return q, timeOpGTE
+	case timeOpLT, timeOpLTE:
+		return q, timeOpLTE
+	default: // timeOpEQ
+		return q, timeOpEQ
+	}
+}
+
+// residualOpFor maps vibuilder's own private timeCompareOp to executor.ResidualOp — a
+// trivial, order-preserving conversion (both enums declare GT/GTE/LT/LTE/EQ in the same
+// order) kept as an explicit named function rather than an unsafe cast so the two enums
+// are free to diverge later without a silent miscompare.
+func residualOpFor(op timeCompareOp) modules_executor.ResidualOp {
+	switch op {
+	case timeOpGT:
+		return modules_executor.ResidualOpGT
+	case timeOpGTE:
+		return modules_executor.ResidualOpGTE
+	case timeOpLT:
+		return modules_executor.ResidualOpLT
+	case timeOpLTE:
+		return modules_executor.ResidualOpLTE
+	default: // timeOpEQ
+		return modules_executor.ResidualOpEQ
+	}
 }
 
 // SPEC-VB-2: lookupColumn discovers and ranged-queries the value-index files for one column,
@@ -1612,6 +1744,41 @@ func toVILookupResults(lrs []valueindex.LookupResult) []modules_executor.VILooku
 			TraceID:   lrs[i].TraceID,
 			SpanID:    lrs[i].SpanID,
 		}
+	}
+	return out
+}
+
+// attachResidual (issue #534) tags every entry in results with residual -- the
+// leaf-level residual predicate buildPredicate/buildRangePredicate resolved for THIS
+// leaf, or nil for the overwhelmingly common fully-decided case. residual == nil (or an
+// empty results slice) is a complete no-op that returns results unchanged -- byte-
+// identical to every call site's pre-#534 behavior for every existing decidable
+// predicate shape and every column other than the two millisecond-bucket-truncated
+// dedicated time columns.
+//
+// A copy, not an in-place mutation: results is the direct return value of
+// lookupColumn/lookupColumnNewestFirst, freshly allocated per call, so aliasing is not a
+// live concern in practice, but returning a new slice keeps this function's contract
+// obviously safe regardless of how a future caller reuses its input.
+//
+// See ResidualColumnPredicate's own doc comment (executor/metrics_trace.go) for why
+// applying the SAME residual uniformly to every result from this leaf -- not just the
+// entries genuinely inside the ambiguous boundary bucket -- is still exactly correct.
+func attachResidual(
+	results []modules_executor.VILookupResult, residual *modules_executor.ResidualColumnPredicate,
+) []modules_executor.VILookupResult {
+	if residual == nil || len(results) == 0 {
+		return results
+	}
+	// A single leaf's own check is always a trivial one-Check AND-group -- see
+	// ResidualGroup's own doc comment for why the executor's AND/OR merge-join needs a
+	// group (not a bare predicate) to correctly combine two DIFFERENT leaves' own residuals
+	// for a query with more than one leaf.
+	group := &modules_executor.ResidualGroup{Checks: []*modules_executor.ResidualColumnPredicate{residual}}
+	out := make([]modules_executor.VILookupResult, len(results))
+	for i, r := range results {
+		r.Residual = group
+		out[i] = r
 	}
 	return out
 }

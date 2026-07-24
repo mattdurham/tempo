@@ -21,8 +21,7 @@ than deleted. `vibuilder/NOTES.md`'s own entries continue to use the separate, s
 counter (spanning `valueindex`/`valueindexcompactor`/`valueindexconsumer`/`executor`/`vibuilder`)
 — this SPEC-VB-N convention applies only to this file and to `TESTS.md`'s parallel `TEST-VB-N`.
 
-Next free ID: **SPEC-VB-8** (corrected — SPEC-VB-7 itself was already assigned/present below;
-this counter had gone stale).
+Next free ID: **SPEC-VB-9** (SPEC-VB-8 assigned 2026-07-24, issue #534).
 
 ---
 
@@ -516,3 +515,99 @@ TWO leaves, not this branch.
 
 Back-refs: `internal/modules/vibuilder/builder.go:decidableTimeBucketThreshold,timeCompareOp,
 intOrDedicatedColType,valueAsRangeColType,buildRangePredicate,betweenTimeBucketBounds`.
+
+## SPEC-VB-8: Residual-predicate pushdown for the millisecond-boundary-ambiguity case (issue #534, corrects SPEC-VB-7's own "decline" contract)
+*Added: 2026-07-24*
+
+**Supersedes SPEC-VB-7's "leave the leaf unindexable" contract for `ok=false` from
+`decidableTimeBucketThreshold`.** SPEC-VB-7 correctly identified that a stored millisecond
+bucket alone cannot decide certain (operator, threshold) pairs, and mandated declining the
+WHOLE leaf whenever that happened. Issue #534 found this discarded real, already-proven
+pruning: every bucket strictly beyond the threshold in the matching direction is a DEFINITE
+match; every bucket strictly on the other side is a DEFINITE non-match; only the ONE bucket
+straddling the threshold (`q = nanos / 1_000_000`) is genuinely ambiguous. A hard decline
+turned this into a permanent 422 for the single most natural way to write a duration/start
+comparison (any round-millisecond threshold with `>` or `<=` — see `decidableTimeBucketThreshold`'s
+own truth table for why those two operators are the common undecidable case).
+
+**Contract (binding):** `decidableTimeBucketThreshold` itself is UNCHANGED — it remains the
+single source of truth for whether an (operator, threshold) pair is gap-free at bucket
+granularity, and its own regression suite (`decidability_test.go`) stays byte-identical.
+What changed is what `intOrDedicatedColType` does with `ok=false`:
+
+1. It no longer returns `ok=false` for `timeOpGT`/`timeOpGTE`/`timeOpLT`/`timeOpLTE`/`timeOpEQ`
+   (every operator `decidableTimeBucketThreshold` covers). Instead
+   `widenedTimeBucketQuery(nanos, op)` computes a WIDENED bucket-domain query capturing the
+   union of the already-decided definite-match region and the single ambiguous boundary
+   bucket `q`: `GTE(q)` for a "greater" comparison (`GT`/`GTE`), `LTE(q)` for a "less"
+   comparison (`LT`/`LTE`), `EQ(q)` for equality (whose true region can only ever fall inside
+   bucket `q` itself — there is no "beyond" region to also capture). `ok=false` is now
+   reserved for a genuinely unrepresentable shape (e.g. a negative literal against a
+   Uint64-backed column) — decidability alone never causes a decline for span:start/
+   span:duration anymore.
+2. It attaches a `*modules_executor.ResidualColumnPredicate` — the ORIGINAL, exact (op,
+   raw-nanosecond-threshold) pair, never bucket-relaxed — that `buildPredicate`/
+   `buildRangePredicate` thread up to `BuildSource`/`BuildSourceBounded`'s leaf loop
+   (`leafWork.residual`), which `attachResidual` (builder.go) applies to EVERY result
+   `lookupColumn`/`lookupColumnNewestFirst` returns for that leaf, uniformly — not just the
+   entries that happen to fall in the genuinely ambiguous bucket. This is still exactly
+   correct (never a wrong answer): a result whose real value is in the region the index
+   alone already proved a definite match will always satisfy the residual too, since the
+   residual is the identical real-domain comparison the widened query is a (possibly loose)
+   superset of. See `ResidualColumnPredicate`'s own doc comment
+   (`internal/modules/executor/metrics_trace.go`) for the full rationale, including why this
+   deliberately simpler "attach to the whole leaf" design was chosen over splitting the VI
+   query into a separate boundary-bucket-only pass (the latter would need
+   `valueindex.LookupResult` to carry back each entry's own matched bucket value, a materially
+   larger, out-of-scope change to the `valueindex` package itself).
+3. **The two-sided `between` branch (`n.Min != nil && n.Max != nil`) is explicitly OUT OF
+   SCOPE and unchanged** — it still declines whenever either bound is undecidable
+   (`loResidual != nil || hiResidual != nil`), per SPEC-VB-7's own "Reachability" finding that
+   this branch is dead code for every real compiled TraceQL query today. Extending residual
+   pushdown to an untested, unreachable shape was judged not worth the risk.
+
+**The one new, real correctness hazard this introduces, and how it's closed:** a residual is
+now a per-LEAF property, but a multi-leaf query's own AND/OR combination
+(`executor.viIntersectSorted`/`viUnionSorted`/`viIntersectOrdered`/`ViUnionNewestFirst`) can
+return either leaf's own copy of a matching row when two leaves share an identity key.
+Silently keeping (or dropping) only one side's residual would itself be a NEW silent
+wrong-answer regression — this is closed by `executor.CombineAND`/`CombineOR` (see
+`ResidualGroup`'s own doc comment) rather than by anything in this package; `attachResidual`
+here only ever constructs the trivial single-leaf group `CombineAND`/`CombineOR` combine.
+
+**Enforcement point (not this package's job):** a residual is a leaf-level ANNOTATION only —
+`vibuilder` never itself re-checks it against real block data (this package never touches a
+block at all). `executor.QueryTraceQLFromIndex`'s `evaluateResidual` re-verifies it once the
+matched candidate's block is already fetched for ordinary field materialization — no extra
+I/O. `executor.ExecuteTraceMetricsFromVI` (which by design never fetches a block, NOTE-VI-032)
+instead declines (`ErrMetricsNoCoverage`) whenever any matched result carries a non-nil
+residual, preserving this leaf shape's pre-#534 decline behavior for the metrics path exactly.
+
+**Regression tests:**
+- `valueindex_boundary_decidability_test.go` (root package): the five formerly-"Declines"
+  tests were rewritten to `*_ResolvesViaResidual`/`*_ResolvesViaResidual`, proving (a) the raw,
+  pre-residual index result is a genuine SUPERSET of the true match set (real pruning still
+  happened), (b) every entry carries a non-nil residual, and (c) applying the residual against
+  each entry's REAL fixture duration narrows it back to the exact, hand-computed correct set —
+  for `>`, `>=`(non-aligned), `<`(non-aligned), `<=`, and `==` (including a genuinely empty
+  correct answer, not a decline, when no real span matches). Every decidable-case test
+  additionally now asserts `Residual == nil` (byte-identical-behavior regression proof).
+- `value_index_oracle_comparison_test.go`'s Shape 9(a/b/c) (root package, renamed
+  `*_MixedResidual`): a real end-to-end AND/OR combination of a residual-carrying
+  span:duration leaf with a decidable same-column sibling (9a/9b) and a fully-covered
+  different-column sibling (9c), through the REAL production `blockpack.QueryTraceQLFromIndex`
+  (real write path, real block fetch) — proves `CombineAND`/`CombineOR`'s cross-leaf
+  correctness end to end, not just at the unit level.
+- Mutation-verified (issue #534): temporarily making `executor.ResidualGroup.Evaluate`
+  unconditionally return `(true, nil)` (simulating residual enforcement disabled) makes all
+  eight of the tests above fail with a genuine WRONG SUPERSET answer (extra spans incorrectly
+  included) — not merely "still declines" — confirming the residual check is load-bearing.
+  Reverted; suite is green again.
+
+Back-refs: `internal/modules/vibuilder/builder.go:intOrDedicatedColType,widenedTimeBucketQuery,
+residualOpFor,valueindexOpFromTimeOp,attachResidual,buildRangePredicate`,
+`internal/modules/executor/metrics_trace.go:ResidualColumnPredicate,ResidualGroup,CombineAND,
+CombineOR,ExecuteTraceMetricsFromVI`, `internal/modules/executor/search_trace_vi.go:
+evaluateResidual,residualRawValue,QueryTraceQLFromIndex`. See NOTE-VI-123
+(`internal/modules/vibuilder/NOTES.md`) for the full design rationale and SPEC-VIS-7
+(`internal/modules/executor/SPECS.md`) for the executor-side contract.

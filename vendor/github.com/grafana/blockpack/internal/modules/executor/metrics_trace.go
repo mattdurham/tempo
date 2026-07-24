@@ -7,6 +7,7 @@ import (
 	"container/heap"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -57,6 +58,25 @@ type ValueIndexSource interface {
 // addressing; the search path treats a zero RowIdx as "row 0" and relies on
 // the caller to gate on coverage. The metrics path (#460) ignores both.
 type VILookupResult struct {
+	// Residual (issue #534, NOTE-VI-123) is nil for the overwhelmingly common case: a
+	// result the value index fully resolved on its own, with no further check ever
+	// needed against the real block data. This MUST stay nil for every existing
+	// decidable predicate shape and every column other than the two millisecond-
+	// bucket-truncated dedicated time columns (span:start/span:duration) — see
+	// ResidualColumnPredicate's own doc comment for the one shape that sets it and
+	// why re-checking every result from that leaf (not just the genuinely ambiguous
+	// ones) is still exactly correct. A *ResidualGroup, not a bare
+	// *ResidualColumnPredicate, because a multi-leaf query's own AND/OR merge-join
+	// (viIntersectSorted/viUnionSorted/viIntersectOrdered/ViUnionNewestFirst) can
+	// combine two DIFFERENT leaves' own residuals for the identical matched row —
+	// see ResidualGroup's own doc comment for why a flat single-check field would
+	// silently drop one side's requirement.
+	//
+	// Placed before SourceRef (not at the struct's end) purely for GC pointer-word
+	// layout (govet fieldalignment) — these are the only two pointer-containing fields,
+	// and placing both pointers before SourceRef's own trailing (non-pointer) length
+	// word minimizes the struct's leading pointer-scan region.
+	Residual  *ResidualGroup
 	SourceRef string
 	TimeSec   uint64
 	BlockID   uint32
@@ -69,6 +89,291 @@ type VILookupResult struct {
 	RowIdx   uint16
 	TraceID  [16]byte
 	SpanID   [8]byte
+}
+
+// ResidualOp is a comparison operator for ResidualColumnPredicate.Match, re-evaluated
+// against a candidate's REAL raw column value (never the value index's millisecond-
+// truncated bucket). Mirrors vibuilder's own private timeCompareOp enum member-for-
+// member (GT/GTE/LT/LTE plus EQ, since valueindex.Op itself has no EQ member — equality
+// resolves through valueindex.NewEqPredicate, never NewRangePredicate) so vibuilder's
+// conversion from its internal op to this one is a trivial, order-preserving mapping.
+type ResidualOp uint8
+
+const (
+	// ResidualOpGT matches a real raw value strictly greater than Threshold.
+	ResidualOpGT ResidualOp = iota
+	// ResidualOpGTE matches a real raw value greater than or equal to Threshold.
+	ResidualOpGTE
+	// ResidualOpLT matches a real raw value strictly less than Threshold.
+	ResidualOpLT
+	// ResidualOpLTE matches a real raw value less than or equal to Threshold.
+	ResidualOpLTE
+	// ResidualOpEQ matches a real raw value exactly equal to Threshold.
+	ResidualOpEQ
+)
+
+// ResidualColumnPredicate (issue #534, NOTE-VI-123) re-evaluates the ORIGINAL, exact
+// TraceQL comparison — the real nanosecond threshold and operator the user actually
+// wrote, never the value index's millisecond-floor-truncated bucket — against a
+// candidate's REAL raw column value, once that candidate's block has already been
+// fetched for ordinary span/trace materialization.
+//
+// # Why this exists
+//
+// decidableTimeBucketThreshold (vibuilder/builder.go) correctly identifies that,
+// for a dedicated time column truncated to whole-millisecond buckets at write time
+// (span:start/span:duration, NOTE-VI-027), exactly ONE bucket straddling the query
+// threshold can be genuinely ambiguous: some real values inside it satisfy the
+// comparison, some don't, and the bucket alone cannot tell them apart. Before issue
+// #534, vibuilder treated this ambiguity as "the whole leaf is unindexable" and
+// declined the entire query outright — discarding all the pruning the index had
+// already proven (every bucket strictly beyond the threshold in the matching
+// direction is a DEFINITE match; every bucket strictly on the other side is a
+// DEFINITE non-match).
+//
+// Since #534, vibuilder instead widens its value-index query to also capture the
+// one ambiguous boundary bucket (in addition to the already-decided region) and
+// attaches this residual to every result it gets back for that leaf. The result is
+// still a real, index-pruned candidate set — never a full scan — but each candidate
+// now carries the instruction "re-verify me against your real value before you
+// trust me," which the search path enforces once each candidate's block is already
+// in hand for materialization (search_trace_vi.go's evaluateResidual) — no extra
+// I/O, since that block fetch already has to happen for every matched candidate
+// regardless of this feature.
+//
+// # Why re-checking EVERY result from the leaf (not just the boundary-bucket ones)
+// is still exactly correct
+//
+// A result whose real value falls in the region the index alone already proved is
+// a definite match will ALWAYS satisfy Match too — Threshold/Op are the exact same
+// real-domain comparison the index's widened bucket query was designed to be a
+// (possibly loose) superset of. Applying Match uniformly, rather than tracking
+// which specific results came from the boundary bucket versus the region beyond
+// it, trades a small amount of redundant (but free — no extra I/O) CPU comparison
+// for a much simpler, lower-regression-risk implementation; it can never turn a
+// true positive into a false negative or vice versa.
+//
+// # Metrics path
+//
+// ExecuteTraceMetricsFromVI answers queries from value-index data ALONE — by
+// design it never fetches a block (NOTE-VI-032) — so it has no raw value to
+// re-check a Residual against. It therefore declines (ErrMetricsNoCoverage)
+// whenever any matched result carries a non-nil Residual, preserving this shape's
+// pre-#534 decline behavior for the metrics path exactly, while the search path
+// (QueryTraceQLFromIndex) gains the real fix.
+type ResidualColumnPredicate struct {
+	// Column is the real on-disk block column to re-read (e.g.
+	// modules_shared.SpanDurationColumnName).
+	Column string
+	// ColType is the block column's real on-disk type. Only
+	// modules_shared.ColumnTypeUint64 is populated by any production caller today
+	// (span:start/span:duration are both Uint64 — NOTE-VI-027) — evaluateResidual
+	// treats any other value as an index/data inconsistency rather than silently
+	// guessing.
+	ColType modules_shared.ColumnType
+	// Op is the ORIGINAL comparison operator the user's query actually specified —
+	// never relaxed/widened the way the value-index bucket query itself may have
+	// been.
+	Op ResidualOp
+	// Threshold is the ORIGINAL, exact raw threshold in the column's real domain
+	// (raw nanoseconds for span:start/span:duration) — never floor-truncated to a
+	// millisecond bucket.
+	Threshold uint64
+}
+
+// Match reports whether raw — a candidate's REAL raw column value, decoded directly
+// from an already-fetched block, never a value-index bucket — satisfies this
+// residual's original, exact comparison.
+func (p *ResidualColumnPredicate) Match(raw uint64) bool {
+	switch p.Op {
+	case ResidualOpGT:
+		return raw > p.Threshold
+	case ResidualOpGTE:
+		return raw >= p.Threshold
+	case ResidualOpLT:
+		return raw < p.Threshold
+	case ResidualOpLTE:
+		return raw <= p.Threshold
+	case ResidualOpEQ:
+		return raw == p.Threshold
+	default:
+		return false
+	}
+}
+
+// ResidualGroup (issue #534) is a boolean combination of one or more
+// ResidualColumnPredicate checks a matched candidate must satisfy before it may be
+// trusted. nil means "fully resolved by the index" — VILookupResult.Residual's own
+// default and the contract every existing decidable predicate shape and every column
+// other than the two dedicated time columns must preserve.
+//
+// # Why a group, not a single flat predicate
+//
+// A single leaf's own boundary-bucket-ambiguity check (vibuilder's attachResidual)
+// always constructs a trivial group of exactly one Check (implicit AND-of-one — Any is
+// irrelevant with a single member). The COMBINATION problem arises one layer up: a
+// multi-leaf TraceQL query (e.g. `{ duration > 100ms && name = "x" }` or
+// `{ duration > 100ms || start > 100ms }`) resolves each leaf's own matched set
+// independently, then the executor's own AND/OR merge-join
+// (viIntersectSorted/viUnionSorted/viIntersectOrdered/ViUnionNewestFirst) combines
+// them into ONE output set — and when the SAME physical row is a match in two
+// DIFFERENT leaves' sets, only one leaf's own copy of that row would survive a naive
+// merge unless the merge explicitly combines both sides' Residual too. Silently
+// keeping only one side's residual (or dropping it entirely) would be exactly the kind
+// of silent wrong answer this whole feature exists to prevent — see CombineAND/
+// CombineOR's own doc comments for the exact boolean semantics each merge direction
+// requires.
+type ResidualGroup struct {
+	// Checks are this group's own direct leaf-level checks.
+	Checks []*ResidualColumnPredicate
+	// Groups are nested subgroups — populated only when CombineOR must combine two
+	// already-nontrivial groups (an OR of two ANDs cannot be flattened into a single
+	// flat list without changing its meaning).
+	Groups []*ResidualGroup
+	// Any selects OR semantics (at least one Check/Group must pass). The default
+	// (false) is AND semantics (every Check/Group must pass) — what a single leaf's
+	// own trivial group, and every AND-merge, always constructs. Placed last purely
+	// for GC pointer-word layout (govet fieldalignment) — Checks/Groups are this
+	// struct's only pointer-containing fields.
+	Any bool
+}
+
+// CombineAND returns the ResidualGroup representing "a's own requirement AND b's own
+// requirement," for the AND merge-join direction (viIntersectSorted/viIntersectOrdered):
+// a matched row surviving an AND-intersection across two leaves must satisfy BOTH
+// leaves' own residuals (if either has one at all).
+//
+// nil combined with anything returns the other side unchanged: a nil group already
+// means "unconditionally true" (fully resolved by the index for that leaf), and AND
+// with an unconditional truth is simply the other side's own requirement. Two
+// non-Any (AND) groups flatten into one (their Checks/Groups concatenated) rather than
+// nesting, since AND-of-AND is associative and flattening keeps Evaluate's recursion
+// shallow for the overwhelmingly common case (every leaf-level group is a trivial
+// non-Any single-check group). An Any (OR) group on either side cannot be flattened
+// this way without changing its meaning, so that case nests instead.
+func CombineAND(a, b *ResidualGroup) *ResidualGroup {
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
+	if !a.Any && !b.Any {
+		return &ResidualGroup{
+			Checks: append(append([]*ResidualColumnPredicate{}, a.Checks...), b.Checks...),
+			Groups: append(append([]*ResidualGroup{}, a.Groups...), b.Groups...),
+		}
+	}
+	return &ResidualGroup{Groups: []*ResidualGroup{a, b}}
+}
+
+// CombineOR returns the ResidualGroup representing "a's own requirement OR b's own
+// requirement," for the OR merge-join direction (viUnionSorted/ViUnionNewestFirst): a
+// row present in BOTH leaves' sets is a true OR match as long as EITHER leaf's own
+// residual (if it has one) passes.
+//
+// Either side nil means that side already proved this row an unconditional match for
+// its own leaf — and OR with an unconditional truth is itself unconditionally true, so
+// the combined result is nil (no further check needed at all), regardless of the other
+// side's own requirement. Two non-Any (AND) groups combine into a single Any (OR) group
+// over the two of them (cannot flatten AND-of-checks into OR the way CombineAND does,
+// since that would change AND semantics into OR); an existing Any group on either side
+// still nests rather than flattens, for the same associativity-without-meaning-change
+// reason CombineAND avoids flattening OR-of-AND.
+func CombineOR(a, b *ResidualGroup) *ResidualGroup {
+	if a == nil || b == nil {
+		return nil
+	}
+	if a.Any && b.Any {
+		return &ResidualGroup{
+			Any:    true,
+			Checks: append(append([]*ResidualColumnPredicate{}, a.Checks...), b.Checks...),
+			Groups: append(append([]*ResidualGroup{}, a.Groups...), b.Groups...),
+		}
+	}
+	return &ResidualGroup{Any: true, Groups: []*ResidualGroup{a, b}}
+}
+
+// ResidualRawValueFunc resolves the REAL raw value for one residual check's own column
+// (at its declared on-disk ColType) for a specific row, from an already-fetched,
+// already-decoded block. Implemented by the search path (search_trace_vi.go);
+// ok=false with a nil error means the column has no readable value at this row for the
+// declared type — Evaluate treats that as an index/data inconsistency and returns an
+// error, never a silent guess at either boolean outcome.
+type ResidualRawValueFunc func(check *ResidualColumnPredicate) (raw uint64, ok bool, err error)
+
+// Evaluate recursively evaluates g's boolean combination of checks against a single
+// matched row, resolving each individual check's own real raw value via get. A nil
+// receiver evaluates to (true, nil) — "no residual requirement" — matching
+// VILookupResult.Residual's own nil-means-fully-resolved contract, so a caller can call
+// Evaluate unconditionally without a separate nil check.
+func (g *ResidualGroup) Evaluate(get ResidualRawValueFunc) (bool, error) {
+	if g == nil {
+		return true, nil
+	}
+	if g.Any {
+		for _, c := range g.Checks {
+			raw, ok, err := get(c)
+			if err != nil {
+				return false, err
+			}
+			if !ok {
+				return false, fmt.Errorf("residual column %q: no readable value for this row", c.Column)
+			}
+			if c.Match(raw) {
+				return true, nil
+			}
+		}
+		for _, sub := range g.Groups {
+			pass, err := sub.Evaluate(get)
+			if err != nil {
+				return false, err
+			}
+			if pass {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	for _, c := range g.Checks {
+		raw, ok, err := get(c)
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			return false, fmt.Errorf("residual column %q: no readable value for this row", c.Column)
+		}
+		if !c.Match(raw) {
+			return false, nil
+		}
+	}
+	for _, sub := range g.Groups {
+		pass, err := sub.Evaluate(get)
+		if err != nil {
+			return false, err
+		}
+		if !pass {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// collectColumns recursively adds every column name referenced anywhere in g (across every
+// Check, at any nesting depth under Groups) into into. A nil receiver is a no-op — the
+// search path (search_trace_vi.go) calls this unconditionally on every matched result's own
+// Residual to build the forced-decode column set a residual check needs, without a separate
+// nil check at each call site.
+func (g *ResidualGroup) collectColumns(into map[string]struct{}) {
+	if g == nil {
+		return
+	}
+	for _, c := range g.Checks {
+		into[c.Column] = struct{}{}
+	}
+	for _, sub := range g.Groups {
+		sub.collectColumns(into)
+	}
 }
 
 // ExecuteTraceMetricsFromVI runs a count_over_time() or rate() query using only
@@ -141,6 +446,20 @@ func ExecuteTraceMetricsFromVI(
 	matches, ok := viMatchSpans(source, prog)
 	if !ok {
 		return nil, false, ErrMetricsNoCoverage
+	}
+
+	// Issue #534: this function answers entirely from value-index data — it never fetches a
+	// block (NOTE-VI-032) — so it has no raw value to re-check a ResidualColumnPredicate
+	// against. A non-nil Residual on any matched result means vibuilder resolved this leaf
+	// via the millisecond-boundary-bucket widening (builder.go's decidableTimeBucketThreshold
+	// undecidable case), which is safe for the search path (QueryTraceQLFromIndex re-verifies
+	// against the real block data it already fetches) but NOT safe here: trusting these
+	// results without that re-check could overcount. Decline exactly as this leaf shape
+	// already declined before #534 (ErrMetricsNoCoverage) — zero behavior change for metrics.
+	for _, m := range matches {
+		if m.Residual != nil {
+			return nil, false, ErrMetricsNoCoverage
+		}
 	}
 
 	numBuckets := (tb.EndTime - tb.StartTime + tb.StepSizeNanos - 1) / tb.StepSizeNanos
@@ -486,7 +805,15 @@ func ViUnionNewestFirst(sets [][]VILookupResult, limit int) []VILookupResult {
 		sourceRef string
 		key       [22]byte
 	}
-	seen := make(map[seenKey]struct{})
+	// seen maps a dedup key to its entry's own INDEX in out (issue #534), not just a
+	// membership marker — a later-popped duplicate from a DIFFERENT input set (i.e. a
+	// different leaf) must still have its own Residual combined into the already-appended
+	// entry via CombineOR (OR semantics: this row is a true union member as long as EITHER
+	// leaf's own requirement, if it has one, passes), rather than being silently dropped the
+	// way this function did before #534. Updating out[idx] in place never changes len(out)
+	// or ordering, so the limit early-stop and newest-first output order above are both
+	// unaffected.
+	seen := make(map[seenKey]int)
 	var out []VILookupResult
 	for h.Len() > 0 {
 		if limit > 0 && len(out) >= limit {
@@ -495,8 +822,10 @@ func ViUnionNewestFirst(sets [][]VILookupResult, limit int) []VILookupResult {
 		it := heap.Pop(h).(viNewestFirstHeapItem) //nolint:forcetypeassert // heap.Interface contract, this package's own type
 		e := sets[it.setIdx][it.elemIdx]
 		sk := seenKey{sourceRef: e.SourceRef, key: viSpanKey(e)}
-		if _, dup := seen[sk]; !dup {
-			seen[sk] = struct{}{}
+		if idx, dup := seen[sk]; dup {
+			out[idx].Residual = CombineOR(out[idx].Residual, e.Residual)
+		} else {
+			seen[sk] = len(out)
 			out = append(out, e)
 		}
 		if it.elemIdx+1 < len(sets[it.setIdx]) {
@@ -555,7 +884,15 @@ func viUnionSorted(a, b []VILookupResult) []VILookupResult {
 	for i < len(a) && j < len(b) {
 		switch viSpanCmp(a[i], b[j]) {
 		case 0:
-			out = append(out, a[i])
+			// Issue #534: the SAME physical row matched both a[i] and b[j]'s own leaf
+			// (every field but Residual is identical by construction, since they share the
+			// same span identity) — combine both leaves' own residuals via CombineOR
+			// (OR semantics: this row is a true union member as long as EITHER leaf's own
+			// requirement, if it has one, passes), rather than silently keeping only a[i]'s
+			// copy the way this function did before #534.
+			merged := a[i]
+			merged.Residual = CombineOR(a[i].Residual, b[j].Residual)
+			out = append(out, merged)
 			i++
 			j++
 		case -1:
@@ -584,7 +921,14 @@ func viIntersectSorted(a, b []VILookupResult) []VILookupResult {
 	for i < len(a) && j < len(b) {
 		switch viSpanCmp(a[i], b[j]) {
 		case 0:
-			out = append(out, a[i])
+			// Issue #534: combine both leaves' own residuals via CombineAND (AND semantics:
+			// a row surviving this intersection must satisfy BOTH leaves' own requirement, if
+			// either has one) — silently keeping only a[i]'s copy (this function's pre-#534
+			// behavior) would drop b[j]'s own leaf's requirement whenever it carried one,
+			// risking a wrong (superset) answer for a multi-leaf AND query.
+			merged := a[i]
+			merged.Residual = CombineAND(a[i].Residual, b[j].Residual)
+			out = append(out, merged)
 			i++
 			j++
 		case -1:

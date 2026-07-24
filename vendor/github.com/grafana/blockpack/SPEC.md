@@ -838,6 +838,39 @@ for what replaced it. The three routine-decline categories this addendum's own m
 says are "unchanged by this phase" remain genuinely unchanged by THIS retraction too — only the
 bounded-scan alternative itself is gone, not the decline categories it once sat alongside.
 
+**Addendum 2026-07-24 (issue #534) — category 1's "no coverage for a leaf" case gains a THIRD
+sub-case: resolve via a residual re-check, not just decline.** Category 1 above lists a
+negation or otherwise unindexable predicate as the "no coverage" decline reason. A dedicated,
+millisecond-bucket-truncated time column (span:start/span:duration) comparison whose exact
+threshold straddles a bucket boundary (decidableTimeBucketThreshold,
+internal/modules/vibuilder/builder.go -- the single most common real-world shape being any
+round-millisecond threshold with `>` or `<=`) used to be exactly this category: a leaf the
+index could not FULLY resolve, so vibuilder.BuildSource left it uncovered and the whole query
+declined -- even though the index had already proven real, usable pruning for every bucket
+except the one straddling the threshold (live incident: tempo-dev-test-03 tenant 11638,
+`{ duration > 100ms }` permanently 422-declining against a window with complete VI coverage,
+while `{ duration >= 100ms }` against the identical window returned 200).
+
+As of issue #534, this specific leaf shape no longer declines: vibuilder widens its VI query
+to capture the union of the already-decided definite-match region and the one genuinely
+ambiguous boundary bucket, and attaches a residual predicate -- the ORIGINAL, exact (operator,
+raw-nanosecond-threshold) pair -- to every result from that leaf. QueryTraceQLFromIndex
+re-verifies a non-nil residual against the candidate's REAL raw column value once its block is
+already fetched for ordinary field materialization, at ZERO extra I/O. This is
+authoritative-index resolution, not a scan fallback: the final answer is exactly correct, and
+the index still did all the real pruning -- only the residual re-check (on data already in
+memory) resolves the one bucket the index alone could not.
+
+ExecuteTraceMetricsFromVI is UNCHANGED by this addendum: it never fetches a block
+(NOTE-VI-032) and has no raw value to re-check a residual against, so it still declines
+(ErrMetricsNoCoverage) for this exact leaf shape -- category 1's decline contract remains true
+for the metrics path specifically, only the search path gained the new resolution.
+
+See internal/modules/vibuilder/SPECS.md SPEC-VB-8 and internal/modules/executor/SPECS.md
+SPEC-VIS-7 for the full binding contract, and internal/modules/vibuilder/NOTES.md NOTE-VI-123
+for the complete design rationale (including the cross-leaf AND/OR residual-combination
+hazard this also had to close). Issue #534.
+
 ---
 
 ## SPEC-FORMAT-001: All Metadata Sections Must Be ToC-Driven for Selective Decoding

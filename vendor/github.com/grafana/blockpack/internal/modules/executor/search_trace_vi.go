@@ -141,7 +141,17 @@ func QueryTraceQLFromIndex(
 	// (internal/modules/valueindex/writer.go's assembleBucket, NOTE-VI-045/094) — so it can never
 	// be trusted as a match's identity; only the real row (already fetched for field
 	// materialization) reliably carries it.
-	want := modules_reader.WantOnly(withSpanIDColumn(wantCols))
+	//
+	// Issue #534: a residual-carrying match's own column (e.g. span:duration) must also always
+	// be decoded, regardless of wantCols — the caller may have asked for a projection that
+	// doesn't include it at all, reasoning (correctly, for every OTHER leaf shape) that the
+	// value index had already fully resolved the filter. evaluateResidual needs the real column
+	// value in hand to re-verify these specific matches below.
+	extra := map[string]struct{}{modules_shared.SpanIDColumnName: {}}
+	for _, m := range filtered {
+		m.Residual.collectColumns(extra)
+	}
+	want := modules_reader.WantOnly(withColumns(wantCols, extra))
 
 	// Coalesced multi-block fetch: adjacent blocks merge into as few round-trips as
 	// possible (Reader.ReadBlocks). Then parse each block once with the restricted
@@ -176,6 +186,26 @@ func QueryTraceQLFromIndex(
 		spanIDCol := bwb.Block.GetColumn(modules_shared.SpanIDColumnName)
 		for _, rowIdx := range rowsByBlock[blockIdx] {
 			m := identity[spanKey{blockIdx: blockIdx, rowIdx: rowIdx}]
+			// Issue #534: re-verify a residual-carrying match against its REAL raw column
+			// value now that its block is already in hand — the millisecond-boundary-bucket
+			// enforcement point. bwb.Block was already fetched/parsed above for this same
+			// match's own field materialization (SPEC-ROOT's single-I/O-per-block invariant
+			// — nothing here issues a second read), so this is a pure in-memory decode +
+			// comparison.
+			if m.Residual != nil {
+				pass, rerr := evaluateResidual(bwb.Block, m.Residual, int(rowIdx))
+				if rerr != nil {
+					return nil, false, fmt.Errorf(
+						"QueryTraceQLFromIndex: residual check block %d row %d: %w", blockIdx, rowIdx, rerr,
+					)
+				}
+				if !pass {
+					// Genuinely excluded by the real value — this row was one of the
+					// widened VI query's boundary-bucket candidates that the original,
+					// exact comparison does not actually satisfy.
+					continue
+				}
+			}
 			spanID, spanIDOK := resolveRowSpanID(spanIDCol, int(rowIdx))
 			if !spanIDOK {
 				return nil, false, fmt.Errorf(
@@ -196,15 +226,63 @@ func QueryTraceQLFromIndex(
 	return out, true, nil
 }
 
-// withSpanIDColumn returns a copy of wantCols with modules_shared.SpanIDColumnName added, never
-// mutating the caller's own map (wantCols may be reused elsewhere by the caller).
-func withSpanIDColumn(wantCols map[string]struct{}) map[string]struct{} {
-	out := make(map[string]struct{}, len(wantCols)+1)
+// withColumns returns a copy of wantCols with every column name in extra added, never
+// mutating the caller's own map (wantCols may be reused elsewhere by the caller). Generalizes
+// the original task #13 withSpanIDColumn helper (issue #534) so a residual-carrying match's
+// own column can be forced into the decode set the same way span:id already was.
+func withColumns(wantCols map[string]struct{}, extra map[string]struct{}) map[string]struct{} {
+	out := make(map[string]struct{}, len(wantCols)+len(extra))
 	for c := range wantCols {
 		out[c] = struct{}{}
 	}
-	out[modules_shared.SpanIDColumnName] = struct{}{}
+	for c := range extra {
+		out[c] = struct{}{}
+	}
 	return out
+}
+
+// evaluateResidual (issue #534) re-checks residual — a VILookupResult's optional
+// ResidualGroup — against the REAL raw column value(s) it references at row, in an
+// already-decoded block. This is the millisecond-boundary-bucket-ambiguity enforcement
+// point: vibuilder attaches a non-nil residual only when decidableTimeBucketThreshold
+// found a leaf's threshold undecidable at the value index's millisecond-bucket
+// granularity, so the widened VI query alone cannot be fully trusted for these specific
+// candidates — the real, un-truncated value decides. residual.Evaluate walks the group's
+// boolean structure (a single leaf's own trivial one-check group, or a combined AND/OR of
+// two leaves' own groups — see ResidualGroup's own doc comment), calling back into
+// residualRawValue below for each individual check's own column.
+//
+// Returns an error only for an index/data inconsistency (a check's own column is absent
+// from the block, or unreadable as its declared type, or the type itself is one no
+// production caller sets today) — never a silent "treat as excluded" guess, mirroring this
+// file's existing resolveRowSpanID/BlockIndexForPage discipline of surfacing corruption
+// rather than masking it.
+func evaluateResidual(block *modules_reader.Block, residual *ResidualGroup, row int) (bool, error) {
+	return residual.Evaluate(func(check *ResidualColumnPredicate) (uint64, bool, error) {
+		return residualRawValue(block, check, row)
+	})
+}
+
+// residualRawValue reads the real raw value of check's own column at row from an
+// already-decoded block, decoded per check's declared ColType.
+func residualRawValue(block *modules_reader.Block, check *ResidualColumnPredicate, row int) (uint64, bool, error) {
+	col := block.GetColumn(check.Column)
+	if col == nil {
+		return 0, false, fmt.Errorf("residual column %q absent from block (index/data inconsistency)", check.Column)
+	}
+	switch check.ColType {
+	case modules_shared.ColumnTypeUint64:
+		v, ok := col.Uint64Value(row)
+		if !ok {
+			return 0, false, fmt.Errorf("residual column %q row %d unreadable as uint64", check.Column, row)
+		}
+		return v, true, nil
+	default:
+		return 0, false, fmt.Errorf(
+			"residual column %q: unsupported residual column type %v (index/data inconsistency)",
+			check.Column, check.ColType,
+		)
+	}
 }
 
 // resolveRowSpanID reads the real span:id value for rowIdx from an already-decoded span:id

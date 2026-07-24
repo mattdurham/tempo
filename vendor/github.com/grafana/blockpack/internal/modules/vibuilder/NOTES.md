@@ -784,3 +784,123 @@ live incident was found in). Tests: `builder_watermark_test.go`, `valueindex_wat
 (the mandatory adversarial reproduction, mutation-tested: reverting `WatermarksFor` to
 `e.ColumnName`-only keying collapses the test's expected 2-entry map to 1, reproducing the
 exact live symptom). Issue #536.
+
+## NOTE-VI-123 — Residual-predicate pushdown resolves the millisecond-boundary-decidability decline instead of accepting it (issue #534, corrects NOTE-VI-107/108's own "decline" conclusion)
+
+Date: 2026-07-24
+
+**The live symptom this closes (tempo-dev-test-03, tenant 11638):** `{ duration > 100ms }` —
+the single most natural way to write a duration threshold query — permanently 422-declined
+with a misleading "search index has no coverage yet" error, even against a window with
+complete, confirmed VI coverage. `{ duration >= 100ms }` and `{ duration > 99999999ns }`
+against the IDENTICAL window both returned 200 with correct results, proving this was a
+query-SHAPE limitation, not a real coverage gap: the exact-millisecond-boundary strict
+`>`/`<=` shape is exactly the one `decidableTimeBucketThreshold` (task #204, NOTE-VI-107/108)
+correctly, but too bluntly, declared undecidable.
+
+**Why task #204's "decline the whole leaf" conclusion was too conservative.** #204 was right
+that the ONE bucket straddling the query threshold is genuinely ambiguous (some real values in
+it satisfy the comparison, some don't) and the stored millisecond bucket alone cannot resolve
+that ambiguity. But #204 also implicitly assumed the only two options were "trust the bucket
+fully" (task #203's bug — a silent wrong answer) or "distrust the bucket entirely" (#204's own
+fix — declining the WHOLE leaf, discarding real pruning the index had already proven for every
+OTHER bucket). There is a third option #204 didn't take: trust the index to PRUNE, and only
+re-verify the genuinely ambiguous slice against the real data once it's already being read for
+another reason anyway.
+
+**The mechanism, end to end:**
+
+1. `intOrDedicatedColType` (`builder.go`) no longer returns `ok=false` for an undecidable
+   (operator, threshold) pair against span:start/span:duration. `widenedTimeBucketQuery`
+   computes a bucket-domain query — always the INCLUSIVE operator in the comparison's own
+   direction, evaluated at the boundary bucket `q = nanos / 1_000_000` — that captures the
+   union of the already-decided definite-match region and the one ambiguous bucket:
+   - "greater" comparisons (`>`, `>=`) widen to `GTE(q)` (this is a no-op for `>=`'s own
+     decidable formula — `GTE(q)` was already correct there; it's a genuine relaxation for
+     `>`, whose decidable formula would have been `GT(q)`).
+   - "less" comparisons (`<`, `<=`) widen to `LTE(q)`, symmetric to the above.
+   - equality widens to `EQ(q)` — its true region, a single point, can only ever fall inside
+     bucket `q`, so there is no "beyond" region to capture at all; this ALSO makes equality
+     against these two columns answerable for the first time ever (previously
+     UNCONDITIONALLY undecidable, per NOTE-VI-107/108's own truth table).
+2. A `*executor.ResidualColumnPredicate` — the ORIGINAL op + raw nanosecond threshold, never
+   the bucket-relaxed one — is attached (via `attachResidual`) to every result the widened
+   query returns for that leaf. Every OTHER leaf/column/predicate shape still resolves exactly
+   as before (`residual == nil`) — this is a targeted, narrow fix, not a general "make
+   everything a residual filter" refactor (explicitly out of scope per the issue).
+3. `executor.QueryTraceQLFromIndex` (search path) re-verifies a non-nil residual once each
+   candidate's block is fetched for its own, ordinary field materialization —
+   `evaluateResidual` decodes the REAL raw column value at that exact row and compares it
+   against the original threshold. This adds ZERO extra I/O: the block fetch already has to
+   happen for every matched candidate regardless, to build the response.
+4. `executor.ExecuteTraceMetricsFromVI` (metrics path) never fetches a block at all
+   (NOTE-VI-032) and has no raw value to check a residual against — it declines
+   (`ErrMetricsNoCoverage`) whenever any matched result carries one, preserving this leaf
+   shape's pre-#534 decline behavior for metrics exactly (zero behavior change there).
+
+**A second, less obvious correctness hazard this surfaced and had to close: cross-leaf
+residual combination.** A residual is attached per LEAF, uniformly to all of that leaf's own
+results — but a multi-leaf query's AND/OR combination
+(`viIntersectSorted`/`viUnionSorted`/`viIntersectOrdered`/`ViUnionNewestFirst`,
+`executor/metrics_trace.go`+`metrics_trace_bounded.go`) merges TWO leaves' own result sets
+into one, and can return either side's own copy of a matching row when both leaves match the
+identical span. Before this fix, every one of those merge functions silently kept only ONE
+side's copy on a match (whichever operand happened to be `a`/first-seen) — harmless before
+#534 (no leaf ever carried a residual), but a genuine NEW silent-wrong-answer regression risk
+once one exists: dropping the OTHER leaf's own residual requirement on an AND merge could
+wrongly INCLUDE a row that fails that leaf's real check; dropping it on an OR merge could
+wrongly EXCLUDE a row that's true via the OTHER (certain) leaf. `executor.CombineAND`/
+`CombineOR` (`ResidualGroup`'s own doc comment, `metrics_trace.go`) close this: every merge
+point that can produce a duplicate-key match now combines both sides' own `*ResidualGroup`
+according to the correct boolean semantics for that merge direction (AND: both must pass; OR:
+either passing is sufficient, and a nil side is unconditionally sufficient on its own).
+`VILookupResult.Residual` is therefore `*ResidualGroup` (a recursive AND/OR tree over one or
+more `*ResidualColumnPredicate` checks), not a bare `*ResidualColumnPredicate` — see
+`ResidualGroup`'s own doc comment for why a flat field would have made this combination
+impossible to express correctly.
+
+**Deliberate simplification, documented rather than silently applied:** the design direction
+this note implements could have split the widened VI query into two SEPARATE lookups (one
+exact-match query for the boundary bucket, residual-tagged; one range query for the
+definitely-true region beyond it, untagged) for a theoretically tighter "only the genuinely
+ambiguous entries carry a residual" shape. This was NOT done: `valueindex.LookupResult` does
+not carry back an entry's own matched bucket value (only addressing — `BlockID`/`RowIdx`/etc.),
+so splitting would require a materially larger change to the `valueindex` package itself
+(explicitly out of this issue's scope: "dedicated time-bucketed numeric columns' boundary case"
+only). Attaching the SAME residual uniformly to every result from an undecidable-boundary leaf
+is functionally identical for correctness and I/O (the residual re-check on an already-certain
+row is a single cheap in-memory comparison against data already being decoded for
+materialization — free) and is significantly simpler and lower-regression-risk to implement
+and review.
+
+**Regression tests, real-fixture-verified (not just "doesn't decline"):**
+- `valueindex_boundary_decidability_test.go` (root): rewrote the five tests that used to assert
+  `require.False(t, ok)` for an undecidable case into `*_ResolvesViaResidual` tests proving (a)
+  the raw index result is a genuine SUPERSET (real pruning happened — asserted via `assert.Less`
+  on the true-set/raw-set sizes), (b) every entry carries a residual, and (c) applying the
+  residual against each entry's REAL fixture duration narrows it to the exact hand-computed
+  answer — precision AND recall, for `>`, `>=` (non-aligned), `<` (non-aligned), `<=`, and `==`
+  (including the correct, decisive EMPTY answer for a threshold no real span matches — a
+  genuine new capability, not merely "no longer errors").
+- `value_index_oracle_comparison_test.go` Shape 9(a/b/c) (root, renamed `*_MixedResidual`): the
+  REAL end-to-end production path (`blockpack.QueryTraceQLFromIndex`, real write path, real
+  block fetch) for a residual-carrying `duration` leaf combined via AND (same-column, 9a;
+  different-column, 9c) and OR (same-column, 9b) with a decidable/fully-covered sibling leaf —
+  this is the test suite that actually exercises `CombineAND`/`CombineOR`'s cross-leaf
+  correctness, not a synthetic unit test.
+- Mutation-verified: temporarily made `executor.ResidualGroup.Evaluate` unconditionally return
+  `(true, nil)` (residual enforcement disabled) — all eight tests above failed with a real
+  WRONG SUPERSET answer (extra, genuinely-non-matching spans incorrectly included in the
+  result), not merely "the query no longer declines." Reverted; full suite green again.
+
+**Back-refs:** `internal/modules/vibuilder/builder.go:intOrDedicatedColType,
+widenedTimeBucketQuery,residualOpFor,valueindexOpFromTimeOp,attachResidual,buildPredicate,
+buildRangePredicate,valueAsColType,valueAsRangeColType`,
+`internal/modules/vibuilder/builder_bounded_and.go:buildSourceBoundedMultiLeafAND`,
+`internal/modules/executor/metrics_trace.go:VILookupResult,ResidualColumnPredicate,
+ResidualGroup,CombineAND,CombineOR,ExecuteTraceMetricsFromVI,viIntersectSorted,viUnionSorted,
+ViUnionNewestFirst`, `internal/modules/executor/metrics_trace_bounded.go:viIntersectOrdered`,
+`internal/modules/executor/search_trace_vi.go:QueryTraceQLFromIndex,evaluateResidual,
+residualRawValue,withColumns`. See SPECS.md SPEC-VB-8 (this package's own binding contract) and
+`internal/modules/executor/SPECS.md` SPEC-VIS-7 (the executor-side contract) and root `SPEC.md`
+SPEC-ROOT-019's 2026-07-24 addendum. Issue #534.

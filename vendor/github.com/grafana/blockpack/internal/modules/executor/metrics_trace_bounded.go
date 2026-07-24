@@ -123,11 +123,20 @@ func viIntersectOrdered(sets [][]VILookupResult) []VILookupResult {
 	if len(sets) == 1 {
 		return viDedupOrdered(sets[0])
 	}
-	memberSets := make([]map[string]struct{}, len(sets)-1)
+	// Issue #534: build a VALUE map (key -> the other leaf's own VILookupResult), not a
+	// bare membership set (ViMembershipSet/ViConfirmAllSets, which throw the entry itself
+	// away and are kept as-is here for vibuilder's own, unrelated confirm-only use) — this
+	// function must combine EVERY contributing leaf's own Residual via CombineAND for a
+	// surviving candidate, not just check identity-key presence, or a non-anchor leaf's own
+	// residual requirement would be silently dropped whenever it carried one.
+	valueSets := make([]map[string]VILookupResult, len(sets)-1)
 	for i := 1; i < len(sets); i++ {
-		memberSets[i-1] = ViMembershipSet(sets[i])
+		m := make(map[string]VILookupResult, len(sets[i]))
+		for _, e := range sets[i] {
+			m[ViSpanIdentityKey(e)] = e
+		}
+		valueSets[i-1] = m
 	}
-	confirmFn := ViConfirmAllSets(memberSets)
 	seen := make(map[string]struct{}, len(sets[0]))
 	out := make([]VILookupResult, 0, len(sets[0]))
 	for _, cand := range sets[0] {
@@ -135,9 +144,19 @@ func viIntersectOrdered(sets [][]VILookupResult) []VILookupResult {
 		if _, dup := seen[key]; dup {
 			continue
 		}
-		ok, _ := confirmFn(cand) // ViConfirmAllSets never returns a non-nil error
-		if ok {
+		matched := true
+		combined := cand.Residual
+		for _, m := range valueSets {
+			other, ok := m[key]
+			if !ok {
+				matched = false
+				break
+			}
+			combined = CombineAND(combined, other.Residual)
+		}
+		if matched {
 			seen[key] = struct{}{}
+			cand.Residual = combined
 			out = append(out, cand)
 		}
 	}
