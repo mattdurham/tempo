@@ -39,13 +39,16 @@ import (
 // case) the operator can act. (ii) index/data inconsistency or any unrecognized error — 5xx: an
 // internal condition the client cannot act on.
 //
-// Deliberately absent from this mapper: modules/frontend/vcnt_fetch.go's
-// ErrPlanTimeLowSelectivityNoLimit. It never reaches the querier at all — it converts to a
-// BadRequest directly at the frontend, PRE-DISPATCH (search_sharder.go/
-// metrics_query_range_sharder.go via pipeline.NewBadRequest), so it never becomes a per-block
-// error DeclineErrorToHTTPResponse would ever see. This is intentional, not a missing mapping —
-// noted here so a future reader auditing "is every decline sentinel mapped?" by grepping this
-// file alone doesn't flag it as a gap.
+// Formerly deliberately absent from this mapper: modules/frontend/vcnt_fetch.go's
+// ErrPlanTimeLowSelectivityNoLimit — it never reached the querier at all (it converted to a
+// BadRequest directly at the frontend, PRE-DISPATCH), so it never became a per-block error this
+// function would see. REMOVED entirely by issue #535 (team-lead ruling, reversing issue #481's
+// R6): a query may only decline for a genuine index/cube coverage gap, never as a
+// cost/selectivity heuristic for a query the system CAN answer correctly, and that sentinel's
+// whole premise no longer holds (see queryplan.SelectSearchStrategy's doc comment, blockpack
+// SPEC-QP-6). Noted here, rather than silently dropped, so a future reader auditing "is every
+// decline sentinel mapped?" doesn't wonder why a prior version of this comment mentioned a
+// symbol that no longer exists.
 func DeclineErrorToHTTPResponse(err error) (status int, message string, matched bool) {
 	switch {
 	case err == nil:

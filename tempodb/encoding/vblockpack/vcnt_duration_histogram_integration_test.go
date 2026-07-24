@@ -22,13 +22,19 @@ package vblockpack
 //               *blockpack.Program from blockpack.CompileTraceQL, never a
 //               hand-built Selectivity value.
 //
-// This proves the #205 plan's whole point end to end: a low-selectivity,
-// no-limit duration predicate now classifies LowSelectivity and
-// SelectSearchStrategy's planTimeDecline signal fires — the actual mechanism
-// buildQueryPlanFromProgram's existing, unmodified decline gate
-// (vcnt_fetch.go:299-324) uses to skip dispatching any block job at all (see
-// vcnt_fetch_test.go's sibling Phase D2 tests for the job-count-level proof of
-// that specific gate).
+// This originally proved the #205 plan's whole point end to end: a low-selectivity, no-limit
+// duration predicate classified LowSelectivity and SelectSearchStrategy's planTimeDecline signal
+// fired — the mechanism buildQueryPlanFromProgram's decline gate used to skip dispatching any
+// block job at all.
+//
+// Update (issue #535, team-lead ruling, reversing issue #481's R6): that decline gate is REMOVED
+// — "we cannot decline a valid query merely because it is expensive... never as a
+// cost/selectivity heuristic for a query the system CAN answer correctly." SelectSearchStrategy's
+// planTimeDecline is now unconditionally false for every Selectivity value. This file's real
+// write -> compact -> read -> classify pipeline is still valuable, unrelated regression coverage
+// (the histogram compaction/classification mechanism itself is untouched by #535 — only what
+// buildQueryPlanFromProgram DOES with the classification changed) — see the tests below, updated
+// to assert the current, correct outcome.
 
 import (
 	"testing"
@@ -101,14 +107,16 @@ func classifyDurationQuery(
 	return sel, planTimeDecline
 }
 
-// TestVCNTDurationHistogramPipeline_LowSelectivity_DeclinesAtPlanTime is #205 Phase D1
-// assertions 1/2: 1000 real spans, 900 with duration 2ms (> 1ms, landing in bucket index 1 —
-// boundary 1ms <= 2ms < 5ms) and 100 with duration 0ms (<= 1ms, landing in bucket index 0) — a
-// deliberately clean, non-straddling split at the query's own threshold (1ms is exactly boundary
-// index 1). Split across two independent accumulator+flush passes (mirroring two separate
-// block-builder flushes) so the real cross-block compaction path is genuinely exercised, not
-// just a single-flush no-op merge.
-func TestVCNTDurationHistogramPipeline_LowSelectivity_DeclinesAtPlanTime(t *testing.T) {
+// TestVCNTDurationHistogramPipeline_LowSelectivity_NoLongerDeclinesAtPlanTime is #205 Phase D1
+// assertions 1/2, updated for issue #535: 1000 real spans, 900 with duration 2ms (> 1ms, landing
+// in bucket index 1 — boundary 1ms <= 2ms < 5ms) and 100 with duration 0ms (<= 1ms, landing in
+// bucket index 0) — a deliberately clean, non-straddling split at the query's own threshold (1ms
+// is exactly boundary index 1). Split across two independent accumulator+flush passes (mirroring
+// two separate block-builder flushes) so the real cross-block compaction path is genuinely
+// exercised, not just a single-flush no-op merge. The classification verdict itself
+// (LowSelectivity) is UNCHANGED by #535 — only what SelectSearchStrategy does with that verdict
+// changed (it no longer declines).
+func TestVCNTDurationHistogramPipeline_LowSelectivity_NoLongerDeclinesAtPlanTime(t *testing.T) {
 	store := newFakeVCNTStore()
 	const startNano = 65 * 1_000_000_000 // bucket 60
 	const twoMs = 2 * 1_000_000
@@ -124,16 +132,18 @@ func TestVCNTDurationHistogramPipeline_LowSelectivity_DeclinesAtPlanTime(t *test
 	sel, planTimeDecline := classifyDurationQuery(t, store, `{ duration > 1ms }`, 0, 200)
 	require.Equal(t, blockpack.LowSelectivity, sel,
 		"900/1000 spans (90%%) exceed the 1ms threshold -- must classify LowSelectivity at the default 0.5 fraction")
-	require.True(t, planTimeDecline,
-		"LowSelectivity with no limit must set SelectSearchStrategy's planTimeDecline signal -- "+
-			"the actual I/O-avoiding signal buildQueryPlanFromProgram's existing decline gate consumes")
+	require.False(t, planTimeDecline,
+		"issue #535: LowSelectivity with no limit must no longer set SelectSearchStrategy's planTimeDecline signal -- "+
+			"a query may only decline for a genuine coverage gap, never a selectivity heuristic")
 }
 
 // TestVCNTDurationHistogramPipeline_Selective_NoDecline is #205 Phase D1 assertion 3: a sibling
 // fixture where only 10/1000 spans (1%) exceed the 1ms threshold must classify Selective and
-// must NOT set planTimeDecline -- proving the feature discriminates real selectivity rather than
-// unconditionally declining (a trivial, useless implementation would still pass the LowSelectivity
-// fixture alone).
+// must NOT set planTimeDecline. Since issue #535, planTimeDecline is false for every Selectivity
+// value (including LowSelectivity, see the sibling test above) — this test's remaining value is
+// pinning the CLASSIFICATION verdict itself (Selective, distinct from the sibling's
+// LowSelectivity, over the identical real write->compact->read pipeline), not a
+// decline/no-decline discrimination that no longer exists.
 func TestVCNTDurationHistogramPipeline_Selective_NoDecline(t *testing.T) {
 	store := newFakeVCNTStore()
 	const startNano = 65 * 1_000_000_000 // bucket 60
@@ -151,5 +161,5 @@ func TestVCNTDurationHistogramPipeline_Selective_NoDecline(t *testing.T) {
 	require.Equal(t, blockpack.Selective, sel,
 		"10/1000 spans (1%%) exceed the 1ms threshold -- must classify Selective, well under the default 0.5 fraction")
 	require.False(t, planTimeDecline,
-		"Selective must never set planTimeDecline -- proves the classifier isn't just always declining")
+		"Selective must never set planTimeDecline (unchanged by issue #535, which affects only the LowSelectivity+no-limit row)")
 }

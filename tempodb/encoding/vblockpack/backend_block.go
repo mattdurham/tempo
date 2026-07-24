@@ -957,14 +957,18 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 	// original QueryPlan.Strategy-threading assumption, which never had a wire path and would
 	// have required protobuf-generator surgery unavailable in this environment): derived LOCALLY
 	// from whether this query carries a limit, exactly the same hasLimit predicate
-	// blockpack.SelectSearchStrategy already applies frontend-side (queryoptions.go, F-6) —
+	// blockpack.SelectSearchStrategy still accepts frontend-side (queryoptions.go, F-6) —
 	// re-evaluated here, not threaded over the wire, so there is only ever ONE implementation of
-	// "does this query have a limit", never two independently-maintained copies. The two-layer
-	// story: the FRONTEND's plan-time gate (buildQueryPlanFromProgram, R6) stays authoritative
-	// for QUERY-SHAPE-driven rejection (LowSelectivity+no-limit fails before any block is ever
-	// dispatched); this querier-local check additionally covers per-block declines the coarse,
-	// tenant-level VCNT classification the frontend used couldn't predict (R17's "coarse-signal"
-	// case) — a query the frontend classified Selective can still decline on an individual
+	// "does this query have a limit", never two independently-maintained copies. Historically
+	// (before issue #535) there was a two-layer story: the FRONTEND's plan-time gate
+	// (buildQueryPlanFromProgram, R6) was authoritative for QUERY-SHAPE-driven rejection
+	// (LowSelectivity+no-limit failed before any block was ever dispatched); this querier-local
+	// check additionally covered per-block declines the coarse, tenant-level VCNT classification
+	// the frontend used couldn't predict (R17's "coarse-signal" case). Issue #535 (team-lead
+	// ruling, reversing R6) removed the frontend's plan-time gate entirely — a query may only
+	// decline for a genuine index/cube coverage gap, never a cost/selectivity heuristic — so
+	// THIS querier-local check is now the only one of the two layers left. It is unaffected by
+	// that removal: a query the frontend classified Selective can still decline on an individual
 	// block, and if a limit is present, bounding the read here is still an honest, budgeted
 	// answer (R2), never a wrong one. indexOnly takes ABSOLUTE priority: forces
 	// boundedAuthorized=false regardless of limit, so a #487/#217 slice job's decline is

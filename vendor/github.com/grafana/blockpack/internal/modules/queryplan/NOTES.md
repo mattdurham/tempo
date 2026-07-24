@@ -722,6 +722,22 @@ value this note's decline-signaling design coexists with). Tests: `queryplan_tes
 (`TestSelectSearchStrategy_FiveRowCore`,
 `TestSelectSearchStrategy_NeverReturnsTimeSlicedOrFakeDeclineStrategy`). Issue #481.
 
+**Update (2026-07-24, issue #535): team-lead ruling R6 — the premise behind this whole note's
+"every per-block job dispatched under this row would decline identically" claim — is REVERSED.**
+Direct read of the actual execution code found R6's premise false: `executor.
+ExecuteTraceMetricsFromVI` and the unbounded value-index read path (`vibuilder.BuildSource`,
+used for a no-limit search query) both compute the correct answer over every matched entry
+unconditionally, with no selectivity-based bailout — dispatching a `LowSelectivity`+no-limit
+query was never actually a certain failure, so declining it at plan time was blocking an
+answerable query. `SelectSearchStrategy` no longer has ANY row that sets `planTimeDecline=true`
+— it is `false` unconditionally now. The out-of-band-bool design this note argues for (vs. a fake
+enum value) is UNCHANGED and still applies to the function's shape/contract; only the fact that
+one specific row used to actually set it true is gone. `ErrPlanTimeLowSelectivityNoLimit` itself
+(tempo's `modules/frontend/vcnt_fetch.go`) has zero remaining production callers as of this
+change and was removed, along with its `DeclineErrorToHTTPResponse` mapping
+(`decline_response.go`). See `SPECS.md` SPEC-QP-6's own 2026-07-24 update entry for the current
+table. Issue #535.
+
 ## NOTE-QP-011: `LeadDetail`'s R4 pre-authorization + parity-first refactor rationale (issue #493, Task 4b)
 
 *Added: 2026-07-09*

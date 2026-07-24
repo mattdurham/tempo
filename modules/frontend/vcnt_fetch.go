@@ -13,8 +13,6 @@ package frontend
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"io"
 	"path"
 	"strings"
@@ -28,23 +26,19 @@ import (
 	"github.com/grafana/tempo/tempodb/encoding/vblockpack"
 )
 
-// ErrPlanTimeLowSelectivityNoLimit (issue #481 parts 2/3, F-6, team-lead ruling R6) is returned
-// by buildQueryPlanFromProgram when a query is resolvable but has NO safe answer at plan time:
-// its VCNT-classified selectivity is low (would match most of the column's live values) and
-// either (a) it's a search query with no limit, or (b) it's a metrics query (never bounded-
-// served, R2) — in both cases every per-block job dispatched would decline identically, so per
-// R6 the frontend fails HERE, at plan time, rather than fanning out N certain-to-decline
-// queries. This is deliberately NOT one of blockpack's F-4 querier-side decline sentinels
-// (ErrMetricsShapeNotAnswerable et al.) — those fire from Fetch/QueryRange per-block, after
-// dispatch; this fires from RoundTrip BEFORE any block job is ever constructed, so it never
-// reaches the querier, the combiner, or F-10's declineErrorToHTTPResponse mapper. Callers
-// (search_sharder.go, metrics_query_range_sharder.go) convert this directly to
-// pipeline.NewBadRequest — a plan-time failure IS "failing in the frontend," no combiner
-// round-trip required.
-var ErrPlanTimeLowSelectivityNoLimit = errors.New(
-	"query has low value-index selectivity with no bounded answer available: " +
-		"a full per-block scan would be required to answer it correctly, which is not attempted",
-)
+// ErrPlanTimeLowSelectivityNoLimit (issue #481 parts 2/3, F-6, team-lead ruling R6) used to be
+// returned by buildQueryPlanFromProgram when a query was resolvable but had, in R6's own
+// (since-reversed) judgment, no safe answer at plan time. REMOVED by issue #535 (team-lead
+// ruling, an explicit reversal of R6, not a silent behavior change): "we cannot decline a valid
+// query merely because it is expensive... never as a cost/selectivity heuristic for a query the
+// system CAN answer correctly." Direct reads of executor.ExecuteTraceMetricsFromVI and the
+// unbounded value-index read path (vibuilder.BuildSource) confirmed neither has any
+// selectivity-based bailout of its own — this sentinel's whole premise (every per-block job
+// would decline identically) was false, and it had zero remaining production callers once both
+// of buildQueryPlanFromProgram's decline branches were removed. See queryplan.SelectSearchStrategy's
+// doc comment (blockpack, SPEC-QP-6) for the reversed decision table this sentinel used to
+// enforce, and this file's buildQueryPlanFromProgram (the "ISSUE #535" comment) for the removed
+// call sites.
 
 // compactedKeyChecker is the minimal seam fetchVCNTSection needs to exclude
 // already-compacted-but-not-yet-reaped VCNT object keys before downloading them (issue #522
@@ -263,23 +257,31 @@ func buildMetricsQueryPlan(
 // own left-leg compile, in particular) — the VCNT-fetch/qualification/selectivity logic itself
 // must stay identical across all three call sites, so it lives in exactly one place.
 //
-// R10 (issue #481 parts 2/3, F-6): the signature changed from a bare *blockpack.QueryPlan return
-// to (*blockpack.QueryPlan, error) — a non-nil error means the query has NO safe answer at plan
-// time (ErrPlanTimeLowSelectivityNoLimit; see its own doc comment) and the caller MUST fail the
-// request here (pipeline.NewBadRequest), never dispatch. A nil plan AND nil error (unchanged from
-// before this phase) means "no real plan could be built for other reasons" (no RawReaderProvider,
-// compile failure, unresolvable index coverage, nothing plannable) — treat exactly like
-// DispatchBlockSharded, byte-identical to today.
+// R10 (issue #481 parts 2/3, F-6) added a (*blockpack.QueryPlan, error) signature so a non-nil
+// error could mean the query has NO safe answer at plan time (the now-removed
+// ErrPlanTimeLowSelectivityNoLimit). Issue #535 (team-lead ruling, reversing R6) removed both
+// plan-time decline branches this function used to have (see the "ISSUE #535" comment below,
+// where selectivity is classified) — as of that change, this function can no longer return a
+// non-nil error at all; every remaining early return is (nil, 0, nil) or (nil, bytesRead, nil).
+// The error return is kept in the signature (rather than dropped) purely for call-site
+// stability — search_sharder.go/metrics_query_range_sharder.go's existing
+// `if planErr != nil { return pipeline.NewBadRequest(planErr), nil }` guards remain correct,
+// harmless, defensive code; they simply never fire from this call path anymore. A nil plan AND
+// nil error (unchanged from before this phase) means "no real plan could be built for other
+// reasons" (no RawReaderProvider, compile failure, unresolvable index coverage, nothing
+// plannable) — treat exactly like DispatchBlockSharded, byte-identical to today.
 //
 // hasLimit is meaningful ONLY when boundedEligible is true (search/structural); metrics callers
-// pass it as false and it is never read on the boundedEligible=false branch, since R2 already
-// forecloses metrics from ever being bounded-served regardless of a limit.
+// pass it as false. As of issue #535, neither hasLimit nor boundedEligible gates dispatch or
+// decline inside this function's body anymore (see the "ISSUE #535" comment below for why) —
+// both are still read once, purely to attach plan.bounded_eligible/plan.has_limit as span
+// observability, so a trace viewer retains the caller-side context even though it no longer
+// changes the outcome.
 // buildQueryPlanFromProgram's second return value (issue #218 Phase 3) is the VCNT bytesRead
 // fetchVCNTSection already computes below — surfaced here so callers can thread it into
 // SearchMetrics.vcntBytesRead without this function needing any response-shape awareness of
 // its own. It is 0 whenever the function returns before reaching the VCNT fetch (nil rawR/
-// query, CheckIndexCoverage decline) and is still reported on both plan-time-decline error
-// returns below, since the VCNT I/O already happened by that point.
+// query, CheckIndexCoverage decline).
 func buildQueryPlanFromProgram(
 	ctx context.Context, rawR backend.RawReader, tenant string, dedicated backend.DedicatedColumns,
 	prog *blockpack.Program, minTS, maxTS uint64, concurrentRequests int, boundedEligible, hasLimit bool,
@@ -356,7 +358,7 @@ func buildQueryPlanFromProgram(
 	}
 	vcntSpan.End()
 
-	// F-6/R3/R6: classify selectivity over the SAME decoded section TimeSliceOracle below
+	// F-6/R3: classify selectivity over the SAME decoded section TimeSliceOracle below
 	// consumes — no extra I/O, a pure-function call over already-in-hand bytes.
 	//
 	// issue #493 Task 4b: ClassifyProgramVCNTWithDetail additionally returns the lead leaf's
@@ -365,43 +367,51 @@ func buildQueryPlanFromProgram(
 	// plan.lead_index_cost/plan.lead_column_total, only when known) so a trace viewer can see
 	// WHY a query classified the way it did, not just the 3-state verdict.
 	sel, leadDetail := blockpack.ClassifyProgramVCNTWithDetail(prog, data, dir, minTS, maxTS)
-	if span.IsRecording() && leadDetail.HasLead {
-		span.SetAttributes(attribute.String("plan.lead_column", leadDetail.LeadColumn))
-		if leadDetail.IndexCostKnown {
-			span.SetAttributes(attribute.Int64("plan.lead_index_cost", leadDetail.IndexCost))
-		}
-		if leadDetail.ColumnTotalKnown {
-			span.SetAttributes(attribute.Int64("plan.lead_column_total", leadDetail.ColumnTotal))
-		}
-	}
-
-	if boundedEligible {
-		_, planTimeDecline := blockpack.SelectSearchStrategy(sel, hasLimit)
-		if planTimeDecline {
-			if span.IsRecording() {
-				span.SetAttributes(attribute.String("plan.qualification_outcome", "low_selectivity_no_limit_search"))
+	if span.IsRecording() {
+		// plan.selectivity/plan.bounded_eligible/plan.has_limit (issue #535): none of the three
+		// gates dispatch/decline below anymore, but they remain real, useful observability — a
+		// trace viewer can see how a query classified and which caller-side path it came
+		// through, even though, post-#535, every combination now routes identically.
+		span.SetAttributes(
+			attribute.String("plan.selectivity", selectivityString(sel)),
+			attribute.Bool("plan.bounded_eligible", boundedEligible),
+			attribute.Bool("plan.has_limit", hasLimit),
+		)
+		if leadDetail.HasLead {
+			span.SetAttributes(attribute.String("plan.lead_column", leadDetail.LeadColumn))
+			if leadDetail.IndexCostKnown {
+				span.SetAttributes(attribute.Int64("plan.lead_index_cost", leadDetail.IndexCost))
 			}
-			return nil, bytesRead, fmt.Errorf("plan-time decline for tenant %s: %w", tenant, ErrPlanTimeLowSelectivityNoLimit)
+			if leadDetail.ColumnTotalKnown {
+				span.SetAttributes(attribute.Int64("plan.lead_column_total", leadDetail.ColumnTotal))
+			}
 		}
-		// SelectSearchStrategy's only other outcome is DispatchBlockSharded (Phase 7,
-		// plan-scan-fallback.md, removed the DispatchBoundedRecentFirst strategy entirely — the
-		// querier's own per-block bounded-index path now handles a limit-bearing low/unknown-
-		// selectivity query directly, without any plan-time signal) — fall through to the
-		// existing cost/perMinuteForLead/BuildQueryPlan flow below exactly as before this phase
-		// (it decides DispatchTimeSliced vs. DispatchBlockSharded on its own, unrelated,
-		// resolvability-only gate).
-	} else if sel == blockpack.LowSelectivity {
-		// Metrics (boundedEligible=false, R2): a resolvable-but-low-selectivity metrics query
-		// has no safe answer — SUM/AVG/HISTOGRAM/etc. need the aggregate over the FULL matching
-		// corpus, and a truncated aggregate is a wrong answer, not a partial one (R2). Per R6,
-		// fail at plan time rather than dispatch N block jobs that would each independently
-		// decline identically once the block-level executor also observes low coverage/shape.
-		if span.IsRecording() {
-			span.SetAttributes(attribute.String("plan.qualification_outcome", "low_selectivity_metrics_no_partial_aggregate"))
-		}
-		return nil, bytesRead, fmt.Errorf("plan-time decline for tenant %s: %w", tenant, ErrPlanTimeLowSelectivityNoLimit)
 	}
 
+	// ISSUE #535 (team-lead ruling, reversing R6): a query may only decline when the index/cube
+	// genuinely isn't built yet for the queried window (a real coverage gap, or cube warming) —
+	// never as a cost/selectivity heuristic for a query the system CAN answer correctly. This
+	// function used to fail here at plan time for TWO cases that both turned out to be
+	// unnecessary once the actual execution code was read directly:
+	//
+	//   - search/structural (boundedEligible=true): blockpack.SelectSearchStrategy's
+	//     LowSelectivity+no-limit row used to set planTimeDecline=true. It no longer can — the
+	//     unbounded value-index read path used for a no-limit query (vibuilder.BuildSource)
+	//     enumerates and returns everything the index finds, with no selectivity-based
+	//     limitation of its own, so there was never an execution-side reason to decline it here.
+	//   - metrics (boundedEligible=false, R2): a resolvable-but-low-selectivity metrics query
+	//     used to decline directly below on sel == blockpack.LowSelectivity. But
+	//     executor.ExecuteTraceMetricsFromVI computes the exact bucketed count over EVERY
+	//     matched value-index entry unconditionally — there is no selectivity-based bailout
+	//     anywhere in that function — so a "resolvable-but-low-selectivity" metrics query was
+	//     never actually unanswerable; it was simply being declined for being expensive.
+	//
+	// Both branches are gone. boundedEligible/hasLimit no longer gate anything below (they are
+	// read once, above, purely for the plan.bounded_eligible/plan.has_limit span attributes) —
+	// sel/leadDetail similarly remain solely observability (issue #493 Task 4b's
+	// WHY-it-classified-this-way span attributes); every Selectivity value, bounded or not,
+	// limited or not, now flows straight into the same cost/TimeSliceOracle/BuildQueryPlan
+	// pipeline, exactly as Selective/UnknownSelectivity already did before this phase.
 	cost, perMinuteForLead := blockpack.TimeSliceOracle(data, dir, minTS, maxTS)
 
 	plan := blockpack.BuildQueryPlan(
@@ -438,5 +448,21 @@ func dispatchStrategyString(s blockpack.DispatchStrategy) string {
 		return "time_sliced"
 	default:
 		return "block_sharded"
+	}
+}
+
+// selectivityString renders a blockpack.Selectivity for the plan.selectivity span attribute
+// (issue #535) — mirrors dispatchStrategyString's own small local-mapping convention;
+// blockpack.Selectivity has no String method of its own for the same reason DispatchStrategy
+// doesn't (an export was not requested and would grow blockpack's public API beyond what was
+// pre-authorized for this phase).
+func selectivityString(sel blockpack.Selectivity) string {
+	switch sel {
+	case blockpack.Selective:
+		return "selective"
+	case blockpack.LowSelectivity:
+		return "low_selectivity"
+	default:
+		return "unknown"
 	}
 }

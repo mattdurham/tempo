@@ -428,12 +428,22 @@ func TestBuildQueryPlanFromProgram_LowSelectivityWithLimit_FallsThroughToResolva
 	require.Equal(t, blockpack.DispatchTimeSliced, plan.Strategy)
 }
 
-// TestBuildMetricsQueryPlanFromProgram_LowSelectivityWithoutLimit_NeverBoundedRecentFirst is a
-// MUST per R2/plan-f.md Task 6 — the wrong-answer guard: metrics is NEVER bounded-served (a
-// truncated aggregate is a wrong answer, not a partial one). A resolvable, LowSelectivity metrics
-// query must plan-time-decline (ErrPlanTimeLowSelectivityNoLimit), never select
-// DispatchBoundedRecentFirst regardless of anything resembling a "limit" on the metrics side.
-func TestBuildMetricsQueryPlanFromProgram_LowSelectivityWithoutLimit_NeverBoundedRecentFirst(t *testing.T) {
+// TestBuildMetricsQueryPlanFromProgram_LowSelectivityWithoutLimit_NoLongerDeclines is issue
+// #535's core regression test — the live-shaped incident this issue exists to fix: a plain,
+// ungrouped rate()/count_over_time() metrics query over a column that matches most of its live
+// values (e.g. `{ status = error } | rate()`) used to decline outright at plan time
+// (ErrPlanTimeLowSelectivityNoLimit, team-lead ruling R6, issue #481). That ruling is REVERSED
+// (team-lead ruling, issue #535): "we cannot decline a valid query merely because it is
+// expensive... never as a cost/selectivity heuristic for a query the system CAN answer
+// correctly." executor.ExecuteTraceMetricsFromVI computes the exact bucketed count over EVERY
+// matched value-index entry unconditionally — there is no selectivity-based bailout anywhere in
+// that function — so a resolvable, LowSelectivity metrics query is, and always was, answerable;
+// it must now build a real, dispatchable plan instead of declining. This replaces the retired
+// TestBuildMetricsQueryPlanFromProgram_LowSelectivityWithoutLimit_NeverBoundedRecentFirst (R2's
+// "never bounded-served" guard is unrelated to and unaffected by this reversal — DispatchStrategy
+// only ever has two values, DispatchBlockSharded/DispatchTimeSliced, neither of which is
+// "bounded"; this test doesn't need to re-pin that separate invariant).
+func TestBuildMetricsQueryPlanFromProgram_LowSelectivityWithoutLimit_NoLongerDeclines(t *testing.T) {
 	restore := vblockpack.ConfigureValueIndexQueryForTest(emptyVIStore{}, testIndexPrefix)
 	defer restore()
 
@@ -444,9 +454,10 @@ func TestBuildMetricsQueryPlanFromProgram_LowSelectivityWithoutLimit_NeverBounde
 
 	plan, _, err := buildMetricsQueryPlan(context.Background(), rawR, tenant, nil,
 		`{ span.http.method = "GET" } | rate()`, 0, 200, 1000, nil)
-	require.Error(t, err, "a resolvable, LowSelectivity metrics query must plan-time-decline, not dispatch")
-	require.True(t, errors.Is(err, ErrPlanTimeLowSelectivityNoLimit))
-	require.Nil(t, plan, "no plan must be returned alongside a plan-time decline error")
+	require.NoError(t, err, "issue #535: a resolvable, LowSelectivity metrics query with no limit must no longer plan-time-decline")
+	require.NotNil(t, plan, "a real, dispatchable plan must be built instead of declining")
+	require.Equal(t, blockpack.DispatchTimeSliced, plan.Strategy,
+		"a resolvable, VCNT-covered leaf still qualifies for DispatchTimeSliced -- the resolvability-only gate is unaffected by this reversal")
 }
 
 // TestBuildQueryPlanFromProgram_UnknownSelectivity_WithLimit_FallsThroughToResolvabilityPath
@@ -527,12 +538,19 @@ func frontendAttrs(s sdktrace.ReadOnlySpan) map[string]attribute.Value {
 
 // TestBuildQueryPlanFromProgram_AttachesQualificationOutcome (issue #493 Task 4a) drives the
 // REAL buildQueryPlanFromProgram entry point (via buildQueryPlan/buildMetricsQueryPlan, R7) for
-// each of its 4 qualification outcomes, asserting plan.qualification_outcome on whatever span was
+// several qualification outcomes, asserting plan.qualification_outcome on whatever span was
 // already active on ctx via trace.ContextWithSpan -- exactly the "attach to the EXISTING span"
 // contract sub-task 4a specifies (search_sharder.go/metrics_query_range_sharder.go already do
 // this same thing with their own real frontend.ShardSearch/frontend.QueryRangeSharder.* spans;
 // this test uses a plain span standing in for either, since the attribute's presence and value
 // don't depend on which caller's span it is).
+//
+// Issue #535 (team-lead ruling, reversing R6) removed two of the outcomes this test used to
+// pin (the "low_selectivity_no_limit_search"/"low_selectivity_metrics_no_partial_aggregate"
+// decline branches) -- there is no longer a classification-driven decline outcome at all, so
+// "qualified" is now the only outcome a resolvable, VCNT-covered query (of any Selectivity) can
+// reach. The subtests below still exercise the identical LowSelectivity/no-limit fixtures that
+// used to decline, now pinning "qualified" instead of deleting the coverage.
 func TestBuildQueryPlanFromProgram_AttachesQualificationOutcome(t *testing.T) {
 	rec := recordedSpansFrontend(t)
 
@@ -565,36 +583,49 @@ func TestBuildQueryPlanFromProgram_AttachesQualificationOutcome(t *testing.T) {
 		require.Equal(t, "not_indexable", got.AsString())
 	})
 
-	t.Run("low_selectivity_no_limit_search", func(t *testing.T) {
+	// low_selectivity_no_limit_search / low_selectivity_metrics_no_partial_aggregate (issue #535,
+	// team-lead ruling, reversing R6): these two qualification_outcome values used to be set on
+	// the decline branches this test pinned above -- both branches are REMOVED (a query may only
+	// decline for a genuine coverage gap, never a cost/selectivity heuristic), so neither string
+	// is ever produced by production code anymore. The two subtests below replace them, pinning
+	// the NEW correct outcome for the identical LowSelectivity/no-limit fixtures: "qualified",
+	// exactly like every other resolvable, VCNT-covered query.
+	t.Run("low_selectivity_no_limit_search_no_longer_declines", func(t *testing.T) {
 		restore := vblockpack.ConfigureValueIndexQueryForTest(emptyVIStore{}, testIndexPrefix)
 		defer restore()
 		rawR, rawW := newLocalRawReadWriter(t)
 		writeVCNTObject(t, rawW, "span.http.method", vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 900, "POST": 100}))
 
+		var capturedPlan *blockpack.QueryPlan
 		span := runWithSpan(t, func(ctx context.Context) {
 			plan, _, err := buildQueryPlan(ctx, rawR, "tenant-a", nil, `{ span.http.method = "GET" }`, 0, 200, 1000, false, nil)
-			require.Error(t, err)
-			require.Nil(t, plan)
+			require.NoError(t, err, "issue #535: LowSelectivity with no limit must no longer plan-time-decline")
+			require.NotNil(t, plan)
+			capturedPlan = plan
 		})
+		require.Equal(t, blockpack.DispatchTimeSliced, capturedPlan.Strategy)
 		got, ok := frontendAttrs(span)["plan.qualification_outcome"]
 		require.True(t, ok)
-		require.Equal(t, "low_selectivity_no_limit_search", got.AsString())
+		require.Equal(t, "qualified", got.AsString())
 	})
 
-	t.Run("low_selectivity_metrics_no_partial_aggregate", func(t *testing.T) {
+	t.Run("low_selectivity_metrics_no_longer_declines", func(t *testing.T) {
 		restore := vblockpack.ConfigureValueIndexQueryForTest(emptyVIStore{}, testIndexPrefix)
 		defer restore()
 		rawR, rawW := newLocalRawReadWriter(t)
 		writeVCNTObject(t, rawW, "span.http.method", vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 900, "POST": 100}))
 
+		var capturedPlan *blockpack.QueryPlan
 		span := runWithSpan(t, func(ctx context.Context) {
 			plan, _, err := buildMetricsQueryPlan(ctx, rawR, "tenant-a", nil, `{ span.http.method = "GET" } | rate()`, 0, 200, 1000, nil)
-			require.Error(t, err)
-			require.Nil(t, plan)
+			require.NoError(t, err, "issue #535: a resolvable, LowSelectivity metrics query must no longer plan-time-decline")
+			require.NotNil(t, plan)
+			capturedPlan = plan
 		})
+		require.Equal(t, blockpack.DispatchTimeSliced, capturedPlan.Strategy)
 		got, ok := frontendAttrs(span)["plan.qualification_outcome"]
 		require.True(t, ok)
-		require.Equal(t, "low_selectivity_metrics_no_partial_aggregate", got.AsString())
+		require.Equal(t, "qualified", got.AsString())
 	})
 
 	t.Run("qualified", func(t *testing.T) {
@@ -683,9 +714,11 @@ func TestBuildQueryPlanFromProgram_AttachesLeadDetail(t *testing.T) {
 // plan.lead_index_cost/plan.lead_column_total being present and correct on the span IS the
 // "histogram object reached classification" proof, mirroring
 // TestBuildQueryPlanFromProgram_AttachesLeadDetail's established pattern exactly but for the
-// duration-histogram column instead of an ordinary equality column. hasLimit=true (like that
-// sibling test) avoids the separate LowSelectivity-no-limit decline path so the plan stays
-// non-nil and inspectable.
+// duration-histogram column instead of an ordinary equality column. hasLimit=true is retained
+// from before issue #535 (it is no longer load-bearing — a LowSelectivity/no-limit query no
+// longer declines either, see TestBuildQueryPlanFromProgram_DurationLowSelectivityNoLimit_
+// NoLongerDeclinesBeforeDispatch — but this test's own subject is leadDetail attachment, not
+// selectivity/decline behavior, so there is no reason to also flip it to false here).
 func TestBuildQueryPlanFromProgram_DimsWideningReachesDurationHistogramClassification(t *testing.T) {
 	rec := recordedSpansFrontend(t)
 	restore := vblockpack.ConfigureValueIndexQueryForTest(emptyVIStore{}, testIndexPrefix)
@@ -768,8 +801,10 @@ func TestFetchVCNTFetch_EmitsChildSpanWithFileStats(t *testing.T) {
 	defer restore()
 
 	rawR, rawW := newLocalRawReadWriter(t)
-	// "POST" is the minority value (Selective) across both objects combined -- avoids the
-	// LowSelectivity plan-time decline path so this test can assert on a real, qualified plan.
+	// "POST" is the minority value (Selective) across both objects combined -- retained from
+	// before issue #535 for classification-verdict variety (Selective, not LowSelectivity), but
+	// no longer load-bearing for reaching a non-nil plan: since #535, a LowSelectivity/no-limit
+	// query builds a real plan too.
 	writeVCNTObject(t, rawW, "span.http.method",
 		vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 5, "POST": 3}))
 	writeVCNTObject(t, rawW, "span.http.method",
@@ -953,43 +988,26 @@ func durationHistogramVCNTObj(t *testing.T, timeStart uint64, countsByDurationMi
 	return vcntObj(t, blockpack.VCNTDurationHistogramColumnName("span:duration"), timeStart, values)
 }
 
-// TestBuildQueryPlanFromProgram_DurationLowSelectivityNoLimit_DeclinesBeforeDispatch is #205
-// Phase D2's explicit I/O-reduction regression test: the job-count-level proof that a
-// low-selectivity, no-limit duration predicate never reaches block-job dispatch at all.
+// TestBuildQueryPlanFromProgram_DurationLowSelectivityNoLimit_NoLongerDeclinesBeforeDispatch is
+// issue #535's search-side counterpart regression test, replacing #205 Phase D2's retired
+// "never reaches block-job dispatch at all" proof. Team-lead ruling R6 (issue #481) — the ruling
+// this test used to pin — is REVERSED by issue #535's own team-lead ruling: "we cannot decline a
+// valid query merely because it is expensive... never as a cost/selectivity heuristic for a
+// query the system CAN answer correctly." The unbounded value-index read path used for a
+// no-limit search query (vibuilder.BuildSource) enumerates and returns everything the index
+// finds regardless of selectivity, so a LowSelectivity duration predicate with no limit is, and
+// always was, answerable — it must now build a real, dispatchable plan.
 //
 // Query operator note: uses `>=` (GTE), not the plan doc's illustrative `>` (GT) --
-// unrelated to #205 itself, this is a pre-existing constraint from task #204's value-index
+// unrelated to #205/#535, this is a pre-existing constraint from task #204's value-index
 // millisecond-decidability gate (vibuilder's decidableTimeBucketThreshold): a GT threshold is
 // only decidable when its raw-nanosecond value ends in exactly `...999999` (vanishingly rare in
 // practice), so `{ duration > 1ms }` fails vibuilder.LeafIndexable/AllLeavesIndexable and never
 // even reaches CheckIndexCoverage's pass -- buildQueryPlanFromProgram returns (nil, 0, nil) via
-// the EARLIER "not_indexable" short-circuit (vcnt_fetch.go:261-266), before fetchVCNTSection or
-// classification run at all, regardless of #205. `>=` at a round-millisecond threshold (r==0) IS
-// decidable, so it is the correct operator for a test that wants to reach #205's own
-// classification/decline logic specifically. (#205 does not touch, and should not need to touch,
-// this decidability gate -- confirmed pre-existing/unrelated.)
-//
-// BEFORE this feature (#205): tempo's vcntwriter.go never wrote ANY VCNT signal for
-// span:duration (only span:name/kind/status), so VCNTDurationCostFunc did not exist and
-// ClassifyProgramVCNTWithDetail's cost oracle had nothing to recognize a duration-range leaf
-// with -- `{ duration >= 1ms }` ALWAYS classified UnknownSelectivity regardless of the real
-// underlying distribution, SelectSearchStrategy's planTimeDecline never fired for it, and
-// buildQueryPlanFromProgram fell through to the ordinary cost/perMinuteForLead/BuildQueryPlan
-// flow, returning a real, non-nil DispatchTimeSliced plan (one job per minute in the query
-// window, per #217) -- i.e. real per-block-job dispatch and its accompanying object-storage I/O,
-// for a predicate that (per this test's fixture) 900/1000 spans -- 90% -- actually match.
-//
-// AFTER this feature (AND after the dims-widening correction this task's own real-pipeline
-// testing found necessary -- see TestBuildQueryPlanFromProgram_DimsWideningReachesDuration
-// HistogramClassification above and this task's final report; the plan doc's §2 "zero
-// tempo-side change" claim was incomplete without it): the same fixture's histogram now lets
-// VCNTDurationCostFunc answer the leaf's cost, ClassifyProgramVCNTWithDetail classifies
-// LowSelectivity (90% >= the default 0.5 fraction), and buildQueryPlanFromProgram's existing,
-// UNMODIFIED decline gate (vcnt_fetch.go:305-312) returns ErrPlanTimeLowSelectivityNoLimit with
-// a nil plan -- dispatching ZERO block jobs. The literal zero-io_ops proof for this mechanism is
-// that no job/plan slice is ever constructed: err is non-nil and plan is nil, so no code path
-// past this point could issue a single block fetch.
-func TestBuildQueryPlanFromProgram_DurationLowSelectivityNoLimit_DeclinesBeforeDispatch(t *testing.T) {
+// the EARLIER "not_indexable" short-circuit, before fetchVCNTSection or classification run at
+// all, regardless of #205/#535. `>=` at a round-millisecond threshold (r==0) IS decidable, so it
+// is the correct operator for a test that wants to reach the classification logic specifically.
+func TestBuildQueryPlanFromProgram_DurationLowSelectivityNoLimit_NoLongerDeclinesBeforeDispatch(t *testing.T) {
 	restore := vblockpack.ConfigureValueIndexQueryForTest(emptyVIStore{}, testIndexPrefix)
 	defer restore()
 
@@ -1003,9 +1021,9 @@ func TestBuildQueryPlanFromProgram_DurationLowSelectivityNoLimit_DeclinesBeforeD
 
 	plan, _, err := buildQueryPlan(context.Background(), rawR, tenant, nil,
 		`{ duration >= 1ms }`, 0, 200, 1000, false /* hasLimit */, nil)
-	require.Error(t, err, "a resolvable, LowSelectivity duration predicate with no limit must plan-time-decline")
-	require.True(t, errors.Is(err, ErrPlanTimeLowSelectivityNoLimit))
-	require.Nil(t, plan, "the returned plan must be nil -- zero block jobs constructed, the literal zero-io_ops proof")
+	require.NoError(t, err, "issue #535: a resolvable, LowSelectivity duration predicate with no limit must no longer plan-time-decline")
+	require.NotNil(t, plan, "a real, dispatchable plan must be built instead of declining")
+	require.Equal(t, blockpack.DispatchTimeSliced, plan.Strategy)
 }
 
 func TestBuildQueryPlan_HalfWindowBackfill_NowDispatchesTimeSlicedInsteadOfDeclining(t *testing.T) {
@@ -1025,11 +1043,13 @@ func TestBuildQueryPlan_HalfWindowBackfill_NowDispatchesTimeSlicedInsteadOfDecli
 	defer restoreWatermarks()
 
 	rawR, rawW := newLocalRawReadWriter(t)
-	// "GET" accounts for 900/1000 of the column's live spans over [0,200) -- LowSelectivity,
-	// so hasLimit=true is required to avoid the SEPARATE (unrelated to this test) plan-time
-	// low-selectivity-without-limit decline, mirroring
+	// "GET" accounts for 900/1000 of the column's live spans over [0,200) -- LowSelectivity.
+	// hasLimit=true is retained from before issue #535 (the fixture mirrors
 	// TestBuildQueryPlanFromProgram_LowSelectivityWithLimit_FallsThroughToResolvabilityPath's
-	// identical fixture.
+	// identical setup); it is no longer required to avoid a plan-time decline (LowSelectivity
+	// with no limit no longer declines either, since #535), but this test's own subject is the
+	// half-window backfill watermark, not selectivity/decline behavior, so there is no reason to
+	// also flip hasLimit here.
 	writeVCNTObject(t, rawW, "span.http.method",
 		vcntObj(t, "span.http.method", 60, map[string]int64{"GET": 900, "POST": 100}))
 

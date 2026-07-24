@@ -35,28 +35,30 @@ const (
 // resolvability (index-coverage). Both are tempo-context concerns the caller must gate on
 // FIRST — an unresolvable plan is DispatchBlockSharded before selectivity is even considered.
 //
-// planTimeDecline=true means the query has NO safe answer at plan time (LowSelectivity with no
-// limit present: every per-block job would decline identically, so dispatching at all wastes N
-// block round-trips on a certain failure). When planTimeDecline is true, the returned strategy
-// value is MEANINGLESS and must NOT be dispatched — the caller (tempo) must fail the query at
-// plan time instead, mapping to the typed hard-error family. This is deliberately NOT
-// represented as a fake DispatchStrategy enum value (e.g. a "DispatchDecline" constant) —
-// decline is a distinct, non-dispatchable outcome, not a dispatch strategy, so it is returned
-// out-of-band via this second bool.
-//
-// A query carrying a limit no longer changes the outcome here: the querier's own per-block
-// bounded-index path (tempo's backend_block.go) now handles a low/unknown-selectivity query
-// with a limit directly, regardless of what this coarse, plan-time classification said — no
-// plan-time signal is needed for that case anymore.
+// ISSUE #535 (team-lead ruling, an explicit REVERSAL of issue #481's R6 ruling, not a silent
+// behavior change): a query may only decline when the index/cube genuinely isn't built yet for
+// the queried window (a real coverage gap, or cube warming) — never as a cost/selectivity
+// heuristic for a query the system CAN answer correctly. R6 previously set
+// planTimeDecline=true for LowSelectivity with no limit present, on the theory that every
+// per-block job would decline identically and dispatching at all would waste N block
+// round-trips on a certain failure. That premise was checked against the actual execution code
+// and found false: executor.ExecuteTraceMetricsFromVI (metrics) and the unbounded value-index
+// read path (vibuilder.BuildSource, search with no limit) both compute the exact answer over
+// EVERY matched entry unconditionally — neither has a selectivity-based bailout. There is no
+// execution-side reason to decline a LowSelectivity/no-limit query, so this function no longer
+// does. planTimeDecline is now ALWAYS false; it is kept as a return value (rather than dropping
+// it and shrinking this to a single-value-returning function) purely for signature/API
+// stability across this function's other callers (root timeslice.go's re-export,
+// cmd/deadcode/main.go) — tempo's own buildQueryPlanFromProgram no longer branches on it at all
+// (that dead call site was removed in the same change), so no production caller anywhere still
+// inspects this value; a future cleanup may drop it once nothing still calls this function
+// expecting the two-value shape.
 //
 //	Selective          -> DispatchBlockSharded  (index-only; hard-errors on decline downstream)
-//	LowSelectivity     + limit    -> DispatchBlockSharded
-//	LowSelectivity     + no limit -> planTimeDecline=true
+//	LowSelectivity     -> DispatchBlockSharded  (index-only; hard-errors on decline downstream;
+//	                       regardless of limit presence — see issue #535 above)
 //	UnknownSelectivity -> DispatchBlockSharded  (index-only; hard-errors on decline downstream)
 func SelectSearchStrategy(sel Selectivity, hasLimit bool) (strategy DispatchStrategy, planTimeDecline bool) {
-	if sel == LowSelectivity && !hasLimit {
-		return DispatchBlockSharded, true
-	}
 	return DispatchBlockSharded, false
 }
 

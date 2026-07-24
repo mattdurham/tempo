@@ -45,12 +45,15 @@ func buildStructuralQueryPlan(
 		return nil, 0, nil
 	}
 	// boundedEligible=true: structural chains that flatten to other than exactly 2 nodes go
-	// through the same plan-time classification as plain search (LowSelectivity+no-limit still
-	// plan-time-declines; every other outcome falls through to the same resolvability-only
-	// DispatchTimeSliced/DispatchBlockSharded gate). A structural query itself never gets ANY
+	// through the same plan-time classification as plain search. Issue #535 (team-lead ruling,
+	// reversing R6) removed the "LowSelectivity+no-limit plan-time-declines" outcome this
+	// comment used to describe — a query may only decline for a genuine index/cube coverage gap,
+	// never a cost/selectivity heuristic — so EVERY classification outcome now falls through to
+	// the same resolvability-only DispatchTimeSliced/DispatchBlockSharded gate, with no
+	// classification-driven decline left at all. A structural query itself still never gets ANY
 	// bounded path querier-side, with or without a limit (Phase 6's asymmetry finding, made
-	// permanent by Phase 7's removal of the #481-part-2 bounded-scan mechanism) — this
-	// classification's only remaining effect on a structural query is the plan-time decline gate.
+	// permanent by Phase 7's removal of the #481-part-2 bounded-scan mechanism) — that asymmetry
+	// finding is unrelated to and unaffected by #535.
 	return buildQueryPlanFromProgram(
 		ctx, rawR, tenant, dedicated, leftProg, minTS, maxTS, concurrentRequests, true, hasLimit, compactedChecker,
 	)

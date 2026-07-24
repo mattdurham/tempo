@@ -82,13 +82,16 @@ const (
 	LowSelectivity = queryplan.LowSelectivity
 )
 
-// SelectSearchStrategy implements R3's ruling table for choosing a search-query dispatch
-// strategy from a VCNT selectivity classification and whether the query carries a limit
-// (issue #481 parts 2/3, team-lead ruling R13) — see queryplan.SelectSearchStrategy's own doc
-// comment for the full five-row decision table and the planTimeDecline contract. Tempo's
-// frontend (buildQueryPlanFromProgram, #481 Task 6) calls this directly for search callers
-// ONLY, after gating on boundedEligible/resolvability itself — metrics callers never reach it
-// (R2: metrics is never bounded-served).
+// SelectSearchStrategy implements the decision table for choosing a search-query dispatch
+// strategy from a VCNT selectivity classification and whether the query carries a limit — see
+// queryplan.SelectSearchStrategy's own doc comment for the full decision table and the
+// planTimeDecline contract. Tempo's frontend (buildQueryPlanFromProgram, #481 Task 6) calls this
+// directly for search callers ONLY, after gating on boundedEligible/resolvability itself —
+// metrics callers never reach it (R2: metrics is never bounded-served).
+//
+// Issue #535 (team-lead ruling, reversing issue #481's R6): planTimeDecline is now ALWAYS false
+// — a query may only decline for a genuine index/cube coverage gap, never as a cost/selectivity
+// heuristic for a query the system can answer correctly.
 func SelectSearchStrategy(sel Selectivity, hasLimit bool) (strategy DispatchStrategy, planTimeDecline bool) {
 	return queryplan.SelectSearchStrategy(sel, hasLimit)
 }

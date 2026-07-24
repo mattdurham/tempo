@@ -412,6 +412,53 @@ direct read of `queryplan_test.go`, matching the table's new row count exactly.
 Back-ref (current): `internal/modules/queryplan/queryplan.go:SelectSearchStrategy,DispatchStrategy`
 (now 2-valued). Tests: `queryplan_test.go:TestSelectSearchStrategy_FourRowCore,TestSelectSearchStrategy_NoLongerReturnsDispatchBoundedRecentFirst`.
 
+**Update (2026-07-24, issue #535, team-lead ruling): the `LowSelectivity`+`hasLimit=false` ->
+`planTimeDecline=true` row above is REVERSED — this is a deliberate reversal of team-lead ruling
+R6 (issue #481), not a silent behavior change.** The team-lead ruling behind this reversal: "We
+cannot decline a valid query merely because it is expensive. A query may only decline when the
+index/cube genuinely isn't built yet for the queried window (a real coverage gap, or cube
+warming) — never as a cost/selectivity heuristic for a query the system CAN answer correctly."
+R6's premise (every per-block job would decline identically for a `LowSelectivity`/no-limit
+query, so plan-time decline avoids N certain-to-fail block round-trips) was checked against the
+actual execution code and found FALSE: `executor.ExecuteTraceMetricsFromVI`
+(`internal/modules/executor/metrics_trace.go`) computes the exact bucketed count over EVERY
+matched value-index entry unconditionally — there is no selectivity-based bailout anywhere in
+that function — and the unbounded value-index read path used for a no-limit search query
+(`vibuilder.BuildSource`) has the identical property: it enumerates and returns everything the
+index finds, with no selectivity-based limitation of its own. Neither execution path needed R6's
+plan-time safety net; it was declining answerable queries.
+
+**The current table (every row, no exceptions):**
+
+| `Selectivity` | `hasLimit` | `strategy` | `planTimeDecline` |
+|---|---|---|---|
+| `Selective` | any | `DispatchBlockSharded` | `false` |
+| `LowSelectivity` | any | `DispatchBlockSharded` | `false` |
+| `UnknownSelectivity` | any | `DispatchBlockSharded` | `false` |
+
+`planTimeDecline` is now `false` in every row — `SelectSearchStrategy` can no longer produce a
+decline outcome at all. `hasLimit` no longer affects the outcome in any way. It is still accepted
+as a parameter purely for this function's own signature/API stability across ITS OTHER callers
+(root `timeslice.go`'s re-export, `cmd/deadcode/main.go`) — tempo's own `buildQueryPlanFromProgram`
+no longer calls `SelectSearchStrategy` or branches on either return value at all (that dead call
+site, and the sibling metrics-side `sel == blockpack.LowSelectivity` decline branch, were BOTH
+removed in the same change; see tempo's own `modules/frontend/vcnt_fetch.go` doc comments). This
+does NOT relax anything about genuine coverage gaps — `ErrSearchNoCoverage`/`ErrCubeWarming`/
+`ErrMetricsNoCoverage` and friends are untouched by this change; only the cost/selectivity
+heuristic (`ErrPlanTimeLowSelectivityNoLimit`, tempo's `modules/frontend/vcnt_fetch.go`) is
+removed, since it now has zero remaining production callers.
+
+Back-ref (current): `internal/modules/queryplan/queryplan.go:SelectSearchStrategy` (function body
+now unconditionally `return DispatchBlockSharded, false`). Tests:
+`queryplan_test.go:TestSelectSearchStrategy_FourRowCore` (retained name, rewritten cases — no
+case still expects `planTimeDecline=true`),
+`TestSelectSearchStrategy_NeverReturnsTimeSlicedOrFakeDeclineStrategy`,
+`TestSelectSearchStrategy_NoLongerReturnsDispatchBoundedRecentFirst`. Real end-to-end regression
+coverage (both search and metrics actually dispatching and returning correct results for a
+`LowSelectivity`+no-limit query) lives in tempo:
+`modules/frontend/vcnt_fetch_test.go`, `tempodb/encoding/vblockpack/vcnt_duration_histogram_integration_test.go`.
+Issue #535.
+
 ---
 
 ## SPEC-QP-7: `LeadDetail` / `ClassifyProgramVCNTWithDetail` — Both-Sides'-Costs Contract
