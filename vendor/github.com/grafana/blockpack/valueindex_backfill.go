@@ -347,3 +347,154 @@ func (e *BackfillEngine) extractAndWriteBlock(
 	}
 	return nil
 }
+
+// BackfillColumnTarget names one (ColumnName, ColumnType) pair for
+// ExtractAndWriteBlockColumns' multi-column single-pass extraction. Deliberately smaller
+// than Entry (no Tenant/Backfill/ColumnHash fields): ColumnHash is derived internally from
+// ColumnName by valueindex.ColHash exactly like flushAndPutL0's existing single-column
+// callers already do, and Tenant is supplied once for the whole call via
+// ExtractAndWriteBlockColumns' own tenant parameter, since every target in one call is, by
+// construction, backfilling against the SAME already-fetched block for the SAME tenant.
+type BackfillColumnTarget struct {
+	ColumnName string
+	ColumnType string
+	// CreatedAtSec feeds writeColumnMetadata's per-column metadata.json, mirroring
+	// BackfillEngine.Run's own entry.CreatedAt usage exactly.
+	CreatedAtSec uint64
+}
+
+// BackfillColumnResult is one target's outcome from ExtractAndWriteBlockColumns, returned
+// once per target, in Targets' input order, after the whole batch's single extraction pass
+// and every target's own metadata-write/flush have been attempted. Err is nil for a target
+// that was hard-excluded (mirrors BackfillEngine.Run's own "immediate success, write
+// nothing" contract for HardExcludedColumns) or that was written successfully; non-nil for
+// a genuine per-target metadata-write or flush failure. A caller loops results in order and
+// stops at the first non-nil Err exactly like the old per-column BackfillEngine.Run loop
+// stopped at the first column whose Run call failed -- see
+// processViBackfillPendingColumns.
+type BackfillColumnResult struct {
+	Err    error
+	Target BackfillColumnTarget
+}
+
+// ExtractAndWriteBlockColumns performs a SINGLE extraction pass over r for every target in
+// targets, writing one L0 value-index file per target through store -- the multi-column
+// analog of BackfillEngine's own per-column extractAndWriteBlock, for the case where N
+// columns are all pending against the SAME already-fetched/staged block
+// (compactionworker's issue #533 block-shaped vi_backfill jobs, one job per real block with
+// columns as vi_backfill_job_columns membership rows).
+//
+// This is a pprof-evidenced memory fix, not a CPU-efficiency nicety (the #533 brainstorm
+// identified "multi-column single-pass extraction" but deferred it as the latter). A live
+// heap profile on a compaction-worker pod showed buildSpanStartSecByRef (valueindex_extract.go)
+// alone at 69% of in-use heap: it builds a map[uint32]uint64 with one entry per span in the
+// WHOLE file, and BackfillEngine.Run's per-column contract meant a block with N pending
+// columns rebuilt that multi-GB map from scratch N times, back-to-back, within one job --
+// where extractAndWriteBlock calls ExtractValueIndexEntriesForColumns once per column, each
+// call independently re-parsing every inner block. Because every target here is
+// extracted via exactly ONE ExtractValueIndexEntriesForColumns call -- scoped to the
+// COMBINED allowlist of every target's ColumnName -- that per-inner-block parse work
+// (including buildSpanStartSecByRef) happens exactly once regardless of len(targets).
+//
+// Each yielded entry is dispatched to the matching target's own l0Group by (ColName,
+// ColType), not ColName alone: two targets can legitimately share a name but differ in
+// type (a column observed as two distinct types is two independent Entries, mirroring
+// l0Group's own keying convention in valueindex_l0write.go, NOTE-VI-024).
+//
+// HardExcludedColumns are skipped identically to extractAndWriteBlock's own R2 guard
+// (permanent exclusion regardless of what any target claims): no metadata is written and no
+// group is created for an excluded target, and its BackfillColumnResult.Err is left nil
+// (success, nothing written) -- mirroring Run's own "immediate Done, writing nothing"
+// contract for a single-column excluded run.
+//
+// A metadata-write or add-entry failure for one target does not abort the batch for any
+// OTHER target: this function's own per-target isolation is strictly more granular than the
+// old "one BackfillEngine.Run call per column" loop ever needed to be, since every target
+// here shares one already-in-flight extraction pass rather than each getting its own
+// independent Run call. Only a genuine failure of the shared extraction pass itself (r's
+// underlying read failing in a way that surfaces as a yield error -- see
+// ExtractValueIndexEntriesForColumns' own contract) aborts the whole call, returning a
+// non-nil error with no results, since that failure mode poisons every target's
+// partially-built group identically.
+//
+// SPEC-ROOT-027.
+func ExtractAndWriteBlockColumns(
+	r *Reader,
+	store ObjectPutter,
+	sourceRef, tenant, indexPrefix string,
+	targets []BackfillColumnTarget,
+) ([]BackfillColumnResult, error) {
+	if r == nil || store == nil || len(targets) == 0 {
+		return nil, nil
+	}
+	if indexPrefix == "" {
+		indexPrefix = defaultL0IndexPrefix
+	}
+
+	results := make([]BackfillColumnResult, len(targets))
+	groups := make(map[string]*l0Group, len(targets))
+	allowlist := make(map[string]struct{}, len(targets))
+	targetIdx := make(map[string]int, len(targets))
+
+	for i, t := range targets {
+		results[i] = BackfillColumnResult{Target: t}
+		if _, excluded := HardExcludedColumns[t.ColumnName]; excluded {
+			continue
+		}
+		if err := writeColumnMetadata(store, tenant, indexPrefix, t.ColumnName, t.ColumnType, t.CreatedAtSec); err != nil {
+			results[i].Err = fmt.Errorf(
+				"blockpack: ExtractAndWriteBlockColumns: write column metadata %q: %w", t.ColumnName, err,
+			)
+			continue
+		}
+		allowlist[t.ColumnName] = struct{}{}
+		targetIdx[t.ColumnName+"\x00"+t.ColumnType] = i
+	}
+
+	if len(allowlist) == 0 {
+		return results, nil
+	}
+
+	err := ExtractValueIndexEntriesForColumns(r, allowlist, func(e ValueIndexEntry) error {
+		key := e.ColName + "\x00" + valueindex.ColTypeName(e.ColType)
+		idx, ok := targetIdx[key]
+		if !ok || results[idx].Err != nil {
+			return nil //nolint:nilerr // deliberate per-target isolation: a target that already failed
+			// (results[idx].Err set) must not abort the SHARED extraction pass for every other
+			// target, so this intentionally swallows the already-recorded failure and keeps
+			// dispatching entries to every OTHER target's own group instead of stopping the whole
+			// batch. Not the "swallowed real error" bug nilerr normally guards against.
+		}
+		g := groups[key]
+		if g == nil {
+			g = &l0Group{writer: valueindex.NewWriter(e.ColName, e.ColType), colName: e.ColName, colType: e.ColType}
+			groups[key] = g
+		}
+		if addErr := addValueIndexEntryToGroup(g, e, sourceRef); addErr != nil {
+			results[idx].Err = fmt.Errorf(
+				"blockpack: ExtractAndWriteBlockColumns: add entry %q: %w", e.ColName, addErr,
+			)
+		}
+		return nil
+	})
+	if err != nil {
+		for _, g := range groups {
+			g.writer.Close()
+		}
+		return nil, fmt.Errorf("blockpack: ExtractAndWriteBlockColumns: extract %q: %w", sourceRef, err)
+	}
+
+	for key, g := range groups {
+		idx := targetIdx[key]
+		if results[idx].Err == nil {
+			if putErr := flushAndPutL0(store, g, tenant, indexPrefix); putErr != nil {
+				results[idx].Err = fmt.Errorf(
+					"blockpack: ExtractAndWriteBlockColumns: flush %q: %w", sourceRef, putErr,
+				)
+			}
+		}
+		g.writer.Close()
+	}
+
+	return results, nil
+}

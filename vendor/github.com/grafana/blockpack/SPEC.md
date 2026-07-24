@@ -1447,3 +1447,52 @@ mechanism this fix lets actually function),
 `valueindex_backfill_test.go:TestBackfillEngine_StreamedExtraction_ManySpansAllPreserved` (mutation-
 tested: reintroducing a per-entry group rebuild — the exact "accumulate/rebuild instead of stream
 once" class of bug — makes this test fail).
+
+## SPEC-ROOT-027: `ExtractAndWriteBlockColumns` — Multi-Column Single-Pass Extraction Against One Already-Fetched Block
+
+**When N callers each need a DIFFERENT column extracted from the SAME already-fetched block, they
+must share one extraction pass, not run N independent single-column passes.** A per-inner-block
+parse (including any whole-file derived lookup map built once per pass) is exactly as expensive
+per call regardless of how many columns that call's own allowlist covers, so paying that cost N
+times for N columns against one block is pure waste — and, per SPEC-ROOT-026's neighboring entry,
+can itself be the dominant source of memory growth even when the actual I/O is fully cached.
+
+**Rationale (found live via pprof, 2026-07-23, issue #533/#535 rollout on tempo-dev-test-03):** a
+heap profile on a running compaction-worker pod showed `buildSpanStartSecByRef`
+(`valueindex_extract.go`) alone at 69% of in-use heap — it builds a `map[uint32]uint64` with ONE
+ENTRY PER SPAN IN THE WHOLE FILE, so it can stamp `TimeSec` on every yielded entry without
+re-reading `span:start` per column. `compactionworker`'s `processViBackfillPendingColumns` looped
+every pending column for a job's one target block and, for EACH column separately, constructed a
+fresh `BackfillEngine` and called `.Run()` — each call independently re-parsing every inner block
+and rebuilding that multi-GB map from scratch. A block with N outstanding columns triggered N
+redundant multi-GB allocations back-to-back within one job — issue #530's `SectionCache` already
+made the underlying object bytes cheap to re-fetch on a cache hit, but that cache sits BELOW this
+rebuild: a 100%-cache-hit re-open still re-triggers `buildSpanStartSecByRef` from scratch, which is
+why the cache alone did not fix this.
+
+**Fix:** `ExtractAndWriteBlockColumns` (`valueindex_backfill.go`) accepts a `[]BackfillColumnTarget`
+(one entry per pending column) and a single already-open `*Reader`, and calls
+`ExtractValueIndexEntriesForColumns` exactly ONCE, scoped to the COMBINED allowlist of every
+target's `ColumnName`. Inside the shared yield callback, each entry is dispatched to the matching
+target's own `l0Group` by `(ColName, ColType)` — not `ColName` alone, since two targets can share a
+name but differ in type (mirrors `l0Group`'s existing keying convention, NOTE-VI-024) — and every
+non-empty group is flushed via the existing `flushAndPutL0` once extraction finishes. This is
+purely additive: `BackfillEngine`'s own single-column `Run`/`extractAndWriteBlock` contract and
+every existing caller are unchanged.
+
+**Rule:** before adding a caller that loops a single-column extraction/backfill entry point once
+per column against the SAME source object, check whether a multi-column variant already exists (or
+should be added) that shares the underlying parse/lookup-map work across every column in one pass
+— looping the single-column entry point is only correct when each iteration targets a genuinely
+DIFFERENT source object.
+
+Back-ref: `valueindex_backfill.go` (`ExtractAndWriteBlockColumns`, `BackfillColumnTarget`,
+`BackfillColumnResult`), `internal/modules/compactionworker/vi_backfill.go`
+(`processViBackfillPendingColumns`, SPEC-COMPACTIONWORKER-13),
+`valueindex_backfill_test.go:TestExtractAndWriteBlockColumns_SharesOnePassAcrossTargets`
+(mutation-tested via `rw.TrackingReaderProvider`: reintroducing a per-target
+`ExtractValueIndexEntriesForColumns` call — the exact N-times-redundant-rebuild class of bug —
+makes this test fail),
+`internal/modules/compactionworker/vi_backfill_test.go:TestProcessViBackfillJob_ThreeColumnsOneBlock_SharesOneExtractionPass`
+(package-layer companion pin via `viBackfillFetchBlockCalls`, proving the caller invokes the block
+fetch/open exactly once per job regardless of column count — also mutation-tested).
