@@ -179,27 +179,32 @@ func TestQualification_MixedIndexableAndNegatedLeafForcesBlockSharded(t *testing
 	require.Equal(t, blockpack.DispatchBlockSharded, plan.Strategy)
 }
 
-// TestCheckIndexCoverage_DurationStrictGT_RemainsUndecidable_UnaffectedByPhase2Simplification
-// (#217 Phase 4.2, the red-herring regression guard) pins Phase 0's grounding-pass finding: the
-// ORIGINAL live repro's `{duration > 1ms}` shape is architecturally UNDECIDABLE
+// TestCheckIndexCoverage_DurationStrictGT_NowCoverageEligibleViaResidualPushdown
+// (#217 Phase 4.2's original red-herring regression guard, UPDATED by issue #534) used to pin
+// Phase 0's grounding-pass finding that `{duration > 1ms}` is architecturally UNDECIDABLE
 // (vibuilder.decidableTimeBucketThreshold's own derivation — a strict `>` at an exact
 // millisecond-aligned threshold cannot be resolved against the millisecond-bucketed dedicated
-// duration column, task #204) and is UNRELATED to this task's coverage-gap fix; it must decline
-// identically before and after every #217 phase. `{duration >= 1ms}` (the SAME threshold, `>=`
-// instead of `>`) IS decidable and must remain eligible. This test exists so a future change
-// that accidentally "fixes" shape-undecidability rejection while touching coverage-tolerance
-// code (Phase 2.1's CheckIndexCoverage simplification, in particular) fails loudly here instead
-// of silently changing which query shapes are answerable from the index.
-func TestCheckIndexCoverage_DurationStrictGT_RemainsUndecidable_UnaffectedByPhase2Simplification(t *testing.T) {
+// duration column, task #204) and must therefore decline outright. Issue #534 deliberately
+// changed this: the ambiguity is now resolved via residual pushdown (vibuilder widens the
+// value-index query to also capture the one genuinely ambiguous boundary bucket, and attaches
+// the ORIGINAL exact predicate as a residual re-checked against the real value once the
+// candidate's block is fetched for materialization — see blockpack's
+// executor.ResidualColumnPredicate/NOTE-VI-123) — so this shape is now genuinely
+// coverage-eligible, exactly like `{duration >= 1ms}` always was. This test's ORIGINAL purpose
+// (a change to CheckIndexCoverage's own simplification logic must not silently alter which
+// query shapes are answerable from the index) still applies; only the expected answer for THIS
+// specific shape flipped, deliberately, with #534's own fix.
+func TestCheckIndexCoverage_DurationStrictGT_NowCoverageEligibleViaResidualPushdown(t *testing.T) {
 	withVIQueryReader(t, &fakeVISink{}, "indexes")
 
 	gtProg, err := blockpack.CompileTraceQL(`{ duration > 1ms }`, blockpack.QueryOptions{})
 	require.NoError(t, err)
-	require.False(t, CheckIndexCoverage(gtProg),
-		"{duration > 1ms} is architecturally undecidable (decidableTimeBucketThreshold, task #204) and must still decline after #217's CheckIndexCoverage simplification (Phase 2.1)")
+	require.True(t, CheckIndexCoverage(gtProg),
+		"{duration > 1ms} is now coverage-eligible (issue #534's residual pushdown resolves the "+
+			"one ambiguous boundary bucket against the real value once the block is fetched)")
 
 	geProg, err := blockpack.CompileTraceQL(`{ duration >= 1ms }`, blockpack.QueryOptions{})
 	require.NoError(t, err)
 	require.True(t, CheckIndexCoverage(geProg),
-		"{duration >= 1ms} is decidable at the SAME threshold (only the operator differs) and must remain eligible — proving the GT case's decline above is shape-driven, not a blanket duration-column rejection")
+		"{duration >= 1ms} was already decidable at the SAME threshold (only the operator differs) and must remain eligible")
 }
