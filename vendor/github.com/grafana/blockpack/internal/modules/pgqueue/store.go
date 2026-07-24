@@ -695,3 +695,41 @@ func backoffDuration(retryAttempt int) time.Duration {
 	}
 	return d
 }
+
+// JobTypeStatusCount is one (job_type, status) group's current row count -- JobCounts' return
+// element.
+type JobTypeStatusCount struct {
+	JobType string
+	Status  string
+	Count   int64
+}
+
+const jobCountsSQL = `SELECT job_type, status, count(*) FROM compaction_jobs GROUP BY job_type, status`
+
+// JobCounts returns the current row count of compaction_jobs grouped by (job_type, status) --
+// the whole queue's live state in one query, backing the compaction-planner's
+// blockpack_compactionplanner_job_queue_depth gauge (issue: "add prometheus metrics to the job
+// scheduler"). A (job_type, status) pair with zero current rows is simply absent from the
+// result -- callers exposing this as a GaugeVec MUST Reset() before repopulating so a pair that
+// drops to zero stops being reported, rather than lingering at its last nonzero value forever
+// (the classic GaugeVec-without-Reset staleness bug).
+func (s *Store) JobCounts(ctx context.Context) ([]JobTypeStatusCount, error) {
+	rows, err := s.pool.Query(ctx, jobCountsSQL)
+	if err != nil {
+		return nil, fmt.Errorf("pgqueue: job counts: %w", err)
+	}
+	defer rows.Close()
+
+	var out []JobTypeStatusCount
+	for rows.Next() {
+		var c JobTypeStatusCount
+		if err := rows.Scan(&c.JobType, &c.Status, &c.Count); err != nil {
+			return nil, fmt.Errorf("pgqueue: scan job count: %w", err)
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("pgqueue: iterate job counts: %w", err)
+	}
+	return out, nil
+}
