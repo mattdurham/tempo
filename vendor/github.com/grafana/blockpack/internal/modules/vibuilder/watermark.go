@@ -34,6 +34,15 @@ func (r GapRange) overlaps(minSec, maxSec uint64) bool {
 // must not depend on internal/modules/viusage either, to keep this package's
 // dependency graph a leaf).
 //
+// Any map[string]ColumnWatermark MUST be keyed by ColumnWatermarkKey(colName, colType), never
+// colName alone: viusage.Entry (the registry row this type is derived from) is keyed by
+// (Tenant, ColumnHash, ColumnType) -- the SAME column name can legitimately exist as two
+// independent entries observed as two distinct types (mirroring l0Group's own keying
+// convention, and ExtractAndWriteBlockColumns' identical (ColName, ColType) dispatch key,
+// valueindex_backfill.go, NOTE-VI-024/SPEC-ROOT-027). A colName-only key silently collapses
+// those two entries' coverage state into one, discarding whichever one a construction loop
+// visits first (the exact bug this doc comment update fixes, issue #536).
+//
 // GapRanges (issue #529) replaces a single scalar watermark as the actual coverage-check input:
 // with many independent, parallel 1-minute vi_backfill jobs, completion is no longer guaranteed
 // monotonic (a genuinely older window can finish after a genuinely newer one), so "covered iff
@@ -64,4 +73,23 @@ func (w ColumnWatermark) CoversRange(minSec, maxSec uint64) bool {
 		}
 	}
 	return true
+}
+
+// ColumnWatermarkKey returns the composite key every map[string]ColumnWatermark MUST be built
+// and read with (issue #536, SPEC-ROOT-028: any map built from per-(name,type) registry entries
+// must key by (name,type), never name alone): colName alone collides whenever a column
+// legitimately exists as two distinct types (viusage.Entry's own (Tenant, ColumnHash,
+// ColumnType) key, entry.go) -- see ColumnWatermark's own doc comment for the full rationale.
+// Uses the same \x00-joined convention ExtractAndWriteBlockColumns already uses internally for
+// the identical name+type collision problem (valueindex_backfill.go), so both fixes share one
+// mental model even though they key unrelated maps.
+//
+// colType must be the STRING form (valueindex.ColTypeName's output, which is also
+// viusage.Entry.ColumnType's own on-disk format) -- a caller holding a
+// modules_shared.ColumnType must convert via valueindex.ColTypeName first. Re-exported from
+// root blockpack as blockpack.ColumnWatermarkKey so both this package's own lookup call sites
+// and tempo's cache-construction site (a separate module, vi_watermark_cache.go) build the
+// identical key and can never drift.
+func ColumnWatermarkKey(colName, colType string) string {
+	return colName + "\x00" + colType
 }

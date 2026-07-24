@@ -109,8 +109,10 @@ func TestCheckIndexCoverage_IgnoresWatermarks_EvenWithHalfBackfill(t *testing.T)
 		entries: map[string]viWatermarkCacheEntry{
 			tenant: {
 				fetched: time.Now(),
+				// Issue #536: keyed by blockpack.ColumnWatermarkKey(colName, colType), not
+				// colName alone -- resource.service.name resolves as a "string" leaf.
 				watermarks: map[string]blockpack.ColumnWatermark{
-					"resource.service.name": {
+					blockpack.ColumnWatermarkKey("resource.service.name", "string"): {
 						Triggered: true, Done: false, WatermarkSec: midpoint,
 						GapRanges: []blockpack.ColumnWatermarkGapRange{{StartSec: 0, EndSec: midpoint}},
 					},

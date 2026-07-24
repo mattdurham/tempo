@@ -1496,3 +1496,52 @@ makes this test fail),
 `internal/modules/compactionworker/vi_backfill_test.go:TestProcessViBackfillJob_ThreeColumnsOneBlock_SharesOneExtractionPass`
 (package-layer companion pin via `viBackfillFetchBlockCalls`, proving the caller invokes the block
 fetch/open exactly once per job regardless of column count — also mutation-tested).
+
+## SPEC-ROOT-028: A Map Built From Per-(Name,Type) Registry Entries Must Key By (Name,Type), Never Name Alone
+
+**Any map keyed off a viusage/registry-derived per-column record — where the record's own
+identity is `(Tenant, ColumnHash, ColumnType)`, not name alone — must use a composite
+`(ColumnName, ColumnType)` key, never `ColumnName` alone.** The same column name can legitimately
+exist as two independent, live entries observed as two distinct types (e.g. a column written as
+both `int64` and `uint64` across its history); a name-only map key silently collapses those two
+entries' state into one, discarding whichever one a construction loop visits last — the exact same
+collision class SPEC-ROOT-027 already closes for `ExtractAndWriteBlockColumns`' dispatch key, but
+for a READ-side coverage map rather than a write-side dispatch map.
+
+**Rationale (found live, 2026-07-24, issue #536, tenant 11638 on tempo-dev-test-03):**
+`vi_watermark_cache.go`'s `WatermarksFor` (tempo, not this repo — but consuming this repo's
+`vibuilder.ColumnWatermark` type) built its `map[string]blockpack.ColumnWatermark` keyed by
+`e.ColumnName` alone. `span:duration` had two live registry entries — a stale, essentially-
+abandoned `int64` entry (`Triggered=true, Done=true, WatermarkSec=0`, near-zero real backfill
+history) and the active, near-completely-backfilled `uint64` entry (12,486+ succeeded jobs, real
+gap-free coverage) — and whichever entry `Load()` returned last silently overwrote the other's
+coverage state in the map. TraceQL queries on `{ duration > 100ms }` (which resolves to the
+`uint64` column) declined with a false "no coverage yet" for windows that DEMONSTRABLY have real
+VI files in the catalog, because the query's real, near-complete `uint64` coverage state was
+sometimes discarded in favor of the stale `int64` entry's near-empty state.
+
+**Fix:** `vibuilder.ColumnWatermarkKey(colName, colType string) string` (`\x00`-joined, mirroring
+`ExtractAndWriteBlockColumns`' identical convention), re-exported at root as
+`blockpack.ColumnWatermarkKey` so both sides of the cross-repo contract — tempo's
+`vi_watermark_cache.go` (construction) and this repo's `vibuilder` lookup call sites
+(`BuildSource`/`BuildSourceBounded`/`buildSourceBoundedMultiLeafAND`, consumption) — build and read
+the IDENTICAL key and can never drift. `ColumnWatermark`'s own doc comment, and every
+`BuildValueIndexSource*` doc comment describing the `watermarks` parameter, now state the
+composite-key contract explicitly.
+
+**Rule:** before adding or reviewing any map built by iterating viusage/registry `Entry` rows (or
+any other per-`(name, type)` registry record), check whether the map is keyed by name alone. If a
+plain column name is the only key, and two entries can plausibly share that name with different
+types, the map MUST use a composite `(name, type)` key instead — a `map[string]struct{}` SET
+(e.g. `dedicatedColumnSet`, `HardExcludedColumns` membership checks) is NOT subject to this rule,
+since a set collision only affects deduplication, never discards a distinct VALUE.
+
+Back-ref: `internal/modules/vibuilder/watermark.go` (`ColumnWatermark`, `ColumnWatermarkKey`),
+`internal/modules/vibuilder/builder.go` (`BuildSource`, `buildSourceBoundedPerLeaf`),
+`internal/modules/vibuilder/builder_bounded_and.go` (`buildSourceBoundedMultiLeafAND`),
+`valueindex_query.go` (`ColumnWatermarkKey` root re-export), tempo's
+`tempodb/encoding/vblockpack/vi_watermark_cache.go` (`WatermarksFor`, the construction site this
+entry's live incident was found in — mutation-tested there: reverting to `e.ColumnName`-only
+keying makes
+`TestViWatermarkCache_SameNameDifferentType_BothPreservedIndependently` fail with the exact
+observed symptom, a collapsed 1-entry map instead of 2).

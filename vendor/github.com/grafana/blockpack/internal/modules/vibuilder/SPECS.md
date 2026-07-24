@@ -197,11 +197,23 @@ enforcement point, at this file's `src.AddLeaf` call site, no other change to `B
 decision logic:**
 
 ```go
-if wm, ok := watermarks[w.col]; ok && !wm.CoversRange(minSec, maxSec) {
+if wm, ok := watermarks[wmKey]; ok && !wm.CoversRange(minSec, maxSec) {
     continue // leave uncovered; the executor's existing decline/fallback path fires
 }
 src.AddLeaf(w.idx, w.col, w.colType, results)
 ```
+
+**[CORRECTED, issue #536, 2026-07-24]** The map key is `wmKey := ColumnWatermarkKey(w.col,
+valueindex.ColTypeName(w.colType))`, NOT the bare `w.col` this entry originally showed. A
+colName-only key silently collides two entries that share a name but differ in type (a live,
+confirmed collision: tenant 11638's `span:duration` existed as both a stale `int64` entry and
+the active, real-coverage `uint64` entry — whichever `Load()` order the registry returned last
+silently discarded the other's coverage state). `ColumnWatermarkKey(colName, colType string)
+string` (`watermark.go`, `\x00`-joined, mirroring `ExtractAndWriteBlockColumns`' identical
+convention, SPEC-ROOT-027) is the ONE function every construction site (tempo's
+`vi_watermark_cache.go`, a separate module) and every lookup site (this file's `BuildSource`,
+`buildSourceBoundedPerLeaf`, `builder_bounded_and.go`'s `buildSourceBoundedMultiLeafAND`) must
+call — see root SPEC-ROOT-028 for the full cross-repo rationale.
 
 1. The leaf-predicate loop (per-leaf `RangeNode` resolution) — the sole remaining gate site.
 
@@ -246,7 +258,7 @@ signal until this second bug was ALSO fixed, because the stale `len(work) > 0` t
 have masked the adversarial test's intended failure mode on a naive first attempt. See
 `NOTES.md` for the full writeup of this second finding.
 
-Back-refs: `internal/modules/vibuilder/watermark.go:ColumnWatermark,CoversRange`,
+Back-refs: `internal/modules/vibuilder/watermark.go:ColumnWatermark,CoversRange,ColumnWatermarkKey`,
 `internal/modules/vibuilder/builder.go:anyLeafAdded`,
 `internal/modules/vibuilder/builder.go:BuildSource` (sole remaining gate site, task #211). See `viusage/SPECS.md`
 SPEC-VIUSAGE-2 (the duplicated-logic twin) and `NOTES.md` (this file) for the import-cycle

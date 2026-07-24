@@ -152,10 +152,11 @@ type FileDiscovererNewestFirst interface {
 // scan on error rather than fail the query.
 //
 // watermarks (#496 R7, plan.md Section 4.7) gates coverage for non-dedicated,
-// usage-triggered columns mid-backfill: keyed by column name, nil (or a
-// column simply absent from the map -- the common case for dedicated columns,
-// which are never usage-tracked) means no gating, exactly today's behavior. A
-// column present in watermarks whose CoversRange(minSec, maxSec) is false is
+// usage-triggered columns mid-backfill: keyed by ColumnWatermarkKey(colName, colTypeName), NOT
+// colName alone (issue #536 -- see ColumnWatermark's own doc comment for why a colName-only key
+// silently collides two same-name, different-type columns). nil (or a column simply absent from
+// the map -- the common case for dedicated columns, which are never usage-tracked) means no
+// gating, exactly today's behavior. A column present in watermarks whose CoversRange(minSec, maxSec) is false is
 // left un-Added, so the executor's existing decline/fallback path fires --
 // identical to "no VI files discovered at all." This is the single most
 // important correctness gate in the whole #496 feature: VI's index is
@@ -248,7 +249,10 @@ func BuildSource(
 				// this query's window must be left un-Added -- see BuildSource's own
 				// doc comment for why this is the feature's single most important
 				// correctness gate.
-				if wm, ok := watermarks[w.col]; ok && !wm.CoversRange(minSec, maxSec) {
+				// Issue #536: keyed by (w.col, w.colType), not w.col alone -- see BuildSource's own
+				// comment and ColumnWatermark's own doc comment for the rationale.
+				wmKey := ColumnWatermarkKey(w.col, valueindex.ColTypeName(w.colType))
+				if wm, ok := watermarks[wmKey]; ok && !wm.CoversRange(minSec, maxSec) {
 					return nil
 				}
 				// Add even when empty: a covered-but-empty column is coverage, not
@@ -457,7 +461,10 @@ func buildSourceBoundedPerLeaf(
 				return lerr
 			}
 			src.RecordFileIO(filesRead, bytesRead)
-			if wm, ok := watermarks[w.col]; ok && !wm.CoversRange(minSec, maxSec) {
+			// Issue #536: keyed by (w.col, w.colType), not w.col alone -- see BuildSource's
+			// identical comment and ColumnWatermark's own doc comment for the rationale.
+			wmKey := ColumnWatermarkKey(w.col, valueindex.ColTypeName(w.colType))
+			if wm, ok := watermarks[wmKey]; ok && !wm.CoversRange(minSec, maxSec) {
 				return nil
 			}
 			// AddLeaf, not Add (issue #206): this stopgap path also resolves a mixed

@@ -730,3 +730,57 @@ BackfillEngine.processBlocks` (root package). Tests: `watermark_test.go`'s rewri
 `TestColumnWatermark_CoversRange_TrueDoneImpliesZeroWatermarkCovers`,
 `internal/modules/viusage/coversrange_parity_test.go` (parity gate covering both
 implementations). Issue #519.
+
+## NOTE-VI-122 — `map[string]ColumnWatermark` keyed by name alone silently collided two same-name, different-type registry entries (issue #536, live on tenant 11638)
+
+Date: 2026-07-24
+
+`vi_watermark_cache.go`'s `WatermarksFor` (tempo, not this repo, but consuming this repo's
+`ColumnWatermark` type) built its coverage-gating map keyed by `e.ColumnName` alone, even though
+the underlying registry keys real rows by `(Tenant, ColumnHash, ColumnType)`
+(`viusage/entry.go:Entry`) — the SAME column name can legitimately have two live entries
+differing only in type. Confirmed live on tempo-dev-test-03, tenant 11638: `span:duration`
+existed as both a stale, essentially-abandoned `int64` entry (`Triggered=true, Done=true,
+WatermarkSec=0`, near-zero real backfill history) and the active, current `uint64` entry
+(12,486+ succeeded jobs, near-complete real coverage). Whichever entry `Load()` returned last
+silently overwrote the other's coverage state in the map — TraceQL queries on
+`{ duration > 100ms }` (which resolves to the `uint64` column) declined with a false "no
+coverage yet" for windows that DEMONSTRABLY have real VI files in the catalog, because the
+query's real, near-complete `uint64` coverage state was sometimes discarded in favor of the
+stale `int64` entry's near-empty state (or vice versa, depending on `Load()`'s row order).
+
+This is the identical collision class SPEC-ROOT-027/NOTE-VI-024 already closed for
+`ExtractAndWriteBlockColumns`' write-side dispatch key — this bug is that same class on the
+READ side, in a map this package's own `BuildSource`/`BuildSourceBounded` consume, that had
+never gotten the same treatment.
+
+**Fix:** `ColumnWatermarkKey(colName, colType string) string` (`watermark.go`, `\x00`-joined,
+mirroring `ExtractAndWriteBlockColumns`' own convention exactly), re-exported at root as
+`blockpack.ColumnWatermarkKey` so tempo's construction site and this package's own lookup call
+sites (`BuildSource`, `buildSourceBoundedPerLeaf`, `buildSourceBoundedMultiLeafAND`) build and
+read the IDENTICAL key and can never drift. `ColumnWatermark`'s own doc comment and every
+`BuildValueIndexSource*` doc comment describing the `watermarks` parameter now state this
+composite-key contract explicitly. See root `SPEC.md` SPEC-ROOT-028 for the full cross-repo
+rationale, and `SPECS.md` SPEC-VB-4's `[CORRECTED, issue #536, 2026-07-24]` addendum for the
+updated enforcement snippet.
+
+**Audit performed for other instances of the same collision class:** `HardExcludedColumns`
+membership checks and tempo's `dedicatedColumnSet` are `map[string]struct{}` SETS keyed by name
+alone — deliberately, since a set collision only affects deduplication, never discards a
+distinct coverage VALUE the way this map's collision did; not a bug. Cube's
+`map[uint32]ResolutionWatermark` (`internal/modules/cube/pg_entry_store.go`,
+`internal/modules/compactionplanner/plan_cube_backfill.go`) is keyed by rollup LEVEL within one
+cube entry, an unrelated domain (no column-name collision possible there). No other
+per-`(name,type)`-registry-entry map was found keyed by name alone.
+
+**Back-refs:** `internal/modules/vibuilder/watermark.go:ColumnWatermark,ColumnWatermarkKey`,
+`internal/modules/vibuilder/builder.go:BuildSource,buildSourceBoundedPerLeaf`,
+`internal/modules/vibuilder/builder_bounded_and.go:buildSourceBoundedMultiLeafAND`,
+`valueindex_query.go:ColumnWatermarkKey` (root re-export). Tempo:
+`tempodb/encoding/vblockpack/vi_watermark_cache.go:WatermarksFor` (the construction site the
+live incident was found in). Tests: `builder_watermark_test.go`, `valueindex_watermark_test.go`
+(this repo, updated to the composite-key contract); tempo's
+`vi_watermark_cache_test.go:TestViWatermarkCache_SameNameDifferentType_BothPreservedIndependently`
+(the mandatory adversarial reproduction, mutation-tested: reverting `WatermarksFor` to
+`e.ColumnName`-only keying collapses the test's expected 2-entry map to 1, reproducing the
+exact live symptom). Issue #536.

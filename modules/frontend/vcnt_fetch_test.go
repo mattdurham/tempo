@@ -1017,8 +1017,10 @@ func TestBuildQueryPlan_HalfWindowBackfill_NowDispatchesTimeSlicedInsteadOfDecli
 	// 100 onward — a genuine "full backfill for half the window" partial-coverage shape, which
 	// pre-#217 would decline the whole window via CheckIndexCoverage's now-removed
 	// BuildValueIndexSource consultation.
+	// Issue #536: keyed by blockpack.ColumnWatermarkKey(colName, colType), not colName alone --
+	// span.http.method resolves as a "string" leaf.
 	restoreWatermarks := vblockpack.ConfigureViWatermarkCacheForTest(tenant, map[string]blockpack.ColumnWatermark{
-		"span.http.method": {Triggered: true, Done: false, WatermarkSec: 100},
+		blockpack.ColumnWatermarkKey("span.http.method", "string"): {Triggered: true, Done: false, WatermarkSec: 100},
 	})
 	defer restoreWatermarks()
 

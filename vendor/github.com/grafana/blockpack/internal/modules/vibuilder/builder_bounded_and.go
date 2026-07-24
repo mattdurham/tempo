@@ -183,7 +183,11 @@ func buildSourceBoundedMultiLeafAND(
 	// eval time are, in general, two different tree instances even for identical query text.
 	// idx keeps leaves disambiguated regardless of column-name collisions and survives that
 	// independent recompile.
-	if wm, ok := watermarks[anchor.col]; !ok || wm.CoversRange(minSec, maxSec) {
+	// Issue #536: keyed by (col, colType), not colName alone -- see ColumnWatermark's own
+	// doc comment for why a colName-only key silently collides two same-name,
+	// different-type columns.
+	anchorWmKey := ColumnWatermarkKey(anchor.col, valueindex.ColTypeName(anchor.colType))
+	if wm, ok := watermarks[anchorWmKey]; !ok || wm.CoversRange(minSec, maxSec) {
 		src.AddLeaf(anchor.idx, anchor.col, anchor.colType, confirmed)
 		added = true
 	}
@@ -191,7 +195,8 @@ func buildSourceBoundedMultiLeafAND(
 		if i == anchorIdx {
 			continue
 		}
-		if wm, ok := watermarks[w.col]; ok && !wm.CoversRange(minSec, maxSec) {
+		wmKey := ColumnWatermarkKey(w.col, valueindex.ColTypeName(w.colType))
+		if wm, ok := watermarks[wmKey]; ok && !wm.CoversRange(minSec, maxSec) {
 			continue
 		}
 		src.AddLeaf(w.idx, w.col, w.colType, otherResults[i])

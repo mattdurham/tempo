@@ -91,7 +91,27 @@ var ErrValueIndexFileNotFound = vibuilder.ErrFileNotFound
 // Section 4.7): re-exported from vibuilder (not defined here directly) to
 // avoid an import cycle, since vibuilder.BuildSource -- which this package
 // already imports -- is the actual consumer of the gate.
+//
+// Any map[string]ColumnWatermark (e.g. BuildValueIndexSource's watermarks parameter) MUST be
+// keyed by ColumnWatermarkKey(colName, colType), never colName alone -- see that function's
+// own doc comment (issue #536).
 type ColumnWatermark = vibuilder.ColumnWatermark
+
+// ColumnWatermarkKey returns the composite (ColumnName, ColumnType) key every
+// map[string]ColumnWatermark must be built and read with (issue #536): a bare column name
+// collides whenever a column legitimately exists as two distinct types (a live, confirmed
+// case: tenant 11638's span:duration exists as both a stale int64 entry and the active,
+// current uint64 entry -- see vibuilder.ColumnWatermark's own doc comment for the full
+// rationale). colType must be the STRING form (ColTypeName's output) -- a caller holding a
+// ColumnType must convert via ColTypeName first.
+//
+// Re-exported from vibuilder so external callers that construct this map (e.g. tempo's
+// vi_watermark_cache.go, a separate module which cannot import vibuilder directly since it is
+// an internal package) and this package's own consumers (vibuilder's lookup call sites) build
+// and read the IDENTICAL key, so the two sides of this cross-repo contract can never drift.
+func ColumnWatermarkKey(colName, colType string) string {
+	return vibuilder.ColumnWatermarkKey(colName, colType)
+}
 
 // ColumnWatermarkGapRange is one contiguous, NOT-yet-covered [StartSec, EndSec) span --
 // ColumnWatermark.GapRanges's element type, re-exported for the same reason ColumnWatermark is
@@ -142,7 +162,7 @@ func ColHash(colName string) string {
 // watermarks (#496 R7) gates coverage for non-dedicated, usage-triggered
 // columns mid-backfill; nil means no gating (today's behavior, dedicated
 // columns) -- see vibuilder.BuildSource's own doc comment for the full
-// contract.
+// contract. Keyed by ColumnWatermarkKey(colName, colType), NOT colName alone (issue #536).
 func BuildValueIndexSource(
 	ctx context.Context,
 	disc *IndexFileCache,
@@ -175,8 +195,8 @@ func BuildValueIndexSource(
 // early-stopping) -- still a correct answer, just not yet early-stopped.
 //
 // limit <= 0 is treated as unbounded and delegates to BuildValueIndexSource directly.
-// disc, store, watermarks, and the (source, ok, err) return contract are identical to
-// BuildValueIndexSource's.
+// disc, store, watermarks (including its ColumnWatermarkKey-keyed contract), and the
+// (source, ok, err) return contract are identical to BuildValueIndexSource's.
 func BuildValueIndexSourceBounded(
 	ctx context.Context,
 	disc *IndexFileCache,
@@ -206,7 +226,8 @@ func BuildValueIndexSourceBounded(
 // caller supplies the discovery window via minSec/maxSec.
 //
 // Returns the same (source, ok, err) contract as BuildValueIndexSource.
-// watermarks has the same #496 R7 contract as BuildValueIndexSource's.
+// watermarks has the same #496 R7 contract as BuildValueIndexSource's, including its
+// ColumnWatermarkKey-keyed contract (issue #536).
 func BuildValueIndexSourceForMetrics(
 	ctx context.Context,
 	disc *IndexFileCache,

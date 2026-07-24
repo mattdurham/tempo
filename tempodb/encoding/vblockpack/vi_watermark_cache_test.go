@@ -68,6 +68,71 @@ func seedViWatermarkEntry(t *testing.T, store blockpack.ObjectStore, tenant, col
 	))
 }
 
+// seedViWatermarkEntryTyped mirrors seedViWatermarkEntry but takes an explicit colType and
+// watermarkSec, so a test can seed TWO independent registry entries sharing the same colName
+// but differing colType -- the exact live collision shape issue #536 fixes (confirmed on
+// tenant 11638: span:duration exists as both a stale int64 entry and the active, real-coverage
+// uint64 entry).
+func seedViWatermarkEntryTyped(t *testing.T, store blockpack.ObjectStore, tenant, colName, colType string, watermarkSec uint64) {
+	t.Helper()
+	registry := blockpack.NewRegistry(store, tenant)
+	result, err := blockpack.RecordUseAndMaybeTrigger(
+		context.Background(), registry, tenant, colName, colType, time.Unix(1000, 0),
+		blockpack.TriggerConfig{LeaseTTLSeconds: 1800},
+	)
+	require.NoError(t, err)
+	require.True(t, result.ShouldBackfill)
+	require.NoError(t, registry.UpdateWatermark(
+		context.Background(), tenant, result.Entry.ColumnHash, result.Entry.ColumnType, watermarkSec, 0, 100_000, false,
+	))
+}
+
+// TestViWatermarkCache_SameNameDifferentType_BothPreservedIndependently is issue #536's mandatory
+// adversarial reproduction of the confirmed live bug (tenant 11638): a column with the SAME name
+// but TWO distinct registry entries by type -- one stale/essentially-abandoned with near-empty
+// real coverage (int64, WatermarkSec close to "now" -- almost nothing of the [0, windowEnd)
+// history is confirmed complete), and one active with real, near-complete coverage (uint64,
+// WatermarkSec == 0 -- fully covered back to the beginning of the window). Before the #536 fix,
+// WatermarksFor kept exactly ONE map entry for this colName (whichever registry row Load()
+// visited last silently overwrote the other's coverage state) -- a query resolving to the
+// uint64 column could get gated by the int64 entry's stale, near-empty coverage (declining a
+// query that DOES have real coverage), or vice versa. After the fix, both entries are
+// independently, correctly preserved and addressable via their own composite key.
+func TestViWatermarkCache_SameNameDifferentType_BothPreservedIndependently(t *testing.T) {
+	const (
+		tenant    = "tenant-collision"
+		col       = "span:duration"
+		windowEnd = uint64(100_000)
+	)
+	store := newCountingObjectStore()
+	// The stale, essentially-abandoned int64 entry: WatermarkSec close to windowEnd means almost
+	// none of [0, windowEnd) is confirmed complete -- near-empty real backfill history.
+	seedViWatermarkEntryTyped(t, store, tenant, col, "int64", windowEnd-1_000)
+	// The active, real-coverage uint64 entry: WatermarkSec == 0 means the ENTIRE window is
+	// confirmed complete -- near-complete real coverage.
+	seedViWatermarkEntryTyped(t, store, tenant, col, "uint64", 0)
+
+	cache := newViWatermarkCache(store, nil, time.Minute)
+	wm, err := cache.WatermarksFor(context.Background(), tenant)
+	require.NoError(t, err)
+
+	// The #536 regression itself: a name-only key would collapse these two entries into one --
+	// this length check alone fails under the pre-fix (name-only) keying.
+	require.Len(t, wm, 2, "both the int64 and uint64 entries for the SAME column name must be "+
+		"preserved independently, not collapsed into one map entry")
+
+	int64Key := blockpack.ColumnWatermarkKey(col, "int64")
+	uint64Key := blockpack.ColumnWatermarkKey(col, "uint64")
+	require.Contains(t, wm, int64Key)
+	require.Contains(t, wm, uint64Key)
+
+	assert.False(t, wm[int64Key].CoversRange(0, windowEnd),
+		"the stale int64 entry's near-empty coverage must correctly decline the full window")
+	assert.True(t, wm[uint64Key].CoversRange(0, windowEnd),
+		"the active uint64 entry's real, near-complete coverage must correctly cover the full "+
+			"window -- and must NEVER be gated by the unrelated int64 entry's stale state")
+}
+
 func TestViWatermarkCache_ReturnsTriggeredColumnsOnly(t *testing.T) {
 	store := newCountingObjectStore()
 	seedViWatermarkEntry(t, store, "tenant-a", "span.custom.attr")
@@ -76,9 +141,11 @@ func TestViWatermarkCache_ReturnsTriggeredColumnsOnly(t *testing.T) {
 	wm, err := cache.WatermarksFor(context.Background(), "tenant-a")
 	require.NoError(t, err)
 
-	require.Contains(t, wm, "span.custom.attr")
-	assert.True(t, wm["span.custom.attr"].Triggered)
-	assert.Equal(t, uint64(500), wm["span.custom.attr"].WatermarkSec)
+	// Issue #536: keyed by blockpack.ColumnWatermarkKey(colName, colType), not colName alone.
+	wmKey := blockpack.ColumnWatermarkKey("span.custom.attr", "string")
+	require.Contains(t, wm, wmKey)
+	assert.True(t, wm[wmKey].Triggered)
+	assert.Equal(t, uint64(500), wm[wmKey].WatermarkSec)
 }
 
 func TestViWatermarkCache_EmptyRegistryReturnsEmptyMap(t *testing.T) {
@@ -120,10 +187,12 @@ func TestViWatermarkCache_PgConfigured_UsesPostgresRegistryNotObjectStore(t *tes
 	wm, err := cache.WatermarksFor(context.Background(), "tenant-a")
 	require.NoError(t, err)
 
-	require.Contains(t, wm, "span.custom.attr",
+	// Issue #536: keyed by blockpack.ColumnWatermarkKey(colName, colType), not colName alone.
+	wmKey := blockpack.ColumnWatermarkKey("span.custom.attr", "string")
+	require.Contains(t, wm, wmKey,
 		"must read the Postgres-backed registry when pg is configured, not the empty object store")
-	assert.True(t, wm["span.custom.attr"].Triggered)
-	assert.Equal(t, uint64(500), wm["span.custom.attr"].WatermarkSec)
+	assert.True(t, wm[wmKey].Triggered)
+	assert.Equal(t, uint64(500), wm[wmKey].WatermarkSec)
 
 	objStore.mu.Lock()
 	gets := objStore.getCalls

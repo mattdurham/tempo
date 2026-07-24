@@ -8,9 +8,19 @@ package vblockpack
 // tenant rather than raw object bytes: one viusage registry Load(ctx) per
 // tenant per TTL window, deduplicated across concurrent callers via
 // singleflight.
+//
+// Keyed by blockpack.ColumnWatermarkKey(e.ColumnName, e.ColumnType), NOT e.ColumnName alone
+// (issue #536): the registry's own Entry rows are keyed by (Tenant, ColumnHash, ColumnType) --
+// the same column name can legitimately exist as two independent, live entries observed as two
+// distinct types (confirmed live on tenant 11638: span:duration exists as both a stale,
+// essentially-abandoned int64 entry and the active, near-completely-backfilled uint64 entry). A
+// name-only key silently collapsed those two entries' coverage state into one, discarding
+// whichever entry WatermarksFor's construction loop visited first -- see
+// blockpack.ColumnWatermark's own doc comment for the full rationale.
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,9 +45,10 @@ type viWatermarkCacheEntry struct {
 
 // viWatermarkCache caches, per tenant, the map[string]blockpack.ColumnWatermark
 // derived from that tenant's usage registry: built from every entry with
-// Backfill.Triggered=true. Dedicated columns and never-triggered columns are
-// simply absent from the map, matching BuildValueIndexSource's own
-// nil/absent-means-no-gating contract (A5).
+// Backfill.Triggered=true, keyed by blockpack.ColumnWatermarkKey(e.ColumnName, e.ColumnType) --
+// NOT e.ColumnName alone (issue #536, see WatermarksFor's own doc comment). Dedicated columns
+// and never-triggered columns are simply absent from the map, matching BuildValueIndexSource's
+// own nil/absent-means-no-gating contract (A5).
 //
 // registryFor resolves per tenant exactly like realUsageRecorder.registryFor
 // (vi_usage_hook.go) -- pg preferred when configured, falling back to the
@@ -97,6 +108,13 @@ func (c *viWatermarkCache) registryFor(tenant string) *blockpack.Registry {
 // Load via singleflight, so a burst of concurrent queries against the same
 // tenant issues at most one registry object-storage GET within the TTL
 // window.
+//
+// The returned map is keyed by blockpack.ColumnWatermarkKey(e.ColumnName, e.ColumnType), never
+// e.ColumnName alone (issue #536): the registry can return two independent Entry rows sharing
+// the same ColumnName but differing ColumnType (Entry is keyed by (Tenant, ColumnHash,
+// ColumnType), not name alone), and a name-only map key would silently discard one entry's
+// entire coverage state in favor of the other's -- see blockpack.ColumnWatermark's own doc
+// comment for the full rationale and a confirmed live example.
 func (c *viWatermarkCache) WatermarksFor(ctx context.Context, tenant string) (map[string]blockpack.ColumnWatermark, error) {
 	if wm, ok := c.cached(tenant); ok {
 		return wm, nil
@@ -124,7 +142,8 @@ func (c *viWatermarkCache) WatermarksFor(ctx context.Context, tenant string) (ma
 			if gerr != nil {
 				return nil, gerr
 			}
-			watermarks[e.ColumnName] = blockpack.ColumnWatermark{
+			// Issue #536: composite (name, type) key -- see WatermarksFor's own doc comment.
+			watermarks[blockpack.ColumnWatermarkKey(e.ColumnName, e.ColumnType)] = blockpack.ColumnWatermark{
 				Triggered:    e.Backfill.Triggered,
 				Done:         e.Backfill.Done,
 				WatermarkSec: e.Backfill.WatermarkSec,
@@ -247,6 +266,10 @@ func setViWatermarkCache(c *viWatermarkCache) {
 // with no columns (i.e. no gating for any column), matching a tenant with no
 // usage-triggered/mid-backfill columns at all. Returns a restore function the caller MUST defer
 // to reset prior process-level state — this is a shared package-level singleton.
+//
+// watermarks MUST be keyed by blockpack.ColumnWatermarkKey(colName, colType), not colName alone
+// (issue #536) — the caller builds this map by hand, so it carries the same composite-key
+// contract WatermarksFor's own real construction does.
 func ConfigureViWatermarkCacheForTest(tenant string, watermarks map[string]blockpack.ColumnWatermark) (restore func()) {
 	viWatermarkCacheMu.Lock()
 	prev := viWatermarkCachePtr
@@ -314,7 +337,7 @@ func BuildViColumnPolicyForTenant(ctx context.Context, vu common.ViUsageConfig, 
 }
 
 // triggeredColumnsOrNil returns tenant's current set of usage-triggered
-// column names (#496 Fix B, R2/R12's write-path ColumnPolicy) -- every key of
+// column NAMES (#496 Fix B, R2/R12's write-path ColumnPolicy) -- derived from every key of
 // watermarksForOrNil's result, since that map is already built from
 // Backfill.Triggered=true registry entries only (viWatermarkCache.WatermarksFor's
 // own construction). nil under the exact same safe conditions
@@ -322,14 +345,27 @@ func BuildViColumnPolicyForTenant(ctx context.Context, vu common.ViUsageConfig, 
 // registry-load failure -- in both cases the write path falls back to
 // "index only the dedicated list," never to "index nothing" or "fail the
 // write," matching WriteValueIndexL0's existing best-effort posture.
+//
+// Issue #536: watermarksForOrNil's keys are now blockpack.ColumnWatermarkKey(name, type)
+// composites, not plain names -- this strips the type suffix and deduplicates, since
+// BuildColumnPolicy's own allow-set (valueindex_policy.go) is name-keyed: a column name
+// observed as two distinct types is still ONE name eligible for write-path indexing, so this
+// must never return the SAME name twice (harmless for BuildColumnPolicy's own set-assignment,
+// but a duplicate-free slice keeps this function's own contract honest).
 func triggeredColumnsOrNil(ctx context.Context, tenant string) []string {
 	watermarks := watermarksForOrNil(ctx, tenant)
 	if len(watermarks) == 0 {
 		return nil
 	}
+	seen := make(map[string]struct{}, len(watermarks))
 	cols := make([]string, 0, len(watermarks))
-	for col := range watermarks {
-		cols = append(cols, col)
+	for key := range watermarks {
+		name, _, _ := strings.Cut(key, "\x00")
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		cols = append(cols, name)
 	}
 	return cols
 }
